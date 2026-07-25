@@ -1,0 +1,1156 @@
+package handlers
+
+// apikey.go — M2.5 slice, part 1: the API-key product's CONFIG/GATING/PRICING
+// layer plus the customer-facing purchase + recharge dialogs.
+//
+// Ports (telegram_bot.py):
+//   - kiro_go_configured @5822 / kiro_go_configured_base @5835 / kiro_go_public_url @5845,
+//   - apikey_rate_usdt @6163, kiro_apikey_enabled @6196, apikey_for_sale @6207,
+//     apikey_price_vnd @6218, _apikey_coded_total @6237, _apikey_price_for @6272,
+//     _apikey_rate_disp_for @6285, _apikey_qty_rows @6292,
+//   - apikey_min_credits @6302 / apikey_max_credits @6321 / apikey_max_per_customer @6336,
+//   - _apikey_key_class @6347 / _order_sale_class @6357 / _apikey_rc_gate @6373,
+//   - _start_apikey_purchase @10417 / _start_apikey_recharge @10471,
+//   - the apikey:start / kiroapi:start / apikeyqty: / kiroapiqty: / apikeyrc:start /
+//     apikeyrcpick: / apikeyrcqty: callbacks @15405-15570,
+//   - the pending_apikey (#45) / pending_apikeyrc (#46) text captures @19058-19103.
+//
+// Delivery (mint + top-up) lives in apikey_deliver.go, the My-Keys/reveal views
+// in apikey_keys.go, and the group refund in apikey_refund.go.
+
+import (
+	"context"
+	"log"
+	"math"
+	"strconv"
+	"strings"
+	"time"
+
+	"codezdev-bot/internal/i18n"
+	"codezdev-bot/internal/kirogo"
+	"codezdev-bot/internal/store"
+	"codezdev-bot/internal/tg"
+)
+
+// registerAPIKey attaches the M2.5 captures + callback routes. Called once from
+// New, AFTER registerCatalog/registerDeposit.
+//
+// CAPTURE ORDER IS THE CONTRACT (handlers-go.md §2.2): pending_apikey is #45 and
+// pending_apikeyrc #46, i.e. after pending_deposit (#44) and before
+// pending_purchase (#48) — the customer priority comment at telegram_bot.py:3639
+// (code > sell > deposit > apikey > apikeyrc > ordercode > purchase). They are
+// therefore INSERTED before the "purchase" stage rather than appended.
+//
+// Callback routes are appended: none of the apikey prefixes overlap any
+// already-registered prefix, so first-match dispatch is order-independent for
+// them (their Python positions are @15405-15592 and @12371-12379).
+func (b *Bot) registerAPIKey() {
+	b.insertCapturesBefore("purchase",
+		stage{name: "apikey", fn: (*Bot).capAPIKey},     // #45 @19058 peek
+		stage{name: "apikeyrc", fn: (*Bot).capAPIKeyRC}, // #46 @19084 peek
+	)
+	b.cbRoutes = append(b.cbRoutes,
+		cbRoute{key: "apikey:start", exact: true, fn: (*Bot).cbApikeyStart},     // @15405
+		cbRoute{key: "kiroapi:start", exact: true, fn: (*Bot).cbApikeyStart},    // @15405
+		cbRoute{key: "apikeyqty:", fn: (*Bot).cbApikeyQty},                      // @15448
+		cbRoute{key: "kiroapiqty:", fn: (*Bot).cbApikeyQty},                     // @15448
+		cbRoute{key: "apikeyrc:start", exact: true, fn: (*Bot).cbApikeyRCStart}, // @15467
+		cbRoute{key: "apikeyrcpick:", fn: (*Bot).cbApikeyRCPick},                // @15502
+		cbRoute{key: "apikeyrcqty:", fn: (*Bot).cbApikeyRCQty},                  // @15549
+		cbRoute{key: "apikeyrev:", fn: (*Bot).cbApikeyRev},                      // @15571
+		cbRoute{key: "apikeyrefok:", fn: (*Bot).cbApikeyRefOK},                  // @12371
+		cbRoute{key: "apikeyrefno", exact: true, fn: (*Bot).cbApikeyRefNo},      // @12375
+		// M2.5 provisional self-service entry points were folded into the M2.6
+		// ss:/refreq: routers (selfservice.go). The TODO below was the handoff note.
+		// cbSSMyKeys is now reached via cbSelfService(ss:mykeys); cbRefReqAPIKey
+		// is reached via cbFileRefundReq which routes apikey orders to
+		// apikeyRefundPreview internally. These two standalone routes are removed.
+	)
+}
+
+// insertCapturesBefore splices stages into the capture chain immediately before
+// the named stage, keeping the chain an in-order subsequence of
+// CanonicalCaptureOrder (handlers-go.md §7: slices land independently, the
+// REMAINING entries must still match the golden list). Appends when the anchor
+// is not registered yet.
+func (b *Bot) insertCapturesBefore(anchor string, stages ...stage) {
+	at := len(b.captureChain)
+	for i, s := range b.captureChain {
+		if s.name == anchor {
+			at = i
+			break
+		}
+	}
+	out := make([]stage, 0, len(b.captureChain)+len(stages))
+	out = append(out, b.captureChain[:at]...)
+	out = append(out, stages...)
+	out = append(out, b.captureChain[at:]...)
+	b.captureChain = out
+}
+
+// ---- SKU model -------------------------------------------------------------
+
+// The two Kiro-Go sale classes. Re-exported from internal/kirogo so this file
+// reads like the Python source ("bedrock" / "kiro") while the wire values stay
+// owned by the client package (telegram_bot.py:3801 _APIKEY_CLASS).
+const (
+	saleClassBedrock = kirogo.SaleClassBedrock
+	saleClassKiro    = kirogo.SaleClassKiro
+)
+
+// apikeyClassForProduct maps a BUY product sentinel to its Kiro-Go saleClass —
+// _APIKEY_CLASS (telegram_bot.py:3801). The recharge sentinel is deliberately
+// absent: a top-up's class comes from the TARGET key's stored sale_class, never
+// from its own product (see orderSaleClass).
+func apikeyClassForProduct(product string) string {
+	if product == kiroApikeyProduct {
+		return saleClassKiro
+	}
+	return saleClassBedrock
+}
+
+// isApikeyBuyProduct reports a NEW-KEY (mint) order — _APIKEY_BUY_PRODUCTS
+// membership (telegram_bot.py:3798). Recharges are excluded.
+func isApikeyBuyProduct(product string) bool {
+	return product == apikeyProduct || product == kiroApikeyProduct
+}
+
+// ---- env/settings bounds (telegram_bot.py:3814-3842) -----------------------
+
+// Quick-pick credit buttons on the amount prompts — APIKEY_QTY_CHOICES @3828 /
+// KIRO_APIKEY_QTY_CHOICES @3842. Buttons outside the live [min, ceiling] range
+// are hidden at render time, so a stale constant can never offer an unsellable
+// amount.
+var (
+	apikeyQtyChoices     = []int64{100, 200, 500, 1000, 2000, 5000, 10000}
+	kiroApikeyQtyChoices = []int64{500, 1000, 2000, 5000, 10000, 20000, 50000}
+)
+
+// apikeyQtyPerRow is APIKEY_QTY_PER_ROW (telegram_bot.py:3831): seven quick
+// picks on one row are unreadably narrow on a phone, so they wrap.
+const apikeyQtyPerRow = 4
+
+// settingsNumber coerces a settings value to a float the way Python's
+// `float(v or 0)` inside a try/except (TypeError, ValueError) does. ok is false
+// when the key is absent, empty, or not coercible — the callers below need that
+// distinction to fall back to a legacy key or an env default.
+func settingsNumber(s map[string]any, key string) (float64, bool) {
+	raw, present := s[key]
+	if !present || raw == nil {
+		return 0, false
+	}
+	switch t := raw.(type) {
+	case float64:
+		return t, true
+	case int:
+		return float64(t), true
+	case string:
+		v := strings.TrimSpace(t)
+		if v == "" {
+			return 0, false
+		}
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	case bool:
+		if t {
+			return 1, true
+		}
+		return 0, true
+	default:
+		return 0, false
+	}
+}
+
+// envInt64 reads an int64 env var through config with a fallback (the
+// APIKEY_* / KIRO_APIKEY_* module constants at telegram_bot.py:3814-3842 are
+// env-backed, so they are read here, not compiled in).
+func (b *Bot) envInt64(key string, def int64) int64 {
+	return int64(b.envInt(key, int(def)))
+}
+
+// apikeyMinCredits is the per-order credit FLOOR for one SKU — apikey_min_credits
+// (telegram_bot.py:6302-6318). Admin setting wins, else that SKU's env default,
+// never below 1 (a floor of 0 would let a customer order 0 credits, which
+// provisioning rejects with a 400 AFTER the money is taken).
+//
+// Read through this on every buy path; never read the env constants directly,
+// or an admin change would apply to some checks and not others.
+func (b *Bot) apikeyMinCredits(saleClass string) int64 {
+	key, envKey, envDef := "apikey_min_credits", "APIKEY_MIN_CREDITS", int64(100)
+	if saleClass == saleClassKiro {
+		key, envKey, envDef = "kiro_apikey_min_credits", "KIRO_APIKEY_MIN_CREDITS", 500
+	}
+	v := int64(0)
+	if f, ok := settingsNumber(b.settings(), key); ok {
+		v = int64(f)
+	}
+	if v <= 0 {
+		v = b.envInt64(envKey, envDef)
+	}
+	return max(1, v)
+}
+
+// apikeyMaxCredits is the per-order credit CEILING for one SKU —
+// apikey_max_credits (telegram_bot.py:6321-6333). Never below the live min, so
+// a max under the min can never make the sellable range empty.
+func (b *Bot) apikeyMaxCredits(saleClass string) int64 {
+	key, envKey := "apikey_max_credits", "APIKEY_MAX_CREDITS"
+	if saleClass == saleClassKiro {
+		key, envKey = "kiro_apikey_max_credits", "KIRO_APIKEY_MAX_CREDITS"
+	}
+	v := int64(0)
+	if f, ok := settingsNumber(b.settings(), key); ok {
+		v = int64(f)
+	}
+	if v <= 0 {
+		v = b.envInt64(envKey, 1000000)
+	}
+	return max(b.apikeyMinCredits(saleClass), v)
+}
+
+// apikeyMaxPerCustomer is the max number of LIVE keys one customer may hold —
+// apikey_max_per_customer (telegram_bot.py:6336-6344). 0 = unlimited. The cap
+// is deliberately SHARED across both SKUs (it caps support surface per
+// customer, which doesn't depend on which pool backs the key).
+func (b *Bot) apikeyMaxPerCustomer() int64 {
+	if f, ok := settingsNumber(b.settings(), "apikey_max_per_customer"); ok {
+		return max(0, int64(f))
+	}
+	return max(0, b.envInt64("APIKEY_MAX_PER_CUSTOMER", 0))
+}
+
+// ---- Kiro-Go configuration gates -------------------------------------------
+
+// kiroGoConfigured is kiro_go_configured (telegram_bot.py:5822-5832): base URL,
+// admin key AND account id all present — the gate for the BEDROCK product. The
+// account id is part of the gate ON PURPOSE: without it every mint would fail
+// AFTER the customer paid and bounce through the auto-refund path. Failing at
+// the menu is the cheap failure; failing at the mint is the expensive one.
+func (b *Bot) kiroGoConfigured() bool {
+	return b.kiroGoConfig().Configured()
+}
+
+// kiroGoConfiguredBase is kiro_go_configured_base (telegram_bot.py:5835-5842):
+// URL + admin key only — the gate for the KIRO-credit SKU, whose mints send no
+// accountId at all (requiring one would hide a fully sellable product behind a
+// setting its mints never read).
+func (b *Bot) kiroGoConfiguredBase() bool {
+	return b.kiroGoConfig().ConfiguredBase()
+}
+
+// kiroGoConfig snapshots the LIVE Kiro-Go connection settings (settings.json
+// overriding .env, per config.KiroGo*). Read fresh per call so an admin who
+// pastes a new key/URL affects the very next gate check, exactly like Python's
+// per-call os.environ reads.
+func (b *Bot) kiroGoConfig() kirogo.Config {
+	if b.cfg == nil {
+		return kirogo.Config{}
+	}
+	return kirogo.Config{
+		BaseURL:   strings.TrimSpace(b.cfg.KiroGoBaseURL()),
+		AdminKey:  strings.TrimSpace(b.cfg.KiroGoAdminKey()),
+		AccountID: strings.TrimSpace(b.cfg.KiroGoAccountID()),
+	}
+}
+
+// kirogoClient builds a Kiro-Go client from the live config, or nil when the
+// base URL / admin key are missing (no admin call can be attempted at all).
+// Cheap: *http.Client with a nil Transport reuses http.DefaultTransport's
+// shared connection pool, so a per-call client costs no new sockets.
+func (b *Bot) kirogoClient() *kirogo.Client {
+	cfg := b.kiroGoConfig()
+	if !cfg.ConfiguredBase() {
+		return nil
+	}
+	return kirogo.New(cfg, nil)
+}
+
+// kiroGoPublicURL is the base URL CUSTOMERS should call, for the delivery
+// instructions — kiro_go_public_url (telegram_bot.py:5845-5850). Falls back to
+// the admin base URL when no separate public URL is set (they usually match;
+// they differ when the bot reaches Kiro-Go via localhost).
+func (b *Bot) kiroGoPublicURL() string {
+	if b.cfg == nil {
+		return ""
+	}
+	u := strings.TrimSpace(b.cfg.Env("KIRO_GO_PUBLIC_URL"))
+	if u == "" {
+		u = strings.TrimSpace(b.cfg.KiroGoBaseURL())
+	}
+	return strings.TrimRight(u, "/")
+}
+
+// ---- pricing ---------------------------------------------------------------
+
+// apikeyRateUSDT is the admin-set USDT price per 100 CREDITS of one SKU —
+// apikey_rate_usdt (telegram_bot.py:6163-6193). 0 / unset / invalid = that SKU
+// DISABLED (buy-menu row hidden, any purchase attempt refused).
+//
+// LEGACY MIGRATION (bedrock only): pricing used to be quoted per 1000 credits.
+// A shop configured before that change still has only `apikey_usdt_per_1k`, so
+// it is read as a FALLBACK and divided by 10 — the effective price per credit
+// is IDENTICAL and nobody's prices move because the display unit changed. The
+// kiro SKU postdates the per-100 change and has no legacy fallback.
+func (b *Bot) apikeyRateUSDT(saleClass string) float64 {
+	s := b.settings()
+	if saleClass == saleClassKiro {
+		f, _ := settingsNumber(s, "kiro_apikey_usdt_per_100")
+		return math.Max(0, f)
+	}
+	// Python parity (telegram_bot.py:6180-6188): the legacy per-1k fallback
+	// applies ONLY when `apikey_usdt_per_100` is ABSENT, nil or "" — Python's
+	// `if v is None or v == ""`. A PRESENT-but-invalid value (a corrupt "abc",
+	// a list, …) hits Python's float() ValueError path and returns 0 (SKU
+	// DISABLED); it must NOT silently fall through to the legacy key and keep
+	// selling at a rate the admin can no longer see or edit.
+	if raw, present := s["apikey_usdt_per_100"]; present && raw != nil {
+		str, isStr := raw.(string)
+		if !isStr || strings.TrimSpace(str) != "" {
+			f, ok := settingsNumber(s, "apikey_usdt_per_100")
+			if !ok {
+				return 0 // present but not coercible -> disabled, never legacy
+			}
+			return math.Max(0, f)
+		}
+	}
+	legacy, _ := settingsNumber(s, "apikey_usdt_per_1k")
+	return math.Max(0, legacy/10.0)
+}
+
+// kiroApikeyEnabled is the KIRO-SKU master toggle — kiro_apikey_enabled
+// (telegram_bot.py:6196-6204), default OFF. Separate from the price so the
+// rollout order is safe: the bot can be priced up while the toggle stays OFF,
+// the saleClass-aware Kiro-Go is deployed, THEN the toggle flips. Enabling
+// against a pre-saleClass server would mint UNCLASSED keys billed by the
+// bedrock rate card — a ~5.7x giveaway.
+func (b *Bot) kiroApikeyEnabled() bool {
+	v, _ := b.settings()["kiro_apikey_enabled"].(bool)
+	return v
+}
+
+// apikeyForSale reports whether a SKU is actually sellable — apikey_for_sale
+// (telegram_bot.py:6207-6215): a positive admin rate AND a reachable-in-
+// principle Kiro-Go config. The product HIDES rather than selling and
+// auto-refunding (repo CLAUDE.md domain invariant).
+func (b *Bot) apikeyForSale(saleClass string) bool {
+	if saleClass == saleClassKiro {
+		return b.kiroApikeyEnabled() && b.apikeyRateUSDT(saleClassKiro) > 0 && b.kiroGoConfiguredBase()
+	}
+	return b.apikeyRateUSDT(saleClassBedrock) > 0 && b.kiroGoConfigured()
+}
+
+// apikeyPriceVND is the VND total for `credits` at the SKU's admin
+// USDT-per-100 rate — apikey_price_vnd (telegram_bot.py:6218-6226). 0 means
+// "not for sale" (rate or USD→VND conversion unset/bad).
+func (b *Bot) apikeyPriceVND(credits int64, saleClass string) int64 {
+	rate := b.apikeyRateUSDT(saleClass)
+	if rate <= 0 || credits <= 0 {
+		return 0
+	}
+	return b.usdtToVND(float64(credits) * rate / 100.0)
+}
+
+// apikeyCodedTotal is (total, effectivePct, volumePct) for an API-key-family
+// order — _apikey_coded_total (telegram_bot.py:6237-6269), code-free subset
+// (promo/referral codes are M2.6).
+//
+// Two deliberate differences from codedTotal, both forced by the product: the
+// base is apikeyPriceVND (a virtual product has no folder price file), and
+// there is no volume tier (qty is CREDITS, not units), so volumePct is always
+// 0. Effective fraction clamped to [0, 0.95] so no discount can zero an order.
+func (b *Bot) apikeyCodedTotal(credits int64, resellerPct int, saleClass string) (total int64, effPct, volPct int) {
+	base := b.apikeyPriceVND(credits, saleClass)
+	if base <= 0 {
+		return base, 0, 0
+	}
+	eff := 0.0
+	if resellerPct != 0 {
+		eff = float64(resellerPct) / 100.0
+	}
+	eff = math.Max(0, math.Min(0.95, eff))
+	return int64(math.Round(float64(base) * (1 - eff))), int(math.Round(eff * 100)), 0
+}
+
+// apikeyPriceFor is the API-key VND total for `credits` WITH this buyer's flat
+// reseller discount — _apikey_price_for (telegram_bot.py:6272-6282). The quoted
+// rate and the charged total both flow through apikeyCodedTotal so they can
+// never drift apart.
+func (b *Bot) apikeyPriceFor(chatID int64, credits int64, saleClass string) int64 {
+	total, _, _ := b.apikeyCodedTotal(credits, b.resellerPctFor(chatID), saleClass)
+	return total
+}
+
+// apikeyRateDisp is the ADVERTISED (undiscounted) per-100-credits price string
+// — apikey_rate_disp (telegram_bot.py:6229-6234). Buy-menu / general display.
+func (b *Bot) apikeyRateDisp(saleClass string) string {
+	return b.usdtDisp(b.apikeyPriceVND(100, saleClass))
+}
+
+// apikeyRateDispFor is the per-100-credits price for THIS buyer (reseller-
+// discounted) — _apikey_rate_disp_for (telegram_bot.py:6285-6289). Kept
+// consistent with the charged total: both flow through apikeyPriceFor.
+func (b *Bot) apikeyRateDispFor(chatID int64, saleClass string) string {
+	return b.usdtDisp(b.apikeyPriceFor(chatID, 100, saleClass))
+}
+
+// apikeyQtyRows wraps quick-pick credit buttons into rows of apikeyQtyPerRow —
+// _apikey_qty_rows (telegram_bot.py:6292-6299). Labelled "<n> cr": a bare
+// number sits directly under a rate line reading "4.00 USDT / 100 credits",
+// where it is easy to misread as a price.
+func apikeyQtyRows(choices []int64, cbPrefix string) [][]tg.InlineKeyboardButton {
+	var rows [][]tg.InlineKeyboardButton
+	for i := 0; i < len(choices); i += apikeyQtyPerRow {
+		end := min(i+apikeyQtyPerRow, len(choices))
+		row := make([]tg.InlineKeyboardButton, 0, end-i)
+		for _, n := range choices[i:end] {
+			row = append(row, tg.InlineKeyboardButton{
+				Text:         itoa64(n) + " cr",
+				CallbackData: cbData(cbPrefix, itoa64(n)),
+			})
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// qtyChoicesFor returns the SKU's quick-pick list filtered to [lo, hi].
+func qtyChoicesFor(saleClass string, lo, hi int64) []int64 {
+	src := apikeyQtyChoices
+	if saleClass == saleClassKiro {
+		src = kiroApikeyQtyChoices
+	}
+	var out []int64
+	for _, n := range src {
+		if n >= lo && n <= hi {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// ---- key-class resolution ---------------------------------------------------
+
+// apikeyKeyClass is the effective SKU of a stored api_keys row for pricing/
+// labels/bounds — _apikey_key_class (telegram_bot.py:6347-6354). "kiro" only
+// when the row was minted as kiro; anything else (bedrock, or the legacy '' of
+// pre-split rows) prices and labels as bedrock, because legacy keys WERE sold
+// at the bedrock rate card.
+//
+// Recharge PAYLOADS must NOT use this: they read the RAW stored value so a
+// legacy '' row omits saleClass entirely (see deliverApikeyRecharge).
+func apikeyKeyClass(row *store.APIKey) string {
+	if row != nil && row.SaleClass == saleClassKiro {
+		return saleClassKiro
+	}
+	return saleClassBedrock
+}
+
+// orderSaleClass is the SKU of any API-key-family order, for pricing/labels —
+// _order_sale_class (telegram_bot.py:6357-6370). A buy order carries it in its
+// product sentinel; a RECHARGE order inherits the TARGET key's class via the
+// order→key binding. Unknown/broken bindings fall back to bedrock, matching
+// every legacy row's real billing.
+func (b *Bot) orderSaleClass(o *store.Order) string {
+	if o == nil {
+		return saleClassBedrock
+	}
+	if isApikeyBuyProduct(o.Product) {
+		return apikeyClassForProduct(o.Product)
+	}
+	if o.Product == apikeyRechargeProduct {
+		rec, err := b.store.APIKeyRechargeForOrder(o.Des)
+		if err != nil || rec == nil {
+			return saleClassBedrock
+		}
+		row, err := b.store.APIKeyForOrder(rec.TargetOrderID)
+		if err != nil {
+			return saleClassBedrock
+		}
+		return apikeyKeyClass(row)
+	}
+	return saleClassBedrock
+}
+
+// ---- live Kiro-Go stats -----------------------------------------------------
+
+// statsTimeout bounds every customer/admin-facing DISPLAY call to Kiro-Go.
+// Python passed timeout=5, attempts=1 on these paths so a hung proxy degrades
+// the display instead of pinning one of the 16 shared workers
+// (telegram_bot.py:5916-5918, 4509-4511). internal/kirogo's retry budget is
+// fixed at 3 attempts, so the equivalent bound here is a context deadline: it
+// aborts the retry sleep (sleepOrDone) and the in-flight request together.
+const statsTimeout = 6 * time.Second
+
+// apikeyLiveStats returns the live per-key stats for a minted key, or nil when
+// the call fails / the key can't be found — _apikey_live_stats
+// (telegram_bot.py:4498-4516). Callers MUST degrade gracefully.
+//
+// Deviation: Python also accepted the original deploy's "apiKeys" response
+// spelling; internal/kirogo decodes only the documented "keys" field
+// (KIRO_GO_API.md:111-124), which is what the deployed server sends.
+func (b *Bot) apikeyLiveStats(ctx context.Context, row *store.APIKey) *kirogo.KeyStat {
+	if row == nil {
+		return nil
+	}
+	client := b.kirogoClient()
+	if client == nil {
+		return nil
+	}
+	req := kirogo.StatsRequest{}
+	if row.KeyID != "" {
+		req.ID = row.KeyID
+	} else {
+		req.APIKey = row.APIKey
+	}
+	cctx, cancel := context.WithTimeout(ctx, statsTimeout)
+	defer cancel()
+	res, err := client.Stats(cctx, req)
+	if err != nil {
+		// Never log the response body or the key — only the order id (invariant 2).
+		log.Println("kiro-go stats failed for order", row.OrderID, ":", err)
+		return nil
+	}
+	if len(res.Keys) == 0 {
+		return nil
+	}
+	return &res.Keys[0]
+}
+
+// apikeyRemainingCredits is the live creditsRemaining for a minted key, or
+// (0, false) when unreadable — _apikey_remaining_credits
+// (telegram_bot.py:4519-4528). Refund maths falls back to the deliberate
+// force-full prompt on false; never guess a payout from stale data.
+func (b *Bot) apikeyRemainingCredits(ctx context.Context, row *store.APIKey) (float64, bool) {
+	st := b.apikeyLiveStats(ctx, row)
+	if st == nil {
+		return 0, false
+	}
+	return float64(st.CreditsRemaining), true
+}
+
+// ---- recharge eligibility gate ---------------------------------------------
+
+// rcGate is the result of apikeyRCGate — the shared eligibility verdict for a
+// recharge, re-run at EVERY step (picker tap, typed amount, order creation) so
+// a stale prompt or forged callback can never bypass a check.
+type rcGate struct {
+	Row       *store.APIKey // nil on "gone"
+	Remaining float64       // live creditsRemaining, clamped >= 0
+	Headroom  int64         // credits still addable under the per-key cap
+	// Err is "" when rechargeable, else one of:
+	//   "gone"      unknown order / not this chat's key / already refunded,
+	//   "stats"     live stats unreadable -> FAIL CLOSED (the cap can't be
+	//               verified without the live remaining balance; unlike the
+	//               mint-time auto-refund, unknown here must BLOCK the sale),
+	//   "disabled"  key manually disabled — a recharge would RE-ENABLE it
+	//               server-side, so it is refused ("exhausted" keys pass:
+	//               re-enabling those is the whole point),
+	//   "unlimited" creditsRemaining == -1 (Kiro-Go 400s credit top-ups on
+	//               unlimited keys),
+	//   "full"      headroom below the minimum order size.
+	Err string
+}
+
+// apikeyRCGate ports _apikey_rc_gate (telegram_bot.py:6373-6428).
+func (b *Bot) apikeyRCGate(ctx context.Context, chatID int64, targetDes string) rcGate {
+	row, err := b.store.APIKeyForOrder(targetDes)
+	if err != nil {
+		log.Println("api_key_for_order failed:", err)
+		return rcGate{Err: "gone"}
+	}
+	// Ownership + liveness: only the buyer's own, non-refunded key. A refunded
+	// key was revoked on Kiro-Go — recharging it would resurrect a paid-back key.
+	if row == nil || row.ChatID != chatID || row.RefundedTS != nil {
+		return rcGate{Err: "gone"}
+	}
+	st := b.apikeyLiveStats(ctx, row)
+	if st == nil {
+		return rcGate{Row: row, Err: "stats"}
+	}
+	// ONLY the tri-state "status" distinguishes a MANUAL disable from plain
+	// exhaustion — an exhausted key also has enabled=false server-side, and
+	// exhausted keys MUST stay rechargeable, so never gate on the bare
+	// `enabled` flag here.
+	if st.Status == "disabled" {
+		return rcGate{Row: row, Err: "disabled"}
+	}
+	if st.CreditsRemaining.IsUnlimited() || st.CreditsRemaining < 0 {
+		return rcGate{Row: row, Err: "unlimited"}
+	}
+	remaining := float64(st.CreditsRemaining)
+	// Per-key cap: total UNUSED credits after the top-up must stay within the
+	// per-order/per-key ceiling, so the sellable headroom is
+	// cap − remaining − any IN-FLIGHT (reserved/paid, not yet applied) recharge
+	// credits for this same key: live creditsRemaining can't see those yet, and
+	// two overlapping checkouts must not jointly breach the cap. Bounds are the
+	// KEY'S OWN SKU's (a kiro key's headroom measured against the bedrock cap
+	// would be off by ~5.7x in either direction).
+	cls := apikeyKeyClass(row)
+	inflight, err := b.store.PendingRechargeCreditsForTarget(targetDes)
+	if err != nil {
+		log.Println("pending_recharge_credits_for_target failed:", err)
+		return rcGate{Row: row, Remaining: remaining, Err: "stats"}
+	}
+	headroom := int64(float64(b.apikeyMaxCredits(cls)) - remaining - float64(inflight))
+	if headroom < b.apikeyMinCredits(cls) {
+		return rcGate{Row: row, Remaining: remaining, Headroom: max(0, headroom), Err: "full"}
+	}
+	return rcGate{Row: row, Remaining: remaining, Headroom: headroom}
+}
+
+// rcGateMessage maps a gate error to its customer-facing notice, so the SAME
+// explanation is shown at picker tap, typed amount and order creation
+// (telegram_bot.py:15520-15528 and 10507-10526).
+func (b *Bot) rcGateMessage(g rcGate, lang i18n.Lang, cls string) string {
+	c := &i18n.C().APIKey
+	switch g.Err {
+	case "gone":
+		return c.RCNone.T(lang)
+	case "stats":
+		return c.RCStatsNA.T(lang)
+	case "disabled", "unlimited":
+		// Both are permanent "this key can't take a credit top-up" states
+		// (a manual disable would be re-enabled by a recharge; an unlimited key
+		// is rejected by Kiro-Go with a 400) — one customer-facing message.
+		return c.RCDisabled.T(lang)
+	case "full":
+		return i18n.F(c.RCFull.T(lang), "remaining", itoa64(int64(g.Remaining)),
+			"cap", itoa64(b.apikeyMaxCredits(cls)))
+	}
+	return ""
+}
+
+// ---- order creation ---------------------------------------------------------
+
+// startApikeyPurchase creates a reserved order for `credits` of one API SKU and
+// shows the payment screen — _start_apikey_purchase (telegram_bot.py:10417-10468).
+// The API-key twin of finalizePurchase: same gates, same order pipeline, but NO
+// stock.Reserve (the "stock" is the Kiro-Go pool, enforced for real at mint time).
+//
+// Order shape: product = the SKU sentinel (the product IS the SKU record on the
+// order), tier = "API" (fixed marker, warranty 0), qty = CREDITS, total = VND
+// at that SKU's admin per-100 rate. Settlement routes through settlePaid ->
+// deliverPaid -> deliverApikey, which reads the class back off the product.
+//
+// NO pool-headroom gate by design (telegram_bot.py:10454-10461): selling is
+// bounded by the ADMIN caps that run below — per-order max credits and the
+// per-customer key cap — not by Kiro-Go's reported pool figure, which goes
+// negative whenever the shop sells ahead of restocking (a normal trading
+// position). Gating on it silently froze ALL sales. A mint the pool truly
+// cannot back still fails safe at mint time and auto-refunds the buyer.
+func (b *Bot) startApikeyPurchase(ctx context.Context, chatID int64, lang i18n.Lang, credits int64, saleClass string) {
+	c := &i18n.C().APIKey
+	// Same hard backstop as finalizePurchase: no NEW order while sales are
+	// paused, even from a stale prompt/button.
+	if b.salesBlocked(ctx, chatID, lang, nil) {
+		return
+	}
+	// Rate/config re-checked at ORDER time (the admin may have zeroed the price,
+	// turned the SKU off, or wiped the Kiro-Go key since the prompt was shown).
+	total := b.apikeyPriceFor(chatID, credits, saleClass) // reseller flat discount applied
+	if !b.apikeyForSale(saleClass) || total <= 0 {
+		b.send(ctx, chatID, c.Off.T(lang), nil)
+		return
+	}
+	// Per-order credit bounds re-checked here so a stale prompt / forged
+	// callback can't exceed the current cap.
+	if credits < b.apikeyMinCredits(saleClass) || credits > b.apikeyMaxCredits(saleClass) {
+		b.send(ctx, chatID, i18n.F(c.BadAmount.T(lang),
+			"min", itoa64(b.apikeyMinCredits(saleClass)),
+			"max", itoa64(b.apikeyMaxCredits(saleClass))), nil)
+		return
+	}
+	// Per-customer key cap (0 = unlimited). Checked before the per-order cap in
+	// Python's ordering so a capped customer gets the right message.
+	if cap := b.apikeyMaxPerCustomer(); cap > 0 {
+		n, err := b.store.CountAPIKeysForChat(chatID)
+		if err != nil {
+			log.Println("count_api_keys_for_chat failed:", err)
+			return
+		}
+		if n >= cap {
+			b.send(ctx, chatID, i18n.F(c.CustCap.T(lang), "cap", itoa64(cap)), nil)
+			return
+		}
+	}
+	des := store.NewDes()
+	product := apikeyProduct
+	if saleClass == saleClassKiro {
+		product = kiroApikeyProduct
+	}
+	if err := b.store.CreateOrder(des, fmtInt(chatID), string(lang), product, "API",
+		credits, total); err != nil {
+		log.Println("create_order (apikey) failed:", err)
+		return
+	}
+	b.spawnOrderExpiry(des)
+	b.sendPayScreen(ctx, chatID, des, "")
+}
+
+// startApikeyRecharge creates a reserved RECHARGE order — _start_apikey_recharge
+// (telegram_bot.py:10471-10545). The recharge twin of startApikeyPurchase: same
+// order pipeline, but the per-CUSTOMER cap does NOT apply (no new key is
+// created) — the per-KEY cap is enforced instead via apikeyRCGate's live
+// headroom, which FAILS CLOSED when stats are unreadable (unlike a mint
+// failure, which auto-refunds: Kiro-Go happily adds past the cap, so an
+// unverifiable cap must block the sale).
+func (b *Bot) startApikeyRecharge(ctx context.Context, chatID int64, lang i18n.Lang, targetDes string, credits int64) {
+	c := &i18n.C().APIKey
+	if b.salesBlocked(ctx, chatID, lang, nil) {
+		return
+	}
+	// The TARGET key's SKU drives every rate/bound below. Read it BEFORE the
+	// full gate: pricing must never mix classes even for one message render.
+	// (Ownership is enforced by apikeyRCGate; a forged target_des at worst reads
+	// a class here and then dies on "gone".)
+	targetRow, _ := b.store.APIKeyForOrder(targetDes)
+	cls := apikeyKeyClass(targetRow)
+	total := b.apikeyPriceFor(chatID, credits, cls) // reseller flat discount applied
+	if !b.apikeyForSale(cls) || total <= 0 {
+		b.send(ctx, chatID, c.Off.T(lang), nil)
+		return
+	}
+	// Absolute bounds first — a forged callback can't smuggle a 1-credit or
+	// 10M-credit order past the prompt.
+	if credits < b.apikeyMinCredits(cls) || credits > b.apikeyMaxCredits(cls) {
+		b.send(ctx, chatID, i18n.F(c.BadAmount.T(lang),
+			"min", itoa64(b.apikeyMinCredits(cls)), "max", itoa64(b.apikeyMaxCredits(cls))), nil)
+		return
+	}
+	// Full eligibility re-check at ORDER time (ownership, live stats,
+	// disabled/unlimited key, per-key cap headroom).
+	g := b.apikeyRCGate(ctx, chatID, targetDes)
+	if g.Err != "" {
+		b.send(ctx, chatID, b.rcGateMessage(g, lang, cls), nil)
+		return
+	}
+	// Per-key cap: unused credits after the top-up must not exceed the cap.
+	if credits > g.Headroom {
+		b.send(ctx, chatID, i18n.F(c.RCTooBig.T(lang), "headroom", itoa64(g.Headroom)), nil)
+		return
+	}
+	des := store.NewDes()
+	// Bind order -> target key BEFORE creating the order row: if the process
+	// dies between the two, an orphan binding for a des that never became an
+	// order is harmless, whereas a PAID order with NO binding could only be
+	// auto-refunded. Both rows must exist before the pay screen is shown.
+	if _, err := b.store.AddAPIKeyRecharge(des, targetDes, chatID, float64(credits)); err != nil {
+		log.Println("add_apikey_recharge failed:", err)
+		return
+	}
+	if err := b.store.CreateOrder(des, fmtInt(chatID), string(lang), apikeyRechargeProduct,
+		"API", credits, total); err != nil {
+		log.Println("create_order (apikey recharge) failed:", err)
+		return
+	}
+	b.spawnOrderExpiry(des)
+	b.sendPayScreen(ctx, chatID, des, "")
+}
+
+// ---- callbacks --------------------------------------------------------------
+
+// cbApikeyStart handles apikey:start / kiroapi:start — the virtual API-key
+// product tapped on the buy menu (telegram_bot.py:15405-15447). Same
+// order-creating gates as buy:/buygo: (sales pause + the confirm-first
+// pending-order gate). Every gate/bound/string below is the TAPPED SKU's own.
+func (b *Bot) cbApikeyStart(cc *cbCtx) {
+	c := &i18n.C().APIKey
+	cls := saleClassBedrock
+	if cc.Data == "kiroapi:start" {
+		cls = saleClassKiro
+	}
+	lang := b.langFor(cc.ChatID, "en")
+	if b.salesBlocked(cc.Ctx, cc.ChatID, lang, nil) {
+		return
+	}
+	if b.pendingGuard(cc.Ctx, cc.ChatID, lang, "buy") {
+		return
+	}
+	if !b.apikeyForSale(cls) { // stale menu / admin turned it off
+		b.send(cc.Ctx, cc.ChatID, c.Off.T(lang), nil)
+		return
+	}
+	// Per-customer key cap: a capped customer can't even open the amount
+	// prompt. Counts keys of BOTH SKUs — the cap is per customer, not per SKU.
+	if cap := b.apikeyMaxPerCustomer(); cap > 0 {
+		n, err := b.store.CountAPIKeysForChat(cc.ChatID)
+		if err != nil {
+			log.Println("count_api_keys_for_chat failed:", err)
+			return
+		}
+		if n >= cap {
+			b.send(cc.Ctx, cc.ChatID, i18n.F(c.CustCap.T(lang), "cap", itoa64(cap)), nil)
+			return
+		}
+	}
+	// Arm the typed-amount capture FOR THIS SKU; drop stale sibling captures
+	// first so an abandoned deposit/code prompt can't eat the number (mirrors
+	// tier:). The stored class keeps the typed amount and the quick buttons
+	// validating against the right bounds.
+	cc.st.ClearCustomerPending()
+	cc.st.mu.Lock()
+	cc.st.APIKey = &APIKeyCtx{SaleClass: cls}
+	cc.st.mu.Unlock()
+
+	mn, mx := b.apikeyMinCredits(cls), b.apikeyMaxCredits(cls)
+	qtyPrefix, prompt := "apikeyqty", c.Prompt
+	if cls == saleClassKiro {
+		qtyPrefix, prompt = "kiroapiqty", c.KiroPrompt
+	}
+	var markup *tg.InlineKeyboardMarkup
+	if choices := qtyChoicesFor(cls, mn, mx); len(choices) > 0 {
+		markup = &tg.InlineKeyboardMarkup{InlineKeyboard: apikeyQtyRows(choices, qtyPrefix)}
+	}
+	balance, _ := b.getBalance(cc.ChatID)
+	text := i18n.F(prompt.T(lang),
+		"rate", b.apikeyRateDispFor(cc.ChatID, cls),
+		"min", itoa64(mn), "balance", b.usdtDisp(balance))
+	if markup != nil {
+		b.send(cc.Ctx, cc.ChatID, text, markup)
+	} else {
+		b.send(cc.Ctx, cc.ChatID, text, nil)
+	}
+}
+
+// cbApikeyQty handles a quick credit-amount button on either mint prompt —
+// apikeyqty: / kiroapiqty: (telegram_bot.py:15448-15466). Atomically claims the
+// pending prompt so a rapid double-tap can't create several reserved orders
+// (mirrors buyqty:). The button's SKU must MATCH the armed one: a stale bedrock
+// button after re-arming the kiro prompt (or vice versa) must not buy the wrong
+// product at the wrong rate.
+func (b *Bot) cbApikeyQty(cc *cbCtx) {
+	cls := saleClassBedrock
+	if strings.HasPrefix(cc.Data, "kiroapiqty:") {
+		cls = saleClassKiro
+	}
+	lang := b.langFor(cc.ChatID, "en")
+	_, raw, _ := strings.Cut(cc.Data, ":")
+	credits, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return
+	}
+	if credits < b.apikeyMinCredits(cls) || credits > b.apikeyMaxCredits(cls) {
+		return // forged/stale button
+	}
+	// Peek the armed SKU, then claim atomically (the pop IS the double-tap guard).
+	cc.st.mu.Lock()
+	armed := cc.st.APIKey
+	if armed == nil || armed.SaleClass != cls {
+		cc.st.mu.Unlock()
+		return // nothing armed / stale cross-SKU button
+	}
+	cc.st.APIKey = nil
+	cc.st.mu.Unlock()
+	b.startApikeyPurchase(cc.Ctx, cc.ChatID, lang, credits, cls)
+}
+
+// cbApikeyRCStart handles apikeyrc:start — the recharge row tapped on the buy
+// menu (telegram_bot.py:15467-15501): lists this chat's LIVE keys as pick
+// buttons. Same order-creating gates as apikey:start.
+func (b *Bot) cbApikeyRCStart(cc *cbCtx) {
+	c := &i18n.C().APIKey
+	lang := b.langFor(cc.ChatID, "en")
+	if b.salesBlocked(cc.Ctx, cc.ChatID, lang, nil) {
+		return
+	}
+	if b.pendingGuard(cc.Ctx, cc.ChatID, lang, "buy") {
+		return
+	}
+	// EITHER SKU sellable keeps the picker open; the picked key's own SKU is
+	// re-gated at pick/order time (a bedrock key can't be topped up while only
+	// the kiro SKU is on sale, and vice versa).
+	if !b.apikeyForSale(saleClassBedrock) && !b.apikeyForSale(saleClassKiro) {
+		b.send(cc.Ctx, cc.ChatID, c.Off.T(lang), nil)
+		return
+	}
+	// Live keys only, filtered IN SQL: a refunded key was revoked on Kiro-Go and
+	// must never be offered for a top-up (a recharge would resurrect it
+	// server-side) — and a Go post-filter over a capped page could hide an older
+	// live key behind newer refunded rows.
+	live, err := b.store.APIKeysForChat(cc.ChatID, 10, true)
+	if err != nil {
+		log.Println("api_keys_for_chat failed:", err)
+		return
+	}
+	if len(live) == 0 {
+		b.send(cc.Ctx, cc.ChatID, c.RCNone.T(lang), nil)
+		return
+	}
+	// One button per key: SKU tag + masked value + originally bought credits, so
+	// a two-SKU customer picks the right kind (the units are ~5.7x apart — a
+	// mispick would read as wild over/under-pricing). The per-key LIVE stats
+	// fetch happens at PICK time (one key, one call) — never one round-trip per
+	// key inside this listing.
+	var rows [][]tg.InlineKeyboardButton
+	for _, k := range live {
+		tag := c.SkuTag[apikeyKeyClass(k)].T(lang)
+		label := tag + " · " + maskAPIKey(k.APIKey) + " · " +
+			itoa64(int64(math.Round(k.Credits))) + " credits"
+		rows = append(rows, btnRow(label, cbData("apikeyrcpick", k.OrderID)))
+	}
+	b.sendMenu(cc.Ctx, cc.ChatID, c.RCPick.T(lang), rows)
+}
+
+// cbApikeyRCPick handles apikeyrcpick:<target des> — a key chosen for a
+// recharge (telegram_bot.py:15502-15548): run the full eligibility gate, then
+// arm the typed-amount capture and show the amount prompt.
+func (b *Bot) cbApikeyRCPick(cc *cbCtx) {
+	c := &i18n.C().APIKey
+	lang := b.langFor(cc.ChatID, "en")
+	if b.salesBlocked(cc.Ctx, cc.ChatID, lang, nil) {
+		return
+	}
+	if b.pendingGuard(cc.Ctx, cc.ChatID, lang, "buy") {
+		return
+	}
+	target := strings.TrimPrefix(cc.Data, "apikeyrcpick:")
+	g := b.apikeyRCGate(cc.Ctx, cc.ChatID, target)
+	// The PICKED key's own SKU gates the sale from here on: rate, bounds and the
+	// for-sale switch are all that class's. (The gate already verified
+	// ownership, so reading the class off g.Row is safe.)
+	cls := apikeyKeyClass(g.Row)
+	if !b.apikeyForSale(cls) {
+		b.send(cc.Ctx, cc.ChatID, c.Off.T(lang), nil)
+		return
+	}
+	if g.Err != "" {
+		b.send(cc.Ctx, cc.ChatID, b.rcGateMessage(g, lang, cls), nil)
+		return
+	}
+	// Arm the typed-amount capture with the TARGET des; drop stale sibling
+	// captures first so an abandoned prompt can't eat the number.
+	cc.st.ClearCustomerPending()
+	cc.st.mu.Lock()
+	cc.st.APIKeyRC = &APIKeyRCCtx{TargetOrderID: target}
+	cc.st.mu.Unlock()
+
+	mn := b.apikeyMinCredits(cls)
+	var markup *tg.InlineKeyboardMarkup
+	// Quick buttons: bounded by the per-key HEADROOM (not the per-order cap), in
+	// the key's own SKU denominations.
+	if choices := qtyChoicesFor(cls, mn, g.Headroom); len(choices) > 0 {
+		markup = &tg.InlineKeyboardMarkup{InlineKeyboard: apikeyQtyRows(choices, "apikeyrcqty")}
+	}
+	balance, _ := b.getBalance(cc.ChatID)
+	text := i18n.F(c.RCPrompt.T(lang),
+		"masked", maskAPIKey(g.Row.APIKey),
+		"remaining", itoa64(int64(g.Remaining)),
+		"rate", b.apikeyRateDispFor(cc.ChatID, cls),
+		"min", itoa64(mn), "headroom", itoa64(g.Headroom),
+		"balance", b.usdtDisp(balance))
+	if markup != nil {
+		b.send(cc.Ctx, cc.ChatID, text, markup)
+	} else {
+		b.send(cc.Ctx, cc.ChatID, text, nil)
+	}
+}
+
+// cbApikeyRCQty handles a quick credit-amount button on the recharge prompt —
+// apikeyrcqty: (telegram_bot.py:15549-15570). Atomically claims the pending
+// capture (which carries the target des) so a rapid double-tap can't create
+// several reserved orders.
+func (b *Bot) cbApikeyRCQty(cc *cbCtx) {
+	lang := b.langFor(cc.ChatID, "en")
+	_, raw, _ := strings.Cut(cc.Data, ":")
+	credits, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return
+	}
+	// Bounds in the TARGET key's own SKU (peek the armed target — the atomic pop
+	// below stays the double-submit guard). A missing capture dies here exactly
+	// as it would at the pop.
+	cc.st.mu.Lock()
+	armed := cc.st.APIKeyRC
+	cc.st.mu.Unlock()
+	if armed == nil {
+		return // stale button, nothing armed
+	}
+	row, _ := b.store.APIKeyForOrder(armed.TargetOrderID)
+	cls := apikeyKeyClass(row)
+	if credits < b.apikeyMinCredits(cls) || credits > b.apikeyMaxCredits(cls) {
+		return // forged/stale button
+	}
+	cc.st.mu.Lock()
+	claimed := cc.st.APIKeyRC
+	cc.st.APIKeyRC = nil
+	cc.st.mu.Unlock()
+	if claimed == nil {
+		return // double-tap loser
+	}
+	b.startApikeyRecharge(cc.Ctx, cc.ChatID, lang, claimed.TargetOrderID, credits)
+}
+
+// ---- text captures ----------------------------------------------------------
+
+// apikeyParseCredits normalizes a typed credit amount the way Python does
+// (telegram_bot.py:19064): strip thousands separators written as either ","
+// or "." so 7500 / 7,500 / 7.500 all mean 7500, then require plain digits
+// (_digits: non-empty, <= 12 chars, ASCII decimal only).
+func apikeyParseCredits(text string) (int64, bool) {
+	raw := strings.NewReplacer(",", "", ".", "").Replace(strings.TrimSpace(text))
+	if !digitsOK(raw) {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// capAPIKey is capture-chain entry #45, pending_apikey — the API-key credit
+// amount free-text capture (telegram_bot.py:19058-19078). PEEK semantics: an
+// escaping text (a "/command" or a keyboard label) leaves the slot ARMED and is
+// NOT consumed; an out-of-bounds/invalid amount is answered and the slot STAYS
+// armed for a retry.
+func (b *Bot) capAPIKey(c *Ctx) bool {
+	c.st.mu.Lock()
+	armed := c.st.APIKey
+	c.st.mu.Unlock()
+	if armed == nil {
+		return false
+	}
+	if strings.HasPrefix(c.Text, "/") || labelToCmd(c.Text) != "" {
+		return false // peek escape: slot stays armed, router keeps going
+	}
+	// The armed value IS the SKU — validate the typed number against THAT
+	// class's bounds (peek; the atomic pop below stays the double-submit guard).
+	cls := armed.SaleClass
+	if cls == "" {
+		cls = saleClassBedrock
+	}
+	cat := &i18n.C().APIKey
+	mn, mx := b.apikeyMinCredits(cls), b.apikeyMaxCredits(cls)
+	credits, ok := apikeyParseCredits(c.Text)
+	if !ok || credits < mn || credits > mx {
+		b.send(c.Ctx, c.ChatID, i18n.F(cat.BadAmount.T(c.Lang),
+			"min", itoa64(mn), "max", itoa64(mx)), nil)
+		return true // invalid -> keep pending for retry
+	}
+	// Atomically claim the prompt so a double-submit can't order twice.
+	c.st.mu.Lock()
+	claimed := c.st.APIKey
+	c.st.APIKey = nil
+	c.st.mu.Unlock()
+	if claimed == nil {
+		return true
+	}
+	b.startApikeyPurchase(c.Ctx, c.ChatID, c.Lang, credits, cls)
+	return true
+}
+
+// capAPIKeyRC is capture-chain entry #46, pending_apikeyrc — the recharge
+// amount free-text capture (telegram_bot.py:19084-19103). Mirrors capAPIKey;
+// the deeper gates (headroom / live stats) re-run inside startApikeyRecharge,
+// so this only pre-validates the basic bounds in the TARGET key's own SKU.
+func (b *Bot) capAPIKeyRC(c *Ctx) bool {
+	c.st.mu.Lock()
+	armed := c.st.APIKeyRC
+	c.st.mu.Unlock()
+	if armed == nil {
+		return false
+	}
+	if strings.HasPrefix(c.Text, "/") || labelToCmd(c.Text) != "" {
+		return false // peek escape
+	}
+	row, _ := b.store.APIKeyForOrder(armed.TargetOrderID)
+	cls := apikeyKeyClass(row)
+	cat := &i18n.C().APIKey
+	mn, mx := b.apikeyMinCredits(cls), b.apikeyMaxCredits(cls)
+	credits, ok := apikeyParseCredits(c.Text)
+	if !ok || credits < mn || credits > mx {
+		b.send(c.Ctx, c.ChatID, i18n.F(cat.BadAmount.T(c.Lang),
+			"min", itoa64(mn), "max", itoa64(mx)), nil)
+		return true // invalid -> keep pending for retry
+	}
+	c.st.mu.Lock()
+	claimed := c.st.APIKeyRC
+	c.st.APIKeyRC = nil
+	c.st.mu.Unlock()
+	if claimed == nil {
+		return true
+	}
+	b.startApikeyRecharge(c.Ctx, c.ChatID, c.Lang, claimed.TargetOrderID, credits)
+	return true
+}
+
+// ---- pay screen -------------------------------------------------------------
+
+// apikeyPayScreenText renders the API-key branch of the payment screen —
+// telegram_bot.py:10213-10239. Called only for an api-key-family order.
+//
+// The per-100 rate is derived from the STORED total so rate × credits always
+// reconciles with what the customer is charged. It MUST match the "/ 100
+// credits" unit in the templates: dividing per 1000 while the label says per
+// 100 would print a rate 10x the real one directly above the correct total, on
+// the payment screen itself. The buyer-specific apikeyRateDispFor is NOT usable
+// here — it reflects only the reseller rate and knows nothing about an applied
+// code, so it would print "Price: $1.00 / 100" above a code-discounted
+// "Total: $40.00" for 5000 credits: arithmetic the customer can see does not
+// add up.
+func (b *Bot) apikeyPayScreenText(o *store.Order, lang i18n.Lang, balance int64) string {
+	c := &i18n.C().APIKey
+	rateDisp := b.usdtDisp(0)
+	if o.Qty != 0 {
+		rateDisp = b.usdtDisp(int64(math.Round(float64(o.Total) * 100.0 / float64(o.Qty))))
+	}
+	if o.Product == apikeyRechargeProduct {
+		// Recharge order: show WHICH key gets topped up (masked). The binding +
+		// key rows exist from order creation; degrade to a bare mask if either is
+		// somehow gone — the pay screen must always render.
+		masked := ""
+		if rec, err := b.store.APIKeyRechargeForOrder(o.Des); err == nil && rec != nil {
+			if krow, err := b.store.APIKeyForOrder(rec.TargetOrderID); err == nil && krow != nil {
+				masked = maskAPIKey(krow.APIKey)
+			}
+		}
+		return i18n.F(c.RCPayPrompt.T(lang),
+			"credits", itoa64(o.Qty), "masked", masked, "rate", rateDisp,
+			"total", b.usdtDisp(o.Total), "balance", b.usdtDisp(balance))
+	}
+	// SKU-correct product naming on the pay screen (same shape either way).
+	tmpl := c.PayPrompt
+	if o.Product == kiroApikeyProduct {
+		tmpl = c.KiroPayPrompt
+	}
+	return i18n.F(tmpl.T(lang),
+		"credits", itoa64(o.Qty), "rate", rateDisp,
+		"total", b.usdtDisp(o.Total), "balance", b.usdtDisp(balance))
+}
+
+// ---- buy-menu rows ----------------------------------------------------------
+
+// apikeyBuyRows returns the virtual API-key rows for the /buy menu and whether
+// ANY key SKU is sellable — the port of telegram_bot.py:11737-11757. Shown
+// whenever the admin has set that SKU's price and Kiro-Go is configured (their
+// "stock" is the proxy pool, checked at the amount prompt + at mint, so there is
+// no per-render pool call in this hot path).
+func (b *Bot) apikeyBuyRows(chatID int64, lang i18n.Lang) (rows [][]tg.InlineKeyboardButton, anySellable bool) {
+	c := &i18n.C().APIKey
+	bedrockOn := b.apikeyForSale(saleClassBedrock)
+	kiroOn := b.apikeyForSale(saleClassKiro)
+	if bedrockOn {
+		rows = append(rows, styledBtnRow(
+			i18n.F(c.Btn.T(lang), "rate", b.apikeyRateDisp(saleClassBedrock)),
+			"apikey:start", "primary"))
+	}
+	if kiroOn {
+		rows = append(rows, styledBtnRow(
+			i18n.F(c.KiroBtn.T(lang), "rate", b.apikeyRateDisp(saleClassKiro)),
+			"kiroapi:start", "primary"))
+	}
+	if !bedrockOn && !kiroOn {
+		return nil, false
+	}
+	// Recharge row: only for customers who already hold a live (non-refunded)
+	// key — everyone else has nothing to top up. Local DB count only; no Kiro-Go
+	// round-trip in this hot menu path. ONE shared row for both SKUs: the picker
+	// lists the customer's keys and each key knows its own class.
+	if n, err := b.store.CountAPIKeysForChat(chatID); err == nil && n > 0 {
+		rows = append(rows, btnRow(c.RCBtn.T(lang), "apikeyrc:start"))
+	}
+	return rows, true
+}
