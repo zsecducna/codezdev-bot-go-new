@@ -68,9 +68,19 @@ func TestCaptureChainOrder(t *testing.T) {
 		}
 		seen[n] = true
 	}
-	// The other two ordered stages are also empty in M2.1.
-	if len(b.fileInterceptNames()) != 0 || len(b.adminTextNames()) != 0 {
-		t.Errorf("file/admin stages should be empty in M2.1")
+	// File intercepts are still empty (their document/photo flows are M3.2+).
+	if len(b.fileInterceptNames()) != 0 {
+		t.Errorf("file intercept stage should still be empty, got %v", b.fileInterceptNames())
+	}
+	// Step 9 now carries the admin panel entry stages (admin.go). Same contract
+	// as the capture chain: whatever is registered must be an in-order
+	// subsequence of the canonical list, so later admin slices can append.
+	if !b.adminTextOrderOK() {
+		t.Errorf("admin text stages %v are not an in-order subsequence of %v",
+			b.adminTextNames(), CanonicalAdminTextOrder)
+	}
+	if got := b.adminTextNames(); len(got) == 0 {
+		t.Errorf("admin text stages must be registered (the Admin button needs them)")
 	}
 }
 

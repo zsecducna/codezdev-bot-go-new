@@ -411,6 +411,11 @@ func New(d Deps) *Bot {
 	// apikeyrc (#46) and purchase (#48). Spliced in before "purchase" so the
 	// chain stays an in-order subsequence of CanonicalCaptureOrder.
 	b.registerCodeCapture()
+	// M3.1 first cut: the admin panel entry point. Registers the two step-9 text
+	// stages (🔑 Admin button + the panel slash commands) and the panel's callback
+	// routes. Without this the Admin button rendered but nothing listened, so a
+	// tap fell through every stage to the step-12 no-op (admin.go header).
+	b.registerAdmin()
 	return b
 }
 
