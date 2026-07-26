@@ -1,0 +1,474 @@
+// Handles directory, audit trail, bans, and admin aggregate queries — port of
+// store.py:522-663 (audit/handles/bans) and store.py:872-994 (admin queries).
+package store
+
+import (
+	"database/sql"
+	"log"
+	"sort"
+	"strings"
+	"time"
+)
+
+// ---- audit ----------------------------------------------------------------
+
+// AuditRow mirrors one `audit` row (store.py:77-83): append-only trail of
+// destructive actions (account delete / password reset / tenant cleanup).
+type AuditRow struct {
+	TS        float64
+	ActorChat string
+	ActorKind string // 'customer' | 'admin' | 'reseller'
+	Action    string
+	Target    string
+	Outcome   string
+	Detail    string
+}
+
+// LogAction appends one destructive-action row to the audit trail
+// (store.py:522-533). Best-effort: a failed audit write is logged and
+// swallowed, never returned to the caller — recording an action must not abort
+// the action itself. Field clipping mirrors Python: target[:4000],
+// outcome[:500], detail[:2000] (rune-safe).
+func (s *Store) LogAction(actorChat, actorKind, action, target, outcome, detail string) {
+	_, err := s.db.Exec(
+		"INSERT INTO audit(ts, actor_chat, actor_kind, action, target, outcome, detail) "+
+			"VALUES (?,?,?,?,?,?,?)",
+		now(), actorChat, actorKind, action,
+		truncRunes(target, 4000), truncRunes(outcome, 500), truncRunes(detail, 2000))
+	if err != nil {
+		log.Println("audit LogAction failed:", err)
+	}
+}
+
+// RecentAudit returns recent audit rows, newest first (store.py:536-550).
+// query: optional case-insensitive substring filter over actor_chat / target /
+// action / detail / actor_kind / outcome ("" = no filter).
+func (s *Store) RecentAudit(limit int, query string) ([]AuditRow, error) {
+	q := "SELECT ts, actor_chat, actor_kind, action, target, outcome, detail FROM audit"
+	var args []any
+	if query != "" {
+		like := "%" + query + "%"
+		q += " WHERE actor_chat LIKE ? OR target LIKE ? OR action LIKE ? " +
+			"OR detail LIKE ? OR actor_kind LIKE ? OR outcome LIKE ?"
+		args = append(args, like, like, like, like, like, like)
+	}
+	q += " ORDER BY id DESC LIMIT ?"
+	args = append(args, limit)
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AuditRow
+	for rows.Next() {
+		var (
+			a                                              AuditRow
+			ts                                             sql.NullFloat64
+			chat, kind, action, target, outcome, detailCol sql.NullString
+		)
+		if err := rows.Scan(&ts, &chat, &kind, &action, &target, &outcome, &detailCol); err != nil {
+			return nil, err
+		}
+		a.TS = ts.Float64
+		a.ActorChat, a.ActorKind, a.Action = chat.String, kind.String, action.String
+		a.Target, a.Outcome, a.Detail = target.String, outcome.String, detailCol.String
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// ---- handles (chat_id <-> @username directory) ----------------------------
+
+// SetHandle persists the latest @handle seen for a chat_id (store.py:553-568).
+// Upsert keyed by chat_id so a username change just overwrites the row.
+// Empty/non-'@'-prefixed handles are ignored so we never blank out a known one
+// and never store dead, unmatchable display names.
+func (s *Store) SetHandle(chatID, handle string) error {
+	if handle == "" || !strings.HasPrefix(handle, "@") {
+		return nil
+	}
+	_, err := s.db.Exec(
+		"INSERT INTO handles(chat_id, handle, ts) VALUES (?,?,?) "+
+			"ON CONFLICT(chat_id) DO UPDATE SET handle=excluded.handle, ts=excluded.ts",
+		chatID, handle, now())
+	return err
+}
+
+// MarkHandleChecked records that a chat_id's handle was looked up, even if it
+// had no username (store.py:571-581). Inserts a NULL-handle marker row (never
+// overwrites a real handle) so the one-time getChat backfill skips this chat
+// on the next restart. HandleForChat returns "" for the NULL marker, and
+// ChatIDForHandle never matches it.
+func (s *Store) MarkHandleChecked(chatID string) error {
+	_, err := s.db.Exec("INSERT OR IGNORE INTO handles(chat_id, handle, ts) VALUES (?,?,?)",
+		chatID, nil, now())
+	return err
+}
+
+// ChatIDsMissingHandle returns customer chat_ids (from orders+balances) with
+// no handle row yet — powers the one-time getChat backfill (store.py:584-594).
+// Python queried handles first, released the lock, then called all_chat_ids();
+// with the 1-connection pool there is no re-entrancy hazard, so we just run
+// both reads sequentially.
+func (s *Store) ChatIDsMissingHandle() ([]string, error) {
+	rows, err := s.db.Query("SELECT chat_id FROM handles")
+	if err != nil {
+		return nil, err
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var cid sql.NullString
+		if err := rows.Scan(&cid); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		have[cid.String] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	all, err := s.AllChatIDs()
+	if err != nil {
+		return nil, err
+	}
+	var missing []string
+	for _, cid := range all {
+		if !have[cid] {
+			missing = append(missing, cid)
+		}
+	}
+	return missing, nil
+}
+
+// HandleForChat returns the stored @handle for a chat_id, or "" (absent OR the
+// NULL checked-marker, store.py:597-602).
+func (s *Store) HandleForChat(chatID string) (string, error) {
+	var handle sql.NullString
+	err := s.db.QueryRow("SELECT handle FROM handles WHERE chat_id=?",
+		chatID).Scan(&handle)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return handle.String, err
+}
+
+// ChatIDForHandle resolves an @username to a chat_id via the handles
+// directory, or "" (store.py:605-620). Case-insensitive; a leading '@' is
+// optional in the query. If several chats ever shared the handle (username
+// reassigned), the most-recently-seen wins.
+func (s *Store) ChatIDForHandle(handle string) (string, error) {
+	if handle == "" {
+		return "", nil
+	}
+	h := strings.TrimSpace(handle)
+	if !strings.HasPrefix(h, "@") {
+		h = "@" + h
+	}
+	var chatID string
+	err := s.db.QueryRow(
+		"SELECT chat_id FROM handles WHERE handle=? COLLATE NOCASE "+
+			"ORDER BY ts DESC LIMIT 1", h).Scan(&chatID)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return chatID, err
+}
+
+// ---- bans -----------------------------------------------------------------
+
+// BannedRow mirrors one `banned` row (store.py:149-150).
+type BannedRow struct {
+	ChatID string
+	Reason string
+	ByChat string
+	TS     float64
+}
+
+// BanUser blocks a chat_id from the bot (idempotent upsert — re-banning
+// refreshes the reason/timestamp, store.py:625-632). The in-memory gate set is
+// the hot path; this is the persistent backing so a ban survives restarts.
+// Reason is clipped to 500 runes like Python's str(reason)[:500].
+func (s *Store) BanUser(chatID, reason, byChat string) error {
+	_, err := s.db.Exec("INSERT OR REPLACE INTO banned(chat_id, reason, by_chat, ts) "+
+		"VALUES (?,?,?,?)", chatID, truncRunes(reason, 500), byChat, now())
+	return err
+}
+
+// UnbanUser lifts a ban. Returns true if the chat was actually banned
+// (store.py:635-639).
+func (s *Store) UnbanUser(chatID string) (bool, error) {
+	res, err := s.db.Exec("DELETE FROM banned WHERE chat_id=?", chatID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// IsBanned reports whether the chat_id is currently banned — the DB is the
+// authoritative source behind the bot's in-memory gate set (store.py:642-647).
+func (s *Store) IsBanned(chatID string) (bool, error) {
+	var one int
+	err := s.db.QueryRow("SELECT 1 FROM banned WHERE chat_id=?", chatID).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// BannedChatIDs returns the set of all banned chat_ids, loaded once at startup
+// into the bot's in-memory gate set (store.py:650-654).
+func (s *Store) BannedChatIDs() (map[string]bool, error) {
+	rows, err := s.db.Query("SELECT chat_id FROM banned")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var cid sql.NullString
+		if err := rows.Scan(&cid); err != nil {
+			return nil, err
+		}
+		out[cid.String] = true
+	}
+	return out, rows.Err()
+}
+
+// BannedList returns banned chats, newest first, for the admin viewer
+// (store.py:657-663).
+func (s *Store) BannedList(limit int) ([]BannedRow, error) {
+	rows, err := s.db.Query("SELECT chat_id, reason, by_chat, ts FROM banned "+
+		"ORDER BY ts DESC LIMIT ?", limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BannedRow
+	for rows.Next() {
+		var (
+			b                   BannedRow
+			chatID, reason, byC sql.NullString
+			ts                  sql.NullFloat64
+		)
+		if err := rows.Scan(&chatID, &reason, &byC, &ts); err != nil {
+			return nil, err
+		}
+		b.ChatID, b.Reason, b.ByChat, b.TS = chatID.String, reason.String, byC.String, ts.Float64
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// ---- admin queries --------------------------------------------------------
+
+// AllChatIDs returns every chat_id we've ever seen (orders + balances),
+// de-duped and sorted (store.py:892-902). Empty ids are skipped like Python's
+// `if cid:` truthiness check.
+func (s *Store) AllChatIDs() ([]string, error) {
+	ids := map[string]bool{}
+	for _, q := range []string{
+		"SELECT DISTINCT chat_id FROM orders",
+		"SELECT DISTINCT chat_id FROM balances",
+	} {
+		rows, err := s.db.Query(q)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var cid sql.NullString
+			if err := rows.Scan(&cid); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if cid.String != "" {
+				ids[cid.String] = true
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	out := make([]string, 0, len(ids))
+	for cid := range ids {
+		out = append(out, cid)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// RevenueSummary aggregates revenue figures for the admin dashboard
+// (store.py:905-932). Revenue counts only DELIVERED account orders (money in
+// + goods out) and excludes wallet top-ups so a balance-funded purchase isn't
+// double-counted.
+type RevenueSummary struct {
+	DeliveredCount   int64
+	DeliveredRevenue int64
+	TodayCount       int64
+	TodayRevenue     int64
+	PendingCount     int64
+	RefundedCount    int64
+	Customers        int64
+	WalletTotal      int64
+}
+
+// GetRevenueSummary computes the dashboard aggregate (store.py:905-932).
+// depositProduct "" defaults to DepositProduct (Python default "__deposit__").
+func (s *Store) GetRevenueSummary(depositProduct string) (*RevenueSummary, error) {
+	if depositProduct == "" {
+		depositProduct = DepositProduct
+	}
+	dayStart := now() - 86400 // "today" = trailing 24h, store.py:915
+	var r RevenueSummary
+	// COALESCE where Python tolerated SUM() returning None (store.py:917-919).
+	if err := s.db.QueryRow("SELECT COUNT(*), COALESCE(SUM(total),0) FROM orders "+
+		"WHERE status='delivered' AND product!=?", depositProduct).
+		Scan(&r.DeliveredCount, &r.DeliveredRevenue); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*), COALESCE(SUM(total),0) FROM orders "+
+		"WHERE status='delivered' AND product!=? AND ts>=?",
+		depositProduct, dayStart).Scan(&r.TodayCount, &r.TodayRevenue); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM orders WHERE status IN ('reserved','paid')").
+		Scan(&r.PendingCount); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM orders WHERE status IN ('refunded','expired')").
+		Scan(&r.RefundedCount); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow("SELECT COUNT(DISTINCT chat_id) FROM orders WHERE status='delivered'").
+		Scan(&r.Customers); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow("SELECT COALESCE(SUM(amount),0) FROM balances").
+		Scan(&r.WalletTotal); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// RevenueDay is one calendar-day row of the revenue matrix (store.py:944-950).
+type RevenueDay struct {
+	Date  string           // "YYYY-MM-DD", LOCAL time
+	Cells map[string]int64 // product -> revenue that day
+	Total int64
+	Count int64
+}
+
+// RevenueMatrix is delivered revenue bucketed by (calendar day × product) for
+// the admin Revenue view (store.py:935-994).
+type RevenueMatrix struct {
+	Products      []string         // columns, ordered by total desc
+	Rows          []RevenueDay     // one per active day, MOST-RECENT first, capped
+	ProductTotals map[string]int64 // column totals (full range)
+	ProductCounts map[string]int64
+	GrandTotal    int64
+	GrandCount    int64
+	Truncated     bool // true if older days were dropped by maxRows
+}
+
+// GetRevenueMatrix ports revenue_matrix (store.py:935-994). Counts only
+// DELIVERED orders, excludes wallet top-ups. sinceTS (epoch seconds, nil = all
+// history) lower-bounds orders by ts. Days are bucketed in LOCAL time so a
+// "day" matches what the admin sees on the clock. Aggregation happens in Go
+// (like Python did in-process) so we don't depend on SQLite date functions.
+func (s *Store) GetRevenueMatrix(depositProduct string, sinceTS *float64, maxRows int) (*RevenueMatrix, error) {
+	if depositProduct == "" {
+		depositProduct = DepositProduct
+	}
+	if maxRows <= 0 {
+		maxRows = 60 // Python default, store.py:935
+	}
+	q := "SELECT ts, product, total FROM orders WHERE status='delivered' AND product!=?"
+	args := []any{depositProduct}
+	if sinceTS != nil {
+		q += " AND ts>=?"
+		args = append(args, *sinceTS)
+	}
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// Aggregate exactly like store.py:964-981: plain maps, bucketed by local
+	// calendar day.
+	dayProd := map[string]map[string]int64{}
+	dayCount := map[string]int64{}
+	prodTotal := map[string]int64{}
+	prodCount := map[string]int64{}
+	var grandTotal, grandCount int64
+	for rows.Next() {
+		var (
+			ts      sql.NullFloat64
+			product sql.NullString
+			total   sql.NullInt64
+		)
+		if err := rows.Scan(&ts, &product, &total); err != nil {
+			return nil, err
+		}
+		// Local-time day bucket — mirrors time.strftime("%Y-%m-%d",
+		// time.localtime(ts or 0)) (store.py:973).
+		day := time.Unix(int64(ts.Float64), 0).Local().Format("2006-01-02")
+		amt := total.Int64
+		cell := dayProd[day]
+		if cell == nil {
+			cell = map[string]int64{}
+			dayProd[day] = cell
+		}
+		cell[product.String] += amt
+		dayCount[day]++
+		prodTotal[product.String] += amt
+		prodCount[product.String]++
+		grandTotal += amt
+		grandCount++
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// products sorted by total revenue desc (store.py:983).
+	products := make([]string, 0, len(prodTotal))
+	for p := range prodTotal {
+		products = append(products, p)
+	}
+	sort.Slice(products, func(i, j int) bool {
+		if prodTotal[products[i]] != prodTotal[products[j]] {
+			return prodTotal[products[i]] > prodTotal[products[j]]
+		}
+		return products[i] < products[j] // stable tie-break
+	})
+
+	// Days most-recent first, capped to maxRows (store.py:984-990).
+	allDays := make([]string, 0, len(dayProd))
+	for d := range dayProd {
+		allDays = append(allDays, d)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(allDays)))
+	truncated := len(allDays) > maxRows
+	if truncated {
+		allDays = allDays[:maxRows]
+	}
+	outRows := make([]RevenueDay, 0, len(allDays))
+	for _, day := range allDays {
+		cells := map[string]int64{}
+		var total int64
+		for _, p := range products {
+			cells[p] = dayProd[day][p]
+			total += cells[p]
+		}
+		outRows = append(outRows, RevenueDay{
+			Date: day, Cells: cells, Total: total, Count: dayCount[day]})
+	}
+	return &RevenueMatrix{
+		Products: products, Rows: outRows,
+		ProductTotals: prodTotal, ProductCounts: prodCount,
+		GrandTotal: grandTotal, GrandCount: grandCount,
+		Truncated: truncated,
+	}, nil
+}

@@ -31,8 +31,13 @@ func (b *Bot) handleCommand(ctx context.Context, chatID int64, cmd, clientLang s
 		b.send(ctx, chatID, i18n.C().Maintenance.T(lang), nil)
 		return
 	}
-	// OTP-session lock (otp_guard @11641) is M2.6: no session is ever armed in
-	// M2.1, so it is a no-op today and intentionally omitted.
+	// An active login-code session locks the chat: any other command/button must
+	// first confirm stopping it, and the confirmation resumes THIS same command
+	// afterwards. The first getcode / /otp that OPENS a session isn't blocked — no
+	// session exists yet (otp_guard @11647).
+	if b.otpGuard(ctx, chatID, lang, cmd) {
+		return
+	}
 
 	switch cmd {
 	case "start":
@@ -64,6 +69,10 @@ func (b *Bot) handleCommand(ctx context.Context, chatID int64, cmd, clientLang s
 	case "info":
 		// Customer Info card: balance (+ referral when enabled) — @11767.
 		b.cmdInfo(ctx, chatID, lang)
+	case "getcode":
+		// Ask which purchased account(s) they want a login code for; the next plain
+		// text line is one or more usernames (ownership-checked, batched) — @11674.
+		b.cmdGetCode(ctx, chatID, lang)
 	case "history":
 		// Per-product purchase summary with a toggle to the detailed list — @11681.
 		b.cmdHistory(ctx, chatID, lang)
@@ -131,7 +140,16 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tg.CallbackQuery) {
 	// this is the only place their handle is seen (@12259-12265).
 	b.captureHandle(chatID, &cb.From)
 
-	// The OTP-session guard (@12271) is M2.6 — no session is ever armed today.
+	// An active login-code session blocks every other inline action too. Checked
+	// BEFORE the delete below so the tapped button survives for a re-tap once they
+	// stop. The otp-control taps are exempt so the stop/keep confirmation itself
+	// works (@12428-12434).
+	if data != "otpkeep" && !strings.HasPrefix(data, "otpstop:") {
+		clang := b.langFor(chatID, cbClientLang(cb))
+		if b.otpGuard(ctx, chatID, clang, "") {
+			return
+		}
+	}
 
 	// Delete the message that held these buttons: once a choice is made the
 	// prompt is spent, so removing it keeps the chat from filling with stale menus

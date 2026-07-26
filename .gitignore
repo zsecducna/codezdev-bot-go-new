@@ -1,0 +1,24 @@
+# Binaries
+/bot
+/codezdev_bot
+*.exe
+
+# DB artifacts
+*.db
+*.db-shm
+*.db-wal
+
+# Env
+.env
+
+# OMC state
+.omc/
+!.omc/skills/
+# Added by code-review-graph
+.code-review-graph/
+
+# CodeGraph index (local tool state, rebuilt on demand)
+.codegraph/
+
+# Scratch review artifacts
+.otp_review_*.txt

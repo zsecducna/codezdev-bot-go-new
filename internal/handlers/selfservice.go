@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"time"
 
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/stock"
@@ -139,11 +138,22 @@ func (b *Bot) cbSelfService(cc *cbCtx) {
 func (b *Bot) showRefundOrderPicker(ctx context.Context, chatID int64, lang i18n.Lang) {
 	c := &i18n.C().Customer
 
+	// No store wired (partial boot, or a unit-test Bot): there is nothing to
+	// list and dereferencing would panic the update. Matches the explicit nil
+	// guard chatOwnsAccount uses (otp.go:270).
+	if b.store == nil {
+		return
+	}
+
 	// Compute the since-timestamp: 30-day window applied to ALL orders including
 	// apikey — matching Python @16814 which applies the same since filter to the
 	// full query. Apikey orders older than 30 days are excluded at DB level (full
 	// warranty does not mean infinite picker window).
-	sinceTS := float64(time.Now().Unix() - refundPickWindowS)
+	//
+	// b.now() rather than time.Now(): every time-dependent handler reads the
+	// injectable clock (dispatch.go:168) so a test can pin the window instead of
+	// racing the wall clock.
+	sinceTS := float64(b.now().Unix() - refundPickWindowS)
 
 	// Fetch the last 20 refundable paid/delivered orders for this chat.
 	orders, err := b.store.OrdersForChat(
@@ -179,7 +189,7 @@ func (b *Bot) showRefundOrderPicker(ctx context.Context, chatID int64, lang i18n
 		return
 	}
 
-	// Build one button row per eligible order — label format mirrors @16828-16838.
+	// Build one button row per eligible order — label format mirrors @16828-16842.
 	rows := make([][]tg.InlineKeyboardButton, 0, len(eligible))
 	for _, o := range eligible {
 		when := "—"
@@ -201,16 +211,35 @@ func (b *Bot) showRefundOrderPicker(ctx context.Context, chatID int64, lang i18n
 			// Standard account order — show warranty tier label.
 			label = fmt.Sprintf("🛡️ %s · %s · %s", b.tierLabel(o.Tier, lang), b.usdtDisp(o.Total), when)
 		}
-		// Telegram button text is limited to 64 bytes — truncate safely.
-		if len(label) > 60 {
-			label = label[:60]
-		}
 		rows = append(rows, []tg.InlineKeyboardButton{
-			{Text: label, CallbackData: "refreq:" + o.Des},
+			{Text: truncateButtonLabel(label), CallbackData: "refreq:" + o.Des},
 		})
 	}
 
 	b.sendMenu(ctx, chatID, c.RefundPickHeader.T(lang), rows)
+}
+
+// truncateButtonLabel caps an inline-button label at 60 CHARACTERS — Python's
+// label[:60] (telegram_bot.py:16843), which slices a str and therefore counts
+// characters, not bytes.
+//
+// Truncating by byte instead would be a silent, total failure: every label the
+// picker builds is multi-byte (🛡️ alone is 7 bytes, 🔁/🔑/🟣 are 4 each, the
+// "·" separators are 2, and tierLabel is localized into Vietnamese/Chinese), so
+// a byte cut can land in the middle of a rune. The resulting string is invalid
+// UTF-8, Telegram rejects the ENTIRE sendMessage rather than just that button,
+// and the customer sees no picker at all — with no error surfaced, because
+// sendMenu is fire-and-forget.
+//
+// Split out of showRefundOrderPicker so the boundary behaviour can be asserted
+// directly; an inline slice expression is unreachable from a test.
+func truncateButtonLabel(label string) string {
+	// Telegram's hard limit is 64 bytes of button text; Python's 60-character
+	// cap is the conservative budget this port keeps.
+	if r := []rune(label); len(r) > 60 {
+		return string(r[:60])
+	}
+	return label
 }
 
 // ---- cbFileRefundReq ---------------------------------------------------------
@@ -227,20 +256,41 @@ func (b *Bot) cbFileRefundReq(cc *cbCtx) {
 }
 
 // fileRefundRequest eligibility-checks order des for chatID, then records a
-// refund request — _file_refund_request (telegram_bot.py:16847-16889).
+// refund request — _file_refund_request (telegram_bot.py:16847-16896).
 //
 // For API-key orders: routes straight to apikeyRefundPreview (auto-approved
 // self-service flow). For standard orders: validates ownership, status,
 // warranty window and duplicate, then creates a pending request for admin review.
 //
-// Ownership failure is a DEAD BUTTON (no message): a des can be guessed/shared,
-// so silently dropping the tap is correct — the Python original returns early
-// with no response on non-ownership (@16851-16852 guard).
+// DELIBERATE DEVIATION — ownership failure is a DEAD BUTTON (no message).
+// Python does NOT do this: _file_refund_request (@16864-16866) calls
+// _refund_ineligible_msg for EVERY failure reason, "not_owner" and "not_found"
+// included, so it answers a tap on someone else's order with "⛔ This order
+// isn't yours." That is an order-id enumeration oracle: a des is a 32-hex string
+// that can be guessed or forwarded, and the distinct replies let a prober tell
+// "exists but not yours" apart from "does not exist". Staying silent leaks
+// nothing and costs a legitimate customer nothing, because a legitimate
+// customer only ever reaches this from their OWN picker.
+//
+// Second, smaller deviation: the status and warranty branches answer with the
+// generic Buy.OrderGone rather than Python's per-reason REFUND_INELIGIBLE
+// strings ("not_refundable" @7083, "warranty_expired" @7089). The customer is
+// told the order can no longer be refunded, just not precisely why. Only the
+// duplicate branch has its own string (RefundIneligibleDuplicate), because
+// there the generic notice would be actively misleading — see below.
 func (b *Bot) fileRefundRequest(ctx context.Context, chatID int64, lang i18n.Lang, des string) {
 	c := &i18n.C().Customer
 
+	// No store wired (partial boot, or a unit-test Bot): fail CLOSED and drop
+	// the tap rather than nil-deref. This gate decides whether money moves, so
+	// "cannot check" must never mean "allow" — same rule as chatOwnsAccount
+	// (otp.go:270).
+	if b.store == nil {
+		return
+	}
+
 	// Load the order; gate: must exist and belong to this chat. Silently drop
-	// foreign-order taps — the callback was for someone else's order (@16851).
+	// foreign-order taps — see the enumeration-oracle note above.
 	o, err := b.store.GetOrder(des)
 	if err != nil || o == nil || o.ChatID != fmtInt(chatID) {
 		// Dead button — no message sent (ownership mismatch or order gone).
@@ -260,8 +310,28 @@ func (b *Bot) fileRefundRequest(ctx context.Context, chatID int64, lang i18n.Lan
 		return
 	}
 
-	// Standard order: warranty window gate — KBH tier is never refundable.
-	if stock.WarrantySeconds(o.Tier) == 0 {
+	// Standard order: warranty window gate — _refund_eligibility (@16800-16802):
+	//
+	//	window = _warranty_seconds(order.get("tier", ""))
+	//	if window <= 0 or now > float(order.get("ts", 0) or 0) + window:
+	//	    return (False, "warranty_expired")
+	//
+	// BOTH arms matter. window == 0 rejects KBH/unknown tiers (no warranty was
+	// ever sold). The elapsed-time arm rejects an order whose warranty has since
+	// run out — without it a 7-day-warranty order bought 20 days ago still files
+	// a request, because the picker's window is 30 days (refundPickWindowS)
+	// while real tiers are much shorter. That creates a refund_requests row
+	// Python would have refused and puts a money decision in front of an admin
+	// that policy already answered.
+	//
+	// b.now(), not time.Now(): the injectable clock (dispatch.go:168) is what
+	// makes this gate testable. Python additionally caps its eligibility clock at
+	// the product-suspend timestamp (@16859-16862) so a warranty that lapsed only
+	// AFTER the product died stays eligible; the Go port has no product-suspend
+	// tracking yet, so the cap is a no-op and plain now is the equivalent value.
+	// M3.x adds product_suspended() and restores min(now, suspend_ts) here.
+	win := stock.WarrantySeconds(o.Tier)
+	if win == 0 || float64(b.now().Unix()) > o.TS+float64(win) {
 		b.send(ctx, chatID, i18n.C().Buy.OrderGone.T(lang), nil)
 		return
 	}
@@ -279,18 +349,33 @@ func (b *Bot) fileRefundRequest(ctx context.Context, chatID int64, lang i18n.Lan
 		return
 	}
 	if existing != nil {
-		// A request already exists — silently show the success notice so the
-		// customer sees their submission was recorded, without creating a duplicate.
-		b.send(ctx, chatID, i18n.F(c.RefundRequestOK.T(lang), "des", des), nil)
+		// An open request already exists — _refund_eligibility returns
+		// (False, "duplicate") here (@16803-16804) and the caller answers with
+		// REFUND_INELIGIBLE["duplicate"] (@7092).
+		//
+		// This MUST NOT reuse RefundRequestOK: that string says a request was
+		// submitted, and nothing was. A customer who re-taps because they think
+		// the first attempt was lost would get the identical confirmation twice
+		// and still have no idea one is already pending.
+		b.send(ctx, chatID, c.RefundIneligibleDuplicate.T(lang), nil)
 		return
 	}
 
-	// Create the refund request. predatedSuspend = 0 (no suspend tracking in
-	// this path yet — M3.x adds product-suspend awareness).
+	// Create the refund request.
+	//
+	// predatedSuspend = TRUE. Python computes `predated = 0 if susp else 1`
+	// (@16879), i.e. 1 ("the customer filed while the product was still ACTIVE
+	// — they beat the admins to the problem") whenever product_suspended()
+	// found no suspension. The Go port has no product-suspend tracking at all,
+	// so susp is unconditionally absent and the Python-equivalent value is 1.
+	// The previous `false` recorded the exact inverse of reality on every single
+	// request, and refund.go:167-170 writes it straight into the
+	// predated_suspend column that the admin refund view and the M3.x payout
+	// maths read. M3.x replaces this constant with the real lookup.
 	_, err = b.refundStore.CreateRequest(
 		des, fmtInt(chatID),
 		o.Product, o.Tier, o.Total, o.TS,
-		false, nil,
+		true, nil,
 	)
 	if err != nil {
 		log.Println("fileRefundRequest: CreateRequest:", err)
@@ -302,6 +387,10 @@ func (b *Bot) fileRefundRequest(ctx context.Context, chatID int64, lang i18n.Lan
 	b.send(ctx, chatID, i18n.F(c.RefundRequestOK.T(lang), "des", des), nil)
 
 	// Best-effort admin notification — log if no channel is wired yet.
+	// TODO(M3.1): _notify_admins with this text (@16887-16896; the call itself
+	// is @16889). Tagged the same way as the other deferred owner-alert sites in
+	// apikey_refund.go and apikey_deliver.go so one TODO(M3.1) sweep finds them
+	// all — deliberately no line numbers here, they drift.
 	log.Printf("NEW REFUND REQUEST des=%s product=%s tier=%s total=%d chat=%d",
 		des, o.Product, o.Tier, o.Total, chatID)
 }
@@ -387,6 +476,12 @@ func (b *Bot) cbApplyCode(cc *cbCtx) {
 	}
 	lang := b.langFor(cc.ChatID, "en")
 
+	// No store wired (partial boot, or a unit-test Bot) — drop rather than
+	// nil-deref (otp.go:270 idiom).
+	if b.store == nil {
+		return
+	}
+
 	// Ownership + status guard: only the owning chat may apply a code, and only
 	// while the order is still reserved (@16059-16062).
 	o, err := b.store.GetOrder(des)
@@ -418,6 +513,12 @@ func (b *Bot) cbRemoveCode(cc *cbCtx) {
 	}
 	lang := b.langFor(cc.ChatID, "en")
 
+	// No store wired (partial boot, or a unit-test Bot) — drop rather than
+	// nil-deref (otp.go:270 idiom).
+	if b.store == nil {
+		return
+	}
+
 	// Ownership + status guard (@16073-16076).
 	o, err := b.store.GetOrder(des)
 	if err != nil || o == nil || o.Status != "reserved" || o.ChatID != fmtInt(cc.ChatID) {
@@ -431,8 +532,13 @@ func (b *Bot) cbRemoveCode(cc *cbCtx) {
 	st.OrderCode = nil
 	st.mu.Unlock()
 
-	// Revert the order price to the baseline (volume or reseller discount),
-	// clearing the code fields — _release_order_code (telegram_bot.py:16079-16089).
+	// Release any promo/referral hold the current code is occupying BEFORE
+	// clearing the columns — _release_order_code (telegram_bot.py:16079). Bug
+	// fix: previously this was not called here, so removing a promo leaked its
+	// reserved use forever. The release must happen against the LOADED order (o)
+	// which still carries the old code fields; UpdateOrderCode clears them next.
+	b.releaseOrderCode(o)
+
 	// Compute the volume/reseller baseline total (@16081-16089).
 	resellerPct := b.resellerPctFor(cc.ChatID)
 	var volTotal int64

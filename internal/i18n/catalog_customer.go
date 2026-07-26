@@ -46,6 +46,13 @@ type CustomerCatalog struct {
 	// sent after a non-apikey request is filed; {des}.
 	RefundRequestOK Str
 
+	// RefundIneligibleDuplicate — REFUND_INELIGIBLE["duplicate"]
+	// (telegram_bot.py:7092-7094), reached via _refund_ineligible_msg
+	// (telegram_bot.py:7154). Sent when the order already has an OPEN refund
+	// request: the customer must learn that nothing new was filed, otherwise a
+	// re-tap looks identical to a successful first submission.
+	RefundIneligibleDuplicate Str
+
 	// ---- Customer password-reset flow (telegram_bot.py:7162-7192) ----
 
 	// CustResetPrompt — CUST_RESET_PROMPT (telegram_bot.py:7162): arming message
@@ -87,6 +94,36 @@ type CustomerCatalog struct {
 	// CodeRemoved — CODE_REMOVED (telegram_bot.py:1556): code stripped, price
 	// reverts to the volume-discount baseline.
 	CodeRemoved Str
+
+	// CodeUsedUp — CODE_USED_UP (telegram_bot.py:1518): the promo exists but is
+	// disabled or fully redeemed; {code}.
+	CodeUsedUp Str
+
+	// PromoAppliedReplace — PROMO_APPLIED_REPLACE (telegram_bot.py:1524): admin
+	// promo with stack=false, so the promo percent REPLACES the volume tier;
+	// {code} {pct}.
+	PromoAppliedReplace Str
+
+	// PromoAppliedStack — PROMO_APPLIED_STACK (telegram_bot.py:1530): admin promo
+	// with stack=true, added ON TOP of the volume tier; {code} {pct} {vol} {eff}.
+	PromoAppliedStack Str
+
+	// RefApplied — REF_APPLIED (telegram_bot.py:1538): referral code accepted;
+	// {code} {pct}. Says out loud that it replaces the volume discount, is
+	// once-per-customer, and pays the referrer.
+	RefApplied Str
+
+	// RefOwnCode — REF_OWN_CODE (telegram_bot.py:1544): the buyer typed their own
+	// referral code.
+	RefOwnCode Str
+
+	// RefAlready — REF_ALREADY (telegram_bot.py:1550): this customer has already
+	// redeemed a referral code (once per customer, for life).
+	RefAlready Str
+
+	// ReferrerEarned — REFERRER_EARNED (telegram_bot.py:1562): DM to the REFERRER
+	// after a referred order is delivered; {code} {amount} {balance}.
+	ReferrerEarned Str
 }
 
 // buildCustomerCatalog populates the M2.6 customer string cluster verbatim
@@ -183,6 +220,14 @@ func buildCustomerCatalog() CustomerCatalog {
 			ZH: "✅ 已提交订单 {des} 的退款申请。管理员将进行审核。",
 		},
 
+		// REFUND_INELIGIBLE["duplicate"] (telegram_bot.py:7092-7094) — copied
+		// byte-for-byte from the Python constant.
+		RefundIneligibleDuplicate: Str{
+			VI: "⛔ Bạn đã có một yêu cầu hoàn tiền đang chờ cho đơn này.",
+			EN: "⛔ You already have a pending refund request for this order.",
+			ZH: "⛔ 您已有此订单的待处理退款申请。",
+		},
+
 		// ── Password reset ────────────────────────────────────────────────────
 
 		// CUST_RESET_PROMPT (telegram_bot.py:7162-7177).
@@ -271,6 +316,55 @@ func buildCustomerCatalog() CustomerCatalog {
 			VI: "✅ Đã bỏ mã. Hiển thị lại giá theo chiết khấu số lượng.",
 			EN: "✅ Code removed. Showing the volume-discount price again.",
 			ZH: "✅ 已移除优惠码。重新显示批量折扣价格。",
+		},
+
+		// CODE_USED_UP (telegram_bot.py:1518-1522); {code}.
+		CodeUsedUp: Str{
+			VI: "⚠️ Mã {code} không còn khả dụng (đã tắt hoặc đã dùng hết lượt).",
+			EN: "⚠️ Code {code} is no longer available (inactive or fully redeemed).",
+			ZH: "⚠️ 优惠码 {code} 已不可用（已停用或已用完）。",
+		},
+
+		// PROMO_APPLIED_REPLACE (telegram_bot.py:1524-1528); {code} {pct}.
+		PromoAppliedReplace: Str{
+			VI: "🎟️ Đã áp dụng mã {code}: giảm {pct}%. ⚠️ Mã này THAY THẾ chiết khấu theo số lượng (bạn được {pct}%, không cộng dồn).",
+			EN: "🎟️ Promo code {code} applied: {pct}% off. ⚠️ This REPLACES the volume discount (you get {pct}%, not the volume tier).",
+			ZH: "🎟️ 已使用优惠码 {code}：减 {pct}%。⚠️ 此码将【替代】批量折扣（您享受 {pct}%，不叠加）。",
+		},
+
+		// PROMO_APPLIED_STACK (telegram_bot.py:1530-1533); {code} {pct} {vol} {eff}.
+		PromoAppliedStack: Str{
+			VI: "🎟️ Đã áp dụng mã {code}: +{pct}% cộng thêm vào chiết khấu số lượng {vol}% (tổng giảm {eff}%).",
+			EN: "🎟️ Promo code {code} applied: +{pct}% on top of your {vol}% volume discount ({eff}% total off).",
+			ZH: "🎟️ 已使用优惠码 {code}：在 {vol}% 批量折扣基础上再减 {pct}%（共减 {eff}%）。",
+		},
+
+		// REF_APPLIED (telegram_bot.py:1538-1542); {code} {pct}.
+		RefApplied: Str{
+			VI: "🎟️ Đã áp dụng mã giới thiệu {code}: giảm {pct}%. ⚠️ Mã giới thiệu THAY THẾ chiết khấu số lượng và mỗi khách chỉ dùng được MỘT lần. Người giới thiệu nhận {pct}% giá trị đơn này.",
+			EN: "🎟️ Referral code {code} applied: {pct}% off. ⚠️ A referral code REPLACES the volume discount and can be used ONCE per customer. Your referrer earns {pct}% of this order.",
+			ZH: "🎟️ 已使用推荐码 {code}：减 {pct}%。⚠️ 推荐码【替代】批量折扣，每位客户只能使用【一次】。推荐人将获得此订单的 {pct}%。",
+		},
+
+		// REF_OWN_CODE (telegram_bot.py:1544-1547).
+		RefOwnCode: Str{
+			VI: "⚠️ Bạn không thể dùng mã giới thiệu của chính mình.",
+			EN: "⚠️ You can't use your own referral code.",
+			ZH: "⚠️ 不能使用自己的推荐码。",
+		},
+
+		// REF_ALREADY (telegram_bot.py:1550-1554).
+		RefAlready: Str{
+			VI: "⚠️ Bạn đã dùng một mã giới thiệu rồi. Mỗi khách chỉ được dùng một lần.",
+			EN: "⚠️ You've already used a referral code. It's limited to one use per customer.",
+			ZH: "⚠️ 您已使用过推荐码。每位客户仅限一次。",
+		},
+
+		// REFERRER_EARNED (telegram_bot.py:1562-1565); {code} {amount} {balance}.
+		ReferrerEarned: Str{
+			VI: "🎉 Mã giới thiệu {code} của bạn vừa được dùng! Bạn nhận {amount} (10% giá trị đơn). Số dư mới: {balance}.",
+			EN: "🎉 Your referral code {code} was just used! You earned {amount} (10% of the order). New balance: {balance}.",
+			ZH: "🎉 您的推荐码 {code} 已被使用！您获得 {amount}（订单的 10%）。新余额：{balance}。",
 		},
 	}
 }

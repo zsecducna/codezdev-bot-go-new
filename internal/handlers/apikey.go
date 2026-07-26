@@ -60,11 +60,15 @@ func (b *Bot) registerAPIKey() {
 		cbRoute{key: "apikeyrev:", fn: (*Bot).cbApikeyRev},                      // @15571
 		cbRoute{key: "apikeyrefok:", fn: (*Bot).cbApikeyRefOK},                  // @12371
 		cbRoute{key: "apikeyrefno", exact: true, fn: (*Bot).cbApikeyRefNo},      // @12375
-		// M2.5 provisional self-service entry points were folded into the M2.6
-		// ss:/refreq: routers (selfservice.go). The TODO below was the handoff note.
-		// cbSSMyKeys is now reached via cbSelfService(ss:mykeys); cbRefReqAPIKey
-		// is reached via cbFileRefundReq which routes apikey orders to
-		// apikeyRefundPreview internally. These two standalone routes are removed.
+		// M2.5's provisional self-service entry points were folded into the M2.6
+		// ss:/refreq: routers (selfservice.go): registerCatalog runs first
+		// (dispatch.go:396) and its ss:/refreq: PREFIX routes matched before
+		// these exact/prefix routes could, and dispatchCB is first-match — so
+		// they were unreachable, not merely redundant. Both routes AND their
+		// handlers (cbSSMyKeys, cbRefReqAPIKey) are deleted; the behaviour lives
+		// on in cbSelfService("mykeys") -> showMyAPIKeys and in
+		// cbFileRefundReq -> fileRefundRequest, which routes api-key-family
+		// orders to apikeyRefundPreview itself.
 	)
 }
 
@@ -354,24 +358,14 @@ func (b *Bot) apikeyPriceVND(credits int64, saleClass string) int64 {
 }
 
 // apikeyCodedTotal is (total, effectivePct, volumePct) for an API-key-family
-// order — _apikey_coded_total (telegram_bot.py:6237-6269), code-free subset
-// (promo/referral codes are M2.6).
+// order at the baseline (NO-code) pricing — kind=None branch of
+// _apikey_coded_total (telegram_bot.py:6237-6269).
 //
-// Two deliberate differences from codedTotal, both forced by the product: the
-// base is apikeyPriceVND (a virtual product has no folder price file), and
-// there is no volume tier (qty is CREDITS, not units), so volumePct is always
-// 0. Effective fraction clamped to [0, 0.95] so no discount can zero an order.
+// M2.6 note: this is now a thin wrapper over apikeyCodedTotalFull (code.go),
+// which carries the kind/percent/stack branches. ONE implementation means a
+// coded and uncoded quote can never drift apart.
 func (b *Bot) apikeyCodedTotal(credits int64, resellerPct int, saleClass string) (total int64, effPct, volPct int) {
-	base := b.apikeyPriceVND(credits, saleClass)
-	if base <= 0 {
-		return base, 0, 0
-	}
-	eff := 0.0
-	if resellerPct != 0 {
-		eff = float64(resellerPct) / 100.0
-	}
-	eff = math.Max(0, math.Min(0.95, eff))
-	return int64(math.Round(float64(base) * (1 - eff))), int(math.Round(eff * 100)), 0
+	return b.apikeyCodedTotalFull(credits, "", 0, false, resellerPct, saleClass)
 }
 
 // apikeyPriceFor is the API-key VND total for `credits` WITH this buyer's flat

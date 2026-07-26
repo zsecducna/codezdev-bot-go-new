@@ -183,6 +183,29 @@ type Bot struct {
 	tronByHash     func(txhash string, minTSMS int64) (*tron.Transfer, error)
 	tronUsdtToVND  func(usdt *big.Rat) (int64, error)
 
+	// ---- login-code (OTP) suite (M2.6, otp.go) ------------------------------
+	//
+	// otpSem is the GLOBAL ceiling on concurrent fetch subprocesses across ALL
+	// chats — the Go twin of Python's `threading.BoundedSemaphore(OTP_MAX_CONCURRENCY)`
+	// (@680). A buffered channel so the acquire can carry a timeout (fail fast,
+	// never queue: a queued fetch would hold its chat's session lock the whole
+	// time). ONE per Bot: a per-chat semaphore would not bound host load at all.
+	otpSem chan struct{}
+	// otpFetch runs the server-side OTP / reset-link lookup for one username,
+	// returning (code, resetURL) with either or both possibly empty. A field for
+	// the same reason sepayFind is one: tests drive the whole suite without ever
+	// spawning node. New binds it to otpFetchNode.
+	//
+	// NEVER log or forward what this returns — both values are live credentials
+	// for a sold account (CLAUDE.md).
+	otpFetch func(ctx context.Context, username string) (code, reset string, err error)
+	// OTP timing knobs — the Python constants (@643, @677, @8283, @8288) as
+	// fields so tests can shrink them; New applies the shipped defaults.
+	otpCooldown     time.Duration // OTP_COOLDOWN_S 15s
+	otpSessionMax   time.Duration // OTP_SESSION_MAX_S 240s (stale-session watchdog)
+	otpSemAcquire   time.Duration // subprocess-slot acquire budget 45s
+	otpFetchTimeout time.Duration // node subprocess budget 90s
+
 	adminID string
 	devIDs  map[string]bool
 
@@ -358,6 +381,16 @@ func New(d Deps) *Bot {
 	}
 	b.tronUsdtToVND = tron.UsdtToVND
 
+	// ---- login-code (OTP) suite (M2.6) --------------------------------------
+	// ONE semaphore for the whole process (telegram_bot.py:680) and the real node
+	// runner as the default fetch seam.
+	b.otpSem = make(chan struct{}, otpMaxConcurrency)
+	b.otpFetch = b.otpFetchNode
+	b.otpCooldown = otpCooldown
+	b.otpSessionMax = otpSessionMax
+	b.otpSemAcquire = otpSemAcquire
+	b.otpFetchTimeout = otpFetchTimeout
+
 	// Register the M2.2 catalog + purchase capture(s) and callback routes, then
 	// the M2.3 deposit / order-pay-by-QR / history captures + routes.
 	b.registerCatalog()
@@ -370,6 +403,14 @@ func New(d Deps) *Bot {
 	// earlier slices registered (#44+), so registerUSDT splices it in before
 	// "deposit" and the chain stays an in-order subsequence of the canonical list.
 	b.registerUSDT()
+	// M2.6 login-code suite last: pending_code is capture #36, ahead of every
+	// capture registered above (#43+), so registerOTP splices it in before "txid"
+	// and the chain stays an in-order subsequence of the canonical list.
+	b.registerOTP()
+	// M2.6 promo/referral code capture: pending_ordercode is #47, between
+	// apikeyrc (#46) and purchase (#48). Spliced in before "purchase" so the
+	// chain stays an in-order subsequence of CanonicalCaptureOrder.
+	b.registerCodeCapture()
 	return b
 }
 
@@ -500,7 +541,21 @@ func (b *Bot) Process(ctx context.Context, u tg.Update) {
 
 	// Step 11: /command routing (alias map + label fallthrough) — @18695-18719.
 	if strings.HasPrefix(text, "/") {
-		b.handleCommand(ctx, chatID, parseSlashCommand(text), clientLang)
+		cmd := parseSlashCommand(text)
+		// /otp is intercepted HERE, before handleCommand, because it is the one
+		// command that takes ARGUMENTS and handleCommand only ever receives the
+		// bare command word — exactly as in Python, which special-cases /otp inside
+		// process() @19416-19431 for the same reason. Everything else keeps its
+		// current signature and behaviour.
+		if cmd == "otp" {
+			arg := ""
+			if _, rest, found := strings.Cut(text, " "); found {
+				arg = rest
+			}
+			b.cmdOTPSlash(ctx, chatID, lang, arg)
+			return
+		}
+		b.handleCommand(ctx, chatID, cmd, clientLang)
 		return
 	}
 	// A tapped reply-keyboard button arrives as its plain-text label.

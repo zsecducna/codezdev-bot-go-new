@@ -68,6 +68,10 @@ type Catalog struct {
 	// refund picker, password reset, account deletion, promo code prompts),
 	// in catalog_customer.go.
 	Customer CustomerCatalog
+	// OTP — the M2.6 login-code cluster (the /otp + "Login code" suite: prompt,
+	// ownership/batch/cooldown refusals, code + reset-link results, and the
+	// session stop/keep confirmation), in catalog_otp.go.
+	OTP OTPCatalog
 }
 
 // Command is one slash-command menu entry: the bare command word plus its
@@ -165,6 +169,8 @@ func buildCatalog() Catalog {
 		Pay: buildPayCatalog(),
 		// M2.6 customer self-service cluster (catalog_customer.go).
 		Customer: buildCustomerCatalog(),
+		// M2.6 login-code / OTP cluster (catalog_otp.go).
+		OTP: buildOTPCatalog(),
 	}
 }
 
