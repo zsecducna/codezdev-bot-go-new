@@ -31,6 +31,7 @@ import (
 	"codezdev-bot/internal/pay/binance"
 	"codezdev-bot/internal/pay/sepay"
 	"codezdev-bot/internal/pay/tron"
+	"codezdev-bot/internal/refund"
 	"codezdev-bot/internal/stock"
 	"codezdev-bot/internal/store"
 	"codezdev-bot/internal/tg"
@@ -129,6 +130,21 @@ func main() {
 	}
 	defer st.Close()
 
+	// Customer refund-REQUEST store (Go port of /Users/z/Desktop/Kiro/refund_store.py,
+	// M2.6). This is a SEPARATE handle on the SAME store.db file — refund.Store
+	// owns its own `refund_requests` table, not a second database — so it opens
+	// right next to store.Open the same way the Python bot's two modules each
+	// held their own sqlite3 connection to one file. Before this wiring existed,
+	// handlers.Deps.RefundStore was left nil by this constructor, which made the
+	// whole M2.6 customer refund-request flow silently inert in production (any
+	// nil-guard downstream just no-ops the request instead of erroring loudly),
+	// so this must fail the same way store.Open does rather than boot half-wired.
+	rst, err := refund.Open(storeDBPath)
+	if err != nil {
+		log.Fatalf("refund store open failed: %v", err)
+	}
+	defer rst.Close()
+
 	// Load the in-memory ban gate once at startup (telegram_bot.py:6555).
 	banned, err := st.BannedChatIDs()
 	if err != nil {
@@ -164,14 +180,15 @@ func main() {
 	}
 
 	bot := handlers.New(handlers.Deps{
-		TG:      client,
-		Store:   st,
-		Stock:   stk,
-		Config:  cfg,
-		Bands:   bandReg,
-		AdminID: adminID,
-		DevIDs:  map[string]bool{DefaultAdminID: true}, // DEV_IDS (telegram_bot.py:84)
-		Banned:  banned,
+		TG:          client,
+		Store:       st,
+		Stock:       stk,
+		RefundStore: rst,
+		Config:      cfg,
+		Bands:       bandReg,
+		AdminID:     adminID,
+		DevIDs:      map[string]bool{DefaultAdminID: true}, // DEV_IDS (telegram_bot.py:84)
+		Banned:      banned,
 	})
 
 	// Confirm connectivity + identity before polling (telegram_bot.py:18978).
