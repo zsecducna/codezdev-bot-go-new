@@ -44,6 +44,22 @@ func tgSendHTML(chatID int64, text string) tg.SendMessageParams {
 	}
 }
 
+// sendHTMLKB sends a parse_mode=HTML admin message with an optional inline
+// keyboard — for screens whose body uses <b>/<code> markup and also needs a
+// reply_markup, which neither tgSendHTML nor apikey_deliver.go's sendHTML
+// carries. Originally added for the AWS IDC provisioning admin screens (since
+// removed from this repo); kept here as a shared helper because adminstock.go's
+// 🌐 Provision Kiro pool screen needs the exact same shape.
+func (b *Bot) sendHTMLKB(ctx context.Context, chatID int64, text string, markup any) {
+	p := tg.SendMessageParams{ChatID: chatID, Text: text, ParseMode: "HTML"}
+	if markup != nil {
+		p.ReplyMarkup = markup
+	}
+	if _, err := b.tg.SendMessage(ctx, p); err != nil {
+		log.Println("sendHTMLKB: sendMessage failed:", err)
+	}
+}
+
 // showMyAPIKeys renders Self-Service → My API Keys: this buyer's minted keys,
 // newest first — _show_my_api_keys (telegram_bot.py:4293-4369).
 //

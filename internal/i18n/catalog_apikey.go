@@ -19,7 +19,12 @@ type APIKeyCatalog struct {
 	// Btn — APIKEY_BTN (telegram_bot.py:3884): buy-menu row; {rate}.
 	Btn Str
 	// Prompt — APIKEY_PROMPT (telegram_bot.py:3888): credit-amount prompt;
-	// {rate} {min} {balance}.
+	// {rate} {min} {balance} {opus}. {opus} is the Opus-5 token-value estimate
+	// block (see apikeyOpusEstFor, apikey.go) — Kiro commit 3069329. Already
+	// newline-terminated when present and EMPTY when it can't be computed, so
+	// the surrounding layout holds either way. BEDROCK ONLY: the kiro credit is
+	// a ~5.7x smaller unit, so the same estimate would overstate it by that
+	// factor — KiroPrompt below carries no {opus} placeholder at all.
 	Prompt Str
 	// PayPrompt — APIKEY_PAY_PROMPT (telegram_bot.py:3917): pay screen;
 	// {credits} {rate} {total} {balance}.
@@ -29,6 +34,15 @@ type APIKeyCatalog struct {
 	Delivered Str
 	// HistLabel — APIKEY_HIST_LABEL (telegram_bot.py:3992); {credits}.
 	HistLabel Str
+	// OpusEst — APIKEY_OPUS_EST (telegram_bot.py, Kiro commit 3069329): the
+	// {opus} block itself, rendered into Prompt above. Two facts the buyer
+	// actually shops on: how many Opus 5 tokens 1 USDT buys, and what 1M Opus 5
+	// tokens costs; {tokens} {per1m}. Both are derived from the SAME
+	// buyer-specific rate as the "Price:" line (apikeyOpusEstFor prices 100
+	// credits through apikeyPriceFor, the same path apikeyRateDispFor uses), so
+	// a reseller's discounted rate is reflected here too and the screen can
+	// never self-contradict. Worded as an estimate in every language.
+	OpusEst Str
 
 	// ---- kiro SKU (__kiroapi__) ----
 
@@ -136,11 +150,11 @@ func buildAPIKeyCatalog() APIKeyCatalog {
 			VI: "🔑 Bedrock API Credits — {rate}/100 credits",
 			ZH: "🔑 Bedrock API Credits — {rate}/100 credits",
 		},
-		// APIKEY_PROMPT (telegram_bot.py:3888).
+		// APIKEY_PROMPT (telegram_bot.py:3888, {opus} added by commit 3069329).
 		Prompt: Str{
-			EN: "🔑 BUY BEDROCK API CREDITS\nPrice: {rate} / 100 credits\nMinimum: {min} credits\nYour balance: {balance}\n\nType how many credits you want (e.g. 7500):",
-			VI: "🔑 MUA BEDROCK API CREDITS\nGiá: {rate} / 100 credits\nTối thiểu: {min} credits\nSố dư của bạn: {balance}\n\nNhập số credits bạn muốn mua (ví dụ 7500):",
-			ZH: "🔑 购买 BEDROCK API CREDITS\n价格：{rate} / 100 credits\n最低：{min} credits\n您的余额：{balance}\n\n请输入要购买的 credits 数量（例如 7500）：",
+			EN: "🔑 BUY BEDROCK API CREDITS\nPrice: {rate} / 100 credits\nMinimum: {min} credits\nYour balance: {balance}\n{opus}\nType how many credits you want (e.g. 7500):",
+			VI: "🔑 MUA BEDROCK API CREDITS\nGiá: {rate} / 100 credits\nTối thiểu: {min} credits\nSố dư của bạn: {balance}\n{opus}\nNhập số credits bạn muốn mua (ví dụ 7500):",
+			ZH: "🔑 购买 BEDROCK API CREDITS\n价格：{rate} / 100 credits\n最低：{min} credits\n您的余额：{balance}\n{opus}\n请输入要购买的 credits 数量（例如 7500）：",
 		},
 		// APIKEY_PAY_PROMPT (telegram_bot.py:3917).
 		PayPrompt: Str{
@@ -160,6 +174,12 @@ func buildAPIKeyCatalog() APIKeyCatalog {
 			EN: "🔑 API key — {credits} credits",
 			VI: "🔑 API key — {credits} credits",
 			ZH: "🔑 API key — {credits} credits",
+		},
+		// APIKEY_OPUS_EST (telegram_bot.py, Kiro commit 3069329).
+		OpusEst: Str{
+			EN: "\n📊 Opus 5 estimate: ≈ {tokens} tokens per 1 USDT\n     ≈ {per1m} USDT per 1M tokens (estimate only)\n",
+			VI: "\n📊 Ước tính Opus 5: ≈ {tokens} token / 1 USDT\n     ≈ {per1m} USDT / 1 triệu token (chỉ là ước tính)\n",
+			ZH: "\n📊 Opus 5 估算：每 1 USDT ≈ {tokens} tokens\n     每 100 万 tokens ≈ {per1m} USDT（仅供参考）\n",
 		},
 		// KIROAPI_BTN (telegram_bot.py:4000).
 		KiroBtn: Str{

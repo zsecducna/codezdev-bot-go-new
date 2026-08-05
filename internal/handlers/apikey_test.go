@@ -766,6 +766,164 @@ func TestApikeyRateUnsetHidesProduct(t *testing.T) {
 	}
 }
 
+// ---- Opus-5 token-value estimate (Kiro commit 3069329) ---------------------
+
+// TestApikeyOpusTokenEstimate pins apikeyOpusEst's pure arithmetic and its
+// failure paths — port of test_opus_token_estimate. Two numbers a buyer shops
+// on (tokens per 1 USDT, USDT per 1M tokens) both derive from the price of
+// 100 credits; they must move linearly with that price and vanish — never
+// print a bogus zero — when the price or the config USD_TO_VND rate is
+// unusable. The rate comes from usdtStrCfg (b.cfg.USDToVND()), the SAME
+// config-layered source the "Price:" line uses, NOT the raw ambient env —
+// see TestApikeyOpusEstimateUsesConfigRateNotAmbientEnv for the regression
+// this matters for.
+func TestApikeyOpusTokenEstimate(t *testing.T) {
+	b, _, _, _, _ := newAPIKeyBot(t)
+	t.Setenv("USD_TO_VND", "25000") // 1 USDT = 25,000 VND
+
+	// 4.00 USDT / 100 credits, 80M tokens per 100 credits ->
+	// 80M / 4 = 20.0M tokens per USDT, 4 / 80 = 0.05 USDT per 1M.
+	if got := b.apikeyOpusEst(100000, i18n.EN); !strings.Contains(got, "20.0M") || !strings.Contains(got, "0.05 USDT per 1M") {
+		t.Errorf("apikeyOpusEst(4.00 USDT/100) = %q, want 20.0M tokens and 0.05 USDT per 1M", got)
+	}
+	// Halving the price must double the tokens per USDT (linear, no drift).
+	if got := b.apikeyOpusEst(50000, i18n.EN); !strings.Contains(got, "40.0M") {
+		t.Errorf("half the price -> twice the tokens per USDT, got %q", got)
+	}
+	// A sub-cent per-1M price (0.70 USDT/100 credits -> 0.00875 USDT/1M) keeps
+	// significant digits instead of rounding away to "0.01".
+	if got := b.apikeyOpusEst(17500, i18n.EN); !strings.Contains(got, "0.00875") {
+		t.Errorf("sub-cent per-1M price rounded away: %q", got)
+	}
+	// Every language renders and none of them crash.
+	for _, lang := range i18n.LANGS {
+		if got := b.apikeyOpusEst(100000, lang); !strings.Contains(got, "20.0M") {
+			t.Errorf("estimate did not render for %v: %q", lang, got)
+		}
+	}
+	// Unknown language falls back to English rather than raising/blanking.
+	if got, want := b.apikeyOpusEst(100000, i18n.Lang("xx")), b.apikeyOpusEst(100000, i18n.EN); got != want {
+		t.Errorf("unknown lang = %q, want English fallback %q", got, want)
+	}
+	// Unusable inputs -> EMPTY block (the screen simply drops the lines).
+	if got := b.apikeyOpusEst(0, i18n.EN); got != "" {
+		t.Errorf("no price -> no estimate, got %q", got)
+	}
+	if got := b.apikeyOpusEst(-5, i18n.EN); got != "" {
+		t.Errorf("negative price -> no estimate, got %q", got)
+	}
+	// An absurd (fat-fingered) rate — 5000 USDT/100 credits — would floor the
+	// M-rendering to a misleading "0.0M tokens"; the block must vanish instead.
+	if got := b.apikeyOpusEst(125000000, i18n.EN); got != "" {
+		t.Errorf("absurd rate -> no estimate, not '0.0M', got %q", got)
+	}
+	// Unsetting the AMBIENT env must NOT blank the estimate: usdtStrCfg reads
+	// through b.cfg.USDToVND(), which falls back to the compiled default
+	// ("25000") when neither settings.json nor the env set a rate — exactly
+	// like usdtDisp/the Price line above it, and UNLIKE the pre-fix code
+	// (usdtStr -> raw os.LookupEnv), which would have gone blank here. No
+	// USD_TO_VND at all is a normal boot state (config.DefaultUSDToVND
+	// exists precisely for it), not an unusable-rate state.
+	os.Unsetenv("USD_TO_VND")
+	if got := b.apikeyOpusEst(100000, i18n.EN); !strings.Contains(got, "20.0M") {
+		t.Errorf("unset ambient USD_TO_VND should still render via the compiled default, got %q", got)
+	}
+}
+
+// TestApikeyOpusEstimateFollowsResellerRate: a reseller's estimate must use
+// their DISCOUNTED rate — port of test_opus_estimate_follows_reseller_rate.
+// The estimate sits directly under the "Price: X / 100 credits" line, which
+// is reseller-specific; if the two were computed from different rates the one
+// screen would contradict itself.
+func TestApikeyOpusEstimateFollowsResellerRate(t *testing.T) {
+	b, _, st, fk, dir := newAPIKeyBot(t)
+	t.Setenv("USD_TO_VND", "25000")
+	const chat = 200
+
+	full := b.apikeyOpusEstFor(chat, i18n.EN) // no @handle -> no reseller -> advertised 4.00 USDT rate
+	if !strings.Contains(full, "20.0M") {
+		t.Errorf("non-reseller sees the advertised-rate estimate, got %q", full)
+	}
+
+	if err := st.SetHandle(fmtInt(chat), "@myreseller"); err != nil {
+		t.Fatal(err)
+	}
+	s := apikeySettings(fk)
+	s["resellers"] = []any{map[string]any{"u": "myreseller", "note": "", "disc": 50}} // 4.00 -> 2.00 USDT/100
+	writeSettings(t, dir, s)
+	discounted := b.apikeyOpusEstFor(chat, i18n.EN)
+	if !strings.Contains(discounted, "40.0M") {
+		t.Errorf("50%%-off reseller sees twice the tokens per USDT, got %q", discounted)
+	}
+
+	// The kiro SKU never gets this block (its credit is a ~5.7x smaller unit);
+	// KiroPrompt carries no {opus} placeholder for the shared i18n.F call to fill.
+	if strings.Contains(i18n.C().APIKey.KiroPrompt.T(i18n.EN), "{opus}") {
+		t.Error("KiroPrompt must not carry an {opus} placeholder")
+	}
+}
+
+// TestApikeyPromptShowsOpusEstimate: cbApikeyStart renders the Opus-5 estimate
+// on the bedrock amount prompt and never on the kiro one (a ~5.7x smaller
+// credit unit, for which the same token count would be a giveaway).
+func TestApikeyPromptShowsOpusEstimate(t *testing.T) {
+	ctx := context.Background()
+	b, f, _, fk, dir := newAPIKeyBot(t)
+	t.Setenv("USD_TO_VND", "25000")
+	s := apikeySettings(fk)
+	s["kiro_apikey_enabled"] = true
+	s["kiro_apikey_usdt_per_100"] = 1.0
+	writeSettings(t, dir, s)
+	const chat = 300
+
+	b.Process(ctx, callbackUpdate(chat, "apikey:start"))
+	if got := lastMsg(t, f).Text; !strings.Contains(got, "Opus 5 estimate") || !strings.Contains(got, "20.0M") {
+		t.Errorf("bedrock prompt missing the opus estimate: %q", got)
+	}
+
+	b.Process(ctx, callbackUpdate(chat, "kiroapi:start"))
+	if got := lastMsg(t, f).Text; strings.Contains(got, "Opus 5 estimate") || strings.Contains(got, "{opus}") {
+		t.Errorf("kiro prompt must not carry the opus estimate or a stray placeholder: %q", got)
+	}
+}
+
+// TestApikeyOpusEstimateUsesConfigRateNotAmbientEnv is a regression pin for a
+// review-caught HIGH bug: apikeyOpusEst originally read USD_TO_VND through
+// usdtStr (paypal.VndToUSD -> raw os.LookupEnv("USD_TO_VND")), while the
+// "Price: X / 100 credits" line directly above it on the SAME screen reads
+// the rate through usdtDisp/apikeyPriceVND (b.cfg.USDToVND() ->
+// settings.json's admin-set "usd_to_vnd" overriding .env, else default).
+// t.Setenv-only tests can't catch that divergence — they set the ONE value
+// both paths would see. This test deliberately makes the two disagree: an
+// admin-set settings.json rate (26000, as adm:setrate would save) against a
+// stale ambient/.env rate (25000) that no longer matches. On the buggy code
+// this reproduces the exact self-contradiction the review flagged — Price:
+// 4.00 USDT, estimate silently computed off 4.16 USDT ("≈19.2M tokens per 1
+// USDT"); on the fix both lines are computed off the SAME 26000 rate
+// ("20.0M").
+func TestApikeyOpusEstimateUsesConfigRateNotAmbientEnv(t *testing.T) {
+	b, _, _, fk, dir := newAPIKeyBot(t)
+	t.Setenv("USD_TO_VND", "25000") // stale ambient/.env rate
+	s := apikeySettings(fk)
+	s["usd_to_vnd"] = 26000 // admin-set rate (adm:setrate), must win over ambient env
+	writeSettings(t, dir, s)
+
+	// apikey_usdt_per_100=4.0 (apikeySettings baseline) priced through the
+	// CONFIG rate is exactly what both apikeyPriceVND and the Price: line use.
+	vndPer100 := b.apikeyPriceVND(100, saleClassBedrock)
+	if vndPer100 != 104000 {
+		t.Fatalf("precondition: apikeyPriceVND = %d, want 104000 (4.00 USDT @ 26000)", vndPer100)
+	}
+
+	got := b.apikeyOpusEst(vndPer100, i18n.EN)
+	if strings.Contains(got, "19.2M") {
+		t.Errorf("apikeyOpusEst used the stale ambient USD_TO_VND (25000) instead of the config rate (26000): %q", got)
+	}
+	if !strings.Contains(got, "20.0M") {
+		t.Errorf("apikeyOpusEst = %q, want 20.0M tokens (same 26000 config rate as the Price line)", got)
+	}
+}
+
 // TestApikeyKiroSKUNeedsToggle: the kiro SKU stays hidden until its master
 // toggle flips, even when priced — enabling against a pre-saleClass server would
 // mint UNCLASSED keys billed at the bedrock rate (~5.7x giveaway).
@@ -1040,6 +1198,95 @@ func TestApikeyGroupRefundProration(t *testing.T) {
 	b.Process(ctx, callbackUpdate(chat, "apikeyrefok:"+keyDes))
 	if bal, _ := st.GetBalance(fmtInt(chat)); bal != balBefore {
 		t.Errorf("double-tap paid out twice: %d -> %d", balBefore, bal)
+	}
+}
+
+// TestDoRefundAdminForceFullApikeyGroup proves the shared admin executor,
+// doRefund, correctly routes an api-key-family order into the group refund
+// path even under force-full (adm:refund's escalation, and frefundm:'s
+// executor) — paying the FULL group total rather than the pro-rated amount,
+// and that refundGroupTotal (the admin preview's "whole-key group" line)
+// agrees with what actually gets paid.
+func TestDoRefundAdminForceFullApikeyGroup(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, fk, _ := newAPIKeyBot(t)
+	const chat = 100
+	const keyDes = "aabb0000aabb0000aabb0000aabb0000"
+	const rcDes = "ccdd0000ccdd0000ccdd0000ccdd0000"
+	seedOrder(t, st, keyDes, chat, apikeyProduct, 1000, 1000000, "delivered")
+	if _, err := st.AddAPIKey(keyDes, chat, "poolkey-adm", "sk-test-adm-0123456789abcdef", 1000, "bedrock"); err != nil {
+		t.Fatal(err)
+	}
+	seedOrder(t, st, rcDes, chat, apikeyRechargeProduct, 500, 500000, "delivered")
+	if _, err := st.AddAPIKeyRecharge(rcDes, keyDes, chat, 500); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkAPIKeyRechargeApplied(rcDes); err != nil {
+		t.Fatal(err)
+	}
+	fk.register("poolkey-adm", "sk-test-adm-0123456789abcdef", 1500, 900)
+
+	o, _ := st.GetOrder(keyDes)
+	groupN, paid := b.refundGroupTotal(o)
+	if groupN != 2 || paid != 1500000 {
+		t.Fatalf("refundGroupTotal = (%d,%d), want (2,1500000)", groupN, paid)
+	}
+
+	res := b.doRefund(ctx, o, "balance", true)
+	if res == nil {
+		t.Fatal("doRefund(forceFull) on an apikey-family order returned nil")
+	}
+	if res.Amount != 1500000 {
+		t.Errorf("force-full amount = %d, want 1500000 (full group paid total)", res.Amount)
+	}
+	if res.Unit != "Credit" {
+		t.Errorf("unit = %q, want Credit", res.Unit)
+	}
+	for _, d := range []string{keyDes, rcDes} {
+		if got, _ := st.GetOrder(d); got.Status != "refunded" {
+			t.Errorf("order %s = %q, want refunded", d, got.Status)
+		}
+	}
+	fk.mu.Lock()
+	nDel := len(fk.Delete)
+	fk.mu.Unlock()
+	if nDel != 1 {
+		t.Errorf("delete_api_key called %d times, want exactly 1 (force-full still revokes once)", nDel)
+	}
+}
+
+// TestDoRefundApikeyGroupCreditBalanceFailure mirrors the plain-order R1
+// proof for the api-key group path: a CreditBalance failure AFTER the group
+// claims already committed must be flagged (CreditFailed), and the customer
+// DM must be skipped entirely rather than falsely confirming a refund whose
+// money never moved.
+func TestDoRefundApikeyGroupCreditBalanceFailure(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, fk, _ := newAPIKeyBot(t)
+	const chat = 100
+	const keyDes = "eeff0000eeff0000eeff0000eeff0000"
+	seedKey(t, st, fk, keyDes, chat, "poolkey-cbf", "sk-test-cbf-0123456789abcdef", "bedrock", 1000, 1000, 400)
+
+	if _, err := st.DB().Exec("DROP TABLE balances"); err != nil {
+		t.Fatal(err)
+	}
+
+	o, _ := st.GetOrder(keyDes)
+	res := b.doRefundApikeyGroup(ctx, o, "balance", false)
+	if res == nil {
+		t.Fatal("doRefundApikeyGroup returned nil — the claim itself must still win even though the credit fails")
+	}
+	if !res.CreditFailed {
+		t.Error("res.CreditFailed = false, want true")
+	}
+	if res.Notified {
+		t.Error("res.Notified = true — the customer DM must be SKIPPED when the credit failed")
+	}
+	if got, _ := st.GetOrder(keyDes); got.Status != "refunded" {
+		t.Errorf("order status = %q, want refunded (claim committed despite credit failure)", got.Status)
+	}
+	if lastSendMsgTo(f, chat) != nil {
+		t.Error("buyer received a DM despite the credit failing")
 	}
 }
 

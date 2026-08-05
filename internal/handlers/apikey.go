@@ -20,12 +20,14 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math"
 	"strconv"
 	"strings"
 	"time"
 
+	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/kirogo"
 	"codezdev-bot/internal/store"
@@ -226,6 +228,124 @@ func (b *Bot) apikeyMaxPerCustomer() int64 {
 	return max(0, b.envInt64("APIKEY_MAX_PER_CUSTOMER", 0))
 }
 
+// apikeyOpusTokensPer100 is APIKEY_OPUS_TOKENS_PER_100 (Kiro commit 3069329):
+// the observed Opus 5 token burn per 100 BEDROCK rate-card credits (~80M
+// tokens), used only to render the "how many tokens does this actually buy"
+// estimate on the bedrock buy screen. It is an OBSERVATION, not a guarantee:
+// real burn moves with the model's live rate card and the caller's
+// input/output mix, so every string built from it is prefixed with "≈" and
+// labelled an estimate (APIKeyCatalog.OpusEst). Env-overridable so the number
+// can be re-tuned without a code change. Deliberately NOT applied to the kiro
+// SKU — a Kiro credit is a ~5.7x smaller unit, so this constant would
+// overstate its token value by that factor (apikeyOpusEstFor only ever prices
+// the bedrock class).
+func (b *Bot) apikeyOpusTokensPer100() int64 {
+	return b.envInt64("APIKEY_OPUS_TOKENS_PER_100", 80000000)
+}
+
+// commaFloat1 renders f with thousands separators and one decimal place —
+// Python's f"{x:,.1f}" used by _apikey_opus_est to print the tokens-per-USDT
+// figure in millions (e.g. "20.0", "1,234.5"). Reuses commaInt's digit
+// grouping (adminsettings.go) for the integer part instead of a second
+// grouping implementation; only the "split at the decimal point" step is new.
+func commaFloat1(f float64) string {
+	neg := f < 0
+	if neg {
+		f = -f
+	}
+	s := strconv.FormatFloat(f, 'f', 1, 64) // e.g. "1234.5"
+	intPart, decPart, _ := strings.Cut(s, ".")
+	n, _ := strconv.Atoi(intPart)
+	out := commaInt(n) + "." + decPart
+	if neg {
+		out = "-" + out
+	}
+	return out
+}
+
+// usdtStrCfg is usdtDisp's exact arithmetic (money.go:19-31) minus the
+// " USDT" suffix and the "— USDT" fallback: a bare 2-decimal USDT string for
+// a VND amount, or "" on an unset/invalid rate. It reads the rate through
+// b.cfg.USDToVND() — settings.json's admin-set usd_to_vnd overriding .env,
+// else the compiled default — the SAME layered source the "Price: X / 100
+// credits" line above the opus estimate uses.
+//
+// This is deliberately NOT usdtStr (usdt.go:179), which goes through
+// paypal.VndToUSD and reads os.LookupEnv("USD_TO_VND") — raw process env
+// only, invisible to an admin's settings.json rate change (there is no Go
+// counterpart to Python's apply_saved_rate, which pushes the saved rate INTO
+// os.environ so paypal.vnd_to_usd picks it up; see cmd/bot/main.go and
+// telegram_bot.py:5317-5324). Using usdtStr here would let this line and the
+// Price line disagree — or, if USD_TO_VND is only ever set via .env/
+// settings.json and never exported into the process env, silently print an
+// EMPTY block on every load (usdtStr sees nothing, apikeyOpusEst's rate<=0
+// guard fires) even though the shop is fully priced. apikeyOpusEst must read
+// the config-layered rate, exactly like usdtDisp/apikeyRateDispFor above it.
+func (b *Bot) usdtStrCfg(vnd int64) string {
+	rateStr := config.DefaultUSDToVND
+	if b.cfg != nil {
+		rateStr = b.cfg.USDToVND()
+	}
+	rate, err := strconv.ParseFloat(rateStr, 64)
+	if err != nil || rate <= 0 {
+		return ""
+	}
+	usd := float64(vnd) / rate
+	// Python: cents = int(usd*100) + (1 if (usd*100) % 1 else 0) -> ceil to
+	// cent (mirrors usdtDisp's own rounding, money.go:29-31).
+	cents := math.Ceil(usd*100 - 1e-9)
+	return fmt.Sprintf("%.2f", cents/100)
+}
+
+// apikeyOpusEst is the rendered Opus-5 token-value estimate for a BEDROCK
+// price of 100 credits — _apikey_opus_est (Kiro commit 3069329). Pure over
+// its (vndPer100, lang) inputs on purpose (VND in, string out — no chat_id
+// read directly) so the arithmetic and its failure paths are directly
+// testable; it still depends on the live config rate exactly as the Python
+// original depends on its process env USD_TO_VND. Given R = the USDT price
+// of 100 credits and T = apikeyOpusTokensPer100():
+//
+//	tokens per 1 USDT   = T / R
+//	USDT per 1M tokens  = R / (T / 1e6)
+//
+// Returns "" — NOT a zero or a placeholder number — whenever the estimate
+// can't be trusted: no price, or the config USD_TO_VND rate unset/invalid
+// (usdtStrCfg swallows that into ""). An empty block simply drops the lines
+// from the screen (i18n.F leaves an absent {opus} substitution as an empty
+// string), which is the correct behaviour for a number we can't stand
+// behind; a bogus "0 tokens per USDT" on a purchase screen would be worse
+// than silence.
+func (b *Bot) apikeyOpusEst(vndPer100 int64, lang i18n.Lang) string {
+	tokensPer100 := b.apikeyOpusTokensPer100()
+	if vndPer100 <= 0 || tokensPer100 <= 0 {
+		return ""
+	}
+	// usdtStrCfg returns "" (not "0") when the config rate is unset/invalid;
+	// ParseFloat then errors on that empty string, which the rate<=0 check
+	// below turns into an empty block — same net effect as Python's
+	// `float(usdt_str(vnd) or 0)` + `if rate <= 0`.
+	rate, err := strconv.ParseFloat(b.usdtStrCfg(vndPer100), 64)
+	if err != nil || rate <= 0 {
+		return ""
+	}
+	tokensPerUSDT := float64(tokensPer100) / rate
+	usdtPer1M := rate / (float64(tokensPer100) / 1_000_000.0)
+	// Below 100k tokens/USDT the "M" rendering floors to a misleading "0.0M"
+	// (needs a ~1,600 USDT per-100-credits price, i.e. a fat-fingered admin
+	// rate). Drop the block instead — same rule as every other untrustworthy
+	// input here: no estimate beats a wrong one on a purchase screen.
+	if tokensPerUSDT < 100_000 {
+		return ""
+	}
+	// Millions is the only readable unit here (raw counts run to 9 digits);
+	// the per-1M price uses 4 significant digits (Go's 'g' verb at precision
+	// 4, the exact analogue of Python's f"{x:.4g}") so a sub-cent rate — e.g.
+	// 0.0125 USDT — is not rounded away to "0.01".
+	return i18n.F(i18n.C().APIKey.OpusEst.T(lang),
+		"tokens", commaFloat1(tokensPerUSDT/1_000_000.0)+"M",
+		"per1m", strconv.FormatFloat(usdtPer1M, 'g', 4, 64))
+}
+
 // ---- Kiro-Go configuration gates -------------------------------------------
 
 // kiroGoConfigured is kiro_go_configured (telegram_bot.py:5822-5832): base URL,
@@ -388,6 +508,16 @@ func (b *Bot) apikeyRateDisp(saleClass string) string {
 // consistent with the charged total: both flow through apikeyPriceFor.
 func (b *Bot) apikeyRateDispFor(chatID int64, saleClass string) string {
 	return b.usdtDisp(b.apikeyPriceFor(chatID, 100, saleClass))
+}
+
+// apikeyOpusEstFor is the buyer-specific {opus} block for the bedrock amount
+// prompt — _apikey_opus_est_for (Kiro commit 3069329). Prices 100 credits
+// through apikeyPriceFor — the SAME path as apikeyRateDispFor's "Price: X /
+// 100 credits" line — so a reseller's discount is reflected in the token
+// estimate and the two lines can never disagree. Bedrock only by
+// construction: cbApikeyStart never calls this for the kiro SKU.
+func (b *Bot) apikeyOpusEstFor(chatID int64, lang i18n.Lang) string {
+	return b.apikeyOpusEst(b.apikeyPriceFor(chatID, 100, saleClassBedrock), lang)
 }
 
 // apikeyQtyRows wraps quick-pick credit buttons into rows of apikeyQtyPerRow —
@@ -799,9 +929,20 @@ func (b *Bot) cbApikeyStart(cc *cbCtx) {
 		markup = &tg.InlineKeyboardMarkup{InlineKeyboard: apikeyQtyRows(choices, qtyPrefix)}
 	}
 	balance, _ := b.getBalance(cc.ChatID)
+	// "opus" is always passed but only c.Prompt (bedrock) carries the {opus}
+	// placeholder — i18n.F is a strings.Replacer pass, so a kv pair whose
+	// "{opus}" token isn't present in the target string (KiroPrompt) is simply
+	// a no-op, keeping the "one F() call feeds either dict" invariant intact
+	// (mirrors Python's str.format silently ignoring a surplus kwarg). It is
+	// computed only for bedrock: the estimate is denominated in rate-card
+	// credits and would be ~5.7x too generous for kiro credits.
+	opus := ""
+	if cls == saleClassBedrock {
+		opus = b.apikeyOpusEstFor(cc.ChatID, lang)
+	}
 	text := i18n.F(prompt.T(lang),
 		"rate", b.apikeyRateDispFor(cc.ChatID, cls),
-		"min", itoa64(mn), "balance", b.usdtDisp(balance))
+		"min", itoa64(mn), "balance", b.usdtDisp(balance), "opus", opus)
 	if markup != nil {
 		b.send(cc.Ctx, cc.ChatID, text, markup)
 	} else {
