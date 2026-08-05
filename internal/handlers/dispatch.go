@@ -51,6 +51,12 @@ type TG interface {
 	// (send_photo_file @10015, called from _send_binance_qr @10069 and the two
 	// on-chain QR senders).
 	SendPhoto(ctx context.Context, chatID int64, filePath, caption string) (*tg.Message, error)
+	// GetFileBytes downloads an uploaded document's raw content by file_id —
+	// the 📦 Stock admin category's upstock/provpool file intercepts
+	// (adminstock.go) are the first callers that need actual bytes rather
+	// than just a re-sendable file_id (tg/client.go's own doc comment on why
+	// this method is new, not a refactor).
+	GetFileBytes(ctx context.Context, fileID string) ([]byte, error)
 }
 
 // Deps bundles everything Bot needs so New can build an isolated instance (no
@@ -84,7 +90,7 @@ type Bot struct {
 	stock       *stock.Store
 	refundStore *refund.Store // customer refund-request store (refund_store.py) — M2.6
 	cfg         *config.Config
-	states *States
+	states      *States
 
 	// workers tracks the per-order expiry goroutines (order_expiry_worker @8974)
 	// so Shutdown can drain them on exit (handlers-go.md §3/§8).
@@ -235,6 +241,26 @@ type Bot struct {
 	// chain @12287-15697): first-match-wins, appended by each slice. A golden
 	// test can pin the order. M2.2 registers the customer buy-pipeline routes.
 	cbRoutes []cbRoute
+
+	// ---- 🧾 ORDERS / refund subsystem (adminorders.go) ----------------------
+
+	// refundAsOfMu guards refundAsOfByDes — the Go home of telegram_bot.py's
+	// module-level _refund_asof_by_des dict (@4468): a FROZEN warranty-clock
+	// snapshot set by refappr: (a customer-request approval) and consumed
+	// exactly once by the refund executor, so admin-review delay can never
+	// shrink an already-approved payout. Deliberately process-wide (keyed by
+	// order des, not by chat) exactly like the Python dict — a des is globally
+	// unique, so this needs no per-chat home.
+	refundAsOfMu    sync.Mutex
+	refundAsOfByDes map[string]float64
+
+	// upstockRenderThrottle is UPSTOCK_RENDER_THROTTLE (py_stock_spec.md §1.7)
+	// — how long the running upstock preview's render loop sleeps between
+	// passes after its first (immediate) iteration, coalescing a burst of
+	// pastes/file uploads into one edited message instead of one per input. A
+	// Bot field (not a bare const) so tests can shrink it, the same pattern
+	// as every other timing knob on this struct (otpCooldown, binancePollInterval, …).
+	upstockRenderThrottle time.Duration
 }
 
 // Ctx is the per-update working context threaded through the dispatch stages,
@@ -268,15 +294,21 @@ func New(d Deps) *Bot {
 		stock:       d.Stock,
 		refundStore: d.RefundStore,
 		cfg:         d.Config,
-		states:    NewStates(),
-		workers:   newWorkerRegistry(),
-		adminID:   d.AdminID,
-		devIDs:    copyBoolMap(d.DevIDs),
-		admins:    map[string]bool{},
-		banned:    copyBoolMap(d.Banned),
-		handles:   map[int64]string{},
-		chatNames: map[int64]string{},
-		chatLang:  map[int64]i18n.Lang{},
+		states:      NewStates(),
+		workers:     newWorkerRegistry(),
+		adminID:     d.AdminID,
+		devIDs:      copyBoolMap(d.DevIDs),
+		// admins is the standard-admin set — loaded from admins.json
+		// (adminusers.go's loadAdminsFile) so a restart doesn't drop every
+		// grant (store.py-equivalent persistence: add_admin/remove_admin,
+		// telegram_bot.py:150-172). Reading a missing/corrupt file yields an
+		// empty set, matching Python's load_admins bare-except default.
+		admins:          loadAdminsFile(),
+		banned:          copyBoolMap(d.Banned),
+		handles:         map[int64]string{},
+		chatNames:       map[int64]string{},
+		chatLang:        map[int64]i18n.Lang{},
+		refundAsOfByDes: map[string]float64{},
 	}
 	// Product-click limits + order timers — env-tunable (telegram_bot.py:12183-12185,
 	// 10542-10550), defaults applied when unset or no config is wired (unit tests).
@@ -391,6 +423,11 @@ func New(d Deps) *Bot {
 	b.otpSemAcquire = otpSemAcquire
 	b.otpFetchTimeout = otpFetchTimeout
 
+	// 📦 Stock admin category (adminstock.go): the upstock preview render
+	// loop's throttle, shipped default 2s (py_stock_spec.md §1.7's literal
+	// UPSTOCK_RENDER_THROTTLE=2.0).
+	b.upstockRenderThrottle = 2 * time.Second
+
 	// Register the M2.2 catalog + purchase capture(s) and callback routes, then
 	// the M2.3 deposit / order-pay-by-QR / history captures + routes.
 	b.registerCatalog()
@@ -416,6 +453,41 @@ func New(d Deps) *Bot {
 	// routes. Without this the Admin button rendered but nothing listened, so a
 	// tap fell through every stage to the step-12 no-op (admin.go header).
 	b.registerAdmin()
+	// ⚙️ SETTINGS + 💳 PAYMENT METHODS (adminsettings.go). Its 7 captures
+	// (setrate/setkirourl/setkirokey/setkiroacct/setbep20/settron/setmaxqty)
+	// are canonically ordered well before "code" (captures.go #10-#23 vs
+	// #37-ish), so it must register after registerCodeCapture has landed
+	// "code" — insertCapturesBefore("code", ...) finds "code" already in the
+	// chain and splices this file's 7 captures ahead of it.
+	b.registerAdminSettings()
+	// 🏷️ PRICING & DISCOUNTS (adminpricing.go). Its captures (setapiprice
+	// through setapicap, canonically #11-#17; discount/promo #34/#36;
+	// tier/price #41/#42) splice ahead of anchors registerAdminSettings /
+	// registerOTP / registerUSDT already landed ("setkirourl", "code",
+	// "txid") — this MUST run last so those anchors already exist in the
+	// chain.
+	b.registerAdminPricing()
+	// 👥 CUSTOMERS / 🛡️ ADMIN ROLES / whitelist / resellers (adminusers.go).
+	// Runs LAST: its captures splice ahead of "setrate" (registered by
+	// registerAdminSettings) and "promo" (registered by registerAdminPricing),
+	// so both anchors must already exist in the chain — see
+	// registerAdminUsers's own doc comment.
+	b.registerAdminUsers()
+	// 🧾 ORDERS + refund subsystem (adminorders.go). Its captures splice ahead
+	// of "custlookup" (registerAdminUsers) and "discount" (registerAdminPricing)
+	// — both anchors must already exist in the chain, so this runs LAST,
+	// after every other admin slice.
+	b.registerAdminOrders()
+	// 📦 STOCK + pool/audit views (adminstock.go). Its captures splice ahead
+	// of "getord" (registerAdminOrders' own first anchor — "upstock" is
+	// canonical #1, earliest of all), "refund" ("newprod"/"renprod"/
+	// "provpool" ahead of it, then "setnotice"/"setdelivery"/"editfile" ahead
+	// of "refund" again — both groups anchor on registerAdminOrders' "refund"
+	// capture, landing in registration order), and "tier" ("hold",
+	// registerAdminPricing's anchor) — every one of those anchors must
+	// already exist in the chain, so this runs absolutely LAST, after every
+	// other admin slice registers.
+	b.registerAdminStock()
 	return b
 }
 
@@ -663,8 +735,12 @@ func (b *Bot) isSuperAdmin(chatID int64) bool {
 }
 
 // isAdmin reports a full admin OR a granted "standard" admin. Port of is_admin
-// (telegram_bot.py:139-146). The standard-admin set is empty until M3.1 wires
-// admins.json.
+// (telegram_bot.py:139-146). The standard-admin set is loaded from admins.json
+// by New() (loadAdminsFile, adminusers.go) and can be non-empty for real —
+// comment corrected by Opus review: an earlier draft of this comment claimed
+// the set was "empty until M3.1", which was stale the moment admins.json
+// loading landed and is exactly the kind of sentence that makes a capability
+// gap invisible on a skim.
 func (b *Bot) isAdmin(chatID int64) bool {
 	if b.isSuperAdmin(chatID) {
 		return true

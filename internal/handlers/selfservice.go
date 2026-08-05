@@ -363,19 +363,27 @@ func (b *Bot) fileRefundRequest(ctx context.Context, chatID int64, lang i18n.Lan
 
 	// Create the refund request.
 	//
-	// predatedSuspend = TRUE. Python computes `predated = 0 if susp else 1`
-	// (@16879), i.e. 1 ("the customer filed while the product was still ACTIVE
-	// — they beat the admins to the problem") whenever product_suspended()
-	// found no suspension. The Go port has no product-suspend tracking at all,
-	// so susp is unconditionally absent and the Python-equivalent value is 1.
-	// The previous `false` recorded the exact inverse of reality on every single
-	// request, and refund.go:167-170 writes it straight into the
-	// predated_suspend column that the admin refund view and the M3.x payout
-	// maths read. M3.x replaces this constant with the real lookup.
+	// predatedSuspend / productSuspendTS now read the REAL product-suspend
+	// state at filing time via productSuspendedAt (adminorders.go) — Python
+	// computes `predated = 0 if susp else 1` and
+	// `product_suspend_ts = susp["ts"] if susp else None` (@16879/16884).
+	// predatedSuspend TRUE means "the customer filed while the product was
+	// still ACTIVE" (they beat the admins to the problem); FALSE means the
+	// product was already suspended when they filed, in which case the
+	// frozen clock (refundRequestAsOf, adminorders.go) must cap the payout's
+	// warranty window at THAT suspend ts, not whatever is live at payout
+	// time. A ts of exactly 0 is treated as "not suspended" (falsy in
+	// Python, `if susp.get("ts")`), matching refundAmount's own guard.
+	susTS, suspOK := b.productSuspendedAt(o.Product)
+	suspended := suspOK && susTS > 0
+	var suspendTS *float64
+	if suspended {
+		suspendTS = &susTS
+	}
 	_, err = b.refundStore.CreateRequest(
 		des, fmtInt(chatID),
 		o.Product, o.Tier, o.Total, o.TS,
-		true, nil,
+		!suspended, suspendTS,
 	)
 	if err != nil {
 		log.Println("fileRefundRequest: CreateRequest:", err)

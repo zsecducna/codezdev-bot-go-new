@@ -14,15 +14,21 @@ import (
 // a customer with an OLD keyboard never sees newly-added buttons until
 // ensureKeyboard re-pushes. BUMP THIS whenever mainKeyboard's layout changes so
 // the new keyboard reaches everyone without a manual /start.
-const KeyboardVersion = "5"
+const KeyboardVersion = "6"
 
 // mainKeyboard builds the persistent reply keyboard — port of main_keyboard
-// (telegram_bot.py:6962-6990). Three rows: business commands (buy + deposit),
-// the Sell-AWS entry on its own row (wide label), then the Self-Service button
-// beside the language button, with the Admin entry appended for admins only.
-// Button labels come from the SAME i18n source as labelToCmd, so a tap always
-// resolves (handlers-go.md §6). resize_keyboard shrinks it to fit and
-// is_persistent keeps it shown after a tap (@6988-6989).
+// (telegram_bot.py:6962-6990). Two rows: business commands (buy + deposit),
+// then the Self-Service button beside the language button, with the Admin
+// entry appended for admins only. Button labels come from the SAME i18n
+// source as labelToCmd, so a tap always resolves (handlers-go.md §6).
+// resize_keyboard shrinks it to fit and is_persistent keeps it shown after a
+// tap (@6988-6989).
+//
+// The Sell-AWS row (SELL_BTN) was removed along with the rest of the AWS-sell
+// feature (internal/awssell, internal/awsval, the awsadm: admin tree) — user
+// decision, full rip-out, never shipped past the store layer. KeyboardVersion
+// bumped 5 -> 6 per this file's own rule so every existing chat's cached
+// keyboard drops the now-dead row without needing a manual /start.
 func mainKeyboard(lang i18n.Lang, admin bool) *tg.ReplyKeyboardMarkup {
 	c := i18n.C()
 	ssRow := []tg.KeyboardButton{
@@ -35,7 +41,6 @@ func mainKeyboard(lang i18n.Lang, admin bool) *tg.ReplyKeyboardMarkup {
 	return &tg.ReplyKeyboardMarkup{
 		Keyboard: [][]tg.KeyboardButton{
 			{{Text: c.DescFor("buy").T(lang)}, {Text: c.DescFor("deposit").T(lang)}},
-			{{Text: c.SellBtn.T(lang)}},
 			ssRow,
 		},
 		ResizeKeyboard: true, // shrink to fit the buttons (@6988)
@@ -82,10 +87,6 @@ func buildLabelMap() map[string]string {
 	m[c.SelfServiceBtn.VI] = "selfservice"
 	m[c.SelfServiceBtn.ZH] = "selfservice"
 	m[i18n.SelfServiceBtnLegacy] = "selfservice"
-	// Sell button in every language (@7025-7026).
-	m[c.SellBtn.EN] = "sellaws"
-	m[c.SellBtn.VI] = "sellaws"
-	m[c.SellBtn.ZH] = "sellaws"
 	return m
 }
 

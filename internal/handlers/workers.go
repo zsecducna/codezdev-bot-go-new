@@ -1,6 +1,9 @@
 package handlers
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
 // workerRegistry tracks the daemon goroutines the handlers spawn (today: the
 // per-order expiry timers, order_expiry_worker @8974) so Shutdown can drain
@@ -54,4 +57,29 @@ func (w *workerRegistry) Shutdown() {
 	}
 	w.mu.Unlock()
 	w.wg.Wait()
+}
+
+// runOnStoppableCtx (H3 fix, originally landed for the AWS IDC provisioning
+// feature — since removed — now shared by every background admin run that
+// spawns via workerRegistry.Go/TryGo) runs fn on a FRESH cancellable context,
+// wiring the registry's stop channel into that context's cancel — the same
+// shape otp.go establishes for background work that must react to Shutdown()
+// rather than block. Running fn on cc.Ctx directly would be wrong: cc.Ctx
+// traces back to main.go's rootCtx (context.Background(), passed unchanged to
+// every update — cmd/bot/main.go's "bot.Process(rootCtx, u)"), which is NEVER
+// cancelled, so Shutdown() would have no way to interrupt an in-flight run and
+// would block on it for up to its own worst-case timeout instead of draining.
+func runOnStoppableCtx(stop <-chan struct{}, fn func(ctx context.Context)) {
+	fctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-stop:
+			cancel()
+		case <-done:
+		}
+	}()
+	fn(fctx)
 }

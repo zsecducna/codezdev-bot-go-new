@@ -39,9 +39,6 @@ type Catalog struct {
 	// SelfServiceBtn — SELFSERVICE_BTN (telegram_bot.py:6919): per-language
 	// label of the Self-Service reply-keyboard button.
 	SelfServiceBtn Str
-	// SellBtn — SELL_BTN (telegram_bot.py:818): per-language label of the "Sell
-	// AWS Account" reply-keyboard button.
-	SellBtn Str
 	// Commands — COMMANDS_BY_LANG (telegram_bot.py:359-384) transposed: one
 	// entry per command in menu order, each carrying its trilingual description.
 	// The per-language menu shown to Telegram (setMyCommands) and the reply
@@ -72,6 +69,10 @@ type Catalog struct {
 	// ownership/batch/cooldown refusals, code + reset-link results, and the
 	// session stop/keep confirmation), in catalog_otp.go.
 	OTP OTPCatalog
+	// Orders — the 🧾 ORDERS / refund-subsystem customer DM cluster (the
+	// manual-payout refund receipt + the two refund-request decision notices),
+	// in catalog_orders.go.
+	Orders OrdersCatalog
 }
 
 // Command is one slash-command menu entry: the bare command word plus its
@@ -141,12 +142,6 @@ func buildCatalog() Catalog {
 			VI: "🛠️ Tự phục vụ",
 			ZH: "🛠️ 自助服务",
 		},
-		// SELL_BTN (telegram_bot.py:818).
-		SellBtn: Str{
-			EN: "💰 Sell AWS Account",
-			VI: "💰 Bán tài khoản AWS",
-			ZH: "💰 出售 AWS 账户",
-		},
 		// COMMANDS_BY_LANG (telegram_bot.py:359-384), transposed to one entry
 		// per command in the source's menu order.
 		Commands: []Command{
@@ -171,6 +166,8 @@ func buildCatalog() Catalog {
 		Customer: buildCustomerCatalog(),
 		// M2.6 login-code / OTP cluster (catalog_otp.go).
 		OTP: buildOTPCatalog(),
+		// 🧾 ORDERS / refund-subsystem customer DM cluster (catalog_orders.go).
+		Orders: buildOrdersCatalog(),
 	}
 }
 

@@ -324,20 +324,17 @@ func (b *Bot) handleForChat(chatID int64) string {
 
 // ---- pricing (volume discount only; codes are M2.6) ------------------------
 
-// defaultDiscountTiers is _DISCOUNT_DEFAULT (telegram_bot.py:5078), checked
-// high-to-low. Used when discounts.json is absent — the admin-editable
-// discounts.json loader lands with the pricing-admin slice (M3.3); until then
-// this is the fresh-install behaviour, exactly as Python (load_discounts @6474).
-var defaultDiscountTiers = []struct {
-	Min  int
-	Frac float64
-}{{50, 0.30}, {20, 0.20}, {10, 0.10}}
-
-// discountFor returns the volume-discount fraction for a quantity — discount_for
-// (telegram_bot.py:6504-6509).
+// discountFor returns the volume-discount fraction for a quantity —
+// discount_for (telegram_bot.py:6509-6514): the tiers are re-read from
+// discounts.json on every call (loadDiscounts, adminpricing.go), so an
+// admin's 📉 Volume discounts edit takes effect on the very next quote with
+// no cache to invalidate — exactly Python's own no-cache load_discounts()
+// call inside discount_for. loadDiscounts already sorts descending by
+// MinQty, so the FIRST tier this quantity clears is the highest (and
+// therefore correct) one; below every threshold, no discount applies.
 func discountFor(qty int) float64 {
-	for _, t := range defaultDiscountTiers {
-		if qty >= t.Min {
+	for _, t := range loadDiscounts() {
+		if qty >= t.MinQty {
 			return t.Frac
 		}
 	}
@@ -357,22 +354,37 @@ func codedTotal(unit, qty, resellerPct int) (total, effPct, volPct int) {
 }
 
 // discountBlock renders the current volume-discount tiers as a human list —
-// discount_block (telegram_bot.py:6517-6536). Built from the default tiers
-// (ascending min_qty) until discounts.json wiring lands (M3.3).
+// discount_block (telegram_bot.py:6517-6536). Reads the SAME live
+// discounts.json discountFor prices off (loadDiscounts, adminpricing.go), so
+// an admin's 📉 Volume discounts edit is reflected here too — this used to
+// show a hardcoded tier list until the pricing-admin slice (M3.3) landed
+// loadDiscounts; a stale display here would otherwise quote a customer a
+// discount schedule that no longer matches what they're actually charged.
 func discountBlock(lang i18n.Lang) string {
-	tiers := []struct {
-		Min  int
-		Frac float64
-	}{{10, 0.10}, {20, 0.20}, {50, 0.30}}
+	desc := loadDiscounts() // descending by MinQty (loadDiscounts' contract)
+	// Python filters to tiers with a positive fraction and bails to "" when
+	// none remain (telegram_bot.py:6530-6536) — an admin-cleared
+	// discounts.json (empty list) or a hand-entered "10:0" tier must never
+	// render a bare "Volume discount:" header with nothing under it on
+	// every product's buy screen.
+	var tiers []discountTier
+	for i := len(desc) - 1; i >= 0; i-- { // reverse to ASCENDING for the range display below
+		if desc[i].Frac > 0 {
+			tiers = append(tiers, desc[i])
+		}
+	}
+	if len(tiers) == 0 {
+		return ""
+	}
 	c := &i18n.C().Buy
 	unit := c.DiscountUnit.T(lang)
 	lines := []string{c.DiscountHeader.T(lang)}
 	for i, t := range tiers {
 		var rng string
 		if i+1 < len(tiers) {
-			rng = fmt.Sprintf("%d-%d", t.Min, tiers[i+1].Min-1)
+			rng = fmt.Sprintf("%d-%d", t.MinQty, tiers[i+1].MinQty-1)
 		} else {
-			rng = fmt.Sprintf("%d+", t.Min)
+			rng = fmt.Sprintf("%d+", t.MinQty)
 		}
 		lines = append(lines, fmt.Sprintf("=> %s %s  -%d%%", rng, unit, int(math.Round(t.Frac*100))))
 	}

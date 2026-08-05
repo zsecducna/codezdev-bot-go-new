@@ -9,6 +9,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/tg"
@@ -163,6 +164,85 @@ func TestAdminCategoryGates(t *testing.T) {
 	}
 }
 
+// TestFilterAdminRowsParity is H1's own audit item: "Verify the Go menu
+// [strips buttons a standard admin cannot use] the same [as Python's
+// _filter_admin_rows], or report the gap." This proves admincap.go's
+// filterAdminRows, wired into showAdminPanel and adminCategoryMenu, actually
+// hides disallowed buttons rather than merely denying the tap after the
+// fact — a standard admin should never even SEE a button their capability
+// set doesn't unlock.
+func TestFilterAdminRowsParity(t *testing.T) {
+	ctx := context.Background()
+	b, f := newTestBot("1", nil) // super admin is chat 1
+	b.adminsMu.Lock()
+	b.admins["7"] = true // chat 7: standard admin, holds only defaultStdCaps
+	b.adminsMu.Unlock()
+
+	t.Run("root panel", func(t *testing.T) {
+		b.Process(ctx, callbackUpdate(7, "admroot"))
+		data := buttonData(lastSendMsg(f).ReplyMarkup)
+		for _, want := range []string{"admcat:stock", "admcat:settings", "adm:audit"} {
+			if !containsStr(data, want) {
+				t.Errorf("standard admin's root panel missing allowed button %q; got %v", want, data)
+			}
+		}
+		for _, deny := range []string{
+			"admcat:orders", "admcat:customers", "admcat:pricing", "admcat:entra",
+			"adm:pool", "adm:revenue", "admcat:roles",
+		} {
+			if containsStr(data, deny) {
+				t.Errorf("standard admin's root panel shows disallowed button %q; got %v", deny, data)
+			}
+		}
+	})
+
+	t.Run("settings category", func(t *testing.T) {
+		f.Sends = nil
+		b.Process(ctx, callbackUpdate(7, "admcat:settings"))
+		data := buttonData(lastSendMsg(f).ReplyMarkup)
+		for _, want := range []string{"adm:togglesales", "adm:toggleprivate", "admcat:whitelist"} {
+			if !containsStr(data, want) {
+				t.Errorf("standard admin's settings menu missing allowed button %q; got %v", want, data)
+			}
+		}
+		for _, deny := range []string{
+			"adm:togglebcast", "adm:setrate", "adm:setkirourl", "admcat:payments",
+			"admcat:resellers", "admcat:stdperms", "adm:setmaxqty",
+		} {
+			if containsStr(data, deny) {
+				t.Errorf("standard admin's settings menu shows disallowed button %q; got %v", deny, data)
+			}
+		}
+	})
+
+	t.Run("stock category", func(t *testing.T) {
+		f.Sends = nil
+		b.Process(ctx, callbackUpdate(7, "admcat:stock"))
+		data := buttonData(lastSendMsg(f).ReplyMarkup)
+		for _, want := range []string{"adm:stock", "adm:holdstock"} {
+			if !containsStr(data, want) {
+				t.Errorf("standard admin's stock menu missing allowed button %q; got %v", want, data)
+			}
+		}
+		for _, deny := range []string{"adm:upstock", "adm:upstockstore", "adm:mngprod", "adm:stockbroadcast", "adm:provpool"} {
+			if containsStr(data, deny) {
+				t.Errorf("standard admin's stock menu shows disallowed button %q; got %v", deny, data)
+			}
+		}
+	})
+
+	t.Run("full admin (super) is never filtered", func(t *testing.T) {
+		f.Sends = nil
+		b.Process(ctx, callbackUpdate(1, "admroot"))
+		data := buttonData(lastSendMsg(f).ReplyMarkup)
+		for _, want := range []string{"admcat:orders", "admcat:customers", "adm:revenue", "admcat:roles"} {
+			if !containsStr(data, want) {
+				t.Errorf("super admin's root panel missing %q; got %v", want, data)
+			}
+		}
+	})
+}
+
 // TestAdminRootBackReturnsPanel: the Back button from any submenu re-renders the
 // root panel (Python's admroot branch).
 func TestAdminRootBackReturnsPanel(t *testing.T) {
@@ -206,7 +286,23 @@ func TestAdminActionsAlwaysAnswer(t *testing.T) {
 	for data := range seen {
 		b, f := newTestBot("42", nil)
 		b.Process(ctx, callbackUpdate(42, data))
-		if lastSendMsg(f) == nil {
+		// adm:stockbroadcast (adminstock.go, py_stock_spec.md §5) is a "no
+		// input, no confirmation" action whose only reply comes from a
+		// background goroutine (workers.Go) — matching the same pattern
+		// execBroadcast/refund-delete sweeps already use
+		// elsewhere in this admin surface. Poll briefly so a scheduling race
+		// doesn't misreport a genuinely-answered button as dead; a TRULY dead
+		// button still fails after the deadline.
+		deadline := time.Now().Add(300 * time.Millisecond)
+		var last *tg.SendMessageParams
+		for {
+			last = lastSendMsg(f)
+			if last != nil || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		if last == nil {
 			t.Errorf("callback %q produced no reply (dead button)", data)
 		}
 	}
@@ -260,4 +356,95 @@ func containsStr(hay []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// TestSlashCommandCapabilityGate is the regression test for the Opus-review
+// H1 finding on admincap.go: `/orders 50` used to bypass the capability gate
+// entirely (step 9 only checked isAdmin), leaking the full orders_view
+// report — customer chat ids, product, tier, total, des — to a standard
+// admin whose hand-crafted `adm:orders`/`admcat:orders` callbacks were
+// already correctly denied. capAdminCmd (admin.go) now consults stdCmdCap
+// the same way the callback path consults stdAdminCbCap.
+func TestSlashCommandCapabilityGate(t *testing.T) {
+	ctx := context.Background()
+	b, f := newTestBot("1", nil) // super admin is chat 1
+	b.adminsMu.Lock()
+	b.admins["7"] = true // chat 7: standard admin, default caps only (no orders_view)
+	b.adminsMu.Unlock()
+
+	t.Run("standard admin /orders is denied, not leaked", func(t *testing.T) {
+		b.Process(ctx, textUpdate(7, "/orders 50"))
+		last := lastSendMsg(f)
+		if last == nil || last.Text != settingsPermissionDenied {
+			t.Fatalf("/orders for a standard admin = %+v, want a plain %q message", last, settingsPermissionDenied)
+		}
+		if strings.Contains(last.Text, "chat=") {
+			t.Fatal("orders_view data leaked to a standard admin via the slash-command path")
+		}
+	})
+
+	t.Run("standard admin /stock (stock_read, a default cap) still works", func(t *testing.T) {
+		f.Sends = nil
+		b.Process(ctx, textUpdate(7, "/stock"))
+		last := lastSendMsg(f)
+		if last == nil || last.Text == settingsPermissionDenied {
+			t.Fatalf("/stock for a standard admin was denied: %+v, want it to pass (stock_read is a default cap)", last)
+		}
+	})
+
+	t.Run("standard admin /admin (nav, cap \"\") still works", func(t *testing.T) {
+		f.Sends = nil
+		b.Process(ctx, textUpdate(7, "/admin"))
+		last := lastSendMsg(f)
+		if last == nil || !strings.Contains(last.Text, "ADMIN DASHBOARD") {
+			t.Fatalf("/admin for a standard admin = %+v, want the panel to open", last)
+		}
+	})
+
+	t.Run("full admin /orders still works", func(t *testing.T) {
+		f.Sends = nil
+		b.Process(ctx, textUpdate(1, "/orders 50"))
+		last := lastSendMsg(f)
+		if last == nil || last.Text == settingsPermissionDenied {
+			t.Fatalf("/orders for the super admin was denied: %+v", last)
+		}
+	})
+}
+
+// wantAdminCapDenied asserts that a standard (granted, non-super) admin was
+// denied `data` by H1's central capability gate (admincap.go, wired into
+// command.go's handleCallback BEFORE the unconditional ack) rather than by
+// any downstream per-handler chat-message refusal (fullAdminOnly,
+// settingsSuperAdminOnly). The gate fires pre-ack, so its alert IS that
+// update's one and only callback answer — never a chat message, and never a
+// SECOND answerCallbackQuery (which is exactly the shape
+// adminsettings.go's settingsSuperAdminOnly doc comment explains real
+// Telegram would silently drop — that gate runs deep in dispatch, AFTER the
+// ack; this one runs before it, so there is no "second" to drop). f.Sends
+// must be untouched by this callback specifically — callers that already
+// primed f.Sends with an earlier arm step should reset it (f.Sends = nil)
+// right before the call under test.
+func wantAdminCapDenied(t *testing.T, f *fakeTG, data string) {
+	t.Helper()
+	if last := lastSendMsg(f); last != nil {
+		t.Errorf("%s: standard admin should get no chat message (denied pre-ack), got %+v", data, last)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// H2 fix (Opus review): assert EXACTLY one answer, not merely "at least
+	// one, check the last". Telegram allows exactly one answerCallbackQuery
+	// per callback_query_id; if the gate ever moved below command.go's
+	// unconditional pre-dispatch ack, f.Answers would become [blank, alert]
+	// — the last entry still matches this alert, so the old `len == 0` check
+	// passed while a real Telegram server would silently drop the SECOND
+	// answer and the denied admin would see nothing at all. buy_test.go's
+	// rate-limit gate assertion already uses this stricter form.
+	if len(f.Answers) != 1 {
+		t.Errorf("%s: want exactly 1 answer (pre-ack denial), got %d", data, len(f.Answers))
+		return
+	}
+	last := f.Answers[len(f.Answers)-1]
+	if !last.ShowAlert || last.Text != settingsPermissionDenied {
+		t.Errorf("%s: denial alert = %+v, want ShowAlert=true Text=%q", data, last, settingsPermissionDenied)
+	}
 }

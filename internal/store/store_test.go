@@ -317,3 +317,169 @@ func TestDebitGuard(t *testing.T) {
 		t.Fatalf("debit: ok=%v bal=%d err=%v", ok, bal, err)
 	}
 }
+
+// TestDebitConcurrent is M8's fix: Debit's overdraw refusal was never
+// exercised concurrently before this — store.go:79's SetMaxOpenConns(1) on a
+// SINGLE *Store already serializes every call through its own connection
+// pool, so hammering ONE Store proves only the boundary (won == wantWon
+// exactly), not atomicity: a naive SELECT-then-UPDATE would pass identically
+// under that serialization, since nothing ever runs concurrently against it.
+// TWO independent *Store handles (two real *sql.DB pools, both WAL +
+// busy_timeout) opened on the SAME store.db file give genuine cross-
+// connection contention on the same row — mirroring promo_test.go's
+// TestPromoReserveUseConcurrent pattern — which is what Debit's atomic
+// `UPDATE ... WHERE amount >= ?` guard (balance.go:141-166) actually has to
+// survive. 30 concurrent 40-unit debits against a 1000-unit balance can let
+// AT MOST 25 succeed; a broken (non-atomic) guard would let more through and
+// drive the balance negative.
+func TestDebitConcurrent(t *testing.T) {
+	const startBalance = 1000
+	const attempts = 30
+	const debitEach = 40 // 30*40 = 1200 > 1000: not every attempt can win
+
+	path := filepath.Join(t.TempDir(), "store.db")
+	s1, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open s1: %v", err)
+	}
+	t.Cleanup(func() { s1.Close() })
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open s2: %v", err)
+	}
+	t.Cleanup(func() { s2.Close() })
+
+	if _, err := s1.CreditBalance("race-debit", startBalance); err != nil {
+		t.Fatalf("CreditBalance: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	oks := make(chan bool, attempts)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		s := s1
+		if i%2 == 1 { // alternate attempts across the two independent pools
+			s = s2
+		}
+		go func(s *Store) {
+			defer wg.Done()
+			ok, _, err := s.Debit("race-debit", debitEach)
+			if err != nil {
+				t.Errorf("Debit err: %v", err)
+				return
+			}
+			oks <- ok
+		}(s)
+	}
+	wg.Wait()
+	close(oks)
+
+	won := 0
+	for ok := range oks {
+		if ok {
+			won++
+		}
+	}
+	const wantWon = startBalance / debitEach // 25
+	if won != wantWon {
+		t.Fatalf("won %d debits, want exactly %d (overdraw guard failed)", won, wantWon)
+	}
+
+	final, err := s1.GetBalance("race-debit")
+	if err != nil {
+		t.Fatalf("GetBalance after race: %v", err)
+	}
+	if final < 0 {
+		t.Fatalf("balance went NEGATIVE (%d) — overdraw guard failed", final)
+	}
+	if want := int64(startBalance - wantWon*debitEach); final != want {
+		t.Errorf("final balance = %d, want %d", final, want)
+	}
+}
+
+// TestClaimOrderRefundedConcurrent is the money-critical double-refund guard
+// (internal/handlers' adminorders.go task brief: "a defect here pays a
+// customer twice or not at all") under GENUINE cross-connection concurrency.
+// TestClaimOrderRace above already proves the boundary (exactly 1 winner) but
+// does so against a SINGLE *Store, whose SetMaxOpenConns(1) already
+// serializes every call through its own connection pool — that test would
+// pass identically even with a naive, non-atomic SELECT-then-UPDATE, since
+// nothing ever runs concurrently against one pool. TWO independent *Store
+// handles (two real *sql.DB pools, both WAL + busy_timeout=30000) opened on
+// the SAME store.db file give genuine cross-connection contention on the
+// same row — mirroring promo_test.go's TestPromoReserveUseConcurrent and this
+// file's own TestDebitConcurrent — which is what ClaimOrder's atomic
+// `UPDATE ... WHERE des=? AND status=?` guard (orders.go) actually has to
+// survive. This exercises the delivered->refunded transition specifically
+// (every refund entry point's shared chokepoint), not the reserved->paid one
+// TestClaimOrderRace already covers.
+func TestClaimOrderRefundedConcurrent(t *testing.T) {
+	const attempts = 30
+
+	path := filepath.Join(t.TempDir(), "store.db")
+	s1, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open s1: %v", err)
+	}
+	t.Cleanup(func() { s1.Close() })
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open s2: %v", err)
+	}
+	t.Cleanup(func() { s2.Close() })
+
+	des := NewDes()
+	if err := s1.CreateOrder(des, "42", "en", "gpt", "BH7D", 1, 10000); err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+	if _, err := s1.ClaimOrder(des, "reserved", "delivered"); err != nil {
+		t.Fatalf("seed delivered: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wins := make(chan *Order, attempts)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		s := s1
+		if i%2 == 1 { // alternate attempts across the two independent pools
+			s = s2
+		}
+		go func(s *Store) {
+			defer wg.Done()
+			o, err := s.ClaimOrder(des, "delivered", "refunded")
+			if err != nil {
+				t.Errorf("ClaimOrder err: %v", err)
+				return
+			}
+			if o != nil {
+				wins <- o
+			}
+		}(s)
+	}
+	wg.Wait()
+	close(wins)
+
+	var winners []*Order
+	for o := range wins {
+		winners = append(winners, o)
+	}
+	if len(winners) != 1 {
+		t.Fatalf("won %d refund claims, want exactly 1 (double-refund guard failed)", len(winners))
+	}
+	if winners[0].Status != "refunded" {
+		t.Fatalf("winner status=%q, want refunded", winners[0].Status)
+	}
+
+	final, err := s1.GetOrder(des)
+	if err != nil || final == nil {
+		t.Fatalf("GetOrder after race: %+v err=%v", final, err)
+	}
+	if final.Status != "refunded" {
+		t.Errorf("final status=%q, want refunded", final.Status)
+	}
+	// A stale re-claim from 'delivered' must now fail — the order already
+	// moved on, so nothing may credit a second payout against it.
+	if o, _ := s1.ClaimOrder(des, "delivered", "refunded"); o != nil {
+		t.Fatal("stale claim from 'delivered' succeeded after the order already transitioned to 'refunded'")
+	}
+}

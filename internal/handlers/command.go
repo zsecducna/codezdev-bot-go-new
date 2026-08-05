@@ -18,7 +18,7 @@ const callbackBannedNotice = "🚫 You are banned from using this bot."
 // its handler — port of handle_command (telegram_bot.py:11627-11669+). M2.1
 // implements the core customer entries (start / language / support /
 // selfservice); feature commands (buy, deposit, info, history, getcode,
-// sellaws, otp) and the admin slash commands land in their own slices, so an
+// otp) and the admin slash commands land in their own slices, so an
 // unrecognized command is a no-op here for now.
 func (b *Bot) handleCommand(ctx context.Context, chatID int64, cmd, clientLang string) {
 	lang := b.langFor(chatID, clientLang)
@@ -85,10 +85,10 @@ func (b *Bot) handleCommand(ctx context.Context, chatID int64, cmd, clientLang s
 
 // handleCallback handles an inline-button tap — port of handle_callback
 // (telegram_bot.py:12221+). Pipeline order (@12221-12285): ban gate -> product-
-// click rate limit (buy:/buyx:) -> [std-admin capability gate: M3] -> ack ->
-// handle capture -> [OTP guard: M2.6] -> delete the tapped menu message (sync
-// LastMenu) -> prefix dispatch. setlang: is handled inline; every other prefix
-// routes through the ordered cbRoutes table (handlers-go.md §4).
+// click rate limit (buy:/buyx:) -> std-admin capability gate (admincap.go, H1
+// fix) -> ack -> handle capture -> [OTP guard: M2.6] -> delete the tapped menu
+// message (sync LastMenu) -> prefix dispatch. setlang: is handled inline; every
+// other prefix routes through the ordered cbRoutes table (handlers-go.md §4).
 func (b *Bot) handleCallback(ctx context.Context, cb *tg.CallbackQuery) {
 	if cb.Message == nil {
 		return
@@ -127,8 +127,25 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tg.CallbackQuery) {
 		}
 	}
 
-	// The standard-admin capability gate (@12251) is M3.1 — no standard admins
-	// exist yet, so it is a no-op today and intentionally omitted.
+	// Standard-admin capability gate (H1 fix, admincap.go) — the chokepoint
+	// telegram_bot.py:12403-12415 runs BEFORE any adm:/admcat:/resmng:/
+	// resdisc:/rmreseller:/rmwl: branch executes, and BEFORE the ack below:
+	// full admins and plain customers skip this (non-admins are blocked by
+	// the per-handler isAdmin checks further down the dispatch chain); a
+	// granted-but-not-super admin tapping a privileged callback outside their
+	// capability set gets ONE alert (this update's only callback answer —
+	// never a second answerCallbackQuery after the unconditional ack below,
+	// which Telegram would silently drop) and nothing else runs.
+	if admin && !b.isSuperAdmin(chatID) && isAdminCB(data) {
+		if !b.cbAllowedFor(chatID, data) {
+			if err := b.tg.AnswerCallbackQuery(ctx, tg.AnswerCallbackQueryParams{
+				CallbackQueryID: cb.ID, Text: settingsPermissionDenied, ShowAlert: true,
+			}); err != nil {
+				log.Println("answerCallbackQuery (capability) failed:", err)
+			}
+			return
+		}
+	}
 
 	// Ack first so Telegram clears the button spinner before slower work
 	// (@12258).

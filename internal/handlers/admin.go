@@ -46,9 +46,21 @@ import (
 // — the tuple at telegram_bot.py:17802-17803. Kept as a set (not a slice) since
 // only membership is asked; the ORDER that matters (the two adminText stages) is
 // pinned by CanonicalAdminTextOrder below.
+// D2 fix (orders/refunds review, landed alongside this slice): this used to
+// be a STRICT SUBSET of Python's _ADMIN_CMDS (telegram_bot.py:211-213) — Go
+// had only {stock, orders, addbal, broadcast, refund, getord, admin, pool}
+// (+ this slice's own "audit"). A command word ABSENT from this map makes
+// capAdminCmd return false — that is NO GATE AT ALL, not deny — so /reset,
+// /ban, /unban, /banned, /fixhandle, /restart, /suspend used to bypass
+// stdCmdCap entirely rather than being denied by it. Now the FULL Python set
+// is gated; handleAdmin's default case still answers adminNotPorted for
+// whichever of these have no real case yet, so the not-yet-ported ones stay
+// honest (a visible "not wired up" reply) while becoming properly gated.
 var adminPanelCmds = map[string]bool{
 	"stock": true, "orders": true, "addbal": true, "broadcast": true,
-	"refund": true, "getord": true, "admin": true, "pool": true,
+	"refund": true, "getord": true, "admin": true, "pool": true, "audit": true,
+	"reset": true, "ban": true, "unban": true, "banned": true,
+	"fixhandle": true, "restart": true, "suspend": true,
 }
 
 // CanonicalAdminTextOrder is the source order of the step-9 admin text stages
@@ -92,19 +104,21 @@ func (b *Bot) registerAdmin() {
 	// only in that "admcat:" and "adm:" are disjoint, so first-match is stable.
 	b.cbRoutes = append(b.cbRoutes,
 		cbRoute{key: "admroot", exact: true, fn: (*Bot).cbAdmRoot}, // @12697
-		cbRoute{key: "admcat:", fn: (*Bot).cbAdmCat},              // @12865
-		cbRoute{key: "adm:", fn: (*Bot).cbAdmAction},              // @12808+
+		cbRoute{key: "admcat:", fn: (*Bot).cbAdmCat},               // @12865
+		cbRoute{key: "adm:", fn: (*Bot).cbAdmAction},               // @12808+
 		// Prefixes reachable from the panels rendered here whose handlers belong
 		// to later slices. Routed to the same notice so the tap always answers.
-		cbRoute{key: "awsadm:", fn: (*Bot).cbAdmTodo},                 // AWS-sell admin menu (M3.4)
-		cbRoute{key: "admrefdel", exact: true, fn: (*Bot).cbAdmTodo},  // refund-delete (M3.3)
-		cbRoute{key: "admpoolr", exact: true, fn: (*Bot).cbAdmTodo},   // pool refresh (M3.4)
-		cbRoute{key: "resmng:", fn: (*Bot).cbAdmTodo},                 // reseller submenu (M3.3)
-		cbRoute{key: "resdisc:", fn: (*Bot).cbAdmTodo},                // reseller discount (M3.3)
-		cbRoute{key: "rmreseller:", fn: (*Bot).cbAdmTodo},             // reseller remove (M3.3)
-		cbRoute{key: "rmwl:", fn: (*Bot).cbAdmTodo},                   // whitelist remove (M3.3)
-		cbRoute{key: "refrev:", fn: (*Bot).cbAdmTodo},                 // refund review (M3.3)
-		cbRoute{key: "refrej:", fn: (*Bot).cbAdmTodo},                 // refund reject (M3.3)
+		cbRoute{key: "admrefdel", exact: true, fn: (*Bot).cbAdmRefDel},     // 🗑️ Delete Refunded Accounts (adminorders.go)
+		cbRoute{key: "admpoolr", exact: true, fn: (*Bot).cbAdmPoolRefresh}, // pool refresh (adminstock.go)
+		// Resellers / whitelist (adminusers.go): full-admin-only management
+		// submenu + per-entry actions, and the toggle_sales-capability
+		// tap-to-remove route.
+		cbRoute{key: "resmng:", fn: (*Bot).cbResMng},
+		cbRoute{key: "resdisc:", fn: (*Bot).cbResDisc},
+		cbRoute{key: "rmreseller:", fn: (*Bot).cbRmReseller},
+		cbRoute{key: "rmwl:", fn: (*Bot).cbRmWL},
+		cbRoute{key: "refrev:", fn: (*Bot).cbRefundReview}, // refund-request review (adminorders.go)
+		cbRoute{key: "refrej:", fn: (*Bot).cbRefundReject}, // refund-request reject (adminorders.go)
 	)
 }
 
@@ -141,6 +155,17 @@ func (b *Bot) capAdminButton(c *Ctx) bool {
 
 // capAdminCmd routes the admin slash commands that open the panel or one of its
 // views — telegram_bot.py:17801-17808. Same clear-pending rule as the button.
+//
+// H1 fix (Opus review of admincap.go): the callback surface (admincap.go's
+// stdAdminCbCap, wired into command.go) was fully policed, but this slash-
+// command path had NO capability gate at all — a standard admin denied
+// `adm:orders`/`admcat:orders` could still type `/orders 50` and get the full
+// orders_view report (customer chat ids, product, tier, total, des), since
+// step 9 only requires isAdmin (dispatch.go). Port of the second Python
+// chokepoint (telegram_bot.py:17766-17779): a command absent from stdCmdCap,
+// or present with a capability the chat doesn't hold, is denied with a plain
+// chat message (this path has no callback_query to answer, unlike the
+// alert-based callback gate). Full admins always pass.
 func (b *Bot) capAdminCmd(c *Ctx) bool {
 	if !strings.HasPrefix(c.Text, "/") {
 		return false
@@ -148,6 +173,13 @@ func (b *Bot) capAdminCmd(c *Ctx) bool {
 	cmd := parseSlashCommand(c.Text)
 	if !adminPanelCmds[cmd] {
 		return false
+	}
+	if !b.isSuperAdmin(c.ChatID) {
+		cap, governed := stdCmdCap[cmd]
+		if !governed || (cap != "" && !b.adminCan(c.ChatID, cap)) {
+			b.send(c.Ctx, c.ChatID, settingsPermissionDenied, nil)
+			return true
+		}
 	}
 	c.st.ClearAdminPending()
 	b.handleAdmin(c.Ctx, c.ChatID, cmd, c.Text)
@@ -175,6 +207,18 @@ func (b *Bot) handleAdmin(ctx context.Context, chatID int64, cmd, text string) {
 			}
 		}
 		b.sendRecentOrders(ctx, chatID, n)
+	case "pool":
+		// /pool — pool-health view (adminstock.go, py_stock_spec.md §7). Fresh
+		// send (edit_message_id=0), matching adm:pool's own callback branch.
+		b.sendPoolView(ctx, chatID, 0)
+	case "audit":
+		// /audit [query] — the arg is everything after the FIRST space, raw
+		// (py_stock_spec.md §8.3: `text.split(" ",1)[1].strip()`).
+		query := ""
+		if _, rest, found := strings.Cut(text, " "); found {
+			query = strings.TrimSpace(rest)
+		}
+		b.sendAuditLog(ctx, chatID, query)
 	default:
 		// addbal / broadcast / refund / getord / pool: their input-collecting
 		// flows are later slices. Answer explicitly instead of dropping the
@@ -191,15 +235,17 @@ func (b *Bot) showAdminPanel(ctx context.Context, chatID int64) {
 		btnRow("💰 Revenue", "adm:revenue"),
 		btnRow("📦 Stock", "admcat:stock"),
 		btnRow("🧾 Orders", "admcat:orders"),
-		btnRow("☁️ AWS Accounts", "awsadm:menu"),
 		btnRow("👥 Customers", "admcat:customers"),
 		btnRow("🏷️ Pricing & discounts", "admcat:pricing"),
 		btnRow("⚙️ Settings", "admcat:settings"),
 		btnRow("☁️ Entra / Kiro SSO", "admcat:entra"),
-		btnRow("🏗️ AWS IDC Provisioning", "adm:idcprov"),
 		btnRow("🏊 Pool health", "adm:pool"),
 		btnRow("📜 Audit log", "adm:audit"),
 	}
+	// H1 fix: a standard admin sees only the categories/actions their
+	// capabilities unlock (_filter_admin_rows, telegram_bot.py:17409); a full
+	// admin sees everything (the filter no-ops) plus Admin roles below.
+	rows = b.filterAdminRows(chatID, rows)
 	// Admin roles configuration is owner-only (@17414-17415).
 	prompt := "🔑 Choose an action:"
 	if b.isSuperAdmin(chatID) {
@@ -360,7 +406,24 @@ func admNav(back string) *tg.InlineKeyboardMarkup { return backKB(back) }
 //
 // Toggle labels read LIVE settings, exactly as Python does, so the label tells
 // the truth even while the toggle handler itself is still a later slice.
+//
+// H1 fix: this wraps adminCategoryMenuRows with filterAdminRows
+// (_filter_admin_rows, telegram_bot.py:12875) so EVERY caller — cbAdmCat,
+// cbRmWL, cbRmReseller, cbResMng, cbResDisc, TestAdminActionsAlwaysAnswer's
+// probe — gets a standard-admin-safe row set for free, instead of each call
+// site needing to remember to filter.
 func (b *Bot) adminCategoryMenu(chatID int64, cat string) (title string, rows [][]tg.InlineKeyboardButton, ok bool) {
+	title, rows, ok = b.adminCategoryMenuRows(cat)
+	if !ok {
+		return title, rows, ok
+	}
+	return title, b.filterAdminRows(chatID, rows), ok
+}
+
+// adminCategoryMenuRows is the raw (unfiltered) row builder — port of
+// _admin_category_menu (telegram_bot.py:11823-11983+). See adminCategoryMenu
+// above for the standard-admin row filter every caller now gets automatically.
+func (b *Bot) adminCategoryMenuRows(cat string) (title string, rows [][]tg.InlineKeyboardButton, ok bool) {
 	s := b.settings()
 	switch cat {
 	case "stock":
@@ -495,25 +558,38 @@ func (b *Bot) adminCategoryMenu(chatID int64, cat string) (title string, rows []
 		rows = append(rows,
 			btnRow("➕ Add customer", "adm:addwl"),
 			btnRow("↩️ Back", "admcat:settings"))
+		// L11 fix: this diverged from Python's verbatim wording (py_customers_
+		// spec.md §6, telegram_bot.py:12031-12033) — restored to the literal
+		// strings rather than a paraphrase.
 		tail := "None yet — add one below."
 		if len(wl) > 0 {
-			tail = "Tap an entry to remove it."
+			tail = "Tap a customer to remove."
 		}
-		return "👥 PRIVATE-SALE CUSTOMERS\nMay buy while public sale is paused and " +
-			"Private Sale is on (resellers already pass).\n" + tail, rows, true
+		return "👥 PRIVATE-SALE CUSTOMERS\nThey can buy while sale is paused + " +
+			"Private Sale is ON (resellers also pass).\n" + tail, rows, true
 	case "stdperms":
-		// Super-admin only (gated by the caller). The capability table itself is
-		// M3.1's admins.json work, so this renders the explanation with no toggle
-		// rows rather than inventing a capability list the runtime can't enforce.
+		// Super-admin only (gated by the caller). M2 fix: the old text here
+		// ("No standard admins exist in this build...") went stale the moment
+		// dispatch.go's New() started loading admins.json for real (H1) —
+		// standard admins can now exist, and the old wording actively misled
+		// the super-admin into thinking there was nothing to restrict. This
+		// describes the REAL state: admincap.go's fixed defaultStdCaps set
+		// (every standard admin holds exactly these four, no per-admin
+		// grant/revoke UI exists yet) rather than a toggle list the runtime
+		// can't actually enforce per-admin.
 		return "🧑‍⚖️ STANDARD-ADMIN PERMISSIONS\n" +
-			"No standard admins exist in this build — the owner and the developer " +
-			"override always have full access, so there is nothing to restrict yet.",
+				"A granted standard admin (admins.json, not the owner or the developer " +
+				"override) currently holds a FIXED capability set — the same four for " +
+				"every standard admin, with no per-admin grant/revoke UI yet:\n" +
+				"  • 📦 Stock — read + hold/restore\n" +
+				"  • 📜 Audit log\n" +
+				"  • toggle_sales — Sales on/off, Private sale, private-sale whitelist\n" +
+				"Everything else (Customers, Orders, Revenue, Pricing, Payments, " +
+				"Pool health, Admin roles, Resellers, password reset, …) is full-admin-only.",
 			[][]tg.InlineKeyboardButton{btnRow("↩️ Back", "admcat:settings")}, true
 	case "refundreq":
-		// The review UI is M3.3; show the live pending count so the number on the
-		// Orders button is verifiable from here too.
-		return "🔁 REFUND REQUESTS (" + itoa64(b.pendingRefundCount()) + " pending)\n" +
-			adminNotPorted, [][]tg.InlineKeyboardButton{btnRow("↩️ Back", "admcat:orders")}, true
+		// The live refund-request queue (adminorders.go, py_orders_spec.md).
+		return b.refundRequestQueueMenu()
 	}
 	return "", nil, false
 }
@@ -729,7 +805,12 @@ func (b *Bot) cbAdmCat(cc *cbCtx) {
 	}
 	cc.st.ClearAdminPending()
 	cat := strings.TrimPrefix(cc.Data, "admcat:")
-	if (cat == "roles" || cat == "stdperms") && !b.isSuperAdmin(cc.ChatID) {
+	// roles/stdperms/resellers are super-admin-only CATEGORIES — none of their
+	// actions appear in any capability table (py_customers_spec.md §0/§7), so
+	// even a standard admin holding every other grant is blocked from opening
+	// the submenu at all, matching Python's chokepoint denial before
+	// handle_callback's admcat: branch even runs (@12411-12415, @12871).
+	if (cat == "roles" || cat == "stdperms" || cat == "resellers") && !b.isSuperAdmin(cc.ChatID) {
 		return
 	}
 	title, rows, ok := b.adminCategoryMenu(cc.ChatID, cat)
@@ -746,16 +827,131 @@ func (b *Bot) cbAdmAction(cc *cbCtx) {
 	if !b.isAdmin(cc.ChatID) {
 		return
 	}
-	switch strings.TrimPrefix(cc.Data, "adm:") {
+	action := strings.TrimPrefix(cc.Data, "adm:")
+	// adm:togglepay:<method> carries a 3rd colon-segment (admin.go:96's own
+	// note); pull it out before the exact-match switch below, which cannot
+	// express a prefix case. Case bodies for every "settings" branch below
+	// live in adminsettings.go (⚙️ SETTINGS + 💳 PAYMENT METHODS submenu,
+	// py_settings_spec.md).
+	if method, ok := strings.CutPrefix(action, "togglepay:"); ok {
+		b.cbTogglePay(cc, method)
+		return
+	}
+	switch action {
 	case "stock":
 		b.send(cc.Ctx, cc.ChatID, b.adminStockText(), admNav("admcat:stock"))
+	// 📦 STOCK category actions (adminstock.go, py_stock_spec.md). upstock/
+	// upstockstore/mngprod/stockbroadcast/provpool are full-admin-only
+	// (admincap.go's default-deny — absent from stdAdminCbCap's table);
+	// holdstock is hold_restore-capability-gated (a standard admin CAN reach
+	// it with the default capability set).
+	case "holdstock":
+		b.cbAdmHoldStock(cc)
+	case "upstock":
+		b.cbAdmUpstock(cc)
+	case "upstockstore":
+		b.cbAdmUpstockStore(cc)
+	case "mngprod":
+		b.cbAdmMngProd(cc)
+	case "stockbroadcast":
+		b.cbAdmStockBroadcast(cc)
+	case "provpool":
+		b.cbAdmProvPool(cc)
+	// 🏊 Pool health / 📜 Audit log (adminstock.go). Both live on the ADMIN
+	// ROOT panel, not inside admcat:stock (py_stock_spec.md §0).
+	case "pool":
+		b.cbAdmPool(cc)
+	case "audit":
+		b.cbAdmAudit(cc)
 	case "orders":
 		b.sendRecentOrders(cc.Ctx, cc.ChatID, 20)
 	case "revenue":
-		// The full by-product/by-date matrix view is M3.3; the dashboard block is
-		// the same store aggregate and is already correct, so show that rather
-		// than nothing.
-		b.send(cc.Ctx, cc.ChatID, b.adminDashboardText(cc.ChatID), admNav("admroot"))
+		// Full by-product/by-date matrix view (adminorders.go), default 7-day
+		// by-product — adm:revenue (py_orders_spec.md).
+		b.cbRevenue(cc)
+	case "getord":
+		// 🔎 Look up order by ID (adminorders.go, py_orders_spec.md).
+		b.cbGetOrd(cc)
+	case "refund":
+		// 💸 Refund order — admin-initiated refund entry point
+		// (adminorders.go, py_orders_spec.md).
+		b.cbRefund(cc)
+	case "broadcast":
+		b.cbBroadcastStart(cc)
+	case "togglebcast":
+		b.cbToggleBcast(cc)
+	case "togglestockbcast":
+		b.cbToggleStockBcast(cc)
+	case "togglesalenotify":
+		b.cbToggleSaleNotify(cc)
+	case "toggledepnotify":
+		b.cbToggleDepNotify(cc)
+	case "togglemaint":
+		b.cbToggleMaint(cc)
+	case "togglesales":
+		b.cbToggleSales(cc)
+	case "toggleprivate":
+		b.cbTogglePrivate(cc)
+	case "togglereferral":
+		b.cbToggleReferral(cc)
+	case "setmaxqty":
+		b.cbSetMaxQty(cc)
+	case "setrate":
+		b.cbSetRate(cc)
+	case "setkirourl":
+		b.cbSetKiroURL(cc)
+	case "setkirokey":
+		b.cbSetKiroKey(cc)
+	case "setkiroacct":
+		b.cbSetKiroAcct(cc)
+	case "setbep20":
+		b.cbSetBep20(cc)
+	case "settron":
+		b.cbSetTron(cc)
+	case "setprice":
+		b.cbSetPrice(cc)
+	case "setdiscount":
+		b.cbSetDiscount(cc)
+	case "promocodes":
+		b.cbPromoCodes(cc)
+	case "promonew":
+		b.cbPromoNew(cc)
+	case "apiprice":
+		b.cbApiPrice(cc)
+	case "apimin":
+		b.cbApiMin(cc)
+	case "apimax":
+		b.cbApiMax(cc)
+	case "apicap":
+		b.cbApiCap(cc)
+	case "kirotoggle":
+		b.cbKiroToggle(cc)
+	case "kiroprice":
+		b.cbKiroPrice(cc)
+	case "kiromin":
+		b.cbKiroMin(cc)
+	case "kiromax":
+		b.cbKiroMax(cc)
+	// 👥 CUSTOMERS (adminusers.go). custlookup is customers_view-capability
+	// (grantable, hence no fullAdminOnly gate here); addbal is full-admin-only.
+	case "custlookup":
+		b.cbCustLookup(cc)
+	case "addbal":
+		b.cbAddBal(cc)
+	// 🛡️ ADMIN ROLES (adminusers.go). All three are full-admin-only.
+	case "listadmins":
+		b.cbListAdmins(cc)
+	case "addadmin":
+		b.cbAddAdmin(cc)
+	case "rmadmin":
+		b.cbRmAdmin(cc)
+	// Private-sale whitelist arm (adminusers.go). toggle_sales-capability
+	// (grantable); rmwl: itself is a standalone top-level route above.
+	case "addwl":
+		b.cbAddWL(cc)
+	// Authorized resellers arm (adminusers.go). Full-admin-only.
+	case "addreseller":
+		b.cbAddReseller(cc)
 	default:
 		b.send(cc.Ctx, cc.ChatID, adminNotPorted, admNav("admroot"))
 	}

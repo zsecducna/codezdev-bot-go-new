@@ -252,10 +252,11 @@ func TestApplyCodeReferral(t *testing.T) {
 // evaluated, so a REJECTED code leaves the order on its volume price."
 //
 // Two subtests:
-//   no_prior_code   — original weak case; still valid as a sanity check.
-//   prior_promo_discarded — the case that proved the original test was
-//     insufficient (prior SAVE30 at 630 VND; BADCODE applied; must land at
-//     volume baseline 900, code cleared, promo use released).
+//
+//	no_prior_code   — original weak case; still valid as a sanity check.
+//	prior_promo_discarded — the case that proved the original test was
+//	  insufficient (prior SAVE30 at 630 VND; BADCODE applied; must land at
+//	  volume baseline 900, code cleared, promo use released).
 func TestUnknownCodeBaseline(t *testing.T) {
 	const (
 		chatID    = int64(50)
@@ -498,9 +499,9 @@ func TestPayReferrer(t *testing.T) {
 
 	// Give buyer and referrer some initial balance (0).
 	const (
-		buyerID   = int64(100)
-		referrer  = "200"
-		des       = "des-payref-1"
+		buyerID    = int64(100)
+		referrer   = "200"
+		des        = "des-payref-1"
 		orderTotal = int64(1000)
 		wantReward = int64(100) // 10% of 1000
 	)
@@ -634,7 +635,33 @@ func TestCaptureChainOrderWithCode(t *testing.T) {
 	b, _ := newTestBot("1", nil)
 	names := b.captureNames()
 
-	want := []string{"code", "txid", "deposit", "apikey", "apikeyrc", "ordercode", "purchase"}
+	// adminsettings.go's 7 captures land ahead of "code", and
+	// adminpricing.go's 11 captures land ahead of "setkirourl"/"code"/"txid"
+	// (dispatch_test.go's TestCaptureChainOrder documents the canonical
+	// positions). adminusers.go's captures land next-to-last: custlookup/
+	// addadmin/addreseller/addwl/rmadmin ahead of "setrate"; reseller_discount
+	// ahead of "promo". addbal is NOT in this chain (M3/M4 fix) — it lives in
+	// the step-9 adminText stages instead, alongside "broadcast".
+	// adminorders.go registers LAST: "getord" ahead of "custlookup",
+	// "refundreject" and "refund" (in that order) both ahead of "discount".
+	// adminstock.go registers last of all — see dispatch_test.go's
+	// TestCaptureChainOrder for the full anchor-by-anchor rationale.
+	want := []string{
+		"upstock",
+		"getord",
+		"custlookup", "addadmin", "addreseller", "addwl", "rmadmin",
+		"setrate",
+		"setapiprice", "setapimin", "setapimax", "setkiroprice", "setkiromin", "setkiromax", "setapicap",
+		"setkirourl", "setkirokey", "setkiroacct", "setbep20", "settron", "setmaxqty",
+		"refundreject",
+		"newprod", "renprod", "provpool",
+		"setnotice", "setdelivery", "editfile",
+		"refund",
+		"discount", "reseller_discount", "promo", "code",
+		"hold",
+		"tier", "price", "txid", "deposit", "apikey", "apikeyrc",
+		"ordercode", "purchase",
+	}
 	if len(names) != len(want) {
 		t.Fatalf("capture chain = %v, want %v", names, want)
 	}

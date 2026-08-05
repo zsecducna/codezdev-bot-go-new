@@ -590,7 +590,7 @@ func (b *Bot) otpReleaseSlot() { <-b.otpSem }
 // reported as one — matching Python, where subprocess.run ignores returncode but
 // a TimeoutExpired falls through to CODE_FAIL.
 func (b *Bot) otpFetchNode(ctx context.Context, username string) (code, reset string, err error) {
-	dir := otpScriptDir()
+	dir := scriptDir()
 	res, err := subproc.Run(ctx, subproc.Request{
 		Path:    otpNodeBin(),
 		Args:    []string{filepath.Join(dir, otpScriptName), username},
@@ -630,13 +630,17 @@ func otpNodeBin() string {
 	return "node"
 }
 
-// otpScriptDir resolves the directory holding fetch_login_code.mjs. Python uses
+// scriptDir resolves the directory holding the bot's sibling helper scripts —
+// fetch_login_code.mjs (@8280, @8289), aws_idc_provision_cli.py, and
+// aws_idc_login.mjs (idc_brief.md item D: promoted from the OTP-only
+// otpScriptDir so the AWS-IDC feature can resolve the same scripts without a
+// second copy of this logic). Python uses
 // `os.path.dirname(os.path.abspath(__file__))` — the bot's own directory — and
 // also runs the child with cwd=there (@8280, @8289). The Go twin of "my own
 // directory" is the executable's directory; KIRO_SCRIPT_DIR overrides it (read
 // lazily, at call time, because .env is loaded into the environment after link
 // time — same reasoning as provision.LoginPythonFromEnv).
-func otpScriptDir() string {
+func scriptDir() string {
 	if v := strings.TrimSpace(os.Getenv("KIRO_SCRIPT_DIR")); v != "" {
 		return v
 	}

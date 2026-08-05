@@ -172,7 +172,7 @@ func (b *Bot) apikeyRefundAmount(ctx context.Context, o *store.Order) (amount, u
 		remaining = bought
 	}
 	used := bought - remaining
-	amount = min(int64(math.Round(float64(groupPaid)*remaining/bought)), groupPaid)
+	amount = min(int64(math.RoundToEven(float64(groupPaid)*remaining/bought)), groupPaid)
 	// A stuck never-applied recharge refunds its FULL face value on top of the
 	// group proration, so the preview must quote the same figure (preview ==
 	// payout).
@@ -185,15 +185,16 @@ func (b *Bot) apikeyRefundAmount(ctx context.Context, o *store.Order) (amount, u
 // apikeyRefundResult is the _do_refund-shaped outcome of a group refund
 // (telegram_bot.py:4906-4911).
 type apikeyRefundResult struct {
-	Amount     int64
-	UnitsTotal int64 // group credits bought
-	UnitNum    int64 // group credits used
-	Balance    int64 // wallet balance after a "balance" payout
-	Des        string
-	Method     string
-	Notified   bool
-	GroupN     int   // how many orders were refunded together
-	PaidTotal  int64 // Σ actually paid across everything refunded here
+	Amount       int64
+	UnitsTotal   int64 // group credits bought
+	UnitNum      int64 // group credits used
+	Balance      int64 // wallet balance after a "balance" payout
+	Des          string
+	Method       string
+	Notified     bool
+	GroupN       int   // how many orders were refunded together
+	PaidTotal    int64 // Σ actually paid across everything refunded here
+	CreditFailed bool  // CreditBalance errored AFTER the claims already committed
 }
 
 // doRefundApikeyGroup refunds an API key as ONE unit — _do_refund_apikey_group
@@ -261,6 +262,10 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 		if w != nil {
 			won = append(won, apikeyRefundMember{Des: w.Des, Status: "refunded",
 				Total: w.Total, Qty: w.Qty})
+			// Any frozen warranty clock is meaningless for credit proration —
+			// drop it so a later unrelated refund never reuses a stale
+			// snapshot (telegram_bot.py:4825).
+			b.dropRefundAsOf(w.Des)
 		}
 	}
 	// The stuck never-applied order refunds at face value via its own atomic
@@ -269,6 +274,7 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 	if stuck {
 		if w, err := b.store.ClaimOrder(o.Des, o.Status, "refunded"); err == nil && w != nil {
 			extra = w.Total
+			b.dropRefundAsOf(w.Des) // telegram_bot.py:4833
 		}
 	}
 	if len(won) == 0 && extra == 0 {
@@ -287,7 +293,7 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 		}
 	case len(won) > 0:
 		// Per-credit rate from the FULL group, applied to the totals actually won.
-		amount = min(int64(math.Round(float64(groupPaid)*remaining/bought)), groupPaid) + extra
+		amount = min(int64(math.RoundToEven(float64(groupPaid)*remaining/bought)), groupPaid) + extra
 		used = int64(math.Round(bought - remaining))
 	default:
 		// Only the stuck order was claimable (e.g. the rest of the group was
@@ -328,16 +334,24 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 		if err != nil {
 			// The claims already committed. Money must never be silently dropped:
 			// page loudly so an operator credits it by hand (the orders are
-			// 'refunded', so no automatic path will retry).
+			// 'refunded', so no automatic path will retry). CreditFailed skips
+			// the customer DM below — telling them "refunded" would be a lie.
 			log.Printf("CRITICAL apikey group refund credit failed [des=%s chat=%s amount=%d]: %v — orders ARE 'refunded'; credit the wallet by hand",
 				des, o.ChatID, amount, err)
+			res.CreditFailed = true
+		} else {
+			res.Balance = newBal
 		}
-		res.Balance = newBal
 	}
 	// Notify the customer (best-effort) — the same receipt the generic refund
-	// sends, anchored on the order they acted from.
+	// sends, anchored on the order they acted from. Skipped entirely when the
+	// credit failed: the money never moved, so a "refunded" DM would be false
+	// reassurance (the caller's own receipt/log carries the loud failure).
+	if res.CreditFailed {
+		return res
+	}
 	chatID, _ := strconv.ParseInt(o.ChatID, 10, 64)
-	blang := b.langFor(chatID, "en")
+	blang := b.langFor(chatID, "vi")
 	date := "—"
 	if o.TS != 0 {
 		date = fmtWhen(o.TS, blang)

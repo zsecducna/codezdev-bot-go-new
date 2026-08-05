@@ -154,7 +154,11 @@ func scanRequest(r rowScanner) (*Request, error) {
 	req.Des, req.ChatID, req.Product, req.Tier = des.String, chatID.String, product.String, tier.String
 	req.Total, req.OrderTS, req.Status = total.Int64, orderTS.Float64, status.String
 	req.PredatedSuspend = predated.Int64 != 0
-	if suspendTS.Valid {
+	if suspendTS.Valid && suspendTS.Float64 > 0 {
+		// A stored suspend ts of exactly 0 is a falsy/absent value in
+		// Python (`if susp.get("ts")`) — treat it the same as NULL rather
+		// than handing callers a "suspended at the Unix epoch" timestamp
+		// that would collapse their warranty-clock maths to 0.
 		v := suspendTS.Float64
 		req.ProductSuspendTS = &v
 	}

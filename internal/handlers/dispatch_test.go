@@ -45,7 +45,47 @@ func TestCaptureChainOrder(t *testing.T) {
 	// Together they match the Python priority comment @3632, including the
 	// M2.6 promo/referral ordercode capture (#47) between apikeyrc and purchase.
 	// `code > … > txid > deposit > apikey > apikeyrc > ordercode > purchase`.
-	want := []string{"code", "txid", "deposit", "apikey", "apikeyrc", "ordercode", "purchase"}
+	// adminsettings.go's 7 captures (setrate/setkirourl/setkirokey/
+	// setkiroacct/setbep20/settron/setmaxqty, canonical #10-#23) are spliced
+	// in ahead of "code" (#37-ish) by registerAdminSettings running after
+	// registerCodeCapture (dispatch.go).
+	// adminpricing.go (🏷️ PRICING & DISCOUNTS) splices its 11 captures in
+	// last: setapiprice/setapimin/setapimax/setkiroprice/setkiromin/
+	// setkiromax/setapicap (canonical #11-#17) ahead of "setkirourl" (#18);
+	// discount/promo (#34/#36) ahead of "code" (#37); tier/price (#41/#42)
+	// ahead of "txid" (#44).
+	// adminusers.go (👥 CUSTOMERS / 🛡️ ADMIN ROLES / whitelist / resellers)
+	// registers next-to-last: custlookup/addadmin/addreseller/addwl/rmadmin
+	// land ahead of "setrate" (canonical #5-#9, all before #10), and
+	// reseller_discount lands ahead of "promo" (canonical #35) — both anchors
+	// already exist in the chain by the time registerAdminUsers runs. addbal
+	// is NOT in this chain (M3/M4 fix) — it lives in the step-9 adminText
+	// stages instead (TestAdminTextStageOrder), alongside "broadcast".
+	// adminorders.go (🧾 ORDERS + refund subsystem) registers LAST of all:
+	// "getord" (canonical #4) ahead of "custlookup" (#5); "refundreject" (#26)
+	// and "refund" (#34), in that order, both ahead of "discount" (#35) —
+	// both anchors already exist by the time registerAdminOrders runs.
+	// adminstock.go (📦 STOCK) registers last of all: "upstock" (#1) ahead of
+	// "getord" (#4); "newprod"/"renprod"/"provpool" (#27-#29) and
+	// "setnotice"/"setdelivery"/"editfile" (#31-#33), in that order, both
+	// ahead of "refund" (#34); "hold" (#41) ahead of "tier" (#42) — every
+	// anchor already exists in the chain by the time registerAdminStock runs.
+	want := []string{
+		"upstock",
+		"getord",
+		"custlookup", "addadmin", "addreseller", "addwl", "rmadmin",
+		"setrate",
+		"setapiprice", "setapimin", "setapimax", "setkiroprice", "setkiromin", "setkiromax", "setapicap",
+		"setkirourl", "setkirokey", "setkiroacct", "setbep20", "settron", "setmaxqty",
+		"refundreject",
+		"newprod", "renprod", "provpool",
+		"setnotice", "setdelivery", "editfile",
+		"refund",
+		"discount", "reseller_discount", "promo", "code",
+		"hold",
+		"tier", "price", "txid", "deposit", "apikey", "apikeyrc",
+		"ordercode", "purchase",
+	}
 	if len(got) != len(want) {
 		t.Fatalf("capture chain = %v, want %v", got, want)
 	}
@@ -57,9 +97,14 @@ func TestCaptureChainOrder(t *testing.T) {
 	if CanonicalCaptureOrder[len(CanonicalCaptureOrder)-1] != "purchase" {
 		t.Errorf("purchase must be the last canonical capture")
 	}
-	// The canonical list itself must stay unique + the pinned length (48).
-	if len(CanonicalCaptureOrder) != 48 {
-		t.Errorf("canonical order length = %d, want 48", len(CanonicalCaptureOrder))
+	// The canonical list itself must stay unique + the pinned length (46 —
+	// adminstock.go's Go-only "provpool" entry, captures.go, brought it from
+	// 49 to 50; M3/M4 fix earlier removed "addbal", which moved to the step-9
+	// adminText chain; AWS IDC provisioning removal took "idcprov" back out,
+	// 50 to 49; AWS-sell removal took "sell"/"setawsprice"/"awsreject" back
+	// out, 49 to 46).
+	if len(CanonicalCaptureOrder) != 46 {
+		t.Errorf("canonical order length = %d, want 46", len(CanonicalCaptureOrder))
 	}
 	seen := map[string]bool{}
 	for _, n := range CanonicalCaptureOrder {
@@ -68,9 +113,20 @@ func TestCaptureChainOrder(t *testing.T) {
 		}
 		seen[n] = true
 	}
-	// File intercepts are still empty (their document/photo flows are M3.2+).
-	if len(b.fileInterceptNames()) != 0 {
-		t.Errorf("file intercept stage should still be empty, got %v", b.fileInterceptNames())
+	// File intercepts: adminsettings.go registers the broadcast photo intercept
+	// (step 5 — photo messages carry no text and skip the admin-text stages).
+	// adminstock.go appends two more: "upstockfile" (adm:upstock's document
+	// upload, py_stock_spec.md §1.4) and "provpoolfile" (adm:provpool's
+	// upload — Python's ONLY wired input path for that flow, §6.2).
+	wantFI := []string{"broadcastphoto", "upstockfile", "provpoolfile"}
+	gotFI := b.fileInterceptNames()
+	if len(gotFI) != len(wantFI) {
+		t.Fatalf("file intercept stages = %v, want %v", gotFI, wantFI)
+	}
+	for i := range wantFI {
+		if gotFI[i] != wantFI[i] {
+			t.Errorf("file intercept stages = %v, want %v", gotFI, wantFI)
+		}
 	}
 	// Step 9 now carries the admin panel entry stages (admin.go). Same contract
 	// as the capture chain: whatever is registered must be an in-order
@@ -172,8 +228,6 @@ func TestLabelRouting(t *testing.T) {
 		{c.SelfServiceBtn.VI, "selfservice"},
 		{c.SelfServiceBtn.ZH, "selfservice"},
 		{i18n.SelfServiceBtnLegacy, "selfservice"},
-		{c.SellBtn.EN, "sellaws"},
-		{c.SellBtn.ZH, "sellaws"},
 		{"  " + i18n.LangButton + "  ", "language"}, // trimmed
 		{"not a button", ""},
 		{i18n.AdminButton, ""}, // admin button routes via step 9, NOT labelToCmd

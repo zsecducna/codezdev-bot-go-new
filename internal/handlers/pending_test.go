@@ -8,26 +8,26 @@ import (
 )
 
 // customerClearFields / adminClearFields are the EXACT field sets
-// ClearCustomerPending / ClearAdminPending must touch (handlers-go.md §3: 10
+// ClearCustomerPending / ClearAdminPending must touch (handlers-go.md §3: 9
 // customer slots, 46 admin slots). TestClearListsExact asserts the code clears
 // precisely these — a new slot added to one clear method but not the expected
 // list (or vice versa) fails the test, mirroring the Python "sibling captures
 // never collide" invariant.
 var customerClearFields = []string{
 	"Purchase", "Deposit", "APIKey", "APIKeyRC", "OrderCode",
-	"Code", "Sell", "CustReset", "CustDelete", "Txid",
+	"Code", "CustReset", "CustDelete", "Txid",
 }
 
 var adminClearFields = []string{
 	"Admin", "CustLookup", "AddAdmin", "AddReseller", "AddWL", "RmAdmin",
 	"Reset", "GetOrd", "Refund", "Discount", "Promo", "ResellerDiscount",
-	"Upstock", "UpstockConfirm", "UpstockAcc", "UpstockPreviewMsg",
+	"Upstock", "UpstockConfirm", "UpstockAcc", "UpstockPreviewMsg", "UpstockStoreSubs",
 	"Price", "Tier", "Hold", "NewProd", "RenProd", "SetNotice", "SetDelivery",
 	"EditFile", "RmProd", "Entra", "SetRate", "SetBep20", "SetTron",
 	"SetApiPrice", "SetApiMin", "SetApiMax", "SetKiroPrice", "SetKiroMin",
 	"SetKiroMax", "SetApiCap", "SetKiroKey", "SetKiroURL", "SetKiroAcct",
-	"ProvPool", "SetMaxQty", "SetAwsPrice", "AwsReject", "RefundReject",
-	"EntraDomains", "EntraVerifyCSV",
+	"ProvPool", "SetMaxQty", "RefundReject",
+	"EntraDomains", "EntraVerifyCSV", "RefundDelete",
 }
 
 // setAllNonZero fills every exported field of *st with a non-zero value via
@@ -101,8 +101,8 @@ func TestClearListsExact(t *testing.T) {
 		}
 	})
 	// Guard the documented counts so a future edit can't silently drift them.
-	if len(customerClearFields) != 10 {
-		t.Errorf("expected 10 customer clear fields, have %d", len(customerClearFields))
+	if len(customerClearFields) != 9 {
+		t.Errorf("expected 9 customer clear fields, have %d", len(customerClearFields))
 	}
 	if len(adminClearFields) != 46 {
 		t.Errorf("expected 46 admin clear fields, have %d", len(adminClearFields))

@@ -25,6 +25,13 @@ type fakeTG struct {
 	Photos      []photoSend // sendPhotoURL calls (SePay QR image links)
 
 	sendErr error // when non-nil, SendMessage returns it (rollback tests)
+
+	// Files/fileErr back GetFileBytes for adminstock.go's upload-intercept
+	// tests: Files maps a file_id to the bytes that "download" should return;
+	// fileErr, when non-nil, makes every GetFileBytes call fail instead
+	// (simulating a getFile/CDN error).
+	Files   map[string][]byte
+	fileErr error
 }
 
 // docSend records one sendDocument call (chat + local file path).
@@ -123,6 +130,15 @@ func (f *fakeTG) SendPhoto(_ context.Context, chatID int64, filePath, caption st
 		ChatID: chatID, PhotoURL: filePath, Caption: caption, Local: true,
 	})
 	return &tg.Message{MessageID: 1, Chat: tg.Chat{ID: chatID}}, nil
+}
+
+func (f *fakeTG) GetFileBytes(_ context.Context, fileID string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fileErr != nil {
+		return nil, f.fileErr
+	}
+	return f.Files[fileID], nil
 }
 
 func (f *fakeTG) sendCount() int {

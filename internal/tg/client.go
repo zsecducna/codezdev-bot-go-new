@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"log"
 	"mime/multipart"
@@ -448,6 +449,71 @@ func (c *Client) GetChat(ctx context.Context, chatID int64) (*Chat, error) {
 		return nil, fmt.Errorf("tg: getChat: decode result: %w", err)
 	}
 	return &chat, nil
+}
+
+// getFileResult is the getFile response's "result" object — only file_path
+// matters (telegram_bot.py never had an equivalent; every prior upload path
+// in this port only ever re-sends a file_id back to Telegram, which resolves
+// it server-side — see GetFileBytes's own doc comment for why this is new).
+type getFileResult struct {
+	FilePath string `json:"file_path"`
+}
+
+// maxDownloadedFileBytes bounds a single incoming-file download. Telegram's
+// Bot API already refuses to serve a getFile above ~20MB, so this is a
+// second, independent ceiling (not a workaround for a known limit) — a
+// defensive cap against ever buffering an unbounded response into memory,
+// mirroring the same "never trust the far end's size claim" posture
+// sendMultipart's retry loop takes toward Telegram's own responses.
+const maxDownloadedFileBytes = 25 << 20 // 25MB
+
+// GetFileBytes downloads the raw content of a previously uploaded file by its
+// file_id — the getFile-then-fetch two-step every Bot API client needs for
+// reading an upload's actual bytes, which nothing in this package needed
+// until now: SendDocument/SendPhoto only ever UPLOAD, and every existing
+// incoming-file path (adminsettings.go's broadcastphoto) only ever stores the
+// file_id and re-sends it, since Telegram accepts a file_id anywhere a fresh
+// upload is accepted. The 📦 Stock admin category is the first feature that
+// must actually READ what an admin uploaded (upstock/provpool account
+// lists), so this is genuinely new capability, not a refactor.
+func (c *Client) GetFileBytes(ctx context.Context, fileID string) ([]byte, error) {
+	raw, err := c.call(ctx, "getFile", map[string]any{"file_id": fileID})
+	if err != nil {
+		return nil, err
+	}
+	var f getFileResult
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return nil, fmt.Errorf("tg: getFile: decode result: %w", err)
+	}
+	if f.FilePath == "" {
+		return nil, fmt.Errorf("tg: getFile: empty file_path for file_id")
+	}
+
+	// The file CDN lives on a sibling path (api.telegram.org/file/bot<token>/…),
+	// not under the JSON-RPC "call" base this package otherwise always posts
+	// to, so this builds its own URL rather than reusing c.call.
+	url := "https://api.telegram.org/file/bot" + c.token + "/" + f.FilePath
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		// url carries the token; redact before it can reach a caller's log line.
+		return nil, fmt.Errorf("tg: downloadFile: build request: %w", c.redact(err))
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("tg: downloadFile: %w", c.redact(err))
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("tg: downloadFile: status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDownloadedFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("tg: downloadFile: read body: %w", err)
+	}
+	if len(body) > maxDownloadedFileBytes {
+		return nil, fmt.Errorf("tg: downloadFile: file exceeds %d bytes", maxDownloadedFileBytes)
+	}
+	return body, nil
 }
 
 // ---- multipart uploads ----------------------------------------------------

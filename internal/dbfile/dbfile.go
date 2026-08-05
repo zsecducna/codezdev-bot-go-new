@@ -1,18 +1,16 @@
 // Package dbfile owns the on-disk permissions of the bot's SQLite files.
 //
 // Security warning, normal prose: store.db holds every customer's CLEARTEXT
-// API key (store/apikeys.go:18 — "cleartext key — the buyer's own secret") and
-// awssell.db holds customer-supplied IAM passwords and AWS secret access keys
-// (awssell.go:24-29 already flags this and asks that the file's permissions be
-// kept tight on the host). The SQLite driver creates a database file with
-// whatever the process umask allows, which under a standard umask is 0644 —
-// world-readable. The WAL and SHM sidecars are created by the driver later, on
-// first write, and inherit the same loose mode, so tightening only the main
-// file is not enough.
+// API key (store/apikeys.go:18 — "cleartext key — the buyer's own secret").
+// The SQLite driver creates a database file with whatever the process umask
+// allows, which under a standard umask is 0644 — world-readable. The WAL and
+// SHM sidecars are created by the driver later, on first write, and inherit
+// the same loose mode, so tightening only the main file is not enough.
 //
-// This package exists because THREE packages open a credential-bearing SQLite
-// file the same way (internal/store, internal/awssell, internal/refund) and a
-// per-package copy of the rule is exactly how one of them ends up skipped.
+// This package exists because more than one package opens a credential-
+// bearing SQLite file the same way (internal/store, internal/refund — both on
+// the SAME store.db file, separate tables) and a per-package copy of the rule
+// is exactly how one of them ends up skipped.
 package dbfile
 
 import (

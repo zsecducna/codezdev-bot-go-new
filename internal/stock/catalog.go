@@ -8,6 +8,7 @@
 package stock
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,6 +16,11 @@ import (
 	"strconv"
 	"strings"
 )
+
+// errReservedTierCode is returned by SetProductPrice/DeleteProductTier when
+// the caller passes the reserved "API" tier code (case-insensitive) — see
+// each function's doc comment.
+var errReservedTierCode = errors.New("stock: \"API\" is a reserved tier code")
 
 // ListProducts returns the sorted subfolder names under AccountsDir (the
 // available products) — Python list_products (telegram_bot.py:4369-4378).
@@ -150,4 +156,74 @@ func tierSortKey(code string) int {
 		return sec
 	}
 	return 1_000_000_000
+}
+
+// SetProductPrice creates or overwrites a warranty tier's price file for a
+// product — the admin editor's write path (telegram_bot.py:19193-19213 add a
+// new tier, :19215-19239 edit an existing tier's price). A price write is
+// MONEY: a crash mid-write must never leave price_<CODE>_VND half-written (a
+// torn read would serve a garbage price on the very next buy-menu render), so
+// this goes through writeFileAtomic (tmp + os.replace, stock.go:192) under the
+// SAME product lock every stock mutation takes (stock.go:110), so a price
+// change can never race a concurrent reservation/sale of this product.
+// existed reports whether this exact tier code already had a price file (the
+// "Updated"/"Added" verb the admin's confirmation message picks between).
+//
+// "API" is rejected outright: it is the reserved marker ProductTiers already
+// skips (telegram_bot.py:5064) for the virtual API-key product, so writing a
+// real price_API_VND file here would create a folder tier that silently
+// collides with — and is invisible to — that reserved code. Unreachable
+// from the admin UI today (product names/tier codes never resolve to
+// "API"), but the guard costs nothing and closes the hole outright.
+func (s *Store) SetProductPrice(product, code string, vnd int) (existed bool, err error) {
+	if strings.ToUpper(code) == "API" {
+		return false, errReservedTierCode
+	}
+	unlock, err := s.lockProduct(product)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	dir := s.productDir(product)
+	if err := os.MkdirAll(dir, credentialDirMode); err != nil {
+		return false, err
+	}
+	path := filepath.Join(dir, "price_"+strings.ToUpper(code)+"_VND")
+	if _, statErr := os.Stat(path); statErr == nil {
+		existed = true
+	}
+	return existed, writeFileAtomic(path, strconv.Itoa(vnd), credentialFileMode)
+}
+
+// DeleteProductTier removes a warranty tier's price file — telegram_bot.py:
+// 14854-14877 (tierdo:), a direct removal with NO confirmation step (the
+// confirm-by-tapping-the-list already happened one screen up, at tierdel:).
+// The match is CASE-INSENSITIVE, the same rule ProductTiers/ProductPrice
+// already read under: the code discovered off a tier button was itself
+// upper-cased by ProductTiers, so deleting by that exact case would silently
+// no-op against an on-disk file some other tool (or an older build) created
+// lower-case. Runs under the product lock so this can never race a concurrent
+// buy that just reserved the last account at this tier's price.
+func (s *Store) DeleteProductTier(product, code string) error {
+	if strings.ToUpper(code) == "API" { // reserved marker, same guard as SetProductPrice
+		return errReservedTierCode
+	}
+	unlock, err := s.lockProduct(product)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	target := strings.ToLower("price_" + code + "_vnd")
+	dir := s.productDir(product)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() || strings.ToLower(e.Name()) != target {
+			continue
+		}
+		return os.Remove(filepath.Join(dir, e.Name()))
+	}
+	return os.ErrNotExist
 }
