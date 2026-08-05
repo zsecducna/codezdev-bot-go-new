@@ -3,6 +3,14 @@
 /codezdev_bot
 *.exe
 
+# Python bytecode cache (helper scripts are run in place from the repo root)
+__pycache__/
+*.pyc
+
+# macOS Finder cruft
+.DS_Store
+**/.DS_Store
+
 # DB artifacts
 *.db
 *.db-shm
@@ -10,6 +18,17 @@
 
 # Env
 .env
+
+# Bot runtime state, written next to the binary at run time. accounts/ is the
+# folder-state stock machine (live credential files, 0600) and orders/ holds
+# reservation + delivery records; admins.json and autodelete.json are live
+# operational state. None of it belongs in the repo, and accounts/ in
+# particular would publish customer credentials.
+/accounts/
+/orders/
+/admins.json
+/autodelete.json
+*.log
 
 # OMC state
 .omc/
