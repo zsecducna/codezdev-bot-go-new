@@ -143,7 +143,7 @@ func TestSettlePaidLateExpiredClaimKindByProduct(t *testing.T) {
 		t.Fatalf("dep status = %q, want refunded", depOrder.Status)
 	}
 	if depOrder.RefundKind == nil || *depOrder.RefundKind != store.RefundKindLateSettled {
-		t.Errorf("dep RefundKind = %v, want %q", depOrder.RefundKind, store.RefundKindLateSettled)
+		t.Errorf("dep RefundKind = %s, want %q", kindStr(depOrder.RefundKind), store.RefundKindLateSettled)
 	}
 
 	// A REGULAR product order sitting 'expired': spawnOrderExpiry already
@@ -169,11 +169,22 @@ func TestSettlePaidLateExpiredClaimKindByProduct(t *testing.T) {
 		t.Fatalf("prod status = %q, want refunded", prodOrder.Status)
 	}
 	if prodOrder.RefundKind == nil || *prodOrder.RefundKind != store.RefundKindOutOfStock {
-		t.Errorf("prod RefundKind = %v, want %q — a late payment on a non-deposit "+
+		t.Errorf("prod RefundKind = %s, want %q — a late payment on a non-deposit "+
 			"expired order must NOT be tagged late_settled, or it becomes invisible "+
 			"on every refund-kind dashboard bucket",
-			prodOrder.RefundKind, store.RefundKindOutOfStock)
+			kindStr(prodOrder.RefundKind), store.RefundKindOutOfStock)
 	}
+}
+
+// kindStr renders a *string failure-message argument safely: RefundKind is a
+// *string, and %v on a pointer prints its ADDRESS, not the value it points
+// to — a diagnostic that degrades to noise exactly when the regression it
+// guards actually fires (carried-over item from the stats-fixes review).
+func kindStr(s *string) string {
+	if s == nil {
+		return "<nil>"
+	}
+	return *s
 }
 
 // ---- small test helpers shared across the handlers test package ------------

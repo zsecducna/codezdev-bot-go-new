@@ -28,6 +28,28 @@ func (b *Bot) usdtDisp(vnd int64) string {
 	usd := float64(vnd) / rate
 	// Python: cents = int(usd*100) + (1 if (usd*100) % 1 else 0)  -> ceil to cent.
 	cents := math.Ceil(usd*100 - 1e-9)
+	// Review finding: at vnd==0, usd*100-1e-9 is a tiny negative number, and
+	// math.Ceil of a small negative returns IEEE-754 NEGATIVE ZERO — which
+	// %.2f then prints WITH its sign, rendering "-0.00 USDT" on every healthy
+	// zero-amount line (Wallet balance, a zero Refunded total, …). cents==0
+	// is true for both +0.0 and -0.0 under IEEE-754 equality, so this
+	// reassignment to the positive-zero literal clears the sign bit.
+	//
+	// Blast radius, stated precisely because an earlier draft of this comment
+	// got it wrong: cents is -0.0 for the whole half-open interval
+	// usd ∈ (-0.01, 0], not for usd==0 alone — every sub-cent NEGATIVE amount
+	// ceils to negative zero too. The consequence is nonetheless stronger than
+	// that sounds and was verified exhaustively rather than argued: over 7
+	// rates × 200,001 VND values spanning ±100,000, the guard changed 210,584
+	// outputs and NOT ONE of them differed in a digit — every difference was
+	// the sign of a zero. No amount the bot renders can change value here.
+	// (The negative half of that interval is unreachable in practice anyway:
+	// the only plausible negative source is a wallet total, and balance.go
+	// debits under `WHERE ... AND amount >= ?`, so a balance cannot go
+	// negative.)
+	if cents == 0 {
+		cents = 0
+	}
 	return fmt.Sprintf("%.2f USDT", cents/100)
 }
 

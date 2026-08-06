@@ -338,6 +338,232 @@ func seedOrderAt(t *testing.T, s *Store, des, product, status string, ts float64
 	}
 }
 
+// seedOrderChatAt is seedOrderAt with an explicit chat_id — needed whenever a
+// test discriminates by COUNT(DISTINCT chat_id) (seedOrderAt always writes
+// chat_id "7", indistinguishable across rows for that purpose).
+func seedOrderChatAt(t *testing.T, s *Store, des, chatID, product, status string, ts float64) {
+	t.Helper()
+	if _, err := s.db.Exec(
+		"INSERT INTO orders(des, chat_id, lang, product, tier, qty, total, status, ts) "+
+			"VALUES (?,?,?,?,?,?,?,?,?)",
+		des, chatID, "en", product, "T1", 1, 5000, status, ts); err != nil {
+		t.Fatalf("seed %s: %v", des, err)
+	}
+}
+
+// TestRevenueSummaryCustomersExcludesDepositOnly is spec T1 — the A1 fix, the
+// highest-ranked audit finding. Customers/DeliveredCount/DeliveredRevenue
+// (misc.go's GetRevenueSummary) either had NO deposit-product filter at all
+// (Customers) or spelled it as a bare `product!=?` (DeliveredCount,
+// TodayCount shares the identical query shape and fix, so is not duplicated
+// here).
+//
+// THE DISCRIMINATION TRAP this test is built to avoid: a bare `product!=?`
+// and a COALESCE-first filter agree on every row with a non-NULL
+// product — `CreateOrder` (and this file's own seedOrder/seedOrderAt/
+// seedOrderChatAt helpers) always write a non-NULL product, so a test that
+// only seeds via those helpers cannot tell a present-but-wrong filter apart
+// from a correct one (this is the exact failure mode
+// TestRefundCountersSeparateKinds documents having already bitten this repo:
+// "an earlier version of this test [stayed] green" after the deposit filter
+// was stripped). This test therefore seeds one delivered, non-deposit row
+// with product IS NULL via a raw INSERT that OMITS the product column
+// (CreateOrder cannot produce this state through the public API), and asserts
+// it is INCLUDED — proving COALESCE-first, not merely "some filter exists".
+//
+// Falsification, verified by TWO INDEPENDENT mutations against this exact
+// test (executed and confirmed failing, then reverted — see the executor
+// report): (1) reverting Customers to its pre-fix no-filter-at-all query
+// makes it read 6, not 3 (every chat_id including the three deposit-only
+// ones and the dual case). (2) reverting ONLY DeliveredCount/
+// DeliveredRevenue's COALESCE-first filter back to a bare `product!=?`
+// (Customers' fix left intact) makes `NULL != x` evaluate to NULL, not TRUE,
+// in SQLite, so the NULL-product row silently drops out of BOTH the count
+// and the sum — DeliveredCount reads 2, not 3, and DeliveredRevenue is short
+// by that row's total (10000, not 17000). Each mutation is caught by a
+// DIFFERENT assertion below, which is what proves the test discriminates the
+// two fixes rather than passing on either one alone.
+func TestRevenueSummaryCustomersExcludesDepositOnly(t *testing.T) {
+	s := newTestStore(t)
+
+	// Two real buyers.
+	seedOrderChatAt(t, s, "buyerA", "A", "kiro-pro", "delivered", 100)
+	seedOrderChatAt(t, s, "buyerB", "B", "kiro-pro", "delivered", 200)
+	// Three wallet-only chats — deposited, never bought a product.
+	seedOrderChatAt(t, s, "depC", "C", DepositProduct, "delivered", 300)
+	seedOrderChatAt(t, s, "depD", "D", DepositProduct, "delivered", 400)
+	seedOrderChatAt(t, s, "depE", "E", DepositProduct, "delivered", 500)
+	// The dual case: chat A ALSO topped up. COUNT(DISTINCT chat_id) must not
+	// count them twice, and this row must not count as a second "customer".
+	seedOrderChatAt(t, s, "buyerA_dep", "A", DepositProduct, "delivered", 600)
+	// The discriminating row: a real, non-deposit, delivered sale with product
+	// IS NULL — a state CreateOrder cannot reach, constructed via raw SQL.
+	if _, err := s.db.Exec(
+		"INSERT INTO orders(des, chat_id, lang, tier, qty, total, status, ts) "+
+			"VALUES (?,?,?,?,?,?,?,?)",
+		"buyerF_nullprod", "F", "en", "T1", 1, 7000, "delivered", 700); err != nil {
+		t.Fatalf("seed NULL-product row: %v", err)
+	}
+
+	r, err := s.GetRevenueSummary("")
+	if err != nil {
+		t.Fatalf("GetRevenueSummary: %v", err)
+	}
+	if r.Customers != 3 {
+		t.Errorf("Customers = %d, want 3 (A, B, F — deposit-only chats C/D/E "+
+			"excluded, chat A's dual deposit not double-counted)", r.Customers)
+	}
+	if r.DeliveredCount != 3 {
+		t.Errorf("DeliveredCount = %d, want 3 — a bare `product!=?` would silently "+
+			"drop the NULL-product row (buyerF_nullprod), undercounting", r.DeliveredCount)
+	}
+	const wantRevenue = 5000 + 5000 + 7000 // buyerA + buyerB + buyerF_nullprod
+	if r.DeliveredRevenue != wantRevenue {
+		t.Errorf("DeliveredRevenue = %d, want %d — the NULL-product row's total "+
+			"must be included in the SUM, not just the COUNT", r.DeliveredRevenue, wantRevenue)
+	}
+}
+
+// TestGetRevenueMatrixIncludesNullProductRow is the review-round coverage gap
+// for the GetRevenueMatrix half of the A1-class NULL-product trap
+// (stats-fixes-spec.md §5.1): a bare `product!=?` would silently DROP a
+// delivered row whose product IS NULL, the same defect
+// TestRevenueSummaryCustomersExcludesDepositOnly proves for
+// GetRevenueSummary — but GetRevenueMatrix is a SEPARATE query in a separate
+// function, so fixing one does not fix the other, and nothing previously
+// exercised this one. Uncaught, this would make the /revenue matrix's
+// GrandTotal/GrandCount disagree with the dashboard's
+// DeliveredRevenue/DeliveredCount on the exact same range — the precise
+// inconsistency this fix's own comment (misc.go, GetRevenueMatrix) cites as
+// its justification.
+//
+// Seeds one ordinary delivered sale plus one delivered, non-deposit row with
+// product IS NULL via a raw INSERT that omits the column (CreateOrder cannot
+// reach this state), and asserts BOTH are folded into GrandTotal/GrandCount.
+//
+// Falsification: reverting GetRevenueMatrix's COALESCE-first filter back to
+// a bare product!=? makes the NULL-product row's 7000 silently vanish from
+// GrandTotal (reads 5000, not 12000) and GrandCount reads 1, not 2 — verified
+// by mutation (see the executor report).
+func TestGetRevenueMatrixIncludesNullProductRow(t *testing.T) {
+	s := newTestStore(t)
+	seedOrderAt(t, s, "prod1", "kiro-pro", "delivered", 1000) // total=5000, seedOrderAt's fixed amount
+
+	if _, err := s.db.Exec(
+		"INSERT INTO orders(des, chat_id, lang, tier, qty, total, status, ts) "+
+			"VALUES (?,?,?,?,?,?,?,?)",
+		"nullprod1", "9", "en", "T1", 1, 7000, "delivered", 2000); err != nil {
+		t.Fatalf("seed NULL-product row: %v", err)
+	}
+
+	m, err := s.GetRevenueMatrix("", nil, 60)
+	if err != nil {
+		t.Fatalf("GetRevenueMatrix: %v", err)
+	}
+	const wantTotal = 5000 + 7000
+	if m.GrandTotal != wantTotal {
+		t.Errorf("GrandTotal = %d, want %d — the NULL-product row must be included, "+
+			"matching GetRevenueSummary's DeliveredRevenue on the same range",
+			m.GrandTotal, wantTotal)
+	}
+	if m.GrandCount != 2 {
+		t.Errorf("GrandCount = %d, want 2", m.GrandCount)
+	}
+}
+
+// TestRevenueSummaryRefundedRevenueTracksGenuineRefundsOnly is the store half
+// of A7 (stats-fixes-spec.md §5.5): the dashboard's old single "Total" line
+// was delivered-only, so a refund on an order from an earlier, already-closed
+// period silently shrank it with nothing on screen explaining why. This adds
+// RefundedRevenue — the money numerator for Gross = Net + Refunded — riding
+// the SAME query as RefundedCount, and this test's job is proving it sums
+// ONLY genuine customer refunds (customer + admin_cancel), never the
+// operational-failure kinds (mint_failed, out_of_stock): those are OUR
+// fulfilment failing, not money a customer asked back, and folding them in
+// would make an outage or a stockout look like a bigger customer-refund
+// number than it is (spec §2.2 — the same rule RefundedCount already
+// enforces for the count; this test pins it for the SUM too, since a sum and
+// a count over the same WHERE clause can drift independently if one query is
+// hand-edited and the other isn't).
+//
+// Uses four DIFFERENT totals (2000/3000/1000/1500) specifically so a query
+// that sums the wrong subset produces a wrong TOTAL, not just a wrong COUNT —
+// a bug that swapped RefundedRevenue for, say, DeliveredRevenue's value would
+// still coincidentally pass a same-total test.
+//
+// Falsification: against pre-change code, RevenueSummary has no
+// RefundedRevenue field at all (compile failure) — the same "field does not
+// exist" falsification TestRefundCountersSeparateKinds documents for its own
+// new fields. Verified further by mutation (see the executor report): summing
+// over ALL refund_kind values instead of IN (RefundKindCustomer,
+// RefundKindAdminCancel) inflates RefundedRevenue from 5000 to 7500, which
+// the exact-total assertion below catches.
+func TestRevenueSummaryRefundedRevenueTracksGenuineRefundsOnly(t *testing.T) {
+	s := newTestStore(t)
+
+	mk := func(des, from string, total int64) {
+		t.Helper()
+		if err := s.CreateOrder(des, "7", "en", "kiro-pro", "T1", 1, total); err != nil {
+			t.Fatalf("CreateOrder(%s): %v", des, err)
+		}
+		if from != "reserved" {
+			if _, err := s.db.Exec("UPDATE orders SET status=? WHERE des=?", from, des); err != nil {
+				t.Fatalf("seed %s -> %s: %v", des, from, err)
+			}
+		}
+	}
+
+	// One still-delivered sale — DeliveredRevenue/DeliveredCount (the Net line,
+	// which A7 must leave UNCHANGED).
+	mk("delivered1", "delivered", 5000)
+
+	// Two GENUINE refunds of DIFFERENT totals.
+	mk("refcust", "delivered", 2000)
+	if _, err := s.ClaimOrderKind("refcust", "delivered", "refunded", RefundKindCustomer); err != nil {
+		t.Fatalf("claim refcust: %v", err)
+	}
+	mk("refadmin", "paid", 3000)
+	if _, err := s.ClaimOrderKind("refadmin", "paid", "refunded", RefundKindAdminCancel); err != nil {
+		t.Fatalf("claim refadmin: %v", err)
+	}
+
+	// Two OPERATIONAL refunds — our own failures, must NOT count toward
+	// RefundedRevenue.
+	mk("refmint", "paid", 1000)
+	if _, err := s.ClaimOrderKind("refmint", "paid", "refunded", RefundKindMintFailed); err != nil {
+		t.Fatalf("claim refmint: %v", err)
+	}
+	mk("refoos", "paid", 1500)
+	if _, err := s.ClaimOrderKind("refoos", "paid", "refunded", RefundKindOutOfStock); err != nil {
+		t.Fatalf("claim refoos: %v", err)
+	}
+
+	r, err := s.GetRevenueSummary("")
+	if err != nil {
+		t.Fatalf("GetRevenueSummary: %v", err)
+	}
+	if r.RefundedCount != 2 {
+		t.Errorf("RefundedCount = %d, want 2", r.RefundedCount)
+	}
+	const wantRefundedRevenue = 2000 + 3000
+	if r.RefundedRevenue != wantRefundedRevenue {
+		t.Errorf("RefundedRevenue = %d, want %d — must sum ONLY customer+admin_cancel "+
+			"refunds, excluding mint_failed/out_of_stock operational failures",
+			r.RefundedRevenue, wantRefundedRevenue)
+	}
+	if r.DeliveredRevenue != 5000 {
+		t.Errorf("DeliveredRevenue (the new Net line) = %d, want 5000 — must be "+
+			"UNCHANGED by this fix, since Net is exactly the OLD Total", r.DeliveredRevenue)
+	}
+	gross := r.DeliveredRevenue + r.RefundedRevenue
+	const wantGross = 5000 + 2000 + 3000
+	if gross != wantGross {
+		t.Errorf("Gross (DeliveredRevenue+RefundedRevenue) = %d, want %d — this is a NEW "+
+			"number higher than any 'Total' an admin has seen before, by design",
+			gross, wantGross)
+	}
+}
+
 // TestPaidUndeliveredExcludesDepositsAndReserved is the A4 store half: the
 // count of orders where MONEY IS IN AND GOODS ARE NOT OUT, plus the age of the
 // oldest so the alarm can say "oldest 3h ago" instead of a bare "2".

@@ -2004,8 +2004,14 @@ func (b *Bot) runPoolProvision(ctx context.Context, chatID int64, accountsText s
 		}
 		summary += "\n\n" + h
 	}
-	if runes := []rune(summary); len(runes) > 4000 {
-		summary = string(runes[:4000])
+	// 3900, not 4000 — the house standard used by every other report in this
+	// layer (adminorders.go's revenue builders, admin.go's sendRecentOrders,
+	// adminusers.go). Telegram counts UTF-16 code units, not runes; a non-BMP
+	// emoji is 1 rune but 2 units, so 4000 left only ~96 chars of margin
+	// against the 4096 hard cap (stats-fixes-spec.md §0 — downgraded from a
+	// real risk to a consistency nit there, but still worth matching).
+	if runes := []rune(summary); len(runes) > 3900 {
+		summary = string(runes[:3900])
 	}
 	b.send(ctx, chatID, summary, admNav("admcat:stock"))
 }

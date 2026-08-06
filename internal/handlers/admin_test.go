@@ -632,6 +632,171 @@ func TestAdminDashboardRefundBucketsRender(t *testing.T) {
 	}
 }
 
+// TestAdminDashboardGrossRefundedNetRender is the HANDLER half of A7
+// (stats-fixes-spec.md §5.5). The old dashboard printed a single "Total" line
+// that already excluded refunds, so a refund on an order from an
+// already-closed period silently shrank that report with nothing on screen
+// explaining why. Also pins the review-round "(at original price)" qualifier
+// on the Refunded line: of the three new lines, Gross and Net are EXACT
+// (Gross sums original charges; Net is the pre-existing figure relabelled),
+// but Refunded can overstate cash actually credited back on a partial refund
+// — the qualifier belongs on screen, not only in misc.go's comment, since an
+// admin reconciling a bank statement never opens the source. Seeds one
+// still-delivered sale (5000 VND) and one GENUINELY refunded sale (2000 VND)
+// and asserts the exact rendered Gross / Refunded / Net lines at the default
+// 25000 VND/USD test rate — Net must
+// equal exactly what the OLD "Total" line would have read (DeliveredRevenue
+// alone, 0.20 USDT / 1 order), and Gross must be the strictly larger,
+// previously-unseen number (0.28 USDT / 2 orders).
+//
+// Falsification: reverting the REVENUE block back to the single
+// "Total: 0.20 USDT (1 orders)" line makes every assertion below fail —
+// verified by mutation (see the executor report).
+func TestAdminDashboardGrossRefundedNetRender(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newDashboardTestBot(t, "1")
+
+	if err := st.CreateOrder("delivered1", "9", "en", "kiro-pro", "T1", 1, 5000); err != nil {
+		t.Fatalf("CreateOrder(delivered1): %v", err)
+	}
+	if _, err := st.ClaimOrder("delivered1", "reserved", "delivered"); err != nil {
+		t.Fatalf("claim delivered1 -> delivered: %v", err)
+	}
+
+	if err := st.CreateOrder("refcust1", "9", "en", "kiro-pro", "T1", 1, 2000); err != nil {
+		t.Fatalf("CreateOrder(refcust1): %v", err)
+	}
+	if _, err := st.ClaimOrder("refcust1", "reserved", "delivered"); err != nil {
+		t.Fatalf("claim refcust1 -> delivered: %v", err)
+	}
+	if _, err := st.ClaimOrderKind("refcust1", "delivered", "refunded", store.RefundKindCustomer); err != nil {
+		t.Fatalf("claim refcust1 -> refunded/customer: %v", err)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "admroot"))
+	last := lastSendMsg(f)
+	if last == nil {
+		t.Fatal("admroot produced no reply")
+	}
+	if !strings.Contains(last.Text, "Gross: 0.28 USDT  (2 orders)") {
+		t.Errorf("want Gross = Net+Refunded = 0.28 USDT over 2 orders, got:\n%s", last.Text)
+	}
+	if !strings.Contains(last.Text, "Refunded: -0.08 USDT (at original price)  (1 orders)") {
+		t.Errorf("want Refunded = -0.08 USDT, qualified 'at original price' since "+
+			"it can overstate cash actually credited back on a partial refund "+
+			"(unlike Gross and Net, which are exact), got:\n%s", last.Text)
+	}
+	if !strings.Contains(last.Text, "Net: 0.20 USDT  (1 orders)") {
+		t.Errorf("want Net = the OLD Total unchanged (0.20 USDT / 1 order), got:\n%s", last.Text)
+	}
+	if strings.Contains(last.Text, "Total: ") {
+		t.Errorf("the old single Total line must be gone, replaced by Gross/Refunded/Net, got:\n%s", last.Text)
+	}
+}
+
+// TestAdminDashboardZeroRefundsOmitsNegativeSign guards the zero-refund
+// formatting edge the A7 render must not get wrong: "-0.00 USDT" on a shop
+// with no refunds at all reads as a bug, not a healthy zero.
+//
+// Review-round update: the negative-zero fix moved from a LOCAL sign-strip
+// on just this Refunded line (admin.go) to the SOURCE, money.go's usdtDisp
+// itself — reverting either the money.go `cents==0` guard OR the surviving
+// `RefundedRevenue>0` sign-add in admin.go would surface this. The Wallet
+// balances line is now asserted too: it shares the SAME usdtDisp call, so it
+// is no longer a separate out-of-scope bug — fixing the source fixed both,
+// which is the whole reason the fix was moved there instead of staying a
+// one-line-only workaround.
+//
+// Falsification: reverting money.go's `if cents == 0 { cents = 0 }` guard
+// makes BOTH assertions below fail (verified by mutation, see the executor
+// report — TestUsdtDispZeroHasNoNegativeSign in money_test.go pins the same
+// fact at the unit level). Separately, unconditionally prefixing "-" to the
+// Refunded line in admin.go (instead of only when RefundedRevenue>0) also
+// makes the Refunded assertion fail on its own.
+func TestAdminDashboardZeroRefundsOmitsNegativeSign(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newDashboardTestBot(t, "1")
+	if err := st.CreateOrder("delivered1", "9", "en", "kiro-pro", "T1", 1, 5000); err != nil {
+		t.Fatalf("CreateOrder(delivered1): %v", err)
+	}
+	if _, err := st.ClaimOrder("delivered1", "reserved", "delivered"); err != nil {
+		t.Fatalf("claim delivered1 -> delivered: %v", err)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "admroot"))
+	last := lastSendMsg(f)
+	if last == nil {
+		t.Fatal("admroot produced no reply")
+	}
+	if strings.Contains(last.Text, "Refunded: -0.00 USDT") {
+		t.Errorf("a healthy zero-refund shop must not render a negative sign on the "+
+			"Refunded line, got:\n%s", last.Text)
+	}
+	if strings.Contains(last.Text, "-0.00 USDT") {
+		t.Errorf("the source-level usdtDisp(0) fix must clear the negative sign "+
+			"EVERYWHERE it renders, not just on the Refunded line, got:\n%s", last.Text)
+	}
+	if !strings.Contains(last.Text, "Refunded: 0.00 USDT  (0 orders)") {
+		t.Errorf("want an unsigned zero Refunded line, got:\n%s", last.Text)
+	}
+}
+
+// TestAdminDashboardAndStockShowDistinctHeldReservedIcons is the HANDLER half
+// of A5 (stats-fixes-spec.md §5.4, audit A5). Before this fix the dashboard's
+// stock block printed 🔒 for CountHeld (admin-quarantined, off-sale) while
+// /stock printed the SAME 🔒 for CountReserved (a live in-flight checkout) —
+// two different folders, same icon, on two different screens, and neither
+// screen showed all three states (dashboard omitted Reserved, /stock omitted
+// Held). Seeds one product with both a held account and a live reserved
+// checkout and asserts both surfaces now show ⏳ reserved / 🔒 held distinctly
+// and completely.
+//
+// Falsification: reverting adminStockText's "⏳ Reserved:"/"🔒 Held:" pair
+// back to the pre-fix single "🔒 Reserved:" line (and dropping Held) makes
+// the /stock assertions below fail; reverting the dashboard loop to omit the
+// CountReserved line makes the dashboard assertion fail — verified by
+// mutation (see the executor report).
+func TestAdminDashboardAndStockShowDistinctHeldReservedIcons(t *testing.T) {
+	ctx := context.Background()
+	b, f, _, stk, dir := newBuyBot(t, "1")
+	seedProduct(t, dir, "kiro-pro", 5000, 5)
+
+	if n, err := stk.Hold("kiro-pro", 2); err != nil || n != 2 {
+		t.Fatalf("Hold(kiro-pro, 2): n=%d err=%v", n, err)
+	}
+	if usernames, err := stk.Reserve("kiro-pro", 1, "ord1", time.Hour); err != nil || len(usernames) != 1 {
+		t.Fatalf("Reserve(kiro-pro, 1): usernames=%v err=%v", usernames, err)
+	}
+
+	b.Process(ctx, textUpdate(1, "/admin"))
+	dash := lastSendMsg(f)
+	if dash == nil {
+		t.Fatal("/admin produced no reply")
+	}
+	if !strings.Contains(dash.Text, "⏳ 1 reserved") {
+		t.Errorf("dashboard missing the reserved count (previously omitted entirely), got:\n%s", dash.Text)
+	}
+	if !strings.Contains(dash.Text, "🔒 2 held") {
+		t.Errorf("dashboard missing the held count, got:\n%s", dash.Text)
+	}
+
+	f.Sends = nil
+	b.Process(ctx, textUpdate(1, "/stock"))
+	stockMsg := lastSendMsg(f)
+	if stockMsg == nil {
+		t.Fatal("/stock produced no reply")
+	}
+	if !strings.Contains(stockMsg.Text, "⏳ Reserved: 1") {
+		t.Errorf("/stock reserved count must use ⏳, not the held icon 🔒, got:\n%s", stockMsg.Text)
+	}
+	if !strings.Contains(stockMsg.Text, "🔒 Held: 2") {
+		t.Errorf("/stock missing the Held field (previously omitted entirely), got:\n%s", stockMsg.Text)
+	}
+	if strings.Contains(stockMsg.Text, "🔒 Reserved:") {
+		t.Errorf("/stock still labels Reserved with the held icon 🔒, got:\n%s", stockMsg.Text)
+	}
+}
+
 // wantAdminCapDenied asserts that a standard (granted, non-super) admin was
 // denied `data` by H1's central capability gate (admincap.go, wired into
 // command.go's handleCallback BEFORE the unconditional ack) rather than by

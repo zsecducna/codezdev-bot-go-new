@@ -286,20 +286,27 @@ func (b *Bot) adminDashboardText(chatID int64) string {
 			// ONLY genuine refunds (customer + admin_cancel, spec §2.2); Expired,
 			// Paid-no-stock and Failed-mint are their own lines so an
 			// operational failure never masquerades as a customer refund.
-			// Denominator is DeliveredCount+RefundedCount, NOT bare DeliveredCount
-			// (review finding on this slice): DeliveredCount is CURRENT
-			// status='delivered' rows only, and a genuine refund moves a row OUT
-			// of that set into the numerator — so the bare-DeliveredCount
-			// denominator shrinks exactly as the numerator grows and can print
-			// well over 100% on a shop with several refunds (e.g. 1 still-
-			// delivered + 4 refunded => "400%"). Adding RefundedCount back
-			// approximates "orders that were ever fulfilled or paid-and-
-			// cancelled", the same Gross = Net + Refunded relationship A7
-			// (§5.5, out of scope here) formalizes properly; this is the
-			// smallest correct fix without building A7's full Gross/Net lines.
+			// grossCount is DeliveredCount+RefundedCount, hoisted here (review
+			// finding on this slice: an earlier draft recomputed this same
+			// expression twice — once here, again for the Gross line below —
+			// under a comment that incorrectly called the duplicate
+			// "money-typed"; it was the same int64 order count both times, and
+			// the duplication was a real drift hazard: widening ONE definition,
+			// e.g. to also count OutOfStockCount, would leave the refund-rate
+			// denominator and the rendered Gross order-count silently
+			// disagreeing on the same screen). Used for two things:
+			// (1) NOT bare DeliveredCount as the refund-rate denominator —
+			// DeliveredCount is CURRENT status='delivered' rows only, and a
+			// genuine refund moves a row OUT of that set into the numerator, so
+			// the bare-DeliveredCount denominator shrinks exactly as the
+			// numerator grows and can print well over 100% on a shop with
+			// several refunds (e.g. 1 still-delivered + 4 refunded => "400%").
+			// (2) the Gross = Net + Refunded order count A7 (§5.5) renders
+			// below as its own money lines.
+			grossCount := r.DeliveredCount + r.RefundedCount
 			refundRateSuffix := ""
-			if gross := r.DeliveredCount + r.RefundedCount; gross > 0 {
-				rate := float64(r.RefundedCount) / float64(gross) * 100
+			if grossCount > 0 {
+				rate := float64(r.RefundedCount) / float64(grossCount) * 100
 				refundRateSuffix = fmt.Sprintf(" (%.1f%%)", rate)
 			}
 			ordersBlock := "\n🧾 ORDERS\n" +
@@ -341,9 +348,49 @@ func (b *Bot) adminDashboardText(chatID int64) string {
 				}
 				ordersBlock += " — customers have paid and received nothing"
 			}
-			parts = append(parts, "💰 REVENUE (delivered orders)\n"+
-				"   Total: "+b.usdtDisp(r.DeliveredRevenue)+"  ("+itoa64(r.DeliveredCount)+" orders)\n"+
-				"   Today: "+b.usdtDisp(r.TodayRevenue)+"  ("+itoa64(r.TodayCount)+" orders)\n"+
+			// A7 fix (stats-fixes-spec.md §5.5): the old single "Total" line was
+			// delivered-only, so a refund on an order from any earlier period
+			// silently shrank an already-closed report with nothing on screen
+			// explaining why — an admin reconciling against a bank statement saw
+			// an unexplained gap. Gross = Net + Refunded makes that reconstructible.
+			// Net is exactly the OLD Total (DeliveredRevenue is unchanged), so
+			// every figure an admin has read before stays correct under its new
+			// label; Gross is a NEW, larger number nobody has seen before — both
+			// are expected, not a regression (spec §5.5's own note). grossCount
+			// is the SAME variable computed above for the refund-rate
+			// denominator, reused here rather than recomputed.
+			grossRevenue := r.DeliveredRevenue + r.RefundedRevenue
+			// usdtDisp(0) used to render "-0.00 USDT" on any healthy zero
+			// (IEEE-754 negative zero, fixed at the source in money.go — see
+			// its comment); no local sign-stripping is needed here anymore, so
+			// a genuine refund is the only thing that ever prepends "-".
+			refundedLine := b.usdtDisp(r.RefundedRevenue)
+			if r.RefundedRevenue > 0 {
+				refundedLine = "-" + refundedLine
+			}
+			// Qualified ON SCREEN, not only in misc.go's comment (review
+			// finding on this slice): of the three new lines, only Refunded is
+			// approximate. Gross is exact — it sums orders.total, the ORIGINAL
+			// charge, which is precisely what "Gross" means. Net is the
+			// pre-existing figure simply relabelled (byte-identical to the old
+			// Total). Refunded alone can overstate cash actually credited back
+			// on a partial/pro-rated refund (misc.go's RefundedRevenue comment
+			// has the full mechanism) — an admin reconciling a bank statement
+			// never opens misc.go, so the qualifier belongs on the line itself.
+			refundedQualifier := ""
+			if r.RefundedRevenue > 0 {
+				refundedQualifier = " (at original price)"
+			}
+			// Today is delivered-only, i.e. the same NET basis as the Net line
+			// above (it has no refund split of its own — a same-day refund is
+			// rare enough not to warrant a fourth pair of lines). Labelled
+			// "(net)" so it doesn't read as ambiguous directly under a triplet
+			// that just taught the admin to distinguish gross from net.
+			parts = append(parts, "💰 REVENUE\n"+
+				"   Gross: "+b.usdtDisp(grossRevenue)+"  ("+itoa64(grossCount)+" orders)\n"+
+				"   Refunded: "+refundedLine+refundedQualifier+"  ("+itoa64(r.RefundedCount)+" orders)\n"+
+				"   Net: "+b.usdtDisp(r.DeliveredRevenue)+"  ("+itoa64(r.DeliveredCount)+" orders)\n"+
+				"   Today (net): "+b.usdtDisp(r.TodayRevenue)+"  ("+itoa64(r.TodayCount)+" orders)\n"+
 				"   Customers: "+itoa64(r.Customers)+"\n"+
 				ordersBlock+"\n"+
 				"   💳 Wallet balances held: "+b.usdtDisp(r.WalletTotal))
@@ -353,12 +400,43 @@ func (b *Bot) adminDashboardText(chatID int64) string {
 		var lines []string
 		total := 0
 		for _, p := range b.listProducts() {
+			// A5 fix (stats-fixes-spec.md §5.4, audit A5): this line and /stock's
+			// adminStockText used to print the SAME 🔒 icon for two different
+			// folders — CountHeld (admin-quarantined, off-sale) here, CountReserved
+			// (live in-flight checkout) there — so an admin comparing the two
+			// screens saw the lock number change and reasonably concluded one
+			// screen was stale. Distinct icons now (🔒 held / ⏳ reserved), and
+			// both counts render on both surfaces.
+			//
+			// NOT fixed, by design — reported instead: CountAvailable and
+			// CountReserved both call sweepExpiredLocked before counting, so
+			// rendering THIS report mutates state (expired reservations get swept
+			// back to active/ as a side effect of loading the dashboard). Two
+			// admins opening the panel seconds apart can legitimately see
+			// different Available/Reserved numbers with no sale or admin action
+			// in between. That behaviour is correct; a read-only render path
+			// would be its own slice of work.
+			//
+			// Adding the Reserved count here (this A5 fix) makes it WORSE, not
+			// just visible: the dashboard used to call CountAvailable (sweeps)
+			// + CountHeld (no sweep) — one sweep, one lock acquisition per
+			// product. It now also calls CountReserved (sweeps), so this loop
+			// takes TWO separate lock/sweep cycles per product on the
+			// most-frequently-opened admin screen. A second consequence beyond
+			// the mutation itself: `a` and the reserved count below are each
+			// read from a DIFFERENT sweep instant, so on the SAME rendered line
+			// Available and Reserved can reflect two different moments in time
+			// (an expiry could fall between the two calls). /stock has always
+			// had this shape; it is new to the DASHBOARD as of this fix.
 			a, err := b.stock.CountAvailable(p)
 			if err != nil {
 				continue
 			}
 			total += a
 			line := "   • " + p + ": 🟢 " + itoa(a)
+			if res, err := b.stock.CountReserved(p); err == nil && res > 0 {
+				line += "  ⏳ " + itoa(res) + " reserved"
+			}
 			if h := b.stock.CountHeld(p); h > 0 {
 				line += "  🔒 " + itoa(h) + " held"
 			}
@@ -398,8 +476,22 @@ func ageString(ts float64) string {
 }
 
 // adminStockText builds the /stock report — port of _admin_stock_text
-// (telegram_bot.py:16341-16360): per-product available/reserved/sold counts plus
-// that product's tier prices.
+// (telegram_bot.py:16341-16360): per-product available/reserved/held/sold
+// counts plus that product's tier prices.
+//
+// A5 fix (stats-fixes-spec.md §5.4, audit A5): this used to print 🔒 for
+// CountReserved (live in-flight checkouts) while the dashboard's stock block
+// printed the SAME 🔒 for CountHeld (admin-quarantined, off-sale) — two
+// screens, same icon, different folders. Now ⏳ reserved / 🔒 held, matching
+// the dashboard, and this view adds the Held count it previously omitted
+// entirely (the dashboard omitted Reserved) so neither screen is a partial
+// view of the other.
+//
+// NOT fixed, by design — see the matching comment on the dashboard's stock
+// loop in adminDashboardText: CountAvailable and CountReserved both sweep
+// expired reservations before counting, so rendering this report mutates
+// state. Two admins loading /stock seconds apart can legitimately see
+// different numbers with no sale in between.
 func (b *Bot) adminStockText() string {
 	if b.stock == nil {
 		return "📊 STOCK OVERVIEW\n" + strings.Repeat("─", 24) + "\n\nNo products."
@@ -416,7 +508,8 @@ func (b *Bot) adminStockText() string {
 		}
 		block := "📦 " + p + "\n" +
 			"   🟢 Available: " + itoa(a) +
-			"    🔒 Reserved: " + itoa(r) +
+			"    ⏳ Reserved: " + itoa(r) +
+			"    🔒 Held: " + itoa(b.stock.CountHeld(p)) +
 			"    ✅ Sold: " + itoa(b.stock.CountSold(p))
 		for _, t := range b.stock.ProductTiers(p) {
 			block += "\n   • " + t.Code + ": " + b.usdtDisp(int64(t.Price))

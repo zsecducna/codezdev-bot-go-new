@@ -125,6 +125,18 @@ func (b *Bot) sendHistory(ctx context.Context, chatID int64, lang i18n.Lang, key
 // historySummaryText builds the per-product purchase summary — _history_summary_text
 // (telegram_bot.py:16490-16529). Σ accounts excludes API-key-family rows (their
 // qty is credits); Σ paid is complete. Returns (text, hasPurchases).
+//
+// Carried-over fix (stats-fixes-spec.md review slice): the old cap was BY
+// COUNT only (40 products, no character budget). Product names are
+// admin-controlled folder names — 40 long ones can exceed Telegram's 4096
+// hard cap, and sendMessage 400s, dropping the WHOLE message rather than a
+// gracefully truncated one. Now bounded by historyMsgBudget (this file's own
+// existing budget constant, already used by historyText's detail view —
+// reused here rather than introducing a second competing magic number in the
+// same file) with truncation at the TAIL: the Σ total is computed over ALL
+// items before the loop runs, so it stays correct even when rows are dropped,
+// matching the "footer is full-range, never rendered-rows" rule the revenue
+// builders in adminorders.go already follow.
 func (b *Bot) historySummaryText(chatID int64, lang i18n.Lang) (string, bool) {
 	h := &i18n.C().History
 	items, err := b.store.DeliveredProductSummary(fmtInt(chatID))
@@ -142,8 +154,17 @@ func (b *Bot) historySummaryText(chatID int64, lang i18n.Lang) (string, bool) {
 		totPaid += r.Paid
 	}
 	const maxProducts = 40
+	// moreMarkerReserve is a conservative reservation for the "+N more
+	// products" line's own length — its exact size varies with N, but never
+	// by enough to matter against a multi-thousand-char budget.
+	const moreMarkerReserve = 64
 	ak := &i18n.C().APIKey
-	lines := []string{h.SummaryHeader.T(lang), ""}
+	footer := i18n.F(h.SummaryTotal.T(lang), "n", itoa64(totAcc), "amount", b.usdtDisp(totPaid))
+	header := h.SummaryHeader.T(lang)
+
+	lines := []string{header, ""}
+	used := len(header) + 1
+	shown := 0
 	for i, r := range items {
 		if i >= maxProducts {
 			break
@@ -160,19 +181,25 @@ func (b *Bot) historySummaryText(chatID int64, lang i18n.Lang) (string, bool) {
 		case apikeyRechargeProduct:
 			label = ak.RCHistLabel
 		}
+		var line string
 		if label != (i18n.Str{}) {
-			lines = append(lines, i18n.F(label.T(lang), "credits", itoa64(r.Accounts))+
-				" · "+b.usdtDisp(r.Paid))
-			continue
+			line = i18n.F(label.T(lang), "credits", itoa64(r.Accounts)) + " · " + b.usdtDisp(r.Paid)
+		} else {
+			line = i18n.F(h.SummaryLine.T(lang),
+				"product", cut(r.Product, 32), "n", itoa64(r.Accounts), "amount", b.usdtDisp(r.Paid))
 		}
-		lines = append(lines, i18n.F(h.SummaryLine.T(lang),
-			"product", cut(r.Product, 32), "n", itoa64(r.Accounts), "amount", b.usdtDisp(r.Paid)))
+		if used+len(line)+1+moreMarkerReserve+len(footer)+2 > historyMsgBudget {
+			break
+		}
+		used += len(line) + 1
+		lines = append(lines, line)
+		shown++
 	}
-	if len(items) > maxProducts {
-		lines = append(lines, i18n.F(h.SummaryMore.T(lang), "n", itoa(len(items)-maxProducts)))
+	if shown < len(items) {
+		lines = append(lines, i18n.F(h.SummaryMore.T(lang), "n", itoa(len(items)-shown)))
 	}
 	lines = append(lines, "") // Σ over ALL products, not just shown
-	lines = append(lines, i18n.F(h.SummaryTotal.T(lang), "n", itoa64(totAcc), "amount", b.usdtDisp(totPaid)))
+	lines = append(lines, footer)
 	return strings.Join(lines, "\n"), true
 }
 

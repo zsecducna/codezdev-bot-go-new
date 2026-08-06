@@ -318,9 +318,9 @@ func (b *Bot) deliverPaid(ctx context.Context, order *store.Order, des string) b
 		// crediting after a failed claim would leave the order 'paid' (so the
 		// stuck-paid reconcile re-drives it later) with the money ALREADY
 		// credited -> double refund. On a claim error nothing moves — the order
-		// stays 'paid' and surfaces in the PaidOrders reconcile for manual review
-		// (Python got this for free: a claim_order exception aborted before the
-		// credit ran).
+		// stays 'paid' and surfaces in the PaidUndelivered alarm (A4,
+		// stats-fixes-spec.md §5.3) for manual review (Python got this for free:
+		// a claim_order exception aborted before the credit ran).
 		// out_of_stock (stats-fixes-spec.md §2.1): the customer paid and the
 		// reserved folder-stock rows were gone — OUR fulfilment failure on the
 		// main product path, not a customer-requested refund. Excluded from the

@@ -332,6 +332,11 @@ type RevenueSummary struct {
 	// sibling fields below, which give each its own visible line instead of
 	// folding it in or dropping it silently.
 	RefundedCount int64
+	// RefundedRevenue — Σ total of the SAME genuine-refund set RefundedCount
+	// counts (stats-fixes-spec.md §5.5, finding A7). The A7 numerator: Gross =
+	// DeliveredRevenue + RefundedRevenue, Net = DeliveredRevenue unchanged. See
+	// GetRevenueSummary's query comment for the caveat on partial refunds.
+	RefundedRevenue int64
 	// ExpiredCount — abandoned checkouts (status='expired'), split out of the
 	// old combined "Refunded/expired" line.
 	ExpiredCount int64
@@ -362,13 +367,59 @@ func (s *Store) GetRevenueSummary(depositProduct string) (*RevenueSummary, error
 	dayStart := now() - 86400 // "today" = trailing 24h, store.py:915
 	var r RevenueSummary
 	// COALESCE where Python tolerated SUM() returning None (store.py:917-919).
+	//
+	// The deposit filter is spelled COALESCE-first rather than a bare
+	// `product!=?` (stats-fixes-spec.md §5.1 / audit A1) — `NULL != x` is NULL,
+	// not TRUE, so a bare filter would silently DROP a delivered row whose
+	// product is NULL out of the WHERE clause entirely, DEFLATING both the
+	// count and the SUM (review finding on this slice: an earlier draft of
+	// this comment had the direction backwards — "inflate" — which sends a
+	// future reader hunting for an over-count when the actual symptom is an
+	// under-count; PaidUndelivered's doc comment below states the correct
+	// direction, "would silently vanish"). COALESCE-first is what puts that
+	// row BACK into both figures. This is now more than cosmetic:
+	// DeliveredCount feeds the refund-rate denominator (admin.go's
+	// adminDashboardText), so a dropped NULL-product row would also quietly
+	// inflate a displayed percentage (fewer orders in the denominator raises
+	// the rate). The exact fragment:
+	//
+	//	COALESCE(product,'')!=?
 	if err := s.db.QueryRow("SELECT COUNT(*), COALESCE(SUM(total),0) FROM orders "+
-		"WHERE status='delivered' AND product!=?", depositProduct).
+		"WHERE status='delivered' AND COALESCE(product,'')!=?", depositProduct).
 		Scan(&r.DeliveredCount, &r.DeliveredRevenue); err != nil {
 		return nil, err
 	}
+	// ts is COALESCE-guarded too (review finding on this slice): ts has no
+	// NOT NULL constraint (store.go's schema; PaidUndelivered's own doc
+	// comment and admin.go's PaidUndeliveredOldestTS>0 guard both already
+	// treat a NULL ts as a live-data possibility one function away from this
+	// one), and `NULL>=x` is NULL, not TRUE — the identical trap this fix
+	// just closed for `product`. Not reachable via CreateOrder today (always
+	// writes now()), same as the product case above.
+	//
+	// THIS GUARD CHANGES NOTHING TODAY, and that is worth stating plainly so
+	// nobody reads it as behaviour or writes a test that only appears to cover
+	// it. dayStart is a real epoch second, so COALESCE(ts,0)>=dayStart is
+	// 0>=1.7e9 — false — while the bare NULL>=dayStart is NULL, also not true.
+	// A NULL-ts row is excluded from Today either way. The two forms diverge
+	// only at a threshold of zero or below, which dayStart cannot reach, so no
+	// test can distinguish this line from its absence and one written to try
+	// would pass against the unfixed code too.
+	//
+	// That "no test can distinguish it" rests on a premise worth naming,
+	// because a routine refactor would falsify it: store.now is a plain func
+	// (store.go), NOT an injectable var — unlike handlers.Bot.now, which is.
+	// Make store.now injectable and a test could drive dayStart to zero and
+	// pin the divergence, at which point this paragraph is wrong and the line
+	// deserves a test.
+	//
+	// It stays for a reason better than documentation: a bare `ts>=` sitting
+	// beside COALESCE(product,'') in the SAME WHERE clause forces every future
+	// reader to work out why one column is guarded and the other is not.
+	// Uniformity across one clause is a maintenance property, and it survives
+	// even if the reasoning above is someday falsified.
 	if err := s.db.QueryRow("SELECT COUNT(*), COALESCE(SUM(total),0) FROM orders "+
-		"WHERE status='delivered' AND product!=? AND ts>=?",
+		"WHERE status='delivered' AND COALESCE(product,'')!=? AND COALESCE(ts,0)>=?",
 		depositProduct, dayStart).Scan(&r.TodayCount, &r.TodayRevenue); err != nil {
 		return nil, err
 	}
@@ -395,10 +446,28 @@ func (s *Store) GetRevenueSummary(depositProduct string) (*RevenueSummary, error
 	// A4. late_settled is deliberately in none of these: it is not a refund
 	// (§2.2) and, being a __deposit__-only kind, would need its own line if
 	// ever surfaced — not conflated with a product refund bucket.
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM orders "+
+	// RefundedRevenue rides the same query as RefundedCount (one row, two
+	// columns) — it is money actually credited back on GENUINE refunds only
+	// (customer + admin_cancel), the numerator A7's Refunded line needs
+	// (stats-fixes-spec.md §5.5). CAVEAT, not fixable here, cuts BOTH ways —
+	// review finding on this slice: orders.total is the ORIGINAL charge and is
+	// never rewritten on a partial refund. adminorders.go's refundAmount
+	// pro-rates day/hour warranty tiers down from o.Total when an admin issues
+	// a non-forceFull refund; only forceFull sets amount=o.Total. The refunded
+	// order still leaves status='delivered' ENTIRELY, so DeliveredRevenue (the
+	// admin-facing Net line) loses the row's FULL total, not just the prorated
+	// amount actually credited. Net result on a partial refund: Refunded
+	// OVERSTATES cash actually returned (SUM(total) is an upper bound), and
+	// Net UNDERSTATES cash actually retained, by the exact same residue
+	// (total-amount) — Gross is unaffected either way. The actual credited
+	// amount is not persisted anywhere queryable, so neither side can be
+	// corrected from this table. Recording it would need a new column (same
+	// shape as list_total/code_discount, spec §3) and is out of this slice's
+	// scope.
+	if err := s.db.QueryRow("SELECT COUNT(*), COALESCE(SUM(total),0) FROM orders "+
 		"WHERE status='refunded' AND COALESCE(product,'')!=? AND refund_kind IN (?,?)",
 		depositProduct, RefundKindCustomer, RefundKindAdminCancel).
-		Scan(&r.RefundedCount); err != nil {
+		Scan(&r.RefundedCount, &r.RefundedRevenue); err != nil {
 		return nil, err
 	}
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM orders "+
@@ -424,7 +493,15 @@ func (s *Store) GetRevenueSummary(depositProduct string) (*RevenueSummary, error
 		Scan(&r.ExpiredCount); err != nil {
 		return nil, err
 	}
-	if err := s.db.QueryRow("SELECT COUNT(DISTINCT chat_id) FROM orders WHERE status='delivered'").
+	// Customers (stats-fixes-spec.md §5.1, audit A1 — the highest-ranked
+	// finding). This query had NO product filter at all, unlike its siblings
+	// above: every chat that has ever topped up a wallet reads as a "delivered
+	// order" customer, so a shop with 10 real buyers and 40 deposit-only chats
+	// rendered "Customers: 50" and looked like a catastrophic-conversion shop
+	// that does not exist. COALESCE-first for the same NULL-product reason as
+	// every filter above.
+	if err := s.db.QueryRow("SELECT COUNT(DISTINCT chat_id) FROM orders "+
+		"WHERE status='delivered' AND COALESCE(product,'')!=?", depositProduct).
 		Scan(&r.Customers); err != nil {
 		return nil, err
 	}
@@ -532,7 +609,14 @@ func (s *Store) GetRevenueMatrix(depositProduct string, sinceTS *float64, maxRow
 	if maxRows <= 0 {
 		maxRows = 60 // Python default, store.py:935
 	}
-	q := "SELECT ts, product, total FROM orders WHERE status='delivered' AND product!=?"
+	// COALESCE-first for the same NULL-product reason as GetRevenueSummary
+	// above (audit A1's trap, stats-fixes-spec.md §5.1): a bare `product!=?`
+	// would silently DROP a NULL-product delivered row (`NULL != x` is NULL,
+	// not TRUE), which would make this matrix's GrandTotal/GrandCount
+	// disagree with the dashboard's DeliveredRevenue/DeliveredCount on the
+	// exact same range — a real inconsistency between the two revenue
+	// surfaces, not a cosmetic gap.
+	q := "SELECT ts, product, total FROM orders WHERE status='delivered' AND COALESCE(product,'')!=?"
 	args := []any{depositProduct}
 	if sinceTS != nil {
 		q += " AND ts>=?"

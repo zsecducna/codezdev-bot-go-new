@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -103,6 +104,70 @@ func TestHistoryEmpty(t *testing.T) {
 	}
 	if len(inlineRows(got)) != 0 {
 		t.Errorf("empty history must have no buttons: %+v", inlineRows(got))
+	}
+}
+
+// TestHistorySummaryTextRespectsCharBudget is the carried-over stats-fixes
+// review item: historySummaryText used to cap at 40 products BY COUNT with no
+// character budget. Product names are admin-controlled folder names — cut()
+// bounds each to 32 RUNES, but Telegram's 4096 limit is BYTES, and 32 runes
+// of heavy multi-byte text (CJK is 3 bytes/rune in UTF-8) is well over 32
+// bytes. 45 such products blew the budget and sendMessage 400s, losing the
+// WHOLE message rather than a gracefully truncated one.
+//
+// Seeds 45 delivered, non-deposit orders for one chat, each with a distinct
+// product name padded to exactly 32 runes of 3-byte-per-rune CJK filler (the
+// worst case cut() allows through unchanged), and asserts: the rendered text
+// stays within historyMsgBudget, the "+N more products" marker appears
+// (proving truncation actually happened, not that the seed was too small),
+// and the Σ total line still reflects ALL 45 products — not just the shown
+// ones — matching the "footer is full-range" rule the revenue builders in
+// adminorders.go already follow.
+//
+// Falsification: reverting historySummaryText to the pre-fix "cap at 40 by
+// count, no budget" shape makes this exact seed render roughly 5000+ bytes
+// (40 lines * ~120 bytes/line of CJK-heavy product name) — the budget
+// assertion below fails, and in production this is the shape that gets the
+// WHOLE message dropped by a Telegram 400. Verified by mutation (see the
+// executor report).
+func TestHistorySummaryTextRespectsCharBudget(t *testing.T) {
+	b, _, st, _, _ := newBuyBot(t, "999")
+	const chat = "100"
+
+	const n = 45
+	for i := range n {
+		// 29 CJK filler runes (3 bytes each in UTF-8) + a 3-digit ASCII suffix
+		// for uniqueness = exactly 32 runes, cut()'s cap, and NOT truncated by
+		// it — so this is the worst case cut() lets through unchanged.
+		product := strings.Repeat("产", 29) + fmt.Sprintf("%03d", i)
+		des := fmt.Sprintf("hsumm%03d", i)
+		if err := st.CreateOrder(des, chat, "en", product, "T1", 1, 5000); err != nil {
+			t.Fatalf("CreateOrder(%s): %v", des, err)
+		}
+		if _, err := st.ClaimOrder(des, "reserved", "delivered"); err != nil {
+			t.Fatalf("claim %s -> delivered: %v", des, err)
+		}
+	}
+
+	text, hasPurchases := b.historySummaryText(100, i18n.EN)
+	if !hasPurchases {
+		t.Fatal("hasPurchases = false, want true")
+	}
+	if len(text) > historyMsgBudget {
+		t.Errorf("historySummaryText produced %d bytes, want <= %d (historyMsgBudget) — "+
+			"this is the shape that gets the WHOLE message dropped by a Telegram 400",
+			len(text), historyMsgBudget)
+	}
+	if !strings.Contains(text, "more products") {
+		t.Errorf("want the truncation marker present (proving truncation actually "+
+			"happened for this seed), got:\n%s", text)
+	}
+	// The Σ total must reflect ALL 45 products (225,000 VND / 45 accounts),
+	// not just however many lines fit under budget.
+	wantTotal := b.usdtDisp(5000 * n)
+	if !strings.Contains(text, wantTotal) {
+		t.Errorf("want the full-range Σ total %s present regardless of truncation, got:\n%s",
+			wantTotal, text)
 	}
 }
 

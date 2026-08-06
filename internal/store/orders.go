@@ -438,15 +438,6 @@ func (s *Store) ReservedOrdersBefore(tsCutoff float64) ([]*Order, error) {
 		tsCutoff)
 }
 
-// PaidOrders returns orders stuck in 'paid' (money in, delivery never
-// completed), newest first (store.py:827-835). Surfaced by the cron reconcile
-// for manual review — re-driving them moves real funds, so they are
-// intentionally never auto-handled.
-func (s *Store) PaidOrders() ([]*Order, error) {
-	return s.queryOrders(
-		"SELECT " + orderCols + " FROM orders WHERE status='paid' ORDER BY ts DESC")
-}
-
 // HasDeliveredOrder reports whether this chat has any DELIVERED account order
 // (i.e. is not a first-time buyer). Wallet top-ups are excluded
 // (store.py:1150-1157).
