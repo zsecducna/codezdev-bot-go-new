@@ -10,7 +10,7 @@ package handlers
 // Permission model (py_settings_spec.md §3): only adm:togglesales and
 // adm:toggleprivate are reachable by a standard (granted, non-super) admin
 // — the toggle_sales capability class. Every other action here (every other
-// toggle, every Kiro-Go setter, both on-chain address setters, all 6 payment
+// toggle, every Kiro-Go setter, both on-chain address setters, all 3 payment
 // toggles, and broadcast) is super-admin/owner/dev only, enforced by
 // settingsSuperAdminOnly. Go has no per-capability grant table yet
 // (admin.go's own header notes the std-admin filter isn't ported), so in
@@ -676,35 +676,91 @@ func (b *Bot) capSetKiroAcct(c *Ctx) bool {
 // the wallet balance) only.
 var payMethodNames = []string{"balance", "bep20", "tron"}
 
-// cbTogglePay is the shared handler for all 6 adm:togglepay:<method> buttons
-// — telegram_bot.py:13931. Super-admin only. Refuses to leave zero payment
-// methods enabled (computed over the CURRENT effective state of all 6,
-// defaults included). Unlike every other handler in this file, a successful
-// toggle RE-RENDERS the payments submenu in place rather than sending a
-// terminal message (py_settings_spec.md §4/§7).
+// depositMethodNames is the subset of payMethodNames that can actually put
+// NEW money into the system — a customer sends on-chain USDT and it lands in
+// their wallet. "balance" is deliberately excluded: it SPENDS money already
+// on deposit, it can never fund anything, so it must not count toward "the
+// shop can still take money" (see cbTogglePay's guard below).
+var depositMethodNames = []string{"bep20", "tron"}
+
+// cbTogglePay is the shared handler for all 3 adm:togglepay:<method> buttons
+// — telegram_bot.py:13931. Super-admin only. Refuses to leave zero WORKING
+// deposit rails — a rail only counts as "working" when it is BOTH
+// admin-enabled AND Configured() (see the WORKING-RAIL note below);
+// disabling "balance" is never blocked, since balance alone cannot fund the
+// shop either way.
+//
+// The guard used to be "at least one of all 3 methods must stay on", which
+// "balance" alone satisfied — an admin could disable both bep20 and tron
+// (balance still on) and the guard waved it through, reaching exactly the
+// unfundable-shop state this is supposed to prevent, just via the admin
+// panel instead of a bad restart default. See
+// TestTogglePayRefusesLastDepositRail, which fails if this regresses to
+// counting "balance" toward the guard again.
+//
+// WORKING-RAIL NOTE (2nd-round fix): the first version of this guard checked
+// only payEnabled(m), matching every OTHER call site's pattern except the
+// render sites (cmdDeposit, the admin payments menu, the buy screen), which
+// all additionally gate on <rail>.Configured(). Since Fix 1 to settings.go
+// made PayEnabled default every method ON, an unconfigured rail (no
+// BEP20_ADDRESS/TRON_ADDRESS set, the common single-chain shop) now reads
+// "enabled" while being invisible to every customer — so the old guard would
+// count it as "another deposit rail" and wave through disabling the ONE
+// rail that actually works. Both bep20Configured/tronConfigured must be
+// consulted here too, or the two independently-correct fixes reopen the
+// exact hole between them.
+//
+// EDGE CASE: the guard only fires when `method` ITSELF is a working rail
+// today (enabled AND configured). If `method` is enabled-but-unconfigured,
+// toggling it changes nothing about the shop's real fundability — the shop
+// was already dark on that rail regardless of the setting — so blocking the
+// toggle would be noise, not protection, and an admin cleaning up a
+// half-configured instance couldn't turn the dead flag off. See
+// TestTogglePayAllowsDisablingUnconfiguredDepositRail and
+// TestTogglePayRefusesLastConfiguredDepositRail (the TRON-only-shop
+// scenario this round's review reproduced).
+//
+// Unlike every other handler in this file, a successful toggle RE-RENDERS
+// the payments submenu in place rather than sending a terminal message
+// (py_settings_spec.md §4/§7).
 func (b *Bot) cbTogglePay(cc *cbCtx, method string) {
 	if !b.settingsSuperAdminOnly(cc) {
 		return
 	}
 	if !slices.Contains(payMethodNames, method) {
-		return // unknown method: silent, matches Python's validated-list guard
+		// Unknown method: a stale adm:togglepay:paypal/binance button tapped
+		// from a menu rendered before the USDT migration (S1-S3) removed
+		// those rails. admin.go:882's dispatcher already deleted the message
+		// that held the tap before we got here (command.go:182), so silently
+		// returning (the pre-fix behavior) left the super-admin staring at a
+		// chat with the menu gone and no explanation — same defect class as
+		// the dep: fall-through fixed for customers in deposit.go's cbDep.
+		b.send(cc.Ctx, cc.ChatID,
+			"⚠️ That payment method no longer exists.",
+			admNav("admcat:payments"))
+		return
 	}
 	if b.cfg == nil {
 		b.send(cc.Ctx, cc.ChatID, settingsNotConfigured, admNav("admcat:payments"))
 		return
 	}
+	// railConfigured mirrors every render site's payEnabled(m) &&
+	// <rail>.Configured() gate — see the WORKING-RAIL note above. Only
+	// bep20/tron have a Configured() concept; "balance" never reaches this
+	// map since it's excluded from depositMethodNames below.
+	railConfigured := map[string]func() bool{"bep20": b.bep20Configured, "tron": b.tronConfigured}
 	cur := b.payEnabled(method)
-	if cur {
-		anyOther := false
-		for _, m := range payMethodNames {
-			if m != method && b.payEnabled(m) {
-				anyOther = true
+	if cur && slices.Contains(depositMethodNames, method) && railConfigured[method]() {
+		anyOtherWorking := false
+		for _, m := range depositMethodNames {
+			if m != method && b.payEnabled(m) && railConfigured[m]() {
+				anyOtherWorking = true
 				break
 			}
 		}
-		if !anyOther {
+		if !anyOtherWorking {
 			b.send(cc.Ctx, cc.ChatID,
-				"⚠️ Can't disable the last payment method — at least one must stay on.",
+				"⚠️ Can't disable the last deposit method — at least one must stay on so customers can fund their wallet.",
 				backKB("admcat:payments"))
 			return
 		}

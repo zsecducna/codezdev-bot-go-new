@@ -85,20 +85,6 @@ type usdtRow struct {
 	TClick float64
 }
 
-// usdtSession is a lock-free snapshot joining a bands.Reservation with its
-// usdtRow, so the pollers/verify can work entirely outside every mutex.
-type usdtSession struct {
-	Des       string
-	ChatID    string
-	Amount    string
-	Total     int64
-	SinceMS   int64
-	TStart    float64
-	TClick    float64
-	Deadline  time.Time
-	CreatedAt time.Time
-}
-
 // registerUSDT attaches the USDT rails' capture + callback routes.
 //
 // pending_txid is capture #43 (handlers-go.md §2.2) — it must sit BEFORE
@@ -264,31 +250,6 @@ func (b *Bot) markUSDTClick(p bands.Provider, des string, at float64) bool {
 	}
 	r.TClick = at
 	return true
-}
-
-// usdtSnapshotAll joins every live row of one provider with its band reservation,
-// under no lock the caller can observe — the input to the Binance poller cycle
-// (`snapshot = dict(_binance_pending)` @9214) and to the rehydrate accounting.
-func (b *Bot) usdtSnapshotAll(p bands.Provider) []usdtSession {
-	b.usdtMu.Lock()
-	rows := make(map[string]usdtRow, len(b.usdtRows[p]))
-	for des, r := range b.usdtRows[p] {
-		rows[des] = *r
-	}
-	b.usdtMu.Unlock()
-	out := make([]usdtSession, 0, len(rows))
-	for des, r := range rows {
-		res, ok := b.bands.Get(p, des) // Registry takes its own lock; usdtMu is released
-		if !ok {
-			continue // band already swept -> the row is dead, the sweeper drops it
-		}
-		out = append(out, usdtSession{
-			Des: des, ChatID: res.ChatID, Amount: res.Amount,
-			Total: r.Total, SinceMS: r.SinceMS, TStart: r.TStart, TClick: r.TClick,
-			Deadline: res.Deadline, CreatedAt: res.CreatedAt,
-		})
-	}
-	return out
 }
 
 // persistUSDTPending writes the rail's persisted pending row so a restart can

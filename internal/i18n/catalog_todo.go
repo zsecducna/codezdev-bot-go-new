@@ -16,7 +16,8 @@ package i18n
 //                          quantity / pay-screen / cancel-keep strings   (M2.2)
 //   catalog_deposit.go   — DEPOSIT_QR, DEPOSIT_OK, DEPOSIT_TIMEOUT, /info
 //                          BALANCE, history HISTORY_* strings            (M2.3)
-//   catalog_pay.go       — PayPal / Binance / BEP20 / TRON prompts       (M2.4)
+//   catalog_pay.go       — BEP20 / TRON prompts (PayPal/Binance removed by
+//                          the USDT-only migration, S1-S3)               (M2.4)
 //   catalog_apikey.go    — APIKEY_BTN, KIROAPI_BTN, APIKEY_RC_BTN, mint /
 //                          recharge / my-keys / group-refund strings     (M2.5)
 //   catalog_customer.go  — Self-Service submenu headers, OTP, refund,

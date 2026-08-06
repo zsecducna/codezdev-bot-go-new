@@ -454,26 +454,142 @@ func TestNonPaymentToggleSendsTerminalMessage(t *testing.T) {
 	}
 }
 
-func TestTogglePayRefusesLastMethod(t *testing.T) {
+// TestTogglePayRefusesLastDepositRail proves the deposit-fundability guard:
+// with bep20 the only WORKING deposit rail (enabled AND configured; tron
+// off, balance irrelevant), disabling bep20 must be refused — otherwise no
+// customer can put new money into the shop at all (Fix 2, teammate review of
+// 1c83611). Mutating cbTogglePay's guard back to
+// slices.Contains(payMethodNames, ...) — the pre-fix "any of 3 methods"
+// check — makes this fail, because "balance" alone used to satisfy it.
+func TestTogglePayRefusesLastDepositRail(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("BEP20_ADDRESS", testSellerBSC) // bep20 must be Configured() too, or the guard never engages
+	t.Setenv("TRON_ADDRESS", "")
+	b, f, cfg := newSettingsTestBot(t, "1")
+	s := cfg.Settings()
+	s["pay_balance"] = true
+	s["pay_bep20"] = true
+	s["pay_tron"] = false
+	if err := cfg.SaveSettings(s); err != nil {
+		t.Fatal(err)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:togglepay:bep20"))
+	want := "⚠️ Can't disable the last deposit method — at least one must stay on so customers can fund their wallet."
+	if last := lastSendMsg(f); last == nil || last.Text != want {
+		t.Fatalf("reply = %+v, want %q", last, want)
+	}
+	s2 := cfg.Settings()
+	if v, _ := s2["pay_bep20"].(bool); !v {
+		t.Error("the last deposit rail must not actually be disabled")
+	}
+}
+
+// TestTogglePayRefusesLastConfiguredDepositRail reproduces the seam bug the
+// 2nd review round caught: a TRON-only shop (the common single-chain setup)
+// — BEP20_ADDRESS never set, so pay_bep20 is absent from settings.json and
+// reads ENABLED (Fix 1's new default), but bep20 is NOT Configured() and
+// therefore invisible to every customer. TRON is both enabled and
+// configured — it is the ONLY rail that actually works. Disabling tron must
+// still be refused: the old (1st-round) guard checked payEnabled(bep20)
+// alone, saw it "on", and would have waved this through, going dark with a
+// success confirmation. Mutating cbTogglePay to drop the railConfigured[m]()
+// check from the "other rail" loop reproduces exactly that and makes this
+// fail.
+func TestTogglePayRefusesLastConfiguredDepositRail(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("TRON_ADDRESS", testSellerTRX)
+	t.Setenv("BEP20_ADDRESS", "") // bep20 stays enabled-by-default but unconfigured
+	b, f, cfg := newSettingsTestBot(t, "1")
+	s := cfg.Settings()
+	s["pay_tron"] = true
+	// pay_bep20 intentionally absent — mirrors a real pre-migration
+	// settings.json with no pay_bep20 key at all.
+	if err := cfg.SaveSettings(s); err != nil {
+		t.Fatal(err)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:togglepay:tron"))
+	want := "⚠️ Can't disable the last deposit method — at least one must stay on so customers can fund their wallet."
+	if last := lastSendMsg(f); last == nil || last.Text != want {
+		t.Fatalf("reply = %+v, want %q — an unconfigured bep20 must not count as a working deposit rail", last, want)
+	}
+	s2 := cfg.Settings()
+	if v, _ := s2["pay_tron"].(bool); !v {
+		t.Error("the last WORKING deposit rail must not actually be disabled")
+	}
+}
+
+// TestTogglePayAllowsDisablingUnconfiguredDepositRail proves the deliberate
+// edge-case decision documented on cbTogglePay: when the method being
+// toggled is itself enabled-but-UNCONFIGURED, the guard does not fire, even
+// if it is the only enabled deposit method. The shop is already dark on that
+// rail regardless of the setting, so blocking the toggle would only stop an
+// admin from cleaning up a half-configured instance — it protects nothing.
+func TestTogglePayAllowsDisablingUnconfiguredDepositRail(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("BEP20_ADDRESS", "")
+	t.Setenv("TRON_ADDRESS", "")
+	b, f, cfg := newSettingsTestBot(t, "1")
+	s := cfg.Settings()
+	s["pay_bep20"] = true // enabled, but unconfigured — not a working rail
+	s["pay_tron"] = false
+	if err := cfg.SaveSettings(s); err != nil {
+		t.Fatal(err)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:togglepay:bep20"))
+	if last := lastSendMsg(f); last == nil || last.Text == "⚠️ Can't disable the last deposit method — at least one must stay on so customers can fund their wallet." {
+		t.Fatalf("disabling an unconfigured deposit rail was blocked, want it to succeed: %+v", last)
+	}
+	s2 := cfg.Settings()
+	if v, _ := s2["pay_bep20"].(bool); v {
+		t.Error("pay_bep20 should now be false")
+	}
+}
+
+// TestTogglePayAllowsDisablingLastBalance proves "balance" is never subject
+// to the last-method guard: it spends money already on deposit, it cannot
+// fund the shop, so counting it toward "a payment method survives" is
+// exactly the bug that let an admin zero out both real deposit rails while
+// the guard still reported success (Fix 2). Here bep20/tron are already
+// off; disabling the sole remaining "balance" must go through cleanly.
+func TestTogglePayAllowsDisablingLastBalance(t *testing.T) {
 	ctx := context.Background()
 	b, f, cfg := newSettingsTestBot(t, "1")
 	s := cfg.Settings()
-	for _, m := range payMethodNames {
-		s["pay_"+m] = false
-	}
 	s["pay_balance"] = true
+	s["pay_bep20"] = false
+	s["pay_tron"] = false
 	if err := cfg.SaveSettings(s); err != nil {
 		t.Fatal(err)
 	}
 
 	b.Process(ctx, callbackUpdate(1, "adm:togglepay:balance"))
-	want := "⚠️ Can't disable the last payment method — at least one must stay on."
-	if last := lastSendMsg(f); last == nil || last.Text != want {
-		t.Fatalf("reply = %+v, want %q", last, want)
+	if last := lastSendMsg(f); last == nil || last.Text == "⚠️ Can't disable the last deposit method — at least one must stay on so customers can fund their wallet." {
+		t.Fatalf("disabling the last balance method was blocked, want it to succeed: %+v", last)
 	}
 	s2 := cfg.Settings()
-	if v, _ := s2["pay_balance"].(bool); !v {
-		t.Error("the last payment method must not actually be disabled")
+	if v, _ := s2["pay_balance"].(bool); v {
+		t.Error("pay_balance should now be false")
+	}
+}
+
+// TestTogglePayStaleMethodAnswers proves a stale adm:togglepay:paypal (or
+// :binance) tap — left over from a menu rendered before the USDT migration
+// removed those rails — gets an explicit answer instead of silently doing
+// nothing after the tapped message was already deleted (Fix 3, same defect
+// class as cbDep's dep: fall-through fix in deposit.go).
+func TestTogglePayStaleMethodAnswers(t *testing.T) {
+	ctx := context.Background()
+	b, f, _ := newSettingsTestBot(t, "1")
+	b.Process(ctx, callbackUpdate(1, "adm:togglepay:paypal"))
+	last := lastSendMsg(f)
+	if last == nil {
+		t.Fatal("a stale adm:togglepay:paypal tap must not be silently dropped")
+	}
+	if last.Text != "⚠️ That payment method no longer exists." {
+		t.Errorf("reply = %q, want the removed-method notice", last.Text)
 	}
 }
 

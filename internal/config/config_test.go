@@ -482,11 +482,32 @@ func TestPayEnabledDefaults(t *testing.T) {
 	if !c.PayEnabled("balance") {
 		t.Error(`PayEnabled("balance") = false, want true default`)
 	}
-	if c.PayEnabled("bep20") {
-		t.Error(`PayEnabled("bep20") = true, want false default (on-chain methods default off)`)
+	if !c.PayEnabled("bep20") {
+		t.Error(`PayEnabled("bep20") = false, want true default`)
 	}
-	if c.PayEnabled("tron") {
-		t.Error(`PayEnabled("tron") = true, want false default`)
+	if !c.PayEnabled("tron") {
+		t.Error(`PayEnabled("tron") = false, want true default`)
+	}
+}
+
+// TestPayEnabledOnChainRailsDefaultOn is the regression guard for the
+// restart-goes-dark bug: a production settings.json written before the USDT
+// migration has NO "pay_bep20"/"pay_tron" keys at all (PayPal/Binance
+// carried the shop back then), so PayEnabled must treat a wholly EMPTY
+// settings.json exactly like a freshly created one — both rails ON. If
+// either rail's default ever flips back to OFF (e.g. a reintroduced
+// _PAY_DEFAULT_OFF-style map), this test fails; bep20.Configured()/
+// tron.Configured() are the correct place to gate an unconfigured rail out
+// of the UI, not this default (settings.go's PayEnabled doc comment).
+func TestPayEnabledOnChainRailsDefaultOn(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "settings.json"), `{}`)
+	c := mustLoad(t, dir)
+	if !c.PayEnabled("bep20") {
+		t.Error(`PayEnabled("bep20") = false on an empty settings.json, want true — the shop would go dark on restart`)
+	}
+	if !c.PayEnabled("tron") {
+		t.Error(`PayEnabled("tron") = false on an empty settings.json, want true — the shop would go dark on restart`)
 	}
 }
 

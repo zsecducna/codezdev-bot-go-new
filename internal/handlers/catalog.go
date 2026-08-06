@@ -52,10 +52,13 @@ func (b *Bot) settings() map[string]any {
 }
 
 // payEnabled reports whether a payment method is admin-enabled — pay_enabled
-// (telegram_bot.py:5150-5153). bep20/tron default OFF; the rest ON.
+// (telegram_bot.py:5150-5153). All methods default ON (config/settings.go's
+// PayEnabled doc comment explains why bep20/tron no longer default OFF); the
+// nil-cfg fallback here (unit tests / unconfigured install) must match that
+// exactly, or it becomes stale bait for someone to "restore" the old default.
 func (b *Bot) payEnabled(method string) bool {
 	if b.cfg == nil {
-		return method != "bep20" && method != "tron"
+		return true
 	}
 	return b.cfg.PayEnabled(method)
 }

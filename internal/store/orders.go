@@ -252,7 +252,7 @@ func IsRealRefundOrder(o *Order) bool {
 // It is enforced structurally rather than by convention — the one UPDATE sets
 // the kind when toStatus=="refunded" and NULLs it for every other status. That
 // matters because three call sites REVERT a refund
-// (apikey_deliver.go:247,404 and purchase.go:343 all do
+// (apikey_deliver.go:247,404 and purchase.go:339 all do
 // ClaimOrder(des, "refunded", "paid")); if the kind survived such a revert, a
 // status='paid' row would carry a stale kind and every GROUP BY refund_kind
 // report would count an order that is not refunded at all.
@@ -270,7 +270,7 @@ func IsRealRefundOrder(o *Order) bool {
 //	apikey_deliver.go:228  mint_failed
 //	apikey_deliver.go:390  mint_failed
 //	purchase.go:324        out_of_stock
-//	deposit.go:253         late_settled
+//	deposit.go:263         late_settled
 //
 // The three dynamic-`from` sites are pre-gated by refundableStatuses
 // {delivered, paid} (apikey_refund.go:33), so each is a REAL refund: delivered

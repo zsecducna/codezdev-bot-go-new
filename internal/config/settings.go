@@ -251,20 +251,32 @@ func (c *Config) ReferralEnabled() bool {
 	return false
 }
 
-// payDefaultOff mirrors _PAY_DEFAULT_OFF (telegram_bot.py:5147): on-chain
-// USDT methods default OFF until the admin sets a receiving address and
-// enables them; every other method defaults ON.
-var payDefaultOff = map[string]bool{"bep20": true, "tron": true}
-
-// PayEnabled reports whether payment method `method`
-// (balance/qr/paypal/binance/bep20/tron) is admin-enabled. Mirrors
-// pay_enabled (telegram_bot.py:5150-5153).
+// PayEnabled reports whether payment method `method` (balance/bep20/tron) is
+// admin-enabled. All three default ON.
+//
+// This used to default on-chain methods (bep20/tron) OFF, mirroring
+// _PAY_DEFAULT_OFF (telegram_bot.py:5147) — the idea being an admin who
+// hasn't set a receiving address yet shouldn't advertise the rail. That
+// rationale is already enforced, independently and more precisely, by
+// bep20.Configured()/tron.Configured(): every render site (cmdDeposit in
+// deposit.go, the admin payments menu, the buy screen) gates on
+// PayEnabled(method) && <rail>.Configured(), so an unconfigured rail can
+// NEVER appear regardless of what this function returns. Defaulting the
+// setting OFF therefore added nothing but a silent failure mode: PayPal and
+// BEP20/TRON were removed from defaultSettings() and pay_bep20/pay_tron were
+// never written into an already-running instance's settings.json (PayPal
+// and Binance carried the shop before the USDT migration), so on restart
+// BOTH surviving rails would read as OFF here, cmdDeposit would offer zero
+// funding methods, and the shop goes dark with no error and a green test
+// suite. Do NOT "restore" the old default — see
+// TestPayEnabledOnChainRailsDefaultOn, which exists specifically to fail if
+// this regresses. Mirrors pay_enabled (telegram_bot.py:5150-5153), with the
+// on-chain-defaults-off behavior deliberately dropped as described above.
 func (c *Config) PayEnabled(method string) bool {
-	def := !payDefaultOff[method]
 	if v, ok := boolValue(c.Settings(), "pay_"+method); ok {
 		return v
 	}
-	return def
+	return true
 }
 
 // MaxBulk returns the admin-configured max accounts per order; 0 means
