@@ -134,7 +134,7 @@ func TestRateValidatorRange(t *testing.T) {
 			b.Process(ctx, textUpdate(1, tc.raw))
 			last := lastSendMsg(f)
 			if tc.wantOK {
-				want := "✅ USD→VND rate set to " + commaInt(tc.wantN) + ". New orders price PayPal/Binance at this rate."
+				want := "✅ USD→VND rate set to " + commaInt(tc.wantN) + ". New orders and USDT quotes price at this rate."
 				if last == nil || last.Text != want {
 					t.Fatalf("raw=%q reply = %+v, want %q", tc.raw, last, want)
 				}
@@ -417,7 +417,7 @@ func TestTogglePrivateBespoke(t *testing.T) {
 func TestPaymentsToggleRerendersMenu(t *testing.T) {
 	ctx := context.Background()
 	b, f, _ := newSettingsTestBot(t, "1")
-	b.Process(ctx, callbackUpdate(1, "adm:togglepay:paypal"))
+	b.Process(ctx, callbackUpdate(1, "adm:togglepay:bep20"))
 	last := lastSendMsg(f)
 	if last == nil {
 		t.Fatal("no message sent")
@@ -520,7 +520,7 @@ func TestSetRateWizard(t *testing.T) {
 	}
 	b.Process(ctx, callbackUpdate(1, "adm:setrate"))
 	b.Process(ctx, textUpdate(1, "23,000"))
-	wantOK := "✅ USD→VND rate set to 23,000. New orders price PayPal/Binance at this rate."
+	wantOK := "✅ USD→VND rate set to 23,000. New orders and USDT quotes price at this rate."
 	if last := lastSendMsg(f); last == nil || last.Text != wantOK {
 		t.Fatalf("valid reply = %+v, want %q", last, wantOK)
 	}

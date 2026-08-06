@@ -1,10 +1,11 @@
 package i18n
 
 // catalog_pay.go — the USDT rail string cluster (telegram_bot.py:1326-1481):
-// the Binance Pay screen, the BEP20/TRON on-chain pay+deposit screens, the
-// "I have made the payment" button, and the whole verify-by-tx-hash message
-// family (TXID_*), plus the two "not configured" notices and the band-exhausted
-// USDT_BUSY notice.
+// the BEP20/TRON on-chain pay+deposit screens, the "I have made the payment"
+// button, and the whole verify-by-tx-hash message family (TXID_*), plus the
+// two "not configured" notices and the band-exhausted USDT_BUSY notice. The
+// Binance Pay screen (BinancePay / BinanceNoID) was removed by the USDT-only
+// migration (S3).
 //
 // Same conventions as the other catalog_<feature>.go files: values are copied
 // byte-verbatim from the cited Python constants, `{token}` placeholders are kept
@@ -12,14 +13,8 @@ package i18n
 // this cluster), and the token SET is identical across the three languages so
 // TestStringsComplete passes.
 
-// PayCatalog holds the Binance / BEP20 / TRON payment + verification strings.
+// PayCatalog holds the BEP20 / TRON payment + verification strings.
 type PayCatalog struct {
-	// BinancePay — BINANCE_PAY (telegram_bot.py:1326): the Binance Pay screen
-	// caption; {usdt} (the UNIQUE amount that identifies the order) and {pay_id}.
-	BinancePay Str
-	// BinanceNoID — BINANCE_NOID (telegram_bot.py:1341): the Binance button was
-	// tapped but BINANCE_API_KEY/SECRET are unset.
-	BinanceNoID Str
 	// BEP20Pay / TronPay — BEP20_PAY / TRON_PAY (telegram_bot.py:1352/1371): the
 	// on-chain pay+deposit screens; {usdt} {address}. Markdown so the address
 	// renders as a copyable code block.
@@ -69,27 +64,6 @@ type PayCatalog struct {
 // cited Python constants.
 func buildPayCatalog() PayCatalog {
 	return PayCatalog{
-		// BINANCE_PAY (telegram_bot.py:1326).
-		BinancePay: Str{
-			VI: "🪙 Gửi CHÍNH XÁC {usdt} USDT qua Binance Pay.\n" +
-				"Binance Pay ID: {pay_id}\n" +
-				"Quét QR bên dưới hoặc nhập Pay ID trong app Binance, rồi gửi đúng {usdt} USDT.\n" +
-				"⚠️ Phải đúng số tiền (dùng để nhận diện đơn). Tự động xác nhận trong tối đa 10 phút...",
-			EN: "🪙 Send EXACTLY {usdt} USDT via Binance Pay.\n" +
-				"Binance Pay ID: {pay_id}\n" +
-				"Scan the QR below or enter the Pay ID in your Binance app, then send {usdt} USDT.\n" +
-				"⚠️ The amount must match exactly (it identifies your order). Auto-confirms within 10 minutes...",
-			ZH: "🪙 通过 Binance Pay 发送准确的 {usdt} USDT。\n" +
-				"Binance Pay ID: {pay_id}\n" +
-				"扫描下方二维码或在币安 App 输入 Pay ID，然后发送 {usdt} USDT。\n" +
-				"⚠️ 金额必须完全一致（用于识别您的订单）。最长 10 分钟内自动确认...",
-		},
-		// BINANCE_NOID (telegram_bot.py:1341).
-		BinanceNoID: Str{
-			VI: "⚠️ Thanh toán Binance chưa được cấu hình. Vui lòng chọn cách khác hoặc liên hệ @zsec_ducna.",
-			EN: "⚠️ Binance payment is not configured. Please choose another method or contact @zsec_ducna.",
-			ZH: "⚠️ 未配置 Binance 支付。请选择其他方式或联系 @zsec_ducna。",
-		},
 		// BEP20_PAY (telegram_bot.py:1352).
 		BEP20Pay: Str{
 			VI: "🟡 Gửi CHÍNH XÁC {usdt} USDT tới địa chỉ BEP20 (BNB Smart Chain) sau:\n" +

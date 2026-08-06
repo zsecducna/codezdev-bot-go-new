@@ -66,11 +66,9 @@ type BuyCatalog struct {
 	// {product} {unit} {qty} {pct} {total} {balance}.
 	PayPrompt Str
 	// PayBtn* — the per-method pay buttons (telegram_bot.py:1302-1310). PayBtnQR
-	// (SePay/VietQR) was removed by the USDT-only migration (S1). PayBtnRmCode
-	// carries {code}.
+	// (SePay/VietQR), PayBtnPayPal and PayBtnBinance were removed by the
+	// USDT-only migration (S1-S3). PayBtnRmCode carries {code}.
 	PayBtnBalance   Str
-	PayBtnPayPal    Str
-	PayBtnBinance   Str
 	PayBtnBEP20     Str
 	PayBtnTRON      Str
 	PayBtnApplyCode Str
@@ -98,13 +96,6 @@ type BuyCatalog struct {
 	// PayMethodOff — PAY_METHOD_OFF (telegram_bot.py:1575): a pay method disabled
 	// under the button (stale tap).
 	PayMethodOff Str
-	// PaypalLink — PAYPAL_LINK (telegram_bot.py:1313): the message carrying the
-	// PayPal approval link for an ORDER pay (paypp:); {usd} {url}.
-	PaypalLink Str
-	// PaypalError — PAYPAL_ERROR (telegram_bot.py:1318): the PayPal order could
-	// not be created (API/credential failure or no approve link). Shared by the
-	// order-pay (paypp:) and wallet-deposit (dep:pp) rails.
-	PaypalError Str
 	// DepositTimeout — DEPOSIT_TIMEOUT (telegram_bot.py:431): the "payment window
 	// closed" notice the expiry worker sends when it wins reserved->expired.
 	DepositTimeout Str
@@ -211,8 +202,6 @@ func buildBuyCatalog() BuyCatalog {
 		},
 		// PAY_BTN_* (telegram_bot.py:1302-1310).
 		PayBtnBalance:   Str{EN: "💰 Pay with balance", VI: "💰 Trả bằng số dư", ZH: "💰 余额支付"},
-		PayBtnPayPal:    Str{EN: "🌍 Pay with PayPal", VI: "🌍 Trả bằng PayPal", ZH: "🌍 PayPal 支付"},
-		PayBtnBinance:   Str{EN: "🪙 Pay with Binance (USDT)", VI: "🪙 Trả bằng Binance (USDT)", ZH: "🪙 Binance 支付 (USDT)"},
 		PayBtnBEP20:     Str{EN: "Pay with USDT (BEP20)", VI: "Trả bằng USDT (BEP20)", ZH: "USDT 支付 (BEP20)"},
 		PayBtnTRON:      Str{EN: "Pay with USDT (TRC20)", VI: "Trả bằng USDT (TRC20)", ZH: "USDT 支付 (TRC20)"},
 		PayBtnApplyCode: Str{EN: "🎟️ Apply promo / referral code", VI: "🎟️ Nhập mã giảm giá", ZH: "🎟️ 使用优惠码 / 推荐码"},
@@ -252,11 +241,13 @@ func buildBuyCatalog() BuyCatalog {
 			VI: "⚠️ Đơn hàng đã hết hạn hoặc đã được xử lý. Vui lòng đặt lại từ /buy.",
 			ZH: "⚠️ 此订单已过期或已处理。请从 /buy 重新下单。",
 		},
-		// INSUFFICIENT (telegram_bot.py:1498).
+		// INSUFFICIENT (telegram_bot.py:1498). Rewritten off the SePay/VietQR
+		// wording (USDT-only migration, S1) — "pay with QR" is no longer a real
+		// option, so the notice now points at the surviving on-chain rails.
 		Insufficient: Str{
-			EN: "⚠️ Insufficient balance. Please top up or pay with QR.",
-			VI: "⚠️ Số dư không đủ. Vui lòng nạp tiền hoặc trả bằng QR.",
-			ZH: "⚠️ 余额不足。请充值或使用二维码支付。",
+			EN: "⚠️ Insufficient balance. Please top up or pay with USDT (BEP20/TRON).",
+			VI: "⚠️ Số dư không đủ. Vui lòng nạp tiền hoặc trả bằng USDT (BEP20/TRON).",
+			ZH: "⚠️ 余额不足。请充值或使用 USDT (BEP20/TRON) 支付。",
 		},
 		// PAID_NO_STOCK (telegram_bot.py:1224) — carries the support @handle.
 		PaidNoStock: Str{
@@ -269,18 +260,6 @@ func buildBuyCatalog() BuyCatalog {
 			EN: "⚠️ This payment method is currently unavailable. Please choose another.",
 			VI: "⚠️ Phương thức thanh toán này hiện không khả dụng. Vui lòng chọn cách khác.",
 			ZH: "⚠️ 此支付方式当前不可用。请选择其他方式。",
-		},
-		// PAYPAL_LINK (telegram_bot.py:1313).
-		PaypalLink: Str{
-			EN: "🌍 Tap to pay with PayPal ({usd} USDT):\n{url}\n\nYour accounts are delivered once payment completes.",
-			VI: "🌍 Nhấn để thanh toán bằng PayPal ({usd} USDT):\n{url}\n\nTài khoản sẽ được giao sau khi thanh toán hoàn tất.",
-			ZH: "🌍 点击使用 PayPal 支付（{usd} USDT）：\n{url}\n\n付款完成后将交付账户。",
-		},
-		// PAYPAL_ERROR (telegram_bot.py:1318) — carries the support @handle.
-		PaypalError: Str{
-			EN: "⚠️ Could not create PayPal payment. Please try another method or contact @zsec_ducna.",
-			VI: "⚠️ Không thể tạo thanh toán PayPal. Vui lòng thử cách khác hoặc liên hệ @zsec_ducna.",
-			ZH: "⚠️ 无法创建 PayPal 付款。请尝试其他方式或联系 @zsec_ducna。",
 		},
 		// DEPOSIT_TIMEOUT (telegram_bot.py:431) — carries the support @handle.
 		DepositTimeout: Str{

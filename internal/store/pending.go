@@ -5,21 +5,17 @@
 // on (store.py:126-133). Persisted so a restart can rehydrate the in-memory
 // poller AND an out-of-process reconcile can settle a credit that arrived
 // while the bot was down.
+//
+// USDT migration note (2026-08-06): the Binance Pay rail was removed (S3),
+// taking its only callers with it — BinancePendingAdd/Del/All and the
+// BinancePending struct were deleted as dead code (defect class: a
+// feature-cut leaving a handler function with zero remaining callers). The
+// `binance_pending` TABLE itself is left in the schema (internal/store/store.go)
+// per the migration plan — any straggler rows stay inspectable until the
+// later live-data migration slice drops it.
 package store
 
 import "database/sql"
-
-// BinancePending mirrors one `binance_pending` row (store.py:131-133).
-// SinceMS is the "ignore older transfers" floor.
-type BinancePending struct {
-	Des      string
-	ChatID   string
-	Amount   string // 2-dp unique USDT string to match on
-	Total    int64  // VND
-	SinceMS  int64
-	Deadline float64
-	TS       float64
-}
 
 // Bep20Pending mirrors one `bep20_pending` row (store.py:137-139). FromBlock
 // was the eth_getLogs floor (unused/0 now — no poller, store.py:769-770).
@@ -34,7 +30,7 @@ type Bep20Pending struct {
 }
 
 // TronPending mirrors one `tron_pending` row (store.py:143-145). MinTS is the
-// epoch-ms verify-query floor (mirrors binance's since_ms).
+// epoch-ms verify-query floor.
 type TronPending struct {
 	Des      string
 	ChatID   string
@@ -43,52 +39,6 @@ type TronPending struct {
 	MinTS    int64
 	Deadline float64
 	TS       float64
-}
-
-// BinancePendingAdd persists a pending Binance order so the poller/reconcile
-// survive a restart (store.py:741-751). INSERT OR REPLACE so a re-tap (same
-// des, same amount) just refreshes the row.
-func (s *Store) BinancePendingAdd(des, chatID, amount string, total, sinceMS int64, deadline float64) error {
-	_, err := s.db.Exec("INSERT OR REPLACE INTO binance_pending"+
-		"(des, chat_id, amount, total, since_ms, deadline, ts) "+
-		"VALUES (?,?,?,?,?,?,?)",
-		des, chatID, amount, total, sinceMS, deadline, now())
-	return err
-}
-
-// BinancePendingDel drops a pending Binance order (settled, expired, or
-// abandoned). Idempotent (store.py:754-757).
-func (s *Store) BinancePendingDel(des string) error {
-	_, err := s.db.Exec("DELETE FROM binance_pending WHERE des=?", des)
-	return err
-}
-
-// BinancePendingAll returns all pending Binance orders (for startup rehydrate
-// / cron reconcile, store.py:760-764).
-func (s *Store) BinancePendingAll() ([]BinancePending, error) {
-	rows, err := s.db.Query(
-		"SELECT des, chat_id, amount, total, since_ms, deadline, ts FROM binance_pending")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []BinancePending
-	for rows.Next() {
-		var (
-			p              BinancePending
-			chatID, amount sql.NullString
-			total, since   sql.NullInt64
-			deadline, ts   sql.NullFloat64
-		)
-		if err := rows.Scan(&p.Des, &chatID, &amount, &total, &since, &deadline, &ts); err != nil {
-			return nil, err
-		}
-		p.ChatID, p.Amount = chatID.String, amount.String
-		p.Total, p.SinceMS = total.Int64, since.Int64
-		p.Deadline, p.TS = deadline.Float64, ts.Float64
-		out = append(out, p)
-	}
-	return out, rows.Err()
 }
 
 // Bep20PendingAdd persists a pending USDT BEP20 order so its unique-amount

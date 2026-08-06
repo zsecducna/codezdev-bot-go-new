@@ -42,9 +42,9 @@ type docSend struct {
 }
 
 // photoSend records one sendPhoto call. PhotoURL carries the hosted image URL
-// (SendPhotoURL / SendPhotoURLOpts) or the LOCAL file path (SendPhoto), so a test
-// can assert on either QR path; Markup is the inline keyboard attached to the
-// photo (the BEP20/TRON "I have made the payment" button).
+// (SendPhotoURLOpts) or the LOCAL file path (SendPhoto), so a test can assert
+// on either QR path; Markup is the inline keyboard attached to the photo (the
+// BEP20/TRON "I have made the payment" button).
 type photoSend struct {
 	ChatID   int64
 	PhotoURL string
@@ -104,13 +104,6 @@ func (f *fakeTG) SendDocument(_ context.Context, chatID int64, filePath, caption
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Docs = append(f.Docs, docSend{ChatID: chatID, FilePath: filePath, Caption: caption})
-	return &tg.Message{MessageID: 1, Chat: tg.Chat{ID: chatID}}, nil
-}
-
-func (f *fakeTG) SendPhotoURL(_ context.Context, chatID int64, photoURL, caption string) (*tg.Message, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.Photos = append(f.Photos, photoSend{ChatID: chatID, PhotoURL: photoURL, Caption: caption})
 	return &tg.Message{MessageID: 1, Chat: tg.Chat{ID: chatID}}, nil
 }
 

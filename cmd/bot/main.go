@@ -28,7 +28,6 @@ import (
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/pay/bands"
 	"codezdev-bot/internal/pay/bep20"
-	"codezdev-bot/internal/pay/binance"
 	"codezdev-bot/internal/pay/tron"
 	"codezdev-bot/internal/refund"
 	"codezdev-bot/internal/stock"
@@ -157,22 +156,23 @@ func main() {
 	// One-shot permission migration for data written by an older build.
 	tightenDataModes()
 
-	// THE ONE unique-amount band registry, constructed here and injected, so all
-	// three USDT rails (Binance Pay, BEP20, TRON) share a single collision set —
-	// a live Binance amount also blocks the same TRON/BEP20 amount
-	// (internal/pay/bands deviation 1). Building one per rail would silently
-	// restore the Python behaviour this port deliberately strengthens, so the
-	// registry is a process-level singleton wired at boot.
+	// THE ONE unique-amount band registry, constructed here and injected, so
+	// both USDT rails (BEP20, TRON) share a single collision set — a live BEP20
+	// amount also blocks the same TRON amount (internal/pay/bands deviation 1).
+	// Building one per rail would silently restore the Python behaviour this
+	// port deliberately strengthens, so the registry is a process-level
+	// singleton wired at boot. Binance Pay was removed by the USDT-only
+	// migration (S3) — the registry itself needed no change; it was always
+	// provider-agnostic.
 	//
 	// Geometry comes from each rail's own env-backed getters (BEP20/TRON step 21
-	// tol 10 at 2 decimals; Binance step 10 tol 4 cents), so an operator tuning
-	// *_OFFSET_STEP / *_MATCH_TOL is honoured. Invalid geometry (a step that
-	// cannot keep bands disjoint) is a money-safety failure: refuse to boot rather
-	// than hand two live orders the same amount.
+	// tol 10 at 2 decimals), so an operator tuning *_OFFSET_STEP / *_MATCH_TOL
+	// is honoured. Invalid geometry (a step that cannot keep bands disjoint) is
+	// a money-safety failure: refuse to boot rather than hand two live orders
+	// the same amount.
 	bandReg, err := bands.New(bands.Config{Providers: map[bands.Provider]bands.Params{
-		bands.ProviderBinance: {Step: binance.AmountOffsetStep(), Tol: binance.AmountMatchTol(), Decimals: 2},
-		bands.ProviderBEP20:   {Step: bep20.AmountOffsetStep(), Tol: bep20.AmountMatchTol(), Decimals: bep20.AmountDecimals()},
-		bands.ProviderTron:    {Step: tron.AmountOffsetStep(), Tol: tron.AmountMatchTol(), Decimals: tron.AmountDecimals()},
+		bands.ProviderBEP20: {Step: bep20.AmountOffsetStep(), Tol: bep20.AmountMatchTol(), Decimals: bep20.AmountDecimals()},
+		bands.ProviderTron:  {Step: tron.AmountOffsetStep(), Tol: tron.AmountMatchTol(), Decimals: tron.AmountDecimals()},
 	}})
 	if err != nil {
 		log.Fatalf("USDT band geometry invalid: %v", err)
@@ -216,13 +216,12 @@ func main() {
 	// takes USDT via BEP20/TRON only, so there is no webhook port to bind here.
 
 	// Boot-time recovery + the periodic expiry backstop — _startup_recovery
-	// (telegram_bot.py:9995-10025). Rehydrates the persisted Binance/BEP20/TRON
-	// pending rows into the band registry (so post-restart pickers still avoid
-	// pre-restart amounts and a customer can still submit a late tx hash),
-	// reconciles Binance credits that landed while we were down, and then keeps a
-	// 120s expiry sweep running so a restart-orphaned checkout still expires and
-	// its band is freed after the grace. Tracked by the worker registry, so
-	// bot.Shutdown drains it.
+	// (telegram_bot.py:9995-10025). Rehydrates the persisted BEP20/TRON pending
+	// rows into the band registry (so post-restart pickers still avoid
+	// pre-restart amounts and a customer can still submit a late tx hash), and
+	// then keeps a 120s expiry sweep running so a restart-orphaned checkout
+	// still expires and its band is freed after the grace. Tracked by the
+	// worker registry, so bot.Shutdown drains it.
 	bot.StartupRecovery(ctx)
 
 	// Hourly owner-@username refresher so a rename propagates to customer

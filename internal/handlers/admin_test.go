@@ -7,11 +7,13 @@ package handlers
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"codezdev-bot/internal/i18n"
+	"codezdev-bot/internal/store"
 	"codezdev-bot/internal/tg"
 )
 
@@ -409,6 +411,138 @@ func TestSlashCommandCapabilityGate(t *testing.T) {
 			t.Fatalf("/orders for the super admin was denied: %+v", last)
 		}
 	})
+}
+
+// newDashboardTestBot wires a Bot to a real Store rooted at a fresh temp dir
+// — the A4 dashboard split (below) reads GetRevenueSummary, which needs real
+// SQL aggregation, not the nil-store no-op path every other admin_test.go
+// case uses.
+func newDashboardTestBot(t *testing.T, adminID string) (*Bot, *fakeTG, *store.Store) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, AdminID: adminID})
+	t.Cleanup(func() { b.Shutdown(); st.Close() })
+	return b, f, st
+}
+
+// seedPaid creates an order and immediately claims it to 'paid' — the A4
+// "money is in, goods are not out" state. seedReserved leaves it at the
+// CreateOrder default. Both use distinct `des` per call so multiple rows
+// coexist.
+func seedPaid(t *testing.T, st *store.Store, des, product string) {
+	t.Helper()
+	if err := st.CreateOrder(des, "9", "en", product, "T1", 1, 5000); err != nil {
+		t.Fatalf("CreateOrder(%s): %v", des, err)
+	}
+	if _, err := st.ClaimOrder(des, "reserved", "paid"); err != nil {
+		t.Fatalf("ClaimOrder(%s -> paid): %v", des, err)
+	}
+}
+
+func seedReserved(t *testing.T, st *store.Store, des, product string) {
+	t.Helper()
+	if err := st.CreateOrder(des, "9", "en", product, "T1", 1, 5000); err != nil {
+		t.Fatalf("CreateOrder(%s): %v", des, err)
+	}
+}
+
+// TestAdminDashboardPaidUndeliveredAlarm is the HANDLER half of A4
+// (stats-fixes-spec.md §5.3). The store half (Store.PaidUndelivered,
+// Store.GetRevenueSummary's split fields) is proven separately in
+// internal/store/stats_test.go; this test proves the DASHBOARD RENDER: the
+// old combined "⏳ Pending: N" line (reserved+paid, deposits included) is
+// gone, 'reserved' renders as ordinary "Awaiting payment", and 'paid' gets
+// its own alarming, deposit-excluding, zero-suppressed line.
+//
+// Falsification: reverting adminDashboardText's ordersBlock to the
+// pre-fix single "⏳ Pending: "+itoa64(r.PendingCount) line makes every
+// sub-test below fail — verified by mutation (see the executor report).
+func TestAdminDashboardPaidUndeliveredAlarm(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("zero paid-undelivered suppresses the alarm entirely", func(t *testing.T) {
+		b, f, st := newDashboardTestBot(t, "1")
+		seedReserved(t, st, "res1", "kiro-pro")
+		b.Process(ctx, callbackUpdate(1, "admroot"))
+		last := lastSendMsg(f)
+		if last == nil {
+			t.Fatal("admroot produced no reply")
+		}
+		if strings.Contains(last.Text, "PAID, NOT DELIVERED") {
+			t.Errorf("alarm line present at PaidUndeliveredCount==0:\n%s", last.Text)
+		}
+		if !strings.Contains(last.Text, "⏳ Awaiting payment: 1") {
+			t.Errorf("expected the reserved order under Awaiting payment, got:\n%s", last.Text)
+		}
+		if strings.Contains(last.Text, "⏳ Pending:") {
+			t.Errorf("the old combined Pending line must be gone, got:\n%s", last.Text)
+		}
+	})
+
+	t.Run("paid product orders trigger the alarm, deposits are excluded", func(t *testing.T) {
+		b, f, st := newDashboardTestBot(t, "1")
+		// The deposit trap: a paid __deposit__ row must not inflate the alarm —
+		// A1's exact bug (a missing product!=? filter) reappearing inside A4.
+		seedPaid(t, st, "dep1", depositProduct)
+		seedPaid(t, st, "prod1", "kiro-pro")
+		seedReserved(t, st, "res1", "kiro-pro")
+
+		b.Process(ctx, callbackUpdate(1, "admroot"))
+		last := lastSendMsg(f)
+		if last == nil {
+			t.Fatal("admroot produced no reply")
+		}
+		if !strings.Contains(last.Text, "🚨 PAID, NOT DELIVERED: 1") {
+			t.Errorf("want exactly 1 paid-undelivered (deposit excluded), got:\n%s", last.Text)
+		}
+		if !strings.Contains(last.Text, "(oldest ") {
+			t.Errorf("alarm line missing the oldest-age annotation, got:\n%s", last.Text)
+		}
+		if !strings.Contains(last.Text, "⏳ Awaiting payment: 1") {
+			t.Errorf("want 1 awaiting payment (the reserved order only), got:\n%s", last.Text)
+		}
+	})
+}
+
+// TestAdminDashboardPaidUndeliveredNullTSOmitsAge is the edge-case hardening
+// found in review: orders.ts is a nullable column (store.go's schema has no
+// NOT NULL on it), so a 'paid' non-deposit row can in principle carry a NULL
+// ts. SQL's MIN() over a non-empty set whose ts values are ALL NULL still
+// returns NULL, which Store.PaidUndelivered surfaces as
+// PaidUndeliveredOldestTS==0 — the SAME zero value used for "no such order".
+// Without a guard, ageString(0) computes an age off the Unix epoch and prints
+// something like "(oldest 20000+d ago)" on a genuine, present-day alarm —
+// false precision that undermines the whole point of showing an age at all.
+// The count alone must still fire the alarm; only the age clause is dropped.
+func TestAdminDashboardPaidUndeliveredNullTSOmitsAge(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newDashboardTestBot(t, "1")
+	// CreateOrder always stamps ts=now(); reach past the public API with a raw
+	// insert to construct the one state Store.PaidUndelivered's own doc
+	// comment calls out as a real possibility: a paid, non-deposit row whose
+	// ts is NULL.
+	if _, err := st.DB().Exec(
+		"INSERT INTO orders(des, chat_id, lang, product, tier, qty, total, status, ts) "+
+			"VALUES ('nullts','9','en','kiro-pro','T1',1,5000,'paid',NULL)"); err != nil {
+		t.Fatalf("seed NULL-ts paid order: %v", err)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "admroot"))
+	last := lastSendMsg(f)
+	if last == nil {
+		t.Fatal("admroot produced no reply")
+	}
+	if !strings.Contains(last.Text, "🚨 PAID, NOT DELIVERED: 1") {
+		t.Errorf("alarm must still fire on the count alone, got:\n%s", last.Text)
+	}
+	if strings.Contains(last.Text, "(oldest") {
+		t.Errorf("age clause must be omitted when the oldest ts is unknown, got:\n%s", last.Text)
+	}
 }
 
 // wantAdminCapDenied asserts that a standard (granted, non-super) admin was

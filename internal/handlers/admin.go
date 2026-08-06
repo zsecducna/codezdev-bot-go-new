@@ -37,6 +37,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"time"
 
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/tg"
@@ -266,12 +267,41 @@ func (b *Bot) adminDashboardText(chatID int64) string {
 	parts := []string{"📈 ADMIN DASHBOARD", strings.Repeat("─", 24)}
 	if b.store != nil {
 		if r, err := b.store.GetRevenueSummary(depositProduct); err == nil {
+			// A4 fix (stats-fixes-spec.md §5.3): the old single "Pending" line
+			// summed 'reserved'+'paid'. 'reserved' is an idle cart that
+			// self-expires — harmless, and routinely the larger of the two, so
+			// admins learned to skim past a big Pending number. 'paid' means
+			// MONEY IS IN AND GOODS ARE NOT OUT — every one of those rows is a
+			// customer who paid and got nothing, and it was invisible inside
+			// that skimmed-past sum. It now gets its own alarming line, with
+			// the oldest order's age ("oldest 3h ago" invites action; a bare
+			// count invites triage-later), and is suppressed entirely at zero
+			// so its mere presence is always an exception to look at.
+			ordersBlock := "\n🧾 ORDERS\n" +
+				"   ⏳ Awaiting payment: " + itoa64(r.AwaitingPaymentCount) +
+				"    ↩️ Refunded/expired: " + itoa64(r.RefundedCount)
+			if r.PaidUndeliveredCount > 0 {
+				ordersBlock += "\n   🚨 PAID, NOT DELIVERED: " + itoa64(r.PaidUndeliveredCount)
+				// PaidUndeliveredOldestTS is 0 both when there are no matching
+				// rows (the caller already guarded that above) AND when
+				// MIN(ts) legitimately returned SQL NULL because every
+				// matching row's ts itself is NULL (store.PaidUndelivered's
+				// own doc: ts is nullable, store.go's schema has no NOT NULL
+				// on it). Printing ageString(0) in that case would render a
+				// multi-DECADE-old age off the Unix epoch on a real alarm —
+				// exactly the false-precision this feature exists to avoid.
+				// Drop the age clause rather than lie about it; the count
+				// alone still fires the alarm.
+				if r.PaidUndeliveredOldestTS > 0 {
+					ordersBlock += "  (oldest " + ageString(r.PaidUndeliveredOldestTS) + ")"
+				}
+				ordersBlock += " — customers have paid and received nothing"
+			}
 			parts = append(parts, "💰 REVENUE (delivered orders)\n"+
 				"   Total: "+b.usdtDisp(r.DeliveredRevenue)+"  ("+itoa64(r.DeliveredCount)+" orders)\n"+
 				"   Today: "+b.usdtDisp(r.TodayRevenue)+"  ("+itoa64(r.TodayCount)+" orders)\n"+
 				"   Customers: "+itoa64(r.Customers)+"\n"+
-				"\n🧾 ORDERS\n"+
-				"   ⏳ Pending: "+itoa64(r.PendingCount)+"    ↩️ Refunded/expired: "+itoa64(r.RefundedCount)+"\n"+
+				ordersBlock+"\n"+
 				"   💳 Wallet balances held: "+b.usdtDisp(r.WalletTotal))
 		}
 	}
@@ -297,6 +327,30 @@ func (b *Bot) adminDashboardText(chatID int64) string {
 		parts = append(parts, "📦 STOCK (available: "+itoa(total)+")\n"+body)
 	}
 	return strings.Join(parts, "\n")
+}
+
+// ageString renders the time since ts (epoch seconds) as a coarse human
+// duration for the PAID, NOT DELIVERED alarm (A4, stats-fixes-spec.md §5.3)
+// — "oldest 3h ago" reads as an incident to work now, where a bare count
+// invites triage-later. Buckets match the coarseness an admin actually
+// needs: minutes, then hours, then days. Callers must not invoke this at
+// count==0 (no such order); the dashboard suppresses the whole alarm line
+// in that case rather than calling this with a meaningless ts.
+func ageString(ts float64) string {
+	d := time.Since(time.Unix(int64(ts), 0))
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return itoa(int(d/time.Minute)) + "m ago"
+	case d < 24*time.Hour:
+		return itoa(int(d/time.Hour)) + "h ago"
+	default:
+		return itoa(int(d/(24*time.Hour))) + "d ago"
+	}
 }
 
 // adminStockText builds the /stock report — port of _admin_stock_text
@@ -487,8 +541,6 @@ func (b *Bot) adminCategoryMenuRows(cat string) (title string, rows [][]tg.Inlin
 	case "payments":
 		return "💳 PAYMENT METHODS", [][]tg.InlineKeyboardButton{
 			btnRow("💰 Balance (wallet): "+onOffState(b.payEnabled("balance")), "adm:togglepay:balance"),
-			btnRow("🌍 PayPal: "+onOffState(b.payEnabled("paypal")), "adm:togglepay:paypal"),
-			btnRow("🪙 Binance USDT: "+b.payMethodLabel("binance", b.binanceConfigured, "keys not set"), "adm:togglepay:binance"),
 			btnRow("🟡 USDT BEP20: "+b.payMethodLabel("bep20", b.bep20Configured, "address not set"), "adm:togglepay:bep20"),
 			btnRow("🟡 Set BEP20 address: "+setUnsetValue(b.bep20AddrStr()), "adm:setbep20"),
 			btnRow("🔴 USDT TRC20 (TRON): "+b.payMethodLabel("tron", b.tronConfigured, "address not set"), "adm:togglepay:tron"),

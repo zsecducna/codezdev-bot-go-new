@@ -22,8 +22,6 @@ func defaultSettings() map[string]any {
 		"admin_sale_notify":    true,
 		"admin_deposit_notify": true,
 		"pay_balance":          true,
-		"pay_paypal":           true,
-		"pay_binance":          true,
 		"private_sale":         false,
 		"suspended":            map[string]any{},
 		"max_qty":              float64(0),

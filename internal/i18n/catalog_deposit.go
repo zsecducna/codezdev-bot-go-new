@@ -1,42 +1,35 @@
 package i18n
 
 // catalog_deposit.go — the M2.3 string clusters: the deposit flow
-// (DEPOSIT_QR / DEPOSIT_OK / DEPOSIT_METHOD / DEP_BTN_* / DEPOSIT_*_AMOUNT /
-// QR_UNDERPAID / PURCHASE_QR / DEPOSIT_LABEL), the /info card (BALANCE +
-// REFERRAL_INFO) and the /history views (HISTORY_* + STATUS_LABEL). Every value
-// is copied verbatim from the cited Python constant so the tables stay
-// byte-diffable against telegram_bot.py.
+// (DEPOSIT_OK / DEPOSIT_METHOD / DEP_BTN_* / DEPOSIT_*_AMOUNT / DEPOSIT_LABEL),
+// the /info card (BALANCE + REFERRAL_INFO) and the /history views (HISTORY_*
+// + STATUS_LABEL). Every value is copied verbatim from the cited Python
+// constant so the tables stay byte-diffable against telegram_bot.py.
 //
 // Format-spec note: Python renders VND amounts with `{paid:,}` etc. (thousands
 // separators). Go's i18n.F does plain `{token}` substitution with no format
 // spec, so those placeholders are kept as bare `{paid}` / `{total}` / `{balance}`
-// here and the handler pre-formats the number with grouping (groupVND) before
-// substituting — same customer-visible output, and the `{token}` set stays
-// identical across the three languages for the completeness test.
+// here — same customer-visible output, and the `{token}` set stays identical
+// across the three languages for the completeness test.
 
 // DepositCatalog holds the deposit-flow strings (telegram_bot.py:421-489,
-// 1490-1497). SePay/VietQR (QR / BtnQR / Underpaid / PurchaseQR) was removed by
-// the USDT-only migration (S1) — the shop no longer accepts VND bank transfers.
+// 1490-1497). SePay/VietQR (QR / BtnQR / Underpaid / PurchaseQR), PayPal
+// (BtnPayPal / PPLink) and Binance Pay (BtnBinance) were removed by the
+// USDT-only migration (S1-S3) — the shop takes USDT via BEP20/TRON (and the
+// wallet balance) only.
 type DepositCatalog struct {
 	// OK — DEPOSIT_OK (telegram_bot.py:427): credited notice; {amount} {balance}.
 	OK Str
 	// Method — DEPOSIT_METHOD (telegram_bot.py:450): the funding-method picker header.
 	Method Str
-	// BtnPayPal / BtnBEP20 / BtnBinance / BtnTRON — DEP_BTN_*
-	// (telegram_bot.py:457-460): per-method deposit picker buttons.
-	BtnPayPal  Str
-	BtnBEP20   Str
-	BtnBinance Str
-	BtnTRON    Str
-	// PPAmount / BEP20Amount / TronAmount — DEPOSIT_PP_AMOUNT / _BEP20_AMOUNT /
-	// _TRON_AMOUNT (telegram_bot.py:462-481): the "enter USDT amount" prompts; {min}.
-	PPAmount    Str
+	// BtnBEP20 / BtnTRON — DEP_BTN_* (telegram_bot.py:458/460): per-method
+	// deposit picker buttons.
+	BtnBEP20 Str
+	BtnTRON  Str
+	// BEP20Amount / TronAmount — DEPOSIT_BEP20_AMOUNT / _TRON_AMOUNT
+	// (telegram_bot.py:469-481): the "enter USDT amount" prompts; {min}.
 	BEP20Amount Str
 	TronAmount  Str
-	// PPLink — DEPOSIT_PP_LINK (telegram_bot.py:482): the message carrying the
-	// PayPal approval link for a WALLET top-up (dep:pp); {usdt} {url}. Distinct
-	// from Buy.PaypalLink (an order pay), which promises account delivery.
-	PPLink Str
 	// BadAmount — DEPOSIT_BAD_AMOUNT (telegram_bot.py:487): amount out of bounds; {min}.
 	BadAmount Str
 	// Label — DEPOSIT_LABEL (telegram_bot.py:582): friendly wallet-top-up row label
@@ -105,20 +98,10 @@ func buildDepositCatalog() DepositCatalog {
 			EN: "💳 Choose a deposit method:",
 			ZH: "💳 请选择充值方式：",
 		},
-		// DEP_BTN_PAYPAL (telegram_bot.py:457).
-		BtnPayPal: Str{VI: "🌍 PayPal", EN: "🌍 PayPal", ZH: "🌍 PayPal"},
 		// DEP_BTN_BEP20 (telegram_bot.py:458).
 		BtnBEP20: Str{VI: "USDT (BEP20)", EN: "USDT (BEP20)", ZH: "USDT (BEP20)"},
-		// DEP_BTN_BINANCE (telegram_bot.py:459).
-		BtnBinance: Str{VI: "🪙 Binance (USDT)", EN: "🪙 Binance (USDT)", ZH: "🪙 Binance (USDT)"},
 		// DEP_BTN_TRON (telegram_bot.py:460).
 		BtnTRON: Str{VI: "USDT (TRC20)", EN: "USDT (TRC20)", ZH: "USDT (TRC20)"},
-		// DEPOSIT_PP_AMOUNT (telegram_bot.py:462).
-		PPAmount: Str{
-			VI: "🌍 Nhập số USDT muốn nạp, tối thiểu {min}:",
-			EN: "🌍 Enter the amount of USDT to deposit, minimum {min}:",
-			ZH: "🌍 请输入要充值的 USDT 金额，最低 {min}：",
-		},
 		// DEPOSIT_BEP20_AMOUNT (telegram_bot.py:469).
 		BEP20Amount: Str{
 			VI: "🟡 Nhập số USDT muốn nạp, tối thiểu {min}.\n⚠️ Lưu ý phí mạng của bạn (tùy nền tảng). Màn hình sau hiển thị số tiền chính xác.",
@@ -130,12 +113,6 @@ func buildDepositCatalog() DepositCatalog {
 			VI: "🔴 Nhập số USDT bạn sẽ nạp, tối thiểu {min}.\n⚠️ Lưu ý phí mạng của bạn (tùy nền tảng). Màn hình sau hiển thị số tiền chính xác cần gửi.",
 			EN: "🔴 Enter the amount of USDT you will send, minimum {min}.\n⚠️ Be aware of your own network fee (varies by platform). The next screen shows the exact amount to send.",
 			ZH: "🔴 请输入您将充值的 USDT 金额，最低 {min}。\n⚠️ 请注意您自己的网络费（因平台而异）。下一屏显示需要发送的准确金额。",
-		},
-		// DEPOSIT_PP_LINK (telegram_bot.py:482).
-		PPLink: Str{
-			VI: "🌍 Nhấn để nạp {usdt} USDT bằng PayPal:\n{url}\n\nSố dư sẽ được cộng sau khi thanh toán hoàn tất.",
-			EN: "🌍 Tap to deposit {usdt} USDT with PayPal:\n{url}\n\nYour balance is credited once payment completes.",
-			ZH: "🌍 点击使用 PayPal 充值 {usdt} USDT：\n{url}\n\n付款完成后将计入您的余额。",
 		},
 		// DEPOSIT_BAD_AMOUNT (telegram_bot.py:487).
 		BadAmount: Str{

@@ -14,7 +14,6 @@ import (
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/pay/bands"
 	"codezdev-bot/internal/pay/bep20"
-	"codezdev-bot/internal/pay/binance"
 	"codezdev-bot/internal/pay/tron"
 	"codezdev-bot/internal/refund"
 	"codezdev-bot/internal/stock"
@@ -35,18 +34,16 @@ type TG interface {
 	GetChat(ctx context.Context, chatID int64) (*tg.Chat, error)
 	// SendDocument uploads a local file (order delivery, _deliver_paid @7817).
 	SendDocument(ctx context.Context, chatID int64, filePath, caption string) (*tg.Message, error)
-	// SendPhotoURL posts a photo by URL — the Binance Pay personal QR image
-	// (telegram_bot.py:10069-10074). Dropped along with Binance Pay in S3.
-	SendPhotoURL(ctx context.Context, chatID int64, photoURL, caption string) (*tg.Message, error)
-	// SendPhotoURLOpts is SendPhotoURL with parse_mode + reply_markup — the
+	// SendPhotoURLOpts posts a photo by URL with parse_mode + reply_markup — the
 	// BEP20/TRON pay screens attach the "I have made the payment" button to the
 	// QR photo and render the address as a Markdown code block
-	// (_send_bep20_qr @9457, _send_tron_qr @9907).
+	// (_send_bep20_qr @9457, _send_tron_qr @9907). The plain-SendPhotoURL variant
+	// (no options) was dropped along with SePay and Binance Pay, its only
+	// callers (S1/S3).
 	SendPhotoURLOpts(ctx context.Context, p tg.SendPhotoURLParams) (*tg.Message, error)
 	// SendPhoto uploads a LOCAL image file — the *_QR_PATH fallback the
-	// Binance/BEP20/TRON screens use when no hosted QR URL is configured
-	// (send_photo_file @10015, called from _send_binance_qr @10069 and the two
-	// on-chain QR senders).
+	// BEP20/TRON screens use when no hosted QR URL is configured
+	// (send_photo_file @10015, called from the two on-chain QR senders).
 	SendPhoto(ctx context.Context, chatID int64, filePath, caption string) (*tg.Message, error)
 	// GetFileBytes downloads an uploaded document's raw content by file_id —
 	// the 📦 Stock admin category's upstock/provpool file intercepts
@@ -103,10 +100,10 @@ type Bot struct {
 	reserveTTL    time.Duration
 	depositPoll   time.Duration // POLL_INTERVAL @10548 — seconds between deposit polls
 
-	// ---- USDT rails (Binance Pay + BEP20 + TRON) ----------------------------
+	// ---- USDT rails (BEP20 + TRON; Binance Pay removed, S3) -----------------
 	//
 	// bands is the ONE cross-provider unique-amount registry. Every rail reserves
-	// through it, so a live Binance amount also blocks the same TRON/BEP20 amount
+	// through it, so a live BEP20 amount also blocks the same TRON amount
 	// (bands deviation 1). Sharing ONE instance is the whole guarantee — never
 	// build a per-rail registry.
 	bands *bands.Registry
@@ -118,11 +115,6 @@ type Bot struct {
 	// rail-specific timestamps which stay with the rails"). Keyed provider -> des.
 	usdtRows map[bands.Provider]map[string]*usdtRow
 
-	// binancePollerMu guards binancePollerOn — the lazy singleton latch behind
-	// _ensure_binance_poller (telegram_bot.py:9118-9126).
-	binancePollerMu sync.Mutex
-	binancePollerOn bool
-
 	// usdtPollMu guards usdtPolls AND the per-chat st.USDTPolling test-and-set, so
 	// "one confirm-poll per chat, at most USDT_MAX_POLLS globally" is decided in
 	// ONE atomic step (_usdt_polling @9856-9860 + USDT_MAX_POLLS @9853).
@@ -130,28 +122,21 @@ type Bot struct {
 	usdtPolls    int
 	maxUSDTPolls int
 
-	// USDT timing knobs (telegram_bot.py:9064-9068, 9541-9558). Fields so tests
-	// can shrink them; New reads the env defaults.
-	binancePollInterval   time.Duration // BINANCE_POLL_INTERVAL 45s
-	expirySweepInterval   time.Duration // EXPIRY_SWEEP_INTERVAL 120s
-	binanceReconcileGrace time.Duration // BINANCE_RECONCILE_GRACE_S 2h
-	usdtPendingGrace      time.Duration // USDT_PENDING_GRACE_S 2h
-	usdtVerifyGrace       time.Duration // USDT_VERIFY_GRACE_S 120s
-	usdtConfirmWait       time.Duration // USDT_CONFIRM_WAIT_S 300s
-	usdtConfirmPoll       time.Duration // USDT_CONFIRM_POLL_S 20s
+	// USDT timing knobs (telegram_bot.py:9541-9558). Fields so tests can shrink
+	// them; New reads the env defaults.
+	expirySweepInterval time.Duration // EXPIRY_SWEEP_INTERVAL 120s
+	usdtPendingGrace    time.Duration // USDT_PENDING_GRACE_S 2h
+	usdtVerifyGrace     time.Duration // USDT_VERIFY_GRACE_S 120s
+	usdtConfirmWait     time.Duration // USDT_CONFIRM_WAIT_S 300s
+	usdtConfirmPoll     time.Duration // USDT_CONFIRM_POLL_S 20s
 
 	// now is the clock, overridable in tests (band deadlines and the verify window
 	// are wall-clock so they survive a restart, exactly like Python's time.time()).
 	now func() time.Time
 
-	// Chain/exchange seams. Same rationale as sepayFind / paypal*: tests drive the
-	// rails with fakes (or httptest-backed real clients) instead of live chain RPC,
+	// Chain/exchange seams. Same rationale as paypal*: tests drive the rails
+	// with fakes (or httptest-backed real clients) instead of live chain RPC,
 	// while New binds the real internal/pay/* clients.
-	binanceConfigured func() bool
-	binanceGetTxns    func(startMS *int64) ([]binance.Transaction, error)
-	binanceMatch      func(txns []binance.Transaction, expected string, sinceMS int64, isUsed func(string) bool) (*binance.MatchedTxn, error)
-	binanceUsdtToVND  func(usdt float64) (int64, error)
-
 	bep20Configured func() bool
 	bep20ByHash     func(txhash string) (*bep20.TransferByHash, error)
 	bep20UsdtToVND  func(usdt *big.Rat) (int64, error)
@@ -230,7 +215,7 @@ type Bot struct {
 	// passes after its first (immediate) iteration, coalescing a burst of
 	// pastes/file uploads into one edited message instead of one per input. A
 	// Bot field (not a bare const) so tests can shrink it, the same pattern
-	// as every other timing knob on this struct (otpCooldown, binancePollInterval, …).
+	// as every other timing knob on this struct (otpCooldown, usdtConfirmPoll, …).
 	upstockRenderThrottle time.Duration
 }
 
@@ -294,15 +279,16 @@ func New(d Deps) *Bot {
 	// ---- USDT rails ---------------------------------------------------------
 	b.now = time.Now
 	// ONE shared registry. A caller that does not inject one (unit tests) gets a
-	// default built from the three rails' own env-backed geometry — still ONE
-	// instance spanning all three providers, so the cross-provider collision
-	// guarantee holds either way (bands deviation 1).
+	// default built from the two rails' own env-backed geometry — still ONE
+	// instance spanning both providers, so the cross-provider collision
+	// guarantee holds either way (bands deviation 1). Binance Pay was removed
+	// by the USDT-only migration (S3); the registry itself needs no change —
+	// it never had provider-count baked into its collision logic.
 	b.bands = d.Bands
 	if b.bands == nil {
 		reg, err := bands.New(bands.Config{Providers: map[bands.Provider]bands.Params{
-			bands.ProviderBinance: {Step: binance.AmountOffsetStep(), Tol: binance.AmountMatchTol(), Decimals: 2},
-			bands.ProviderBEP20:   {Step: bep20.AmountOffsetStep(), Tol: bep20.AmountMatchTol(), Decimals: bep20.AmountDecimals()},
-			bands.ProviderTron:    {Step: tron.AmountOffsetStep(), Tol: tron.AmountMatchTol(), Decimals: tron.AmountDecimals()},
+			bands.ProviderBEP20: {Step: bep20.AmountOffsetStep(), Tol: bep20.AmountMatchTol(), Decimals: bep20.AmountDecimals()},
+			bands.ProviderTron:  {Step: tron.AmountOffsetStep(), Tol: tron.AmountMatchTol(), Decimals: tron.AmountDecimals()},
 		}})
 		if err != nil {
 			// Misconfigured band geometry (e.g. a hand-set step of 0) would let two
@@ -312,9 +298,8 @@ func New(d Deps) *Bot {
 			// operator sees the log line.
 			log.Printf("bands: invalid env geometry (%v) — falling back to shipped defaults", err)
 			reg, err = bands.New(bands.Config{Providers: map[bands.Provider]bands.Params{
-				bands.ProviderBinance: {Step: 10, Tol: 4, Decimals: 2},
-				bands.ProviderBEP20:   {Step: 21, Tol: 10, Decimals: 2},
-				bands.ProviderTron:    {Step: 21, Tol: 10, Decimals: 2},
+				bands.ProviderBEP20: {Step: 21, Tol: 10, Decimals: 2},
+				bands.ProviderTron:  {Step: 21, Tol: 10, Decimals: 2},
 			}})
 			if err != nil { // unreachable: the shipped defaults validate
 				panic("handlers: shipped band defaults are invalid: " + err.Error())
@@ -323,33 +308,19 @@ func New(d Deps) *Bot {
 		b.bands = reg
 	}
 	b.usdtRows = map[bands.Provider]map[string]*usdtRow{
-		bands.ProviderBinance: {},
-		bands.ProviderBEP20:   {},
-		bands.ProviderTron:    {},
+		bands.ProviderBEP20: {},
+		bands.ProviderTron:  {},
 	}
-	// Timing knobs — Python's module constants, env-overridable (telegram_bot.py:
-	// 9064-9068, 9541-9558).
-	b.binancePollInterval = time.Duration(b.envInt("BINANCE_POLL_INTERVAL", 45)) * time.Second
+	// Timing knobs — Python's module constants, env-overridable (telegram_bot.py:9541-9558).
 	b.expirySweepInterval = time.Duration(b.envInt("EXPIRY_SWEEP_INTERVAL", 120)) * time.Second
-	b.binanceReconcileGrace = time.Duration(b.envInt("BINANCE_RECONCILE_GRACE_S", 2*3600)) * time.Second
 	b.usdtPendingGrace = time.Duration(b.envInt("USDT_PENDING_GRACE_S", 2*3600)) * time.Second
 	b.usdtVerifyGrace = time.Duration(b.envInt("USDT_VERIFY_GRACE_S", 120)) * time.Second
 	b.usdtConfirmWait = time.Duration(b.envInt("USDT_CONFIRM_WAIT_S", 300)) * time.Second
 	b.usdtConfirmPoll = time.Duration(b.envInt("USDT_CONFIRM_POLL_S", 20)) * time.Second
 	b.maxUSDTPolls = max(b.envInt("USDT_MAX_POLLS", 200), 1)
 	// Chain/exchange clients. Each package reads its own credentials/addresses
-	// from the process env at call time (bep20_pay.py / tron_pay.py /
-	// binance_pay.py parity), so nothing is snapshotted here.
-	binanceKey, binanceSecret := "", ""
-	if b.cfg != nil {
-		binanceKey, binanceSecret = b.cfg.Env("BINANCE_API_KEY"), b.cfg.Env("BINANCE_SECRET_KEY")
-	}
-	b.binanceConfigured = func() bool { return binance.Configured() && binanceKey != "" && binanceSecret != "" }
-	b.binanceGetTxns = func(startMS *int64) ([]binance.Transaction, error) {
-		return binance.GetPayTransactions(binanceKey, binanceSecret, startMS, 100)
-	}
-	b.binanceMatch = binance.MatchPayment
-	b.binanceUsdtToVND = binance.UsdtToVND
+	// from the process env at call time (bep20_pay.py / tron_pay.py parity),
+	// so nothing is snapshotted here.
 	b.bep20Configured = bep20.Configured
 	b.bep20ByHash = bep20.GetTransferToSellerByHash
 	b.bep20UsdtToVND = bep20.UsdtToVND

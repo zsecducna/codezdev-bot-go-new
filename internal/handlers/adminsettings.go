@@ -420,8 +420,17 @@ func (b *Bot) capSetRate(c *Ctx) bool {
 		b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:settings"))
 		return true
 	}
+	// Residual fix (Opus review of commit 11e033d): this used to say "New
+	// orders price PayPal/Binance at this rate" — both rails are gone (the
+	// USDT migration removed SePay+PayPal in this commit; Binance was cut
+	// earlier). Today the rate feeds vndToUSD (usdt.go), which prices every
+	// BEP20/TRON quote and every VND-denominated display conversion
+	// (money.go, adminpricing.go, apikey.go, deposit.go) — not any specific
+	// payment rail. The whole rate feature is slated to die in the USDT
+	// migration's S5 once the ledger moves to micro-USDT; until then this
+	// text must describe what the rate actually does today.
 	b.send(c.Ctx, c.ChatID,
-		"✅ USD→VND rate set to "+commaInt(n)+". New orders price PayPal/Binance at this rate.",
+		"✅ USD→VND rate set to "+commaInt(n)+". New orders and USDT quotes price at this rate.",
 		admNav("admcat:settings"))
 	return true
 }
@@ -662,9 +671,10 @@ func (b *Bot) capSetKiroAcct(c *Ctx) bool {
 // ---- adm:togglepay:<method> -------------------------------------------------
 
 // payMethodNames mirrors PAY_METHODS' method-name column (telegram_bot.py:5147).
-// "qr" (SePay/VietQR) was removed by the USDT-only migration (S1) — the shop no
-// longer accepts VND bank transfers.
-var payMethodNames = []string{"balance", "paypal", "binance", "bep20", "tron"}
+// "qr" (SePay/VietQR), "paypal" and "binance" (Binance Pay) were removed by
+// the USDT-only migration (S1-S3) — the shop takes USDT via BEP20/TRON (and
+// the wallet balance) only.
+var payMethodNames = []string{"balance", "bep20", "tron"}
 
 // cbTogglePay is the shared handler for all 6 adm:togglepay:<method> buttons
 // — telegram_bot.py:13931. Super-admin only. Refuses to leave zero payment

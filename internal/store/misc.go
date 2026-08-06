@@ -308,10 +308,23 @@ type RevenueSummary struct {
 	DeliveredRevenue int64
 	TodayCount       int64
 	TodayRevenue     int64
-	PendingCount     int64
-	RefundedCount    int64
-	Customers        int64
-	WalletTotal      int64
+	// AwaitingPaymentCount — 'reserved', non-deposit: a customer opened a
+	// checkout and wandered off. Harmless, expires by itself, normally large.
+	AwaitingPaymentCount int64
+	// PaidUndeliveredCount — 'paid', non-deposit: MONEY IS IN AND GOODS ARE
+	// NOT OUT. Every one of these is a customer who has paid and received
+	// nothing. Never sum this into AwaitingPaymentCount: the whole defect was
+	// that a routinely-large number taught admins to ignore a field that also
+	// carried this one.
+	PaidUndeliveredCount int64
+	// PaidUndeliveredOldestTS is the epoch-seconds ts of the OLDEST such order,
+	// or 0 when there are none. The render needs it because "2" invites
+	// triage-later while "oldest 3h ago" does not. Formatting is the handler's
+	// job; the store returns the raw stamp.
+	PaidUndeliveredOldestTS float64
+	RefundedCount           int64
+	Customers               int64
+	WalletTotal             int64
 }
 
 // GetRevenueSummary computes the dashboard aggregate (store.py:905-932).
@@ -333,10 +346,21 @@ func (s *Store) GetRevenueSummary(depositProduct string) (*RevenueSummary, error
 		depositProduct, dayStart).Scan(&r.TodayCount, &r.TodayRevenue); err != nil {
 		return nil, err
 	}
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM orders WHERE status IN ('reserved','paid')").
-		Scan(&r.PendingCount); err != nil {
+	// The split that matters (spec §5.3). Both exclude wallet top-ups, for the
+	// same reason DeliveredCount does: a deposit is not a product sale, and a
+	// deposit sitting in 'paid' is not a customer waiting on goods. Omitting
+	// this filter would be A1's bug reappearing here and would make the alarm
+	// cry wolf.
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM orders "+
+		"WHERE status='reserved' AND COALESCE(product,'')!=?", depositProduct).
+		Scan(&r.AwaitingPaymentCount); err != nil {
 		return nil, err
 	}
+	paidN, paidOldest, err := s.PaidUndelivered(depositProduct)
+	if err != nil {
+		return nil, err
+	}
+	r.PaidUndeliveredCount, r.PaidUndeliveredOldestTS = paidN, paidOldest
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM orders WHERE status IN ('refunded','expired')").
 		Scan(&r.RefundedCount); err != nil {
 		return nil, err
@@ -350,6 +374,60 @@ func (s *Store) GetRevenueSummary(depositProduct string) (*RevenueSummary, error
 		return nil, err
 	}
 	return &r, nil
+}
+
+// PaidUndelivered counts the orders where MONEY IS IN AND GOODS ARE NOT OUT —
+// status 'paid', wallet top-ups excluded — and returns the epoch-seconds ts of
+// the OLDEST one (0 when the count is 0). Audit finding A4
+// (.omc/artifacts/stats-audit.md), spec §5.3.
+//
+// Why this is its own method rather than another line in GetRevenueSummary:
+// every one of these rows is a customer who has paid and received nothing, so
+// the figure is worth checking on its own (including straight against prod)
+// without computing an entire dashboard. The dashboard consumes it too.
+//
+// The deposit exclusion is load-bearing, not cosmetic. A __deposit__ order in
+// 'paid' is a top-up mid-settle, not a customer waiting on goods; counting it
+// would be the A1 defect (a missing `AND product!=?`) reappearing inside A4's
+// fix and would make an alarm that must stay believable cry wolf. The SAME
+// filter is applied to MIN(ts) — dropping it only there still yields a correct
+// count with a wrong, overstated age.
+//
+// COALESCE(product,'') rather than a bare `product!=?`: orders.product has no
+// NOT NULL constraint (store.go's schema), and in SQL `NULL != x` is NULL, not
+// TRUE — a 'paid' row with a NULL product would silently vanish from BOTH the
+// count and MIN(ts) instead of being caught by the deposit filter, which is
+// the opposite failure direction of what this filter exists to guarantee
+// (Opus review finding on this slice). CreateOrder always writes a non-NULL
+// product today, so this guards a live-data edge, not a currently-reachable
+// application path.
+//
+// NOTE, deliberately not folded in: a __deposit__ order stuck in 'paid' means a
+// customer's money arrived and their wallet was never credited. That is also
+// real harm, but it is a DIFFERENT incident class with a different fix, and
+// merging it here would rebuild the very conflation this split exists to undo.
+// It deserves its own counter — recorded in the audit's gap list, not silently
+// swept in.
+//
+// depositProduct "" defaults to DepositProduct.
+func (s *Store) PaidUndelivered(depositProduct string) (count int64, oldestTS float64, err error) {
+	if depositProduct == "" {
+		depositProduct = DepositProduct
+	}
+	// MIN() over an empty set is NULL, hence the NullFloat64 rather than
+	// COALESCE(...,0): "no such order" and "an order stamped 0" are different
+	// facts, and only the former may report a zero age.
+	var oldest sql.NullFloat64
+	err = s.db.QueryRow(
+		"SELECT COUNT(*), MIN(ts) FROM orders WHERE status='paid' AND COALESCE(product,'')!=?",
+		depositProduct).Scan(&count, &oldest)
+	if err != nil {
+		return 0, 0, err
+	}
+	if oldest.Valid {
+		oldestTS = oldest.Float64
+	}
+	return count, oldestTS, nil
 }
 
 // RevenueDay is one calendar-day row of the revenue matrix (store.py:944-950).

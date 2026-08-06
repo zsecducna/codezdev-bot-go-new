@@ -577,13 +577,12 @@ func (c *Client) SendPhoto(ctx context.Context, chatID int64, filePath, caption 
 
 // sendPhotoURLParams is the JSON sendPhoto payload used when `photo` is a URL
 // (Telegram fetches the image itself). Distinct from SendPhoto, which uploads a
-// local file via multipart — the VietQR deposit/pay flows pass a qr.sepay.vn URL
-// (telegram_bot.py:10621, 15642 `sendPhoto` with a URL "photo").
+// local file via multipart.
 // SendPhotoURLParams is the full JSON sendPhoto payload for a URL photo. The
-// SePay QR flows only need chat/photo/caption, but the BEP20/TRON pay screens
-// send the address as a Markdown code block AND attach the "I have made the
-// payment" inline button to the photo itself (telegram_bot.py:9461-9466,
-// 9911-9916), so parse_mode + reply_markup are part of the payload there.
+// BEP20/TRON pay screens send the address as a Markdown code block AND attach
+// the "I have made the payment" inline button to the photo itself
+// (telegram_bot.py:9461-9466, 9911-9916), so parse_mode + reply_markup are
+// part of the payload there.
 type SendPhotoURLParams struct {
 	ChatID      int64  `json:"chat_id"`
 	Photo       string `json:"photo"`
@@ -606,9 +605,12 @@ func (c *Client) SendPhotoURLOpts(ctx context.Context, p SendPhotoURLParams) (*M
 	return &m, nil
 }
 
-// SendPhotoURL sends a photo BY URL (no local upload) — the JSON sendPhoto
-// variant the SePay QR flows use (telegram_bot.py:10621, 15642). Telegram
-// downloads the image from photoURL and posts it with the caption.
+// SendPhotoURL sends a photo BY URL (no local upload) — the 3-argument JSON
+// sendPhoto variant (telegram_bot.py:10621, 15642). Telegram downloads the
+// image from photoURL and posts it with the caption. Currently unused by
+// production handlers (its last caller, Binance Pay's QR sender, was removed
+// by the USDT-only migration, S3) — kept as generic client surface; SendPhoto
+// requests still use SendPhotoURLOpts directly.
 func (c *Client) SendPhotoURL(ctx context.Context, chatID int64, photoURL, caption string) (*Message, error) {
 	return c.SendPhotoURLOpts(ctx, SendPhotoURLParams{ChatID: chatID, Photo: photoURL, Caption: caption})
 }

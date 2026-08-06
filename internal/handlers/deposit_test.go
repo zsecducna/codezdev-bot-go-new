@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"codezdev-bot/internal/i18n"
 )
 
 // waitFor polls cond up to 2s (fast tick) so worker-goroutine tests aren't flaky.
@@ -63,6 +65,34 @@ func TestDepositAmountBounds(t *testing.T) {
 	b.Process(ctx, textUpdate(chat, "5"))
 	if b.states.Get(chat).Deposit != nil {
 		t.Error("valid amount must consume pending_deposit")
+	}
+}
+
+// TestCbDepStaleMethodAnswersPayMethodOff is the regression test for the
+// residual fix (Opus review of 11e033d): cbDep's switch used to have no
+// default case, so a stale "dep:qr"/"dep:pp"/"dep:bnb" tap — left over from a
+// deposit picker rendered before the SePay/PayPal/Binance removal (S1-S3) —
+// fell through silently. command.go unconditionally deletes the tapped
+// message BEFORE dispatch, so that silent fall-through left the customer with
+// NOTHING: no menu, no error, no way forward. Every dep: tap must now answer.
+func TestCbDepStaleMethodAnswersPayMethodOff(t *testing.T) {
+	ctx := context.Background()
+	b, f, _, _, _ := newBuyBot(t, "999")
+	const chat = 100
+	primeKB(b, chat)
+
+	for _, stale := range []string{"pp", "bnb", "qr", "sepay"} {
+		f.Sends = nil
+		b.Process(ctx, callbackUpdate(chat, "dep:"+stale))
+		last := lastSendMsg(f)
+		want := i18n.C().Buy.PayMethodOff.T(i18n.EN)
+		if last == nil {
+			t.Errorf("dep:%s produced no reply — the customer is left with nothing", stale)
+			continue
+		}
+		if last.Text != want {
+			t.Errorf("dep:%s reply = %q, want %q", stale, last.Text, want)
+		}
 	}
 }
 

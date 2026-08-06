@@ -239,10 +239,6 @@ func (b *Bot) customerLookupText(chatID string) string {
 				e = "•"
 			}
 			when := fmtWhen(o.TS, i18n.EN)
-			pay := "—"
-			if o.PaypalOrderID != nil && *o.PaypalOrderID != "" {
-				pay = *o.PaypalOrderID
-			}
 			olang := o.Lang
 			if olang == "" {
 				olang = "—"
@@ -262,7 +258,20 @@ func (b *Bot) customerLookupText(chatID string) string {
 			}
 			lines = append(lines, "   🆔 "+o.Des)
 			lines = append(lines, "   🗓️ "+when+" · 🌐 "+olang)
-			lines = append(lines, "   💳 PayPal: "+pay)
+			// Residual fix (Opus review of 11e033d) — judgement call: KEEP, but
+			// stop printing it unconditionally. o.PaypalOrderID is HISTORICAL
+			// ONLY now — SetPaypalOrder (the write half) was already deleted
+			// with the PayPal rail (S2, orders.go:161-168); the field stays
+			// readable purely so an order placed BEFORE that removal still
+			// shows the id it really carried. It is not a live capability —
+			// no code path can ever set it on a new order again. Printing
+			// "PayPal: —" on every order forever would just be permanent
+			// noise about a capability that no longer exists, so the line now
+			// appears only on the (shrinking, eventually zero) set of orders
+			// that actually have one.
+			if o.PaypalOrderID != nil && *o.PaypalOrderID != "" {
+				lines = append(lines, "   💳 PayPal (historical): "+*o.PaypalOrderID)
+			}
 		}
 	}
 

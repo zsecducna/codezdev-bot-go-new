@@ -26,13 +26,26 @@ type Order struct {
 	CodeKind       *string  // 'promo' | 'referral'
 	ReferrerChat   *string  // who to pay on delivery (referral only)
 	EntraDeletedTS *float64 // refund-delete sweep stamp (store.py:113-117)
+	// RefundKind classifies WHY this order is 'refunded' (stats-fixes-spec.md
+	// §2.1). nil on every non-refunded order — that is the invariant
+	// ClaimOrderKind enforces.
+	//
+	// nil on a REFUNDED row means UNCLASSIFIED, which is broader than
+	// "pre-migration" and will stay broader until the step-3 handler migration
+	// lands: today the seven forward-to-'refunded' sites still call the plain
+	// ClaimOrder wrapper, so newly refunded rows also come out nil. Reports
+	// must bucket nil separately and must NOT label that bucket
+	// "pre-migration" until step 3 ships, or the count will keep growing and
+	// look like the migration never took.
+	RefundKind *string
 }
 
 // orderCols is the explicit column list every order SELECT uses — explicit
 // (never SELECT *) so scanning is immune to physical column order differences
 // between a freshly-created DB and an ALTER-migrated old one.
 const orderCols = "des, chat_id, lang, product, tier, qty, total, status, " +
-	"paypal_order_id, ts, code, code_kind, referrer_chat, entra_deleted_ts"
+	"paypal_order_id, ts, code, code_kind, referrer_chat, entra_deleted_ts, " +
+	"refund_kind"
 
 // rowScanner abstracts *sql.Row / *sql.Rows for the shared scan helper.
 type rowScanner interface{ Scan(dest ...any) error }
@@ -48,9 +61,11 @@ func scanOrder(r rowScanner) (*Order, error) {
 		paypal, code, kind, referrer sql.NullString
 		ts, entraTS                  sql.NullFloat64
 		chatID                       sql.NullString
+		refundKind                   sql.NullString
 	)
 	if err := r.Scan(&o.Des, &chatID, &lang, &product, &tier, &qty, &total,
-		&status, &paypal, &ts, &code, &kind, &referrer, &entraTS); err != nil {
+		&status, &paypal, &ts, &code, &kind, &referrer, &entraTS,
+		&refundKind); err != nil {
 		return nil, err
 	}
 	o.ChatID = chatID.String
@@ -75,6 +90,10 @@ func scanOrder(r rowScanner) (*Order, error) {
 	if entraTS.Valid {
 		v := entraTS.Float64
 		o.EntraDeletedTS = &v
+	}
+	if refundKind.Valid {
+		v := refundKind.String
+		o.RefundKind = &v
 	}
 	return &o, nil
 }
@@ -118,14 +137,6 @@ func (s *Store) GetOrder(des string) (*Order, error) {
 	return o, err
 }
 
-// SetPaypalOrder records the PayPal order id so a webhook can map it back to
-// `des` (store.py:216-220).
-func (s *Store) SetPaypalOrder(des, paypalOrderID string) error {
-	_, err := s.db.Exec("UPDATE orders SET paypal_order_id=? WHERE des=?",
-		paypalOrderID, des)
-	return err
-}
-
 // MarkEntraDeleted records that the Entra account(s) for order `des` have been
 // soft-deleted, so the refund-delete admin sweep and per-order button both
 // skip it from then on (store.py:223-228).
@@ -147,17 +158,14 @@ func (s *Store) UpdateOrderCode(des string, code, codeKind, referrerChat *string
 	return err
 }
 
-// OrderDesForPaypal reverse-looks-up our `des` from a PayPal order id
-// (survives restart, store.py:247-252). Returns "" if unknown.
-func (s *Store) OrderDesForPaypal(paypalOrderID string) (string, error) {
-	var des string
-	err := s.db.QueryRow("SELECT des FROM orders WHERE paypal_order_id=?",
-		paypalOrderID).Scan(&des)
-	if err == sql.ErrNoRows {
-		return "", nil
-	}
-	return des, err
-}
+// USDT migration note (2026-08-06): SetPaypalOrder (the write half of the
+// paypal_order_id column) and OrderDesForPaypal (the webhook's reverse
+// lookup) were removed as dead code once the PayPal rail's only callers
+// (internal/handlers/paypal.go) were deleted — S2. PaypalOrderID itself stays
+// readable on Order (scanOrder above) for historical order display
+// (adminusers.go), and the paypal_order_id COLUMN stays in the schema per
+// the migration plan — both are dropped together only in the later live-data
+// migration slice (S9), not here.
 
 // ClaimOrder atomically moves an order from `fromStatus` to `toStatus`
 // (store.py:255-270). Returns the order if THIS call won the transition
@@ -167,6 +175,141 @@ func (s *Store) OrderDesForPaypal(paypalOrderID string) (string, error) {
 // guard against double-delivery across goroutines/events
 // (architecture-go.md §5).
 func (s *Store) ClaimOrder(des, fromStatus, toStatus string) (*Order, error) {
+	return s.ClaimOrderKind(des, fromStatus, toStatus, "")
+}
+
+// Refund kinds — the five semantically distinct events that all collapse into
+// status='refunded' today (stats-fixes-spec.md §2.1). Keeping them apart is the
+// whole point: the original dashboard summed refunds, abandoned checkouts,
+// failed mints and rescued late payments into one "Refunded/expired" number, so
+// a shop with ZERO real refunds could report hundreds.
+const (
+	// RefundKindCustomer — an admin refunded a COMPLETED sale (delivered ->
+	// refunded). Goods went out, money came back. A real refund.
+	RefundKindCustomer = "customer"
+	// RefundKindAdminCancel — an admin refunded a PAID order before delivery.
+	// Money back, no goods. A real refund.
+	RefundKindAdminCancel = "admin_cancel"
+	// RefundKindMintFailed — our own API-key mint failed (apikey_deliver.go).
+	// The customer wanted to buy and WE could not deliver: an operational
+	// failure, not a customer refund.
+	RefundKindMintFailed = "mint_failed"
+	// RefundKindOutOfStock — the customer paid and the reserved folder-stock
+	// rows were gone (purchase.go). Our fulfilment failure, on the MAIN product
+	// path. Counting it as a customer refund would blame customers for our own
+	// stockouts.
+	RefundKindOutOfStock = "out_of_stock"
+	// RefundKindLateSettled — payment landed after the checkout window and was
+	// credited to the wallet. For a __deposit__ order the customer is sent
+	// Deposit.OK: this is a SUCCESS wearing a refund's status, and counting it
+	// as a refund is the exact defect this taxonomy exists to remove.
+	RefundKindLateSettled = "late_settled"
+)
+
+// validRefundKinds gates ClaimOrderKind. An unrecognised string is rejected
+// rather than stored: a typo silently creating a sixth bucket would be the same
+// class of defect as the four-way overload being fixed here.
+var validRefundKinds = map[string]bool{
+	RefundKindCustomer:    true,
+	RefundKindAdminCancel: true,
+	RefundKindMintFailed:  true,
+	RefundKindOutOfStock:  true,
+	RefundKindLateSettled: true,
+}
+
+// IsRealRefund reports whether a refund kind counts toward the CUSTOMER-FACING
+// refund rate. Only an admin-issued refund of a paid or delivered order does.
+//
+// mint_failed and out_of_stock are OUR failures — folding them in makes an
+// outage or a stockout look like customer dissatisfaction and hides both.
+// late_settled is frequently a completed top-up. A NULL kind (pre-migration
+// row) is not a real refund either: it is unknown, and unknown must be reported
+// as its own bucket, never assumed (stats-fixes-spec.md §2.2).
+func IsRealRefund(kind string) bool {
+	return kind == RefundKindCustomer || kind == RefundKindAdminCancel
+}
+
+// IsRealRefundOrder is the nil-safe form for an Order straight out of the
+// store, and is what report code should call. Order.RefundKind is a *string
+// that is legitimately nil on every unclassified refunded row — both the
+// pre-migration ones and (until the step-3 handler migration lands) any row
+// refunded through the plain ClaimOrder wrapper. Dereferencing it to call
+// IsRealRefund would panic on the very first such row, on a money-reporting
+// path, so the pointer form exists to make the safe call the obvious one.
+// nil is NOT a real refund: unknown must be reported as its own bucket, never
+// assumed either way (stats-fixes-spec.md §1.2).
+func IsRealRefundOrder(o *Order) bool {
+	if o == nil || o.RefundKind == nil {
+		return false
+	}
+	return IsRealRefund(*o.RefundKind)
+}
+
+// ClaimOrderKind is ClaimOrder plus the refund_kind write, in the SAME atomic
+// UPDATE that already guards double-delivery.
+//
+// THE INVARIANT: refund_kind is non-NULL if and only if status='refunded'.
+// It is enforced structurally rather than by convention — the one UPDATE sets
+// the kind when toStatus=="refunded" and NULLs it for every other status. That
+// matters because three call sites REVERT a refund
+// (apikey_deliver.go:247,404 and purchase.go:343 all do
+// ClaimOrder(des, "refunded", "paid")); if the kind survived such a revert, a
+// status='paid' row would carry a stale kind and every GROUP BY refund_kind
+// report would count an order that is not refunded at all.
+//
+// Because ClaimOrder delegates here with kind=="", every pre-existing call site
+// clears the column for free, with no edit and no chance of anyone forgetting.
+// Only the forward-to-'refunded' sites need to change. There are SEVEN of them
+// (spec §2.1) — not five; the API-key rail refunds through its OWN path, since
+// doRefund branches at adminorders.go:206 into doRefundApikeyGroup for any
+// isApikeyFamily product and never reaches adminorders.go:233:
+//
+//	adminorders.go:233     customer | admin_cancel   (branch on o.Status)
+//	apikey_refund.go:257   customer | admin_cancel   (branch on m.Status)
+//	apikey_refund.go:275   customer | admin_cancel   (branch on o.Status)
+//	apikey_deliver.go:228  mint_failed
+//	apikey_deliver.go:390  mint_failed
+//	purchase.go:324        out_of_stock
+//	deposit.go:253         late_settled
+//
+// The three dynamic-`from` sites are pre-gated by refundableStatuses
+// {delivered, paid} (apikey_refund.go:33), so each is a REAL refund: delivered
+// -> customer, paid -> admin_cancel.
+//
+// Completeness check for step 3: grep ClaimOrderKind for exactly SEVEN hits AND
+// confirm `grep -rn 'ClaimOrder(' internal/handlers/ | grep '"refunded")'`
+// returns nothing left on the plain wrapper. Do not trust the count alone —
+// this list was wrong twice (it missed purchase.go, then the two apikey_refund
+// sites), and both misses would have silently dropped real refunds into the
+// unclassified bucket.
+//
+// refundKind must be "" or one of the RefundKind* constants; anything else is
+// rejected WITHOUT moving the order. Passing a kind with a non-refunded
+// toStatus is also rejected — it means the caller has confused itself.
+func (s *Store) ClaimOrderKind(des, fromStatus, toStatus, refundKind string) (*Order, error) {
+	if refundKind != "" && !validRefundKinds[refundKind] {
+		return nil, fmt.Errorf("claim order %s: unknown refund kind %q", des, refundKind)
+	}
+	if refundKind != "" && toStatus != "refunded" {
+		return nil, fmt.Errorf("claim order %s: refund kind %q given for status %q (only 'refunded' carries a kind)",
+			des, refundKind, toStatus)
+	}
+	// A self-transition is the ONE sequence that could strip a kind off a row
+	// that is still legitimately refunded: refunded -> refunded matches the
+	// WHERE, reports RowsAffected()==1, and writes NULL. No caller does this
+	// today (the dynamic-`from` sites are gated to {delivered, paid}), but that
+	// guard lives in internal/handlers, so the store must not rely on it.
+	// Rejecting is correct rather than COALESCE-preserving the old kind:
+	// preserving would break the revert path, which is the real invariant.
+	if fromStatus == toStatus {
+		return nil, fmt.Errorf("claim order %s: no-op transition %q -> %q", des, fromStatus, toStatus)
+	}
+	// nil -> SQL NULL. Any transition away from 'refunded' therefore clears a
+	// previously-set kind as part of the same guarded write.
+	var kindArg any
+	if toStatus == "refunded" && refundKind != "" {
+		kindArg = refundKind
+	}
 	// One BEGIN IMMEDIATE transaction so the guarded UPDATE and the read-back
 	// SELECT see a consistent row (mirror of Python's single `with c` conn).
 	tx, err := s.db.Begin()
@@ -174,8 +317,8 @@ func (s *Store) ClaimOrder(des, fromStatus, toStatus string) (*Order, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
-	res, err := tx.Exec("UPDATE orders SET status=? WHERE des=? AND status=?",
-		toStatus, des, fromStatus)
+	res, err := tx.Exec("UPDATE orders SET status=?, refund_kind=? WHERE des=? AND status=?",
+		toStatus, kindArg, des, fromStatus)
 	if err != nil {
 		return nil, err
 	}

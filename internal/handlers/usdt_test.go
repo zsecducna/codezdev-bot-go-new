@@ -8,14 +8,22 @@ package handlers
 //	                               excluding a chat's own DEAD sessions
 //	tests/test_usdt_verify.py    — confirmed/unconfirmed/reverted/wrong-recipient
 //	                               by-hash lookups + the band-spacing invariant
-//	tests/test_binance_match.py  — the shared poller's match invariants
 //	tests/test_deposit_credit.py — the ±30c deposit credit decision (the pure
 //	                               function itself is pinned in bands/credit_test.go;
 //	                               here it is pinned END-TO-END through a deposit)
 //
 // Plus the integration pin this slice exists for: ONE bands.Registry shared by
-// all three rails, so a live Binance band blocks the same TRON/BEP20 amount
+// both surviving rails, so a live BEP20 band blocks the same TRON amount
 // END-TO-END THROUGH THE HANDLERS — not merely in the bands unit tests.
+//
+// USDT migration note (2026-08-06): Binance Pay (the shared poller, its
+// reconcile pass, tests/test_binance_match.py's port) was removed — the shop
+// takes USDT via BEP20/TRON only (S3). TestBinancePollerMatchesMultiplePendings,
+// TestBinancePollerRestartsAfterIdleExit, TestStartupRecoveryNoDoubleCredit and
+// TestBinanceReconcileGrace went with it. Tests that merely used
+// bands.ProviderBinance as a vehicle to prove the shared-registry property
+// (TestUSDTSharedBandAcrossRails) were retargeted to the two surviving
+// providers instead of deleted.
 //
 // No live network: the chain/exchange seams are driven by fakes, and
 // TestUSDTRealClientsByHash additionally drives the REAL bep20/tron clients
@@ -37,7 +45,6 @@ import (
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/pay/bands"
 	"codezdev-bot/internal/pay/bep20"
-	"codezdev-bot/internal/pay/binance"
 	"codezdev-bot/internal/pay/tron"
 	"codezdev-bot/internal/store"
 )
@@ -59,10 +66,7 @@ type usdtFakes struct {
 	// transfer to us" (unknown hash / reverted / too shallow / wrong recipient).
 	bscByHash map[string]*bep20.TransferByHash
 	trxByHash map[string]*tron.Transfer
-	// binanceTxns is the whole pay/transactions payload the shared poller sees.
-	binanceTxns []binance.Transaction
-	binanceHits atomic.Int64
-	bscHits     atomic.Int64
+	bscHits   atomic.Int64
 }
 
 func (u *usdtFakes) setBSC(hash string, tx *bep20.TransferByHash) {
@@ -83,14 +87,9 @@ func (u *usdtFakes) setTRX(hash string, tx *tron.Transfer) {
 	u.trxByHash[strings.ToLower(hash)] = tx
 }
 
-func (u *usdtFakes) setBinanceTxns(txns []binance.Transaction) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.binanceTxns = txns
-}
-
-// newUSDTBot builds a Bot with all three USDT rails CONFIGURED and ENABLED, fast
-// timers, and the chain/exchange seams pointed at scripted fakes.
+// newUSDTBot builds a Bot with both surviving USDT rails (BEP20, TRON)
+// CONFIGURED and ENABLED, fast timers, and the chain seams pointed at
+// scripted fakes. Binance Pay was removed by the USDT-only migration (S3).
 //
 // Env is set BEFORE handlers.New so the band geometry, the seller addresses and
 // the USD_TO_VND rate are all in place when the registry is built.
@@ -99,16 +98,13 @@ func newUSDTBot(t *testing.T) (*Bot, *fakeTG, *store.Store, string, *usdtFakes) 
 	t.Setenv("USD_TO_VND", "25000") // 1 USDT = 25,000 VND
 	t.Setenv("BEP20_ADDRESS", testSellerBSC)
 	t.Setenv("TRON_ADDRESS", testSellerTRX)
-	t.Setenv("BINANCE_PAY_ID", "payid-1")
-	t.Setenv("BINANCE_API_KEY", "k")
-	t.Setenv("BINANCE_SECRET_KEY", "s")
 
 	b, f, st, _, dir := newBuyBot(t, "999")
-	// bep20/tron default OFF (pay_enabled @5150) — turn every USDT rail on.
+	// bep20/tron default OFF (pay_enabled @5150) — turn both USDT rails on.
 	// SaveSettings persists the WHOLE dict, so edit the live settings rather than
 	// a hand-built subset (which would drop every other default).
 	s := b.cfg.Settings()
-	s["pay_bep20"], s["pay_tron"], s["pay_binance"] = true, true, true
+	s["pay_bep20"], s["pay_tron"] = true, true
 	if err := b.cfg.SaveSettings(s); err != nil {
 		t.Fatalf("save settings: %v", err)
 	}
@@ -125,14 +121,7 @@ func newUSDTBot(t *testing.T) (*Bot, *fakeTG, *store.Store, string, *usdtFakes) 
 		defer fk.mu.Unlock()
 		return fk.trxByHash[strings.ToLower(strings.TrimPrefix(txhash, "0x"))], nil
 	}
-	b.binanceGetTxns = func(_ *int64) ([]binance.Transaction, error) {
-		fk.binanceHits.Add(1)
-		fk.mu.Lock()
-		defer fk.mu.Unlock()
-		return append([]binance.Transaction(nil), fk.binanceTxns...), nil
-	}
-	// Fast timers so the pollers/sweeps run inside a test.
-	b.binancePollInterval = 2 * time.Millisecond
+	// Fast timers so the confirm-poll/sweeps run inside a test.
 	b.usdtConfirmPoll = 2 * time.Millisecond
 	b.usdtConfirmWait = 2 * time.Second
 	b.expirySweepInterval = 5 * time.Millisecond
@@ -246,48 +235,43 @@ func anySendContains(f *fakeTG, want string) bool {
 	return false
 }
 
-// ---- 1. the integration pin: ONE registry across all three rails ------------
+// ---- 1. the integration pin: ONE registry across both rails -----------------
 
-// TestUSDTSharedBandAcrossRails is the reason this slice exists: a live Binance
-// band must block the same amount on TRON and BEP20 END-TO-END THROUGH THE
-// HANDLERS. Python kept three independent registries, so a Binance amount could
-// equal a live TRON amount; this port routes every rail through the ONE injected
-// bands.Registry (bands deviation 1), whose collision set spans all providers.
+// TestUSDTSharedBandAcrossRails is the reason this slice exists: a live BEP20
+// band must block the same amount on TRON END-TO-END THROUGH THE HANDLERS.
+// Python kept independent per-rail registries, so a same-price order on two
+// rails could get the same amount; this port routes both surviving rails
+// through the ONE injected bands.Registry (bands deviation 1), whose
+// collision set spans every provider. (Binance Pay was a third rail sharing
+// this same registry until the USDT-only migration removed it, S3; the
+// property under test — ONE shared registry, not "three registries" — is
+// unaffected by the provider count.)
 //
-// Three same-price orders, one per rail, each opened by tapping its real pay
-// button: every pair of live amounts must stay at least max(tol)*2+1 units
-// apart, so one incoming payment can never fall inside two bands.
+// Two same-price orders, one per rail, each opened by tapping its real pay
+// button: the live amounts must stay at least max(tol)*2+1 units apart, so
+// one incoming payment can never fall inside both bands.
 func TestUSDTSharedBandAcrossRails(t *testing.T) {
 	ctx := context.Background()
 	b, f, st, _, _ := newUSDTBot(t)
 	const total = 150000 // 6.00 USDT at 25,000 VND/USDT
 
-	desA := usdtOrder(t, st, 101, total)
 	desB := usdtOrder(t, st, 102, total)
 	desC := usdtOrder(t, st, 103, total)
 
-	b.Process(ctx, callbackUpdate(101, "paybnb:"+desA))
 	b.Process(ctx, callbackUpdate(102, "paybsc:"+desB))
 	b.Process(ctx, callbackUpdate(103, "paytrx:"+desC))
 
-	uA := bandUnits(t, b, bands.ProviderBinance, desA)
 	uB := bandUnits(t, b, bands.ProviderBEP20, desB)
 	uC := bandUnits(t, b, bands.ProviderTron, desC)
 
-	// Cross-provider spacing is max(tolA,tolB)*2+1 — full band disjointness from
-	// EITHER side's tolerance (bands deviation 1).
-	minGap := int64(2*max(bep20.AmountMatchTol(), max(tron.AmountMatchTol(), binance.AmountMatchTol())) + 1)
-	for _, pair := range [][3]any{
-		{"binance/bep20", uA, uB}, {"binance/tron", uA, uC}, {"bep20/tron", uB, uC},
-	} {
-		name := pair[0].(string)
-		x, y := pair[1].(int64), pair[2].(int64)
-		if x == y {
-			t.Fatalf("%s: both rails handed out the SAME amount %d — the shared registry is not shared", name, x)
-		}
-		if d := x - y; d < 0 && -d < minGap || d >= 0 && d < minGap {
-			t.Errorf("%s: amounts %d and %d are closer than the %d-unit min gap — bands overlap", name, x, y, minGap)
-		}
+	// Cross-provider spacing is max(tolBEP20,tolTron)*2+1 — full band
+	// disjointness from EITHER side's tolerance (bands deviation 1).
+	minGap := int64(2*max(bep20.AmountMatchTol(), tron.AmountMatchTol()) + 1)
+	if uB == uC {
+		t.Fatalf("bep20/tron: both rails handed out the SAME amount %d — the shared registry is not shared", uB)
+	}
+	if d := uB - uC; (d < 0 && -d < minGap) || (d >= 0 && d < minGap) {
+		t.Errorf("bep20/tron: amounts %d and %d are closer than the %d-unit min gap — bands overlap", uB, uC, minGap)
 	}
 	// Every rail actually rendered its screen (the flow really ran end-to-end).
 	if !anySendContains(f, "USDT") && len(f.Photos) == 0 {
@@ -850,97 +834,6 @@ func TestUSDTBadHashKeepsSlotArmed(t *testing.T) {
 	}
 }
 
-// ---- 6. Binance: the ONE shared poller --------------------------------------
-
-// TestBinancePollerMatchesMultiplePendings: ONE pay/transactions call must settle
-// EVERY pending Binance order it matches (telegram_bot.py:9190-9247) — that is
-// the whole point of a single shared poller (bounded API weight).
-func TestBinancePollerMatchesMultiplePendings(t *testing.T) {
-	ctx := context.Background()
-	b, _, st, dir, fk := newUSDTBot(t)
-	const total = 150000
-
-	desA := deliverableOrder(t, b, st, dir, 500, total)
-	seedProduct(t, dir, "prodDeliver2", total, 3)
-	desB := store.NewDes()
-	if r, err := b.stock.Reserve("prodDeliver2", 1, desB, b.reserveTTL); err != nil || len(r) != 1 {
-		t.Fatalf("reserve B: %v", err)
-	}
-	if err := st.CreateOrder(desB, fmtInt(501), "en", "prodDeliver2", "KBH", 1, total); err != nil {
-		t.Fatal(err)
-	}
-
-	b.Process(ctx, callbackUpdate(500, "paybnb:"+desA))
-	b.Process(ctx, callbackUpdate(501, "paybnb:"+desB))
-	resA, _ := b.bands.Get(bands.ProviderBinance, desA)
-	resB, _ := b.bands.Get(bands.ProviderBinance, desB)
-	if resA.Amount == resB.Amount {
-		t.Fatal("two live Binance orders share an amount")
-	}
-
-	// ONE payload carrying BOTH credits.
-	nowMS := time.Now().UnixMilli()
-	fk.setBinanceTxns([]binance.Transaction{
-		{TransactionID: "1001", TransactionTime: nowMS, Amount: resA.Amount, Currency: "USDT"},
-		{TransactionID: "1002", TransactionTime: nowMS, Amount: resB.Amount, Currency: "USDT"},
-	})
-
-	if !waitFor(t, func() bool {
-		oa, _ := st.GetOrder(desA)
-		ob, _ := st.GetOrder(desB)
-		return oa != nil && oa.Status == "delivered" && ob != nil && ob.Status == "delivered"
-	}) {
-		oa, _ := st.GetOrder(desA)
-		ob, _ := st.GetOrder(desB)
-		t.Fatalf("poller did not settle both: A=%s B=%s", oa.Status, ob.Status)
-	}
-	// Both credits consumed exactly once (processed PK).
-	for _, id := range []string{"bn:1001", "bn:1002"} {
-		if used, _ := st.TxnExists(id); !used {
-			t.Errorf("%s was not recorded in the processed ledger", id)
-		}
-	}
-	// Both rows dropped -> bands freed.
-	if _, ok := b.bands.Get(bands.ProviderBinance, desA); ok {
-		t.Error("band A still held after settlement")
-	}
-}
-
-// TestBinancePollerRestartsAfterIdleExit: the poller stops when no orders remain
-// and MUST be restartable — the latch it holds is cleared on the way out
-// (telegram_bot.py:9221-9223). A regression here silently strands every Binance
-// order placed after the first idle exit: the customer sees a unique amount that
-// nothing is watching for.
-func TestBinancePollerRestartsAfterIdleExit(t *testing.T) {
-	ctx := context.Background()
-	b, _, st, dir, fk := newUSDTBot(t)
-	const total = 150000
-
-	// Start the poller with NO pending orders; it must exit and release the latch.
-	b.ensureBinancePoller()
-	if !waitFor(t, func() bool {
-		b.binancePollerMu.Lock()
-		defer b.binancePollerMu.Unlock()
-		return !b.binancePollerOn
-	}) {
-		t.Fatal("an idle poller never exited / never released its latch")
-	}
-
-	// A NEW order must get a working poller.
-	des := deliverableOrder(t, b, st, dir, 640, total)
-	b.Process(ctx, callbackUpdate(640, "paybnb:"+des))
-	res, _ := b.bands.Get(bands.ProviderBinance, des)
-	fk.setBinanceTxns([]binance.Transaction{
-		{TransactionID: "3001", TransactionTime: time.Now().UnixMilli(), Amount: res.Amount, Currency: "USDT"},
-	})
-	if !waitFor(t, func() bool {
-		o, _ := st.GetOrder(des)
-		return o != nil && o.Status == "delivered"
-	}) {
-		t.Fatal("the restarted poller never settled the order — the singleton latch leaked")
-	}
-}
-
 // TestUSDTPersistFailureRefusesScreen: a pending row that cannot be PERSISTED
 // would not survive a restart (the reconcile/rehydrate could never see it), so
 // the rail must undo its reservation and refuse rather than invite a payment it
@@ -1024,88 +917,6 @@ func TestStartupRecoveryReadoptsBands(t *testing.T) {
 		if d := u - taken; d > -21 && d < 21 {
 			t.Errorf("fresh amount %d collides with rehydrated %d", u, taken)
 		}
-	}
-}
-
-// TestStartupRecoveryNoDoubleCredit: the boot Binance reconcile must NOT re-settle
-// a credit already consumed. store.MarkTxn's PK is the guard (telegram_bot.py:
-// 9254-9262 "idempotent and concurrency-safe").
-func TestStartupRecoveryNoDoubleCredit(t *testing.T) {
-	ctx := context.Background()
-	b, _, st, dir, fk := newUSDTBot(t)
-	const chat = 610
-	const total = 150000
-
-	des := deliverableOrder(t, b, st, dir, chat, total)
-	b.Process(ctx, callbackUpdate(chat, "paybnb:"+des))
-	res, _ := b.bands.Get(bands.ProviderBinance, des)
-	fk.setBinanceTxns([]binance.Transaction{
-		{TransactionID: "2001", TransactionTime: time.Now().UnixMilli(), Amount: res.Amount, Currency: "USDT"},
-	})
-
-	// First reconcile settles it.
-	b.binanceReconcileOnce(ctx)
-	o, _ := st.GetOrder(des)
-	if o.Status != "delivered" {
-		t.Fatalf("first reconcile left status %s", o.Status)
-	}
-	balAfter, _ := st.GetBalance(fmtInt(chat))
-
-	// Re-persist the row (as a crashed run might) and reconcile again: the
-	// processed PK must stop any second settlement or credit.
-	if err := st.BinancePendingAdd(des, fmtInt(chat), res.Amount, total,
-		time.Now().Add(-time.Minute).UnixMilli(), float64(time.Now().Add(time.Minute).Unix())); err != nil {
-		t.Fatal(err)
-	}
-	b.binanceReconcileOnce(ctx)
-	if bal, _ := st.GetBalance(fmtInt(chat)); bal != balAfter {
-		t.Errorf("a second reconcile credited again (%d -> %d)", balAfter, bal)
-	}
-}
-
-// TestBinanceReconcileGrace: an EXPIRED order still gets ONE last match attempt
-// while within BINANCE_RECONCILE_GRACE_S (a late credit then refunds to the
-// wallet), and is dropped once past it (telegram_bot.py:9280-9300).
-func TestBinanceReconcileGrace(t *testing.T) {
-	ctx := context.Background()
-	b, _, st, _, fk := newUSDTBot(t)
-	const total = 150000
-	fk.setBinanceTxns(nil) // no credit ever arrives
-
-	// (a) expired but WITHIN the grace -> the row survives one more attempt.
-	inGrace := usdtOrder(t, st, 620, total)
-	st.ClaimOrder(inGrace, "reserved", "expired")
-	if err := st.BinancePendingAdd(inGrace, "620", "6.00", total,
-		time.Now().UnixMilli(), float64(time.Now().Unix())); err != nil {
-		t.Fatal(err)
-	}
-	// (b) expired and PAST the grace -> pruned before any match attempt.
-	stale := usdtOrder(t, st, 621, total)
-	st.ClaimOrder(stale, "reserved", "expired")
-	if err := st.BinancePendingAdd(stale, "621", "6.21", total,
-		time.Now().UnixMilli(), float64(time.Now().Unix())); err != nil {
-		t.Fatal(err)
-	}
-	// Shrink the grace so (b)'s just-written row is already past it, then widen it
-	// again for (a) in a second pass.
-	b.binanceReconcileGrace = 0
-	b.binanceReconcileOnce(ctx)
-	rows, _ := st.BinancePendingAll()
-	if len(rows) != 0 {
-		t.Errorf("rows past the grace were kept: %d", len(rows))
-	}
-
-	// Re-add (a) with a generous grace: no match -> dropIfNoMatch fires, but only
-	// AFTER the reconcile actually queried Binance for it.
-	if err := st.BinancePendingAdd(inGrace, "620", "6.00", total,
-		time.Now().UnixMilli(), float64(time.Now().Unix())); err != nil {
-		t.Fatal(err)
-	}
-	b.binanceReconcileGrace = time.Hour
-	hits := fk.binanceHits.Load()
-	b.binanceReconcileOnce(ctx)
-	if fk.binanceHits.Load() != hits+1 {
-		t.Error("an in-grace expired order was not given its last match attempt")
 	}
 }
 

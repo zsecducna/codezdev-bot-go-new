@@ -11,7 +11,6 @@ import (
 
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/pay/bep20"
-	"codezdev-bot/internal/pay/binance"
 	"codezdev-bot/internal/pay/tron"
 	"codezdev-bot/internal/stock"
 	"codezdev-bot/internal/store"
@@ -195,12 +194,6 @@ func (b *Bot) sendPayScreen(ctx context.Context, chatID int64, des, note string)
 	if b.payEnabled("balance") {
 		rows = append(rows, btnRow(c.PayBtnBalance.T(lang), cbData("paybal", des)))
 	}
-	if b.payEnabled("paypal") {
-		rows = append(rows, btnRow(c.PayBtnPayPal.T(lang), cbData("paypp", des)))
-	}
-	if b.payEnabled("binance") && binance.Configured() {
-		rows = append(rows, btnRow(c.PayBtnBinance.T(lang), cbData("paybnb", des)))
-	}
 	if b.payEnabled("bep20") && bep20.Configured() {
 		rows = append(rows, styledBtnRow(c.PayBtnBEP20.T(lang), cbData("paybsc", des), "primary"))
 	}
@@ -278,7 +271,7 @@ func (b *Bot) cbPayBalance(cc *cbCtx) {
 		return
 	}
 	if !ok {
-		// Can't cover it -> revert to reserved so QR/PayPal stay available.
+		// Can't cover it -> revert to reserved so other rails stay available.
 		b.store.ClaimOrder(des, "paid", "reserved")
 		b.send(cc.Ctx, cc.ChatID, c.Insufficient.T(lang), nil)
 		return
@@ -297,8 +290,8 @@ func (b *Bot) deliverPaid(ctx context.Context, order *store.Order, des string) b
 	// API-key orders (either SKU) have no folder stock to finalize: route to the
 	// Kiro-Go minting path, which owns its own idempotency + refund-on-failure
 	// and reads the SKU off the product sentinel. Every payment rail (balance,
-	// QR, PayPal, Binance, on-chain) fulfills the virtual product through this
-	// ONE branch (telegram_bot.py:7834-7844).
+	// on-chain USDT) fulfills the virtual product through this ONE branch
+	// (telegram_bot.py:7834-7844).
 	if isApikeyBuyProduct(order.Product) {
 		return b.deliverApikey(ctx, order, des)
 	}

@@ -5,8 +5,8 @@ package handlers
 // Ports _deliver_apikey (telegram_bot.py:7458-7673) and
 // _deliver_apikey_recharge (telegram_bot.py:7676-7820). Both are reached from
 // the ONE shared settle path (settlePaid -> deliverPaid), so every payment rail
-// (balance, QR, PayPal, Binance, on-chain) fulfills the virtual product through
-// this single branch — there is no second settle path.
+// (balance, on-chain USDT) fulfills the virtual product through this single
+// branch — there is no second settle path.
 //
 // The two money invariants this file exists to enforce:
 //

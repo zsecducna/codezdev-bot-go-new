@@ -177,12 +177,57 @@ func (s *Store) initSchema() error {
 			return fmt.Errorf("migrate orders.entra_deleted_ts: %w", err)
 		}
 	}
+	// Migration: statistics columns (.omc/artifacts/stats-fixes-spec.md §1.1).
+	// A Go-side addition with no store.py counterpart — the Python original
+	// never recorded any of this, which is precisely why its reports could not
+	// tell a customer refund from a stockout, or measure what a promo cost.
+	//
+	// All three are NULLABLE ON PURPOSE. SQLite cannot ADD COLUMN ... NOT NULL
+	// without a constant default, and any constant here would be a LIE ABOUT
+	// HISTORY: an existing 'refunded' row cannot be retroactively classified
+	// (the distinguishing information was never recorded), and an existing
+	// order's pre-discount price is gone for good because `total` was
+	// overwritten in place by UpdateOrderCode. So NULL carries its own meaning
+	// — UNCLASSIFIED — which is a DISTINCT state from any real value, and
+	// reports MUST bucket it separately rather than defaulting it into a kind
+	// or counting it as a zero discount (spec §1.2).
+	//
+	// NOTE for whoever writes those reports: NULL does not mean "pre-migration"
+	// yet. Until the step-3 handler migration lands, newly refunded rows also
+	// come out NULL (the seven refund sites still call the plain ClaimOrder
+	// wrapper), and list_total/code_discount have no writer at all until spec
+	// §3. Labelling the bucket "pre-migration orders" before then produces a
+	// count that grows daily and reads as a failed migration.
+	// `have` is reused, not re-read, matching the two migrations above.
+	if !have["refund_kind"] {
+		if _, err := tx.Exec("ALTER TABLE orders ADD COLUMN refund_kind TEXT"); err != nil {
+			return fmt.Errorf("migrate orders.refund_kind: %w", err)
+		}
+	}
+	// list_total / code_discount are written by a later slice (spec §3); the
+	// columns land now so the schema migrates in one step rather than asking a
+	// live prod DB to migrate twice.
+	for _, col := range []string{"list_total", "code_discount"} {
+		if !have[col] {
+			if _, err := tx.Exec("ALTER TABLE orders ADD COLUMN " + col + " INTEGER"); err != nil {
+				return fmt.Errorf("migrate orders.%s: %w", col, err)
+			}
+		}
+	}
 
 	creates2 := []string{
 		// Secondary indexes for the hot non-PK lookups (store.py:118-125).
 		"CREATE INDEX IF NOT EXISTS idx_orders_paypal ON orders(paypal_order_id)",
 		"CREATE INDEX IF NOT EXISTS idx_orders_chat ON orders(chat_id)",
 		"CREATE INDEX IF NOT EXISTS idx_orders_status_ts ON orders(status, ts)",
+		// Statistics indexes (stats-fixes-spec.md §1.1) — the refund-kind
+		// counters and the promo-cost report both group on these columns, and
+		// without an index each dashboard render is a full table scan of every
+		// order the shop has ever taken. Declared here (not beside the column
+		// ALTERs above) because CREATE INDEX IF NOT EXISTS is idempotent and
+		// this is where every other orders index lives.
+		"CREATE INDEX IF NOT EXISTS idx_orders_refund_kind ON orders(refund_kind)",
+		"CREATE INDEX IF NOT EXISTS idx_orders_code_kind ON orders(code_kind)",
 		// Pending Binance USDT payments — restart-safe poller state
 		// (store.py:126-133).
 		"CREATE TABLE IF NOT EXISTS binance_pending (" +

@@ -1,17 +1,9 @@
 package handlers
 
-// usdt.go — the USDT rails: Binance Pay (polled) plus USDT BEP20 and USDT TRC20
-// (customer-driven verify-by-tx-hash, no poller). Ports:
+// usdt.go — the USDT rails: USDT BEP20 and USDT TRC20 (customer-driven
+// verify-by-tx-hash, no poller). Ports:
 //
-//	_binance_unique_amount      @9101   -> bands.Registry.Reserve(ProviderBinance)
-//	_ensure_binance_poller      @9118   -> ensureBinancePoller (lazy singleton)
-//	_binance_poller_loop        @9190   -> binancePollerLoop (ONE call, ALL pendings)
-//	_settle_binance_credit      @9128   -> settleBinanceCredit
-//	_consume_and_settle         @9152   -> consumeAndSettle
-//	_binance_reconcile_once     @9254   -> binanceReconcileOnce (2h grace)
-//	_recover_binance_pending    @9350   -> recoverBinancePending
-//	start_binance_deposit       @10627  -> startBinanceDeposit
-//	paybnb: / paybsc: / paytrx: @15898/15947/15990 -> cbPayBNB / cbPayBSC / cbPayTRX
+//	paybsc: / paytrx:              @15947/15990 -> cbPayBSC / cbPayTRX
 //	start_bep20_deposit         @9478   -> startBep20Deposit
 //	start_tron_deposit          @9935   -> startTronDeposit
 //	_send_bep20_qr / _send_tron_qr @9457/9907 -> sendOnchainQR
@@ -24,12 +16,16 @@ package handlers
 //	_expiry_sweep_once          @9313   -> expirySweepOnce
 //	_startup_recovery           @9995   -> StartupRecovery
 //
-// THE ONE REGISTRY. Python keeps three independent pending dicts, so a Binance
-// amount could equal a live TRON amount. This port routes ALL THREE rails through
-// the single injected bands.Registry (Bot.bands), whose collision set spans every
-// provider — a strictly stronger non-collision guarantee (bands deviation 1). The
+// USDT migration note (2026-08-06): Binance Pay (the shared poller, its
+// reconcile pass, and start_binance_deposit / cbPayBNB) was removed — the
+// shop takes USDT via BEP20/TRON only. THE ONE REGISTRY comment below still
+// applies to the two surviving rails: bands.Registry (Bot.bands) is shared
+// across providers so a live BEP20 amount also blocks the same TRON amount
+// (bands deviation 1) — that guarantee no longer needs to span three
+// providers, but nothing about how it works changed.
+//
 // registry owns amount / chat / deadline / created-at; usdtRows holds only the
-// rail-specific extras (VND total, the Binance since_ms floor, and the on-chain
+// rail-specific extras (VND total, TRON's min_ts floor, and the on-chain
 // [t_start, t_click] freshness window) that a Reservation deliberately does not
 // carry.
 //
@@ -37,7 +33,7 @@ package handlers
 //   - Settlement goes through the ONE shared chokepoint: settlePaid's
 //     reserved->paid CAS. Never both credit a wallet and deliver the same order.
 //   - Deposit/credit idempotency lives in the STORAGE layer: store.Credit /
-//     store.MarkTxn are PK-guarded on the ledger id ("bn:"/"bsc:"/"trx:" + hash).
+//     store.MarkTxn are PK-guarded on the ledger id ("bsc:"/"trx:" + hash).
 //   - An underpay never delivers: a PAY order settles only when the received
 //     amount is inside its own band; anything else is banked to the wallet or
 //     refused.
@@ -62,7 +58,6 @@ import (
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/pay/bands"
 	"codezdev-bot/internal/pay/bep20"
-	"codezdev-bot/internal/pay/binance"
 	"codezdev-bot/internal/pay/tron"
 	"codezdev-bot/internal/store"
 	"codezdev-bot/internal/tg"
@@ -110,15 +105,16 @@ type usdtSession struct {
 // pending_deposit (#44) so a pasted 64-hex hash is never misread as a deposit
 // amount (telegram_bot.py:18976 "Consumed before the deposit/qty handlers").
 //
-// The paybnb:/paybsc:/paytrx: callback routes are NOT appended here: M2.2
-// registered them as documented stubs, and dispatchCB is first-match-wins, so an
-// appended route would be shadowed forever. rebindCBRoute swaps the real handler
-// into the stub's EXISTING slot, which also keeps the route order pinned.
+// The paybsc:/paytrx: callback routes are NOT appended here: M2.2 registered
+// them as documented stubs, and dispatchCB is first-match-wins, so an
+// appended route would be shadowed forever. rebindCBRoute swaps the real
+// handler into the stub's EXISTING slot, which also keeps the route order
+// pinned. paybnb: (Binance Pay) stays a stub — Binance Pay was removed by the
+// USDT-only migration (S3).
 func (b *Bot) registerUSDT() {
 	b.insertCapturesBefore("deposit",
 		stage{name: "txid", fn: (*Bot).capTxid}, // #43 @18978 peek
 	)
-	b.rebindCBRoute("paybnb:", (*Bot).cbPayBNB) // @15898
 	b.rebindCBRoute("paybsc:", (*Bot).cbPayBSC) // @15947
 	b.rebindCBRoute("paytrx:", (*Bot).cbPayTRX) // @15990
 	// usdtpaid: has no stub to replace — append it (it is the last of the
@@ -159,24 +155,38 @@ func providerForChain(chain string) (bands.Provider, bool) {
 	return "", false
 }
 
-// ledgerPrefix is the processed-ledger id namespace per rail, so a BSC hash, a
-// TRON hash, a Binance transactionId and a SePay numeric id can never collide in
-// the single `processed` PK (telegram_bot.py:9214 "bn:<id>", 9737 prefix).
+// ledgerPrefix is the processed-ledger id namespace per rail, so a BSC hash and
+// a TRON hash can never collide in the single `processed` PK
+// (telegram_bot.py:9737 prefix).
 func ledgerPrefix(p bands.Provider) string {
-	switch p {
-	case bands.ProviderBinance:
-		return "bn"
-	case bands.ProviderBEP20:
+	if p == bands.ProviderBEP20 {
 		return "bsc"
-	default:
-		return "trx"
 	}
+	return "trx"
 }
 
 // usdtStr is Python's usdt_str(vnd) — the customer-facing 2-decimal USDT string
 // for a VND amount. It must produce the pay screen's base amount and the
-// deposit's desired amount, or a correct payment could miss its band. "" on a
-// missing/invalid USD_TO_VND rate (the caller then abandons).
+// deposit's desired amount, or a correct payment could miss its band.
+//
+// Stale-comment fix: this used to say "" on a missing/invalid rate. That is
+// no longer accurate — vndToUSD always has a fallback (config.DefaultUSDToVND,
+// "25000") for a genuinely MISSING rate, so "missing" can no longer produce
+// "". "" is still possible on an actually INVALID configured rate (the
+// resolved string fails to parse as a float, or parses to <=0) — e.g. a
+// broken ambient USD_TO_VND env var, since capSetRate already range-guards
+// the admin-set path.
+//
+// That branch is real, not dead, but it is only CHECKED at two of its three
+// call sites: startOnchainDeposit (usdtStr at ~line 433) and cbPayOnchain
+// (~line 585) both test for "" and abandon rather than quote a broken price.
+// The third call site — the audit-log line in the on-chain settle path
+// (~line 942, "+"+b.usdtStr(creditVND)+" USDT") — does NOT check it: on an
+// invalid rate the wallet is still credited correctly (that path doesn't call
+// usdtStr for the money, only for the audit string), but the audit row would
+// read "+ USDT" with the amount silently missing. Flagged, not fixed here —
+// out of this slice's scope (a stale-comment fix, not a money-handling
+// change), but a real gap worth closing separately.
 func (b *Bot) usdtStr(vnd int64) string {
 	s, err := b.vndToUSD(vnd)
 	if err != nil {
@@ -283,29 +293,21 @@ func (b *Bot) usdtSnapshotAll(p bands.Provider) []usdtSession {
 
 // persistUSDTPending writes the rail's persisted pending row so a restart can
 // rehydrate the band + the customer can still submit a hash
-// (store.binance_pending_add / bep20_pending_add / tron_pending_add).
+// (store.bep20_pending_add / tron_pending_add).
 func (b *Bot) persistUSDTPending(p bands.Provider, des, chatID, amount string, total, sinceMS int64, deadline float64) error {
-	switch p {
-	case bands.ProviderBinance:
-		return b.store.BinancePendingAdd(des, chatID, amount, total, sinceMS, deadline)
-	case bands.ProviderBEP20:
+	if p == bands.ProviderBEP20 {
 		// from_block is unused (verify is by-hash, not eth_getLogs) -> 0 (@9520).
 		return b.store.Bep20PendingAdd(des, chatID, amount, total, 0, deadline)
-	default:
-		return b.store.TronPendingAdd(des, chatID, amount, total, sinceMS, deadline)
 	}
+	return b.store.TronPendingAdd(des, chatID, amount, total, sinceMS, deadline)
 }
 
 // delUSDTPersisted drops the rail's persisted pending row. Idempotent.
 func (b *Bot) delUSDTPersisted(p bands.Provider, des string) error {
-	switch p {
-	case bands.ProviderBinance:
-		return b.store.BinancePendingDel(des)
-	case bands.ProviderBEP20:
+	if p == bands.ProviderBEP20 {
 		return b.store.Bep20PendingDel(des)
-	default:
-		return b.store.TronPendingDel(des)
 	}
+	return b.store.TronPendingDel(des)
 }
 
 // dropUSDTPending removes a resolved session from the band registry, the
@@ -401,44 +403,6 @@ func (b *Bot) adoptUSDTAmount(p bands.Provider, amount, chatID, des string, tota
 
 // ---- deposit starts ---------------------------------------------------------
 
-// startBinanceDeposit creates a Binance USDT top-up that CREDITS the wallet by
-// `vnd` once paid — start_binance_deposit (telegram_bot.py:10627-10658).
-// Persisted as a __deposit__ order so settlePaid routes the sentinel product to
-// CreditBalance instead of delivering accounts.
-func (b *Bot) startBinanceDeposit(ctx context.Context, chatID int64, lang i18n.Lang, vnd int64) {
-	c := &i18n.C().Pay
-	if !b.binanceConfigured() {
-		b.send(ctx, chatID, c.BinanceNoID.T(lang), nil)
-		return
-	}
-	des := store.NewDes()
-	if err := b.store.CreateOrder(des, fmtInt(chatID), string(lang), depositProduct, "Binance", 0, vnd); err != nil {
-		log.Println("binance deposit create_order failed:", err)
-		b.send(ctx, chatID, c.BinanceNoID.T(lang), nil)
-		return
-	}
-	base := b.usdtStr(vnd)
-	if base == "" { // exchange rate unset -> can't price it
-		b.abandonUSDTStub(des)
-		b.send(ctx, chatID, c.BinanceNoID.T(lang), nil)
-		return
-	}
-	now := b.now()
-	// Wall-clock deadline so it survives a restart (@10650).
-	deadline := now.Add(b.expiryTimeout)
-	amount, err := b.reserveUSDTAmount(bands.ProviderBinance, base, fmtInt(chatID), des,
-		vnd, now.UnixMilli(), deadline)
-	if err != nil {
-		b.abandonUSDTStub(des) // @10653 abandon the stub order
-		b.sendBandError(ctx, chatID, lang, err, c.BinanceNoID)
-		return
-	}
-	// Start polling BEFORE the QR send, as a safety net (@10656).
-	b.ensureBinancePoller()
-	b.sendBinanceQR(ctx, chatID, i18n.F(c.BinancePay.T(lang),
-		"usdt", amount, "pay_id", binancePayIDOrDash()))
-}
-
 // startBep20Deposit / startTronDeposit create an on-chain USDT top-up credited
 // when the customer submits a CONFIRMED tx hash — start_bep20_deposit
 // (telegram_bot.py:9478-9525) and start_tron_deposit (@9935-9962).
@@ -516,35 +480,6 @@ func (b *Bot) sendBandError(ctx context.Context, chatID int64, lang i18n.Lang, e
 }
 
 // ---- pay screens ------------------------------------------------------------
-
-// binancePayIDOrDash renders the Pay ID with Python's "—" placeholder (@10657).
-func binancePayIDOrDash() string {
-	if id := binance.PayID(); id != "" {
-		return id
-	}
-	return "—"
-}
-
-// sendBinanceQR sends the seller's personal Binance QR with `caption`: hosted
-// URL, else uploaded file, else text-only — _send_binance_qr
-// (telegram_bot.py:10060-10074). The Pay ID + amount in the caption are always
-// actionable, so the text fallback loses nothing that matters.
-func (b *Bot) sendBinanceQR(ctx context.Context, chatID int64, caption string) {
-	if u := binance.QRURL(); u != "" {
-		if _, err := b.tg.SendPhotoURL(ctx, chatID, u, caption); err == nil {
-			return
-		} else {
-			log.Println("binance qr send error:", err) // fall through to text
-		}
-	} else if p := binance.QRPath(); p != "" {
-		if _, err := b.tg.SendPhoto(ctx, chatID, p, caption); err == nil {
-			return
-		} else {
-			log.Println("binance qr send error:", err)
-		}
-	}
-	b.send(ctx, chatID, caption, nil)
-}
 
 // sendUSDTScreen shows the on-chain pay/deposit screen: the seller address, the
 // EXACT amount to send, and the "I have made the payment" button that arms the
@@ -634,35 +569,6 @@ func (b *Bot) payableOrder(cc *cbCtx, prefix, method string, configured func() b
 func (b *Bot) orderTS(o *store.Order) time.Time {
 	sec, frac := int64(o.TS), o.TS-float64(int64(o.TS))
 	return time.Unix(sec, int64(frac*1e9))
-}
-
-// cbPayBNB pays a reserved order by Binance USDT — the paybnb: branch
-// (telegram_bot.py:15898-15946). Assigns the order a UNIQUE amount, registers it
-// with the ONE shared poller, and shows the Pay ID + personal QR.
-func (b *Bot) cbPayBNB(cc *cbCtx) {
-	c := &i18n.C().Pay
-	o := b.payableOrder(cc, "paybnb:", "binance", b.binanceConfigured, c.BinanceNoID)
-	if o == nil {
-		return
-	}
-	lang := langSafe(o)
-	base := b.usdtStr(o.Total) // USDT ~ USD via USD_TO_VND (@15928)
-	if base == "" {
-		b.send(cc.Ctx, cc.ChatID, c.BinanceNoID.T(lang), nil)
-		return
-	}
-	// since_ms / deadline come from the ORDER's own creation time, so a re-tap
-	// cannot move the match floor or extend the payment window (@15930-15931).
-	created := b.orderTS(o)
-	amount, err := b.reserveUSDTAmount(bands.ProviderBinance, base, o.ChatID, o.Des,
-		o.Total, created.UnixMilli(), created.Add(b.expiryTimeout))
-	if err != nil {
-		b.sendBandError(cc.Ctx, cc.ChatID, lang, err, c.BinanceNoID)
-		return
-	}
-	b.ensureBinancePoller() // start polling BEFORE the QR send (safety net, @15944)
-	b.sendBinanceQR(cc.Ctx, cc.ChatID, i18n.F(c.BinancePay.T(lang),
-		"usdt", amount, "pay_id", binancePayIDOrDash()))
 }
 
 // cbPayBSC / cbPayTRX pay a reserved order on-chain — the paybsc: (@15947) and
@@ -1233,335 +1139,6 @@ func (b *Bot) audit(chatID, action, target, outcome, detail string) {
 	b.store.LogAction(chatID, "customer", action, target, outcome, detail)
 }
 
-// ---- Binance: the ONE shared poller -----------------------------------------
-
-// ensureBinancePoller starts the single shared poller goroutine if it isn't
-// already running — _ensure_binance_poller (telegram_bot.py:9118-9126). ONE
-// weighted pay/transactions call per cycle covers ALL pending Binance orders, so
-// the API weight stays bounded no matter how many orders are in flight.
-func (b *Bot) ensureBinancePoller() {
-	b.binancePollerMu.Lock()
-	if b.binancePollerOn {
-		b.binancePollerMu.Unlock()
-		return
-	}
-	b.binancePollerOn = true
-	b.binancePollerMu.Unlock()
-	if !b.workers.TryGo(b.binancePollerLoop) {
-		// Registry already shutting down: clear the latch so a later Bot instance
-		// (or a restart) can start its own poller.
-		b.binancePollerMu.Lock()
-		b.binancePollerOn = false
-		b.binancePollerMu.Unlock()
-	}
-}
-
-// binancePollerLoop is the shared poller — _binance_poller_loop
-// (telegram_bot.py:9190-9247). Each cycle: prune finished/expired orders, make
-// ONE pay/transactions call, and match EVERY remaining order by its unique
-// amount. A transient error can never kill the poller; the loop exits only when
-// no orders remain (a new order restarts it) so there is never an idle thread.
-func (b *Bot) binancePollerLoop(stop <-chan struct{}) {
-	// latchReleased marks that the no-work exit path below ALREADY cleared the
-	// singleton latch (and possibly handed off to a successor poller). The defer
-	// must then keep its hands off it: clearing a successor's latch would let a
-	// third ensureBinancePoller start a SECOND concurrent poller.
-	latchReleased := false
-	defer func() {
-		if latchReleased {
-			return
-		}
-		b.binancePollerMu.Lock()
-		b.binancePollerOn = false
-		b.binancePollerMu.Unlock()
-	}()
-	ctx := context.Background() // the request ctx is long gone
-	for {
-		select {
-		case <-stop:
-			return
-		case <-time.After(b.binancePollInterval):
-		}
-		if !b.binancePollerCycle(ctx) {
-			continue // work remains (or the cycle faulted) -> keep polling
-		}
-		// No orders left -> stop; the next order restarts the poller. Python
-		// decides this and clears the latch under ONE lock (telegram_bot.py:
-		// 9221-9223, inside _binance_lock — the same lock _ensure_binance_poller
-		// takes), so a row registered in between cannot be orphaned.
-		//
-		// This port reads its work list from an unlocked snapshot, so the two
-		// steps cannot be one critical section. Instead: release the latch FIRST,
-		// then RE-CHECK. An order registered between the snapshot and the release
-		// saw binancePollerOn==true and its ensureBinancePoller no-oped; the
-		// re-check picks it up and starts a successor. Without this the customer
-		// would be shown a unique amount nothing is watching for, and their payment
-		// would sit unmatched until the next Binance order or a restart-time
-		// reconcile.
-		b.binancePollerMu.Lock()
-		b.binancePollerOn = false
-		b.binancePollerMu.Unlock()
-		latchReleased = true
-		if len(b.usdtSnapshotAll(bands.ProviderBinance)) > 0 {
-			b.ensureBinancePoller()
-		}
-		return
-	}
-}
-
-// binancePollerCycle runs ONE poller cycle and reports whether the poller is now
-// IDLE (no pending Binance orders left, so the caller may hand off its latch and
-// exit). Split out of binancePollerLoop purely so the cycle can carry the
-// per-cycle panic guard Python has at telegram_bot.py:9243-9245
-// (`except Exception: print(...); continue`).
-//
-// A faulted cycle reports idle=false — never "no orders left". Reporting idle on
-// a fault would tear down the poller while orders are still pending, stranding
-// every customer who is mid-payment; false only costs one more cycle.
-func (b *Bot) binancePollerCycle(ctx context.Context) (idle bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			// Recovered value suppressed, stack kept — same policy as the OTP
-			// fetch guards (otp.go:465-470) and the top-level worker recover
-			// (cmd/bot/main.go). This cycle unwinds through the Binance signing
-			// and credit paths, whose locals include the API secret and the
-			// signed request URL, so a panic value formatted with %v can put a
-			// live credential in the journal. The stack alone locates the fault.
-			log.Printf("binance poller cycle panic (payload suppressed)\n%s", debug.Stack())
-			idle = false
-		}
-	}()
-	{
-		// Prune first. Every DB read happens OUTSIDE usdtMu (usdtSnapshotAll took
-		// its copy already), so the allocation mutex is never held across I/O.
-		live := make([]usdtSession, 0, 8)
-		now := b.now()
-		for _, s := range b.usdtSnapshotAll(bands.ProviderBinance) {
-			o, err := b.store.GetOrder(s.Des)
-			if err != nil {
-				live = append(live, s) // DB blip: keep the row, retry next cycle
-				continue
-			}
-			if now.After(s.Deadline) || o == nil || o.Status != "reserved" {
-				// Paid another way while Binance was pending: a real USDT credit may
-				// have landed in the seller's own wallet (recoverable) — log it so the
-				// operator can reconcile (@9203-9207).
-				if o != nil && (o.Status == "paid" || o.Status == "delivered" || o.Status == "refunded") {
-					log.Printf("binance: dropping pending order %s (status=%s); check for an unmatched USDT credit to refund",
-						s.Des, o.Status)
-				}
-				b.dropUSDTPending(bands.ProviderBinance, s.Des)
-				continue
-			}
-			live = append(live, s)
-		}
-		if len(live) == 0 {
-			return true // IDLE: the caller releases the latch and hands off
-		}
-		oldest := live[0].SinceMS
-		for _, s := range live {
-			if s.SinceMS < oldest {
-				oldest = s.SinceMS
-			}
-		}
-		// Query floor mirrors match_payment's per-order floor (since - grace).
-		floor := oldest - binance.ClockGraceMS
-		txns, err := b.binanceGetTxns(&floor)
-		if err != nil {
-			log.Println("binance poller cycle error:", err) // never let a cycle kill the poller
-			return false                                    // work remains -> next cycle retries
-		}
-		for _, s := range live {
-			// Skip credits already consumed (store.TxnExists) so a stale credit can't
-			// shadow a fresh one of the same (recycled) amount.
-			txn, merr := b.binanceMatch(txns, s.Amount, s.SinceMS, b.txnUsed)
-			if merr != nil {
-				log.Printf("binance match error for %s: %v", s.Des, merr)
-				continue
-			}
-			if txn == nil {
-				continue
-			}
-			paidVND, verr := b.binanceUsdtToVND(txn.Amount)
-			if verr != nil {
-				log.Printf("binance usdt_to_vnd failed for %s: %v", s.Des, verr)
-				continue // unpriced credit -> retry next cycle rather than credit 0
-			}
-			if b.consumeAndSettle(ctx, s.Des, s.ChatID, s.Total, "bn:"+txn.ID, paidVND,
-				strconv.FormatFloat(txn.Amount, 'f', -1, 64), "binance") {
-				b.dropUSDTPending(bands.ProviderBinance, s.Des)
-			}
-		}
-	}
-	// Orders were still live this cycle: keep polling. Whether the settles above
-	// emptied the registry is decided by the NEXT cycle's prune, exactly as the
-	// Python loop re-evaluates `if not _binance_pending` at the top of each pass.
-	return false
-}
-
-// consumeAndSettle consumes a matched USDT credit (dedupe) and settles the order,
-// returning true if the pending row should be DROPPED, false to KEEP it for a
-// later retry — _consume_and_settle (telegram_bot.py:9152-9188).
-//
-// The dedupe (store.MarkTxn, PK) claims the credit BEFORE settling so two racing
-// settlers (live poller / startup reconcile) can't both deliver. If the settle
-// then fails BEFORE any money moves (order still 'reserved'), the mark is
-// RELEASED and the row kept, so the credit is retried instead of silently burned.
-// If it failed AFTER money moved, the mark is kept (re-running would double-pay)
-// and the row dropped; the half-finished order surfaces in the paid-but-
-// undelivered report.
-func (b *Bot) consumeAndSettle(ctx context.Context, des, chatID string, total int64, txnID string, paidVND int64, amount, tag string) bool {
-	isNew, err := b.store.MarkTxn(txnID, chatID, paidVND)
-	if err != nil {
-		log.Printf("%s: mark_txn failed [%s]: %v", tag, txnID, err)
-		return false
-	}
-	if !isNew {
-		return false // a peer owns this credit -> leave the row to it
-	}
-	if serr := b.settleBinanceCredit(ctx, des, chatID, total, paidVND); serr != nil {
-		o, _ := b.store.GetOrder(des)
-		if o != nil && o.Status == "reserved" {
-			// Failed before settlePaid's atomic claim -> nothing delivered/credited.
-			if uerr := b.store.UnmarkTxn(txnID); uerr != nil {
-				log.Printf("%s: unmark_txn failed [%s]: %v", tag, txnID, uerr)
-			}
-			log.Printf("%s: settle failed pre-claim for %s, will retry: %v", tag, des, serr)
-			return false
-		}
-		log.Printf("%s: MANUAL REVIEW %s %s %sUSDT — settle raised after money moved (status=%s); verify wallet/delivery: %v",
-			tag, des, txnID, amount, orderStatus(o), serr)
-		return true
-	}
-	log.Printf("%s: settled %s from %s (%s USDT)", tag, des, txnID, amount)
-	return true
-}
-
-// settleBinanceCredit routes a freshly-confirmed Binance credit so it is NEVER
-// dropped — _settle_binance_credit (telegram_bot.py:9128-9150):
-//   - order still reserved -> settlePaid (deliver; or refund if it raced to expired)
-//   - already paid/delivered another way -> a genuine SECOND payment, so credit it
-//     to the wallet instead of silently keeping confirmed money.
-//
-// `paidVND` is the VND value of the USDT ACTUALLY received; the second-payment
-// wallet credit uses it so the top-up reflects real money rather than the order's
-// cached total. The reserved path defers to settlePaid, which credits/delivers off
-// the order itself.
-func (b *Bot) settleBinanceCredit(ctx context.Context, des, chatID string, total, paidVND int64) error {
-	o, err := b.store.GetOrder(des)
-	if err != nil {
-		return err
-	}
-	if o != nil && (o.Status == "paid" || o.Status == "delivered") {
-		amount := paidVND
-		if amount == 0 {
-			amount = total
-		}
-		bal, cerr := b.store.CreditBalance(chatID, amount)
-		if cerr != nil {
-			return cerr
-		}
-		id, _ := strconv.ParseInt(chatID, 10, 64)
-		b.send(ctx, id, i18n.F(i18n.C().Deposit.OK.T(langSafe(o)),
-			"amount", b.usdtDisp(amount), "balance", b.usdtDisp(bal)), nil)
-		// notify_admin_deposit (@9136) is M3.
-		return nil
-	}
-	_, err = b.settlePaid(ctx, des) // reserved->deliver, or expired->refund
-	return err
-}
-
-// binanceReconcileOnce matches every persisted Binance pending order against
-// pay/transactions and settles any arrived credit — IGNORING per-order deadlines,
-// so a payment made while the bot was offline is still caught
-// (_binance_reconcile_once, telegram_bot.py:9254-9348).
-//
-// Idempotent and concurrency-safe: MarkTxn dedupes the credit (PK) and settlePaid
-// is claim-guarded, so it is safe to run from startup alongside the live poller.
-// A still-reserved order is kept on a no-match; a recently-EXPIRED order gets ONE
-// more match attempt (a late credit then refunds to wallet via settlePaid) and is
-// dropped after binanceReconcileGrace; an order resolved another way is pruned.
-func (b *Bot) binanceReconcileOnce(ctx context.Context) {
-	if !b.binanceConfigured() {
-		return
-	}
-	rows, err := b.store.BinancePendingAll()
-	if err != nil {
-		log.Println("binance reconcile: load failed:", err)
-		return
-	}
-	now := b.now()
-	type candidate struct {
-		row           store.BinancePending
-		dropIfNoMatch bool
-	}
-	pend := make([]candidate, 0, len(rows))
-	for _, r := range rows {
-		o, gerr := b.store.GetOrder(r.Des)
-		if gerr != nil {
-			continue // DB blip: leave the row for the next run
-		}
-		if o == nil {
-			b.dropUSDTPending(bands.ProviderBinance, r.Des) // order vanished -> drop
-			continue
-		}
-		switch {
-		case o.Status == "reserved":
-			pend = append(pend, candidate{row: r})
-		case o.Status == "expired" && now.Sub(tsToTime(r.TS)) < b.binanceReconcileGrace:
-			// Grace measured from the last pending-row write (refreshed on re-tap);
-			// biases toward MORE recovery, the safe direction for money (@9285-9288).
-			pend = append(pend, candidate{row: r, dropIfNoMatch: true}) // one last try
-		default:
-			// A still-pending row on an order settled ANOTHER way can mean a genuine
-			// SECOND USDT credit landed; mirror the live poller and LOG it (the money
-			// is recoverable in the seller's wallet) instead of dropping silently.
-			if o.Status == "paid" || o.Status == "delivered" || o.Status == "refunded" {
-				log.Printf("binance reconcile: dropping pending %s (status=%s); check for an unmatched USDT credit to refund",
-					r.Des, o.Status)
-			}
-			b.dropUSDTPending(bands.ProviderBinance, r.Des) // stale row -> drop
-		}
-	}
-	if len(pend) == 0 {
-		return
-	}
-	oldest := pend[0].row.SinceMS
-	for _, c := range pend {
-		if c.row.SinceMS < oldest {
-			oldest = c.row.SinceMS
-		}
-	}
-	floor := oldest - binance.ClockGraceMS
-	txns, terr := b.binanceGetTxns(&floor)
-	if terr != nil {
-		log.Println("binance reconcile: pay/transactions failed:", terr)
-		return
-	}
-	for _, c := range pend {
-		txn, merr := b.binanceMatch(txns, c.row.Amount, c.row.SinceMS, b.txnUsed)
-		if merr != nil {
-			log.Printf("binance reconcile: match error for %s: %v", c.row.Des, merr)
-			continue
-		}
-		if txn == nil {
-			if c.dropIfNoMatch {
-				b.dropUSDTPending(bands.ProviderBinance, c.row.Des)
-			}
-			continue
-		}
-		paidVND, verr := b.binanceUsdtToVND(txn.Amount)
-		if verr != nil {
-			log.Printf("binance reconcile: usdt_to_vnd failed for %s: %v", c.row.Des, verr)
-			continue
-		}
-		if b.consumeAndSettle(ctx, c.row.Des, c.row.ChatID, c.row.Total, "bn:"+txn.ID, paidVND,
-			strconv.FormatFloat(txn.Amount, 'f', -1, 64), "binance") {
-			b.dropUSDTPending(bands.ProviderBinance, c.row.Des)
-		}
-	}
-}
-
 // ---- startup recovery + expiry backstop -------------------------------------
 
 // tsToTime converts a stored epoch-seconds float to a time.
@@ -1574,10 +1151,12 @@ func tsToTime(ts float64) time.Time {
 // rehydrate + the periodic expiry backstop, on a tracked goroutine so it never
 // delays startup and Shutdown drains it.
 //
-// Binance rehydrates AND reconciles (it keeps its poller). BEP20 and TRON only
-// LOAD their pending rows — verify is customer-driven by-hash, so there is no
-// poller and no reconcile. Then a light expiry sweep keeps running so a
-// restart-orphaned checkout still expires and its band is eventually freed.
+// BEP20 and TRON only LOAD their pending rows — verify is customer-driven
+// by-hash, so there is no poller and no reconcile. (Binance Pay used to
+// additionally rehydrate AND reconcile through its own shared poller; that
+// rail was removed by the USDT-only migration, S3.) Then a light expiry
+// sweep keeps running so a restart-orphaned checkout still expires and its
+// band is eventually freed.
 func (b *Bot) StartupRecovery(ctx context.Context) {
 	b.workers.Go(func(stop <-chan struct{}) {
 		// Each step is panic-isolated exactly as Python isolates them
@@ -1585,7 +1164,6 @@ func (b *Bot) StartupRecovery(ctx context.Context) {
 		// and must never take the bot down at boot — StartupRecovery replays the
 		// same persisted rows on the next start, so an unguarded panic here is a
 		// crash loop, not a one-off.
-		safeStep("startup recovery (binance)", func() { b.recoverBinancePending(ctx) })
 		safeStep("startup recovery (bep20)", func() { b.rehydrateOnchainPending(bands.ProviderBEP20) })
 		safeStep("startup recovery (tron)", func() { b.rehydrateOnchainPending(bands.ProviderTron) })
 		for {
@@ -1601,39 +1179,6 @@ func (b *Bot) StartupRecovery(ctx context.Context) {
 			}
 		}
 	})
-}
-
-// recoverBinancePending rehydrates the in-memory poller state from the persisted
-// table and settles any credit that arrived while we were down —
-// _recover_binance_pending (telegram_bot.py:9350-9385). Only still-reserved
-// orders are rehydrated; the reconcile pass (deadline-agnostic) then settles
-// anything already paid, and the live poller resumes for the rest.
-func (b *Bot) recoverBinancePending(ctx context.Context) {
-	rows, err := b.store.BinancePendingAll()
-	if err != nil {
-		log.Println("binance recover: load failed:", err)
-		return
-	}
-	n := 0
-	for _, r := range rows {
-		o, gerr := b.store.GetOrder(r.Des)
-		if gerr != nil || o == nil || o.Status != "reserved" {
-			continue // reconcile/sweep will prune it
-		}
-		if aerr := b.adoptPersisted(bands.ProviderBinance, r.Des, r.ChatID, r.Amount,
-			r.Total, r.SinceMS, r.TS, r.Deadline); aerr != nil {
-			log.Printf("binance recover: adopt %s failed: %v", r.Des, aerr)
-			continue
-		}
-		n++
-	}
-	if n > 0 {
-		log.Printf("binance recover: rehydrated %d pending order(s)", n)
-	}
-	b.binanceReconcileOnce(ctx) // settle anything already paid (incl. during downtime)
-	if len(b.usdtSnapshotAll(bands.ProviderBinance)) > 0 {
-		b.ensureBinancePoller()
-	}
 }
 
 // rehydrateOnchainPending LOADS persisted BEP20/TRON pending rows back into the

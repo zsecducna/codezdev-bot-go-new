@@ -1,19 +1,18 @@
 package handlers
 
-// deposit.go — the deposit flow (BEP20/TRON on-chain rails; SePay VietQR and
-// PayPal were removed by the USDT-only migration, S1/S2), the order-pay
-// balance rail, and the shared settle chokepoint. Ports:
+// deposit.go — the deposit flow (BEP20/TRON on-chain rails; SePay VietQR,
+// PayPal and Binance Pay were removed by the USDT-only migration, S1-S3), the
+// order-pay balance rail, and the shared settle chokepoint. Ports:
 //   - start_deposit @10592 (the funding-method picker),
 //   - the dep:* callbacks @15494-15556,
 //   - the pending_deposit amount capture @18809,
 //   - settle_paid @8932 (the shared claim path every USDT rail settles through).
 //
 // USDT migration note (2026-08-06): SePay/VietQR (start_deposit_qr,
-// deposit_worker, payqr:, qr_payment_worker, groupVND) and the PayPal deposit
-// start (paypal.go) were removed — the shop takes USDT via BEP20/TRON only.
-// `settlePaid` and `txnUsed` survive: settlePaid is the shared claim path the
-// surviving rails settle through, and txnUsed still adapts store.TxnExists for
-// the Binance poller's dedupe check until S3 removes Binance Pay too.
+// deposit_worker, payqr:, qr_payment_worker, groupVND), the PayPal deposit
+// start (paypal.go) and Binance Pay (start_binance_deposit, the shared poller)
+// were removed — the shop takes USDT via BEP20/TRON only. `settlePaid`
+// survives as the shared claim path the surviving rails settle through.
 import (
 	"context"
 	"log"
@@ -24,7 +23,6 @@ import (
 	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/pay/bep20"
-	"codezdev-bot/internal/pay/binance"
 	"codezdev-bot/internal/pay/tron"
 	"codezdev-bot/internal/tg"
 )
@@ -89,15 +87,12 @@ func (b *Bot) usdtToVND(usdt float64) int64 {
 // ---- deposit method picker (start_deposit @10592) --------------------------
 
 // cmdDeposit renders the funding-method picker — start_deposit (telegram_bot.py:
-// 10592-10614). Only admin-ENABLED methods show (same toggles as the buy screen);
-// binance/bep20/tron additionally need their config set. No method enabled ->
+// 10592-10614). Only admin-ENABLED methods show (same toggles as the buy
+// screen); bep20/tron additionally need their config set. No method enabled ->
 // PAY_METHOD_OFF.
 func (b *Bot) cmdDeposit(ctx context.Context, chatID int64, lang i18n.Lang) {
 	c := &i18n.C().Deposit
 	var rows [][]tg.InlineKeyboardButton
-	if b.payEnabled("binance") && binance.Configured() {
-		rows = append(rows, btnRow(c.BtnBinance.T(lang), "dep:bnb"))
-	}
 	if b.payEnabled("bep20") && bep20.Configured() {
 		rows = append(rows, styledBtnRow(c.BtnBEP20.T(lang), "dep:bsc", "primary"))
 	}
@@ -121,15 +116,6 @@ func (b *Bot) cbDep(cc *cbCtx) {
 	method := strings.TrimPrefix(cc.Data, "dep:")
 
 	switch method {
-	case "bnb":
-		// Binance/on-chain: the button only renders when configured; a stale tap
-		// on an unconfigured method degrades to PAY_METHOD_OFF (the NOID notices
-		// land with M2.4).
-		if !b.payEnabled("binance") || !binance.Configured() {
-			b.send(cc.Ctx, cc.ChatID, i18n.C().Buy.PayMethodOff.T(lang), nil)
-			return
-		}
-		b.armDeposit(cc, "bnb", i18n.F(c.PPAmount.T(lang), "min", b.minDepositStr()))
 	case "bsc":
 		if !b.payEnabled("bep20") || !bep20.Configured() {
 			b.send(cc.Ctx, cc.ChatID, i18n.C().Buy.PayMethodOff.T(lang), nil)
@@ -142,12 +128,22 @@ func (b *Bot) cbDep(cc *cbCtx) {
 			return
 		}
 		b.armDeposit(cc, "trx", i18n.F(c.TronAmount.T(lang), "min", b.minDepositStr()))
+	default:
+		// Residual fix (Opus review of 11e033d): a stale "dep:qr"/"dep:pp"/
+		// "dep:bnb" tap — a picker rendered before the SePay/PayPal/Binance
+		// removal (S1-S3) and left open in a customer's chat — has no
+		// matching rail here. command.go:182 unconditionally deletes the
+		// message that held the tapped buttons BEFORE this dispatches, so
+		// silently falling through (the pre-fix behavior) left the customer
+		// with NOTHING: no menu, no error, no way forward. Mirrors
+		// cmdDeposit's own "every method disabled" reply just above.
+		b.send(cc.Ctx, cc.ChatID, i18n.C().Buy.PayMethodOff.T(lang), nil)
 	}
 }
 
 // armDeposit clears sibling customer captures and arms pending_deposit with the
-// funding method, then sends the amount prompt (the shared tail of the dep:bnb /
-// bsc / trx branches @15508-15556).
+// funding method, then sends the amount prompt (the shared tail of the dep:bsc
+// / trx branches @15508-15556).
 func (b *Bot) armDeposit(cc *cbCtx, method, prompt string) {
 	cc.st.ClearCustomerPending() // drop stale sibling captures first
 	cc.st.mu.Lock()
@@ -208,13 +204,11 @@ func (b *Bot) capDeposit(c *Ctx) bool {
 
 // startDepositMethod routes a validated deposit amount to its funding rail —
 // the dispatch tail of the pending_deposit capture (telegram_bot.py:19040-19051).
-// The three USDT rails are start_binance_deposit @10627 / start_bep20_deposit
-// @9478 / start_tron_deposit @9935 (usdt.go). PayPal (formerly "pp") was
-// removed by the USDT-only migration (S2).
+// The two surviving USDT rails are start_bep20_deposit @9478 / start_tron_deposit
+// @9935 (usdt.go). PayPal (formerly "pp") and Binance Pay (formerly "bnb") were
+// removed by the USDT-only migration (S2/S3).
 func (b *Bot) startDepositMethod(ctx context.Context, chatID int64, lang i18n.Lang, method string, vnd int64) {
 	switch method {
-	case "bnb":
-		b.startBinanceDeposit(ctx, chatID, lang, vnd)
 	case "bsc":
 		b.startBep20Deposit(ctx, chatID, lang, vnd)
 	case "trx":
@@ -229,10 +223,10 @@ func (b *Bot) startDepositMethod(ctx context.Context, chatID int64, lang i18n.La
 // single guard against double-delivery: only the winner delivers (or, for a
 // __deposit__ order, credits the wallet). A payment that lands AFTER expiry
 // refunds to the wallet so confirmed money is never dropped. Returns
-// (settled, err); callers (the USDT verify-by-hash path, the Binance poller)
-// use err to decide whether to release their own dedupe mark. Reuses
-// deliverPaid (M2.2) for the folder-stock delivery — no duplicate settle
-// logic. NO wallet debit here: the money arrived off-wallet (on-chain).
+// (settled, err); the USDT verify-by-hash path (usdt.go) uses err to decide
+// whether to release its own dedupe mark. Reuses deliverPaid (M2.2) for the
+// folder-stock delivery — no duplicate settle logic. NO wallet debit here:
+// the money arrived off-wallet (on-chain).
 func (b *Bot) settlePaid(ctx context.Context, des string) (bool, error) {
 	won, err := b.store.ClaimOrder(des, "reserved", "paid")
 	if err != nil {
@@ -240,7 +234,7 @@ func (b *Bot) settlePaid(ctx context.Context, des string) (bool, error) {
 	}
 	if won != nil {
 		if won.Product == depositProduct {
-			// Wallet top-up (PayPal/Binance deposit): credit balance, don't deliver.
+			// Wallet top-up (an on-chain USDT deposit): credit balance, don't deliver.
 			if _, cerr := b.store.ClaimOrder(des, "paid", "delivered"); cerr != nil {
 				log.Printf("deposit close-claim failed [des=%s]: %v", des, cerr)
 			}
@@ -287,17 +281,4 @@ func (b *Bot) settlePaid(ctx context.Context, des string) (bool, error) {
 	}
 	// delivered / paid / refunded -> already handled, dedupe (do nothing).
 	return false, nil
-}
-
-// txnUsed adapts store.TxnExists to the Binance poller's isUsed predicate
-// (drops the error; a read failure conservatively reports "not used" so a
-// real match isn't hidden). Only the Binance rail still calls this — dropped
-// along with Binance Pay in S3.
-func (b *Bot) txnUsed(txnID string) bool {
-	used, err := b.store.TxnExists(txnID)
-	if err != nil {
-		log.Println("txn_exists check failed:", err)
-		return false
-	}
-	return used
 }
