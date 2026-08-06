@@ -50,6 +50,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"math/big"
 	"regexp"
 	"runtime/debug"
@@ -57,6 +58,7 @@ import (
 	"strings"
 	"time"
 
+	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/pay/bands"
 	"codezdev-bot/internal/pay/bep20"
@@ -172,16 +174,47 @@ func ledgerPrefix(p bands.Provider) string {
 }
 
 // usdtStr is Python's usdt_str(vnd) — the customer-facing 2-decimal USDT string
-// for a VND amount. Python computes it with paypal.vnd_to_usd (@10646, @9487),
-// and so does this port: the SAME converter must produce the pay screen's base
-// amount and the deposit's desired amount, or a correct payment could miss its
-// band. "" on a missing/invalid USD_TO_VND rate (the caller then abandons).
+// for a VND amount. It must produce the pay screen's base amount and the
+// deposit's desired amount, or a correct payment could miss its band. "" on a
+// missing/invalid USD_TO_VND rate (the caller then abandons).
 func (b *Bot) usdtStr(vnd int64) string {
-	s, err := b.paypalVndToUSD(vnd)
+	s, err := b.vndToUSD(vnd)
 	if err != nil {
 		return ""
 	}
 	return s
+}
+
+// vndToUSD is SCAFFOLDING introduced by the SePay/PayPal/Binance removal
+// (USDT migration slices S1-S3, 2026-08-06). usdtStr used to route through
+// paypal.VndToUSD for its VND->USD conversion; paypal.go is gone along with
+// the rest of the PayPal rail. There is no drop-in replacement on the
+// surviving BEP20/TRON rails — their UsdtToVND converters go the opposite
+// direction (USD->VND) and read the rate a different way.
+//
+// Reads the rate through the CONFIG CHAIN (cfg.USDToVND(): settings.json's
+// admin-set usd_to_vnd overriding .env/ambient USD_TO_VND, else the compiled
+// default) — deliberately NOT os.LookupEnv, which is the quote/charge
+// rate-source split rate-source-investigation.md flags as a defect this
+// migration supersedes rather than reproduces.
+//
+// Migration slice S5 deletes this function, its one call site (usdtStr), and
+// the VND rate itself outright when the ledger flips to micro-USDT — do not
+// build new callers on it.
+func (b *Bot) vndToUSD(vnd int64) (string, error) {
+	rateStr := config.DefaultUSDToVND
+	if b.cfg != nil {
+		rateStr = b.cfg.USDToVND()
+	}
+	rate, err := strconv.ParseFloat(rateStr, 64)
+	if err != nil || rate <= 0 {
+		return "", fmt.Errorf("usdt: no USD_TO_VND rate configured")
+	}
+	usd := float64(vnd) / rate
+	// Python: cents = int(usd*100) + (1 if (usd*100) % 1 else 0) -> ceil to cent
+	// (mirrors the deleted paypal.VndToUSD's own rounding exactly).
+	cents := math.Ceil(usd*100 - 1e-9)
+	return fmt.Sprintf("%.2f", cents/100), nil
 }
 
 // ---- pending-row registry (the rail-side half) ------------------------------

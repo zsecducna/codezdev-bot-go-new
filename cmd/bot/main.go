@@ -29,7 +29,6 @@ import (
 	"codezdev-bot/internal/pay/bands"
 	"codezdev-bot/internal/pay/bep20"
 	"codezdev-bot/internal/pay/binance"
-	"codezdev-bot/internal/pay/sepay"
 	"codezdev-bot/internal/pay/tron"
 	"codezdev-bot/internal/refund"
 	"codezdev-bot/internal/stock"
@@ -79,28 +78,28 @@ func main() {
 	adminID := cfg.EnvOr("ADMIN_ID", DefaultAdminID)
 
 	// Multi-tenant money-safety boot guard (telegram_bot.py:19180-19194): ADMIN_ID
-	// and the SePay bank account are "bound" at import from the AMBIENT env (before
-	// .env loads). If the merged config's value for either disagrees with that
-	// bound value, this instance was started WITHOUT its systemd EnvironmentFile
-	// and would silently act as a DIFFERENT tenant — e.g. routing customer QR
-	// payments into the wrong bank. Refuse to boot rather than mis-route money.
+	// is "bound" at import from the AMBIENT env (before .env loads). If the merged
+	// config's value disagrees with that bound value, this instance was started
+	// WITHOUT its systemd EnvironmentFile and would silently act as a DIFFERENT
+	// tenant. Refuse to boot rather than mis-route money.
 	//
 	// The bound value reads os.Getenv (ambient only, or the compiled default),
 	// mirroring Python's import-time freeze; cfg.Env reads the ambient-wins merge
 	// of ambient + .env. When ambient set the value both agree; when only .env set
 	// it, they differ and we refuse — exactly Python's semantics. An unset key is
 	// never a mismatch (BootGuard only compares a present .env value).
+	//
+	// USDT migration note (2026-08-06): the SePay bank-account boot guard was
+	// removed along with the SePay/VietQR rail (internal/pay/sepay is gone) — the
+	// shop takes USDT via BEP20/TRON only, so there is no bank account to bind.
 	boundAdmin := os.Getenv("ADMIN_ID")
 	if boundAdmin == "" {
 		boundAdmin = DefaultAdminID
 	}
-	if err := cfg.BootGuard("SEPAY_ACCOUNT", sepay.AccountNumber()); err != nil {
-		log.Fatal(err)
-	}
 	if err := cfg.BootGuard("ADMIN_ID", boundAdmin); err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("Instance config: admin=%s bank=%s/%s", boundAdmin, sepay.Bank(), sepay.AccountNumber())
+	log.Printf("Instance config: admin=%s", boundAdmin)
 
 	// Token check comes before opening any resource, so a missing token exits
 	// cleanly with a clear message and no side effects (telegram_bot.py:18953-18955).
@@ -212,14 +211,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(rootCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Start the PayPal webhook listener (international payments) only when PayPal
-	// is configured — a reseller without PayPal keys binds no port (no 8080
-	// fallback / cross-instance clash). Port of telegram_bot.py:19435-19443; the
-	// configured-check + skip log live inside StartPaypalWebhook. It shuts down
-	// gracefully on ctx cancellation (and again, harmlessly, on bot.Shutdown).
-	if _, err := bot.StartPaypalWebhook(ctx); err != nil {
-		log.Println("paypal webhook server not started:", err)
-	}
+	// USDT migration note (2026-08-06): the PayPal webhook listener was removed
+	// along with the PayPal rail itself (internal/pay/paypal is gone) — the shop
+	// takes USDT via BEP20/TRON only, so there is no webhook port to bind here.
 
 	// Boot-time recovery + the periodic expiry backstop — _startup_recovery
 	// (telegram_bot.py:9995-10025). Rehydrates the persisted Binance/BEP20/TRON

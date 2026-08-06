@@ -195,9 +195,6 @@ func (b *Bot) sendPayScreen(ctx context.Context, chatID int64, des, note string)
 	if b.payEnabled("balance") {
 		rows = append(rows, btnRow(c.PayBtnBalance.T(lang), cbData("paybal", des)))
 	}
-	if b.payEnabled("qr") {
-		rows = append(rows, btnRow(c.PayBtnQR.T(lang), cbData("payqr", des)))
-	}
 	if b.payEnabled("paypal") {
 		rows = append(rows, btnRow(c.PayBtnPayPal.T(lang), cbData("paypp", des)))
 	}

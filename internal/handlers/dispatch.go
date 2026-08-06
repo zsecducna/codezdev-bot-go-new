@@ -5,7 +5,6 @@ import (
 	"log"
 	"maps"
 	"math/big"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,8 +15,6 @@ import (
 	"codezdev-bot/internal/pay/bands"
 	"codezdev-bot/internal/pay/bep20"
 	"codezdev-bot/internal/pay/binance"
-	"codezdev-bot/internal/pay/paypal"
-	"codezdev-bot/internal/pay/sepay"
 	"codezdev-bot/internal/pay/tron"
 	"codezdev-bot/internal/refund"
 	"codezdev-bot/internal/stock"
@@ -38,8 +35,8 @@ type TG interface {
 	GetChat(ctx context.Context, chatID int64) (*tg.Chat, error)
 	// SendDocument uploads a local file (order delivery, _deliver_paid @7817).
 	SendDocument(ctx context.Context, chatID int64, filePath, caption string) (*tg.Message, error)
-	// SendPhotoURL posts a photo by URL — the SePay VietQR image for deposits and
-	// order-pay-by-QR (telegram_bot.py:10621, 15642).
+	// SendPhotoURL posts a photo by URL — the Binance Pay personal QR image
+	// (telegram_bot.py:10069-10074). Dropped along with Binance Pay in S3.
 	SendPhotoURL(ctx context.Context, chatID int64, photoURL, caption string) (*tg.Message, error)
 	// SendPhotoURLOpts is SendPhotoURL with parse_mode + reply_markup — the
 	// BEP20/TRON pay screens attach the "I have made the payment" button to the
@@ -104,33 +101,7 @@ type Bot struct {
 	clickCooldown time.Duration
 	expiryTimeout time.Duration
 	reserveTTL    time.Duration
-	depositPoll   time.Duration // POLL_INTERVAL @10548 — seconds between SePay checks
-
-	// sepayFind polls SePay for an incoming transfer matching a deposit/order
-	// `des`, returning (nil, nil) when none matched yet. isUsed (nil for deposits;
-	// store.TxnExists for order-pay) skips already-consumed txns. A field so tests
-	// inject a fake without live HTTP; defaulted in New to sepay.FindMatchingTxn
-	// bound to the SEPAY_API_KEY env (deposit_worker @10566, qr_payment_worker @9019).
-	sepayFind func(des string, isUsed func(txnID string) bool) (*sepay.MatchedTxn, error)
-
-	// PayPal seams (M2.4). Fields for the same reason sepayFind is one: tests
-	// drive the deposit / order-pay / webhook paths with fakes instead of live
-	// PayPal HTTP, while New binds them to the real internal/pay/paypal client.
-	// paypalVndToUSD is deliberately the SAME converter paypal.CreateOrder uses
-	// internally, so the webhook amount gate compares against exactly what the
-	// customer was charged (a settings-rate variant here could reject a correct
-	// payment or, worse, accept a short one).
-	paypalConfigured    func() bool
-	paypalVndToUSD      func(vnd int64) (string, error)
-	paypalCreateOrder   func(vndTotal int64, des, description string) (orderID, approveURL string, err error)
-	paypalCaptureOrder  func(orderID string) (paypal.CaptureResult, error)
-	paypalVerifyWebhook func(headers http.Header, rawBody []byte) (bool, error)
-
-	// Webhook listener bind target — PAYPAL_WEBHOOK_HOST / _PORT with Python's
-	// 127.0.0.1:8080 defaults (telegram_bot.py:19252-19253). Set from env in New;
-	// tests override them (port "0" for an ephemeral port).
-	paypalWebhookHost string
-	paypalWebhookPort string
+	depositPoll   time.Duration // POLL_INTERVAL @10548 — seconds between deposit polls
 
 	// ---- USDT rails (Binance Pay + BEP20 + TRON) ----------------------------
 	//
@@ -320,31 +291,6 @@ func New(d Deps) *Bot {
 	b.expiryTimeout = 600 * time.Second
 	b.reserveTTL = (600 + 120) * time.Second
 	b.depositPoll = 10 * time.Second // POLL_INTERVAL @10548
-	// SePay lookup: bind the API key from the env once (Python read SEPAY_API_KEY
-	// per poll @10566; binding it here is equivalent and keeps the worker pure).
-	apiKey := ""
-	if b.cfg != nil {
-		apiKey = b.cfg.Env("SEPAY_API_KEY")
-	}
-	b.sepayFind = func(des string, isUsed func(txnID string) bool) (*sepay.MatchedTxn, error) {
-		return sepay.FindMatchingTxn(apiKey, des, 50, isUsed)
-	}
-	// PayPal rail (M2.4): bind the real client. The paypal package reads its
-	// credentials/rate from the process env at call time (paypal.py parity), so
-	// there is nothing to snapshot here.
-	b.paypalConfigured = paypal.Configured
-	b.paypalVndToUSD = paypal.VndToUSD
-	b.paypalCreateOrder = paypal.CreateOrder
-	b.paypalCaptureOrder = paypal.CaptureOrder
-	b.paypalVerifyWebhook = paypal.VerifyWebhook
-	// Webhook bind target (telegram_bot.py:19252-19253). 127.0.0.1 by default so
-	// the listener sits behind a reverse proxy rather than facing the internet.
-	b.paypalWebhookHost = "127.0.0.1"
-	b.paypalWebhookPort = "8080"
-	if b.cfg != nil {
-		b.paypalWebhookHost = b.cfg.EnvOr("PAYPAL_WEBHOOK_HOST", b.paypalWebhookHost)
-		b.paypalWebhookPort = b.cfg.EnvOr("PAYPAL_WEBHOOK_PORT", b.paypalWebhookPort)
-	}
 	// ---- USDT rails ---------------------------------------------------------
 	b.now = time.Now
 	// ONE shared registry. A caller that does not inject one (unit tests) gets a

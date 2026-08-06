@@ -65,10 +65,10 @@ type BuyCatalog struct {
 	// PayPrompt — PAY_PROMPT (telegram_bot.py:1294): the payment screen body;
 	// {product} {unit} {qty} {pct} {total} {balance}.
 	PayPrompt Str
-	// PayBtn* — the per-method pay buttons (telegram_bot.py:1302-1310). PayBtnRmCode
+	// PayBtn* — the per-method pay buttons (telegram_bot.py:1302-1310). PayBtnQR
+	// (SePay/VietQR) was removed by the USDT-only migration (S1). PayBtnRmCode
 	// carries {code}.
 	PayBtnBalance   Str
-	PayBtnQR        Str
 	PayBtnPayPal    Str
 	PayBtnBinance   Str
 	PayBtnBEP20     Str
@@ -211,7 +211,6 @@ func buildBuyCatalog() BuyCatalog {
 		},
 		// PAY_BTN_* (telegram_bot.py:1302-1310).
 		PayBtnBalance:   Str{EN: "💰 Pay with balance", VI: "💰 Trả bằng số dư", ZH: "💰 余额支付"},
-		PayBtnQR:        Str{EN: "📷 Pay with QR (VN)", VI: "📷 Trả bằng QR (VN)", ZH: "📷 扫码支付 (越南)"},
 		PayBtnPayPal:    Str{EN: "🌍 Pay with PayPal", VI: "🌍 Trả bằng PayPal", ZH: "🌍 PayPal 支付"},
 		PayBtnBinance:   Str{EN: "🪙 Pay with Binance (USDT)", VI: "🪙 Trả bằng Binance (USDT)", ZH: "🪙 Binance 支付 (USDT)"},
 		PayBtnBEP20:     Str{EN: "Pay with USDT (BEP20)", VI: "Trả bằng USDT (BEP20)", ZH: "USDT 支付 (BEP20)"},

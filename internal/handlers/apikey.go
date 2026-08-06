@@ -270,17 +270,16 @@ func commaFloat1(f float64) string {
 // else the compiled default — the SAME layered source the "Price: X / 100
 // credits" line above the opus estimate uses.
 //
-// This is deliberately NOT usdtStr (usdt.go:179), which goes through
-// paypal.VndToUSD and reads os.LookupEnv("USD_TO_VND") — raw process env
-// only, invisible to an admin's settings.json rate change (there is no Go
-// counterpart to Python's apply_saved_rate, which pushes the saved rate INTO
-// os.environ so paypal.vnd_to_usd picks it up; see cmd/bot/main.go and
-// telegram_bot.py:5317-5324). Using usdtStr here would let this line and the
-// Price line disagree — or, if USD_TO_VND is only ever set via .env/
-// settings.json and never exported into the process env, silently print an
-// EMPTY block on every load (usdtStr sees nothing, apikeyOpusEst's rate<=0
-// guard fires) even though the shop is fully priced. apikeyOpusEst must read
-// the config-layered rate, exactly like usdtDisp/apikeyRateDispFor above it.
+// Historical note (accurate as of the USDT-only migration, 2026-08-06):
+// before that migration this was deliberately NOT usdtStr (usdt.go), which
+// went through paypal.VndToUSD and read os.LookupEnv("USD_TO_VND") — raw
+// process env only, invisible to an admin's settings.json rate change. The
+// SePay/PayPal/Binance removal deleted that split: usdt.go's usdtStr now
+// routes through its own vndToUSD helper, which reads the SAME cfg.USDToVND()
+// config chain this function does. The two helpers are kept separate rather
+// than merged into one shared function because usdt.go's vndToUSD is itself
+// scaffolding slated for deletion in migration slice S5 — this function is
+// not.
 func (b *Bot) usdtStrCfg(vnd int64) string {
 	rateStr := config.DefaultUSDToVND
 	if b.cfg != nil {

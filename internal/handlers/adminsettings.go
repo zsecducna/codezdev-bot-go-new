@@ -662,7 +662,9 @@ func (b *Bot) capSetKiroAcct(c *Ctx) bool {
 // ---- adm:togglepay:<method> -------------------------------------------------
 
 // payMethodNames mirrors PAY_METHODS' method-name column (telegram_bot.py:5147).
-var payMethodNames = []string{"balance", "qr", "paypal", "binance", "bep20", "tron"}
+// "qr" (SePay/VietQR) was removed by the USDT-only migration (S1) — the shop no
+// longer accepts VND bank transfers.
+var payMethodNames = []string{"balance", "paypal", "binance", "bep20", "tron"}
 
 // cbTogglePay is the shared handler for all 6 adm:togglepay:<method> buttons
 // — telegram_bot.py:13931. Super-admin only. Refuses to leave zero payment

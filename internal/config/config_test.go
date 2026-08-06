@@ -188,8 +188,8 @@ func TestSettingsMergesFileOverDefaults(t *testing.T) {
 		t.Errorf("pay_balance = %v (ok=%v), want false (file overrides default)", v, ok)
 	}
 	// Untouched default key must still be present.
-	if v, ok := boolValue(s, "pay_qr"); !ok || !v {
-		t.Errorf("pay_qr = %v (ok=%v), want true (default preserved)", v, ok)
+	if v, ok := boolValue(s, "pay_paypal"); !ok || !v {
+		t.Errorf("pay_paypal = %v (ok=%v), want true (default preserved)", v, ok)
 	}
 	if v := intValue(s, "max_qty"); v != 5 {
 		t.Errorf("max_qty = %d, want 5", v)

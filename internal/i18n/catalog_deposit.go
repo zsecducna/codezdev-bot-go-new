@@ -15,18 +15,15 @@ package i18n
 // identical across the three languages for the completeness test.
 
 // DepositCatalog holds the deposit-flow strings (telegram_bot.py:421-489,
-// 1490-1497). QR reuses Buy.DepositTimeout for the timeout notice (DEPOSIT_TIMEOUT
-// @431 is the same string, already in BuyCatalog).
+// 1490-1497). SePay/VietQR (QR / BtnQR / Underpaid / PurchaseQR) was removed by
+// the USDT-only migration (S1) — the shop no longer accepts VND bank transfers.
 type DepositCatalog struct {
-	// QR — DEPOSIT_QR (telegram_bot.py:422): the VietQR image caption; {des}.
-	QR Str
 	// OK — DEPOSIT_OK (telegram_bot.py:427): credited notice; {amount} {balance}.
 	OK Str
 	// Method — DEPOSIT_METHOD (telegram_bot.py:450): the funding-method picker header.
 	Method Str
-	// BtnQR / BtnPayPal / BtnBEP20 / BtnBinance / BtnTRON — DEP_BTN_*
-	// (telegram_bot.py:456-460): per-method deposit picker buttons.
-	BtnQR      Str
+	// BtnPayPal / BtnBEP20 / BtnBinance / BtnTRON — DEP_BTN_*
+	// (telegram_bot.py:457-460): per-method deposit picker buttons.
 	BtnPayPal  Str
 	BtnBEP20   Str
 	BtnBinance Str
@@ -42,12 +39,6 @@ type DepositCatalog struct {
 	PPLink Str
 	// BadAmount — DEPOSIT_BAD_AMOUNT (telegram_bot.py:487): amount out of bounds; {min}.
 	BadAmount Str
-	// Underpaid — QR_UNDERPAID (telegram_bot.py:439): an order-pay transfer for less
-	// than the total; banked to the wallet, not delivered; {paid} {total} {balance}.
-	Underpaid Str
-	// PurchaseQR — PURCHASE_QR (telegram_bot.py:1490): the amount-pinned order-pay QR
-	// caption; {total} {des}.
-	PurchaseQR Str
 	// Label — DEPOSIT_LABEL (telegram_bot.py:582): friendly wallet-top-up row label
 	// in /history.
 	Label Str
@@ -102,12 +93,6 @@ type HistoryCatalog struct {
 // cited Python constants (format specs dropped per the file note).
 func buildDepositCatalog() DepositCatalog {
 	return DepositCatalog{
-		// DEPOSIT_QR (telegram_bot.py:422).
-		QR: Str{
-			VI: "💳 Quét mã QR bằng app ngân hàng để nạp tiền.\nNội dung chuyển khoản: {des}\nĐang chờ thanh toán (tối đa 10 phút)...",
-			EN: "💳 Scan this QR with your banking app to deposit.\nTransfer content: {des}\nWaiting for payment (up to 10 minutes)...",
-			ZH: "💳 用银行App扫描二维码充值。\n转账备注：{des}\n等待付款（最多10分钟）...",
-		},
 		// DEPOSIT_OK (telegram_bot.py:427).
 		OK: Str{
 			VI: "✅ Nạp tiền thành công: +{amount}\nSố dư hiện tại: {balance}",
@@ -120,8 +105,6 @@ func buildDepositCatalog() DepositCatalog {
 			EN: "💳 Choose a deposit method:",
 			ZH: "💳 请选择充值方式：",
 		},
-		// DEP_BTN_QR (telegram_bot.py:456).
-		BtnQR: Str{VI: "📷 VietQR (VN)", EN: "📷 VietQR (VN)", ZH: "📷 VietQR (越南)"},
 		// DEP_BTN_PAYPAL (telegram_bot.py:457).
 		BtnPayPal: Str{VI: "🌍 PayPal", EN: "🌍 PayPal", ZH: "🌍 PayPal"},
 		// DEP_BTN_BEP20 (telegram_bot.py:458).
@@ -159,18 +142,6 @@ func buildDepositCatalog() DepositCatalog {
 			VI: "⚠️ Số tiền không hợp lệ. Nhập một số ≥ {min}.",
 			EN: "⚠️ Invalid amount. Enter a number ≥ {min}.",
 			ZH: "⚠️ 金额无效。请输入 ≥ {min} 的数字。",
-		},
-		// QR_UNDERPAID (telegram_bot.py:439) — carries the support @handle.
-		Underpaid: Str{
-			VI: "⚠️ Số tiền chuyển ({paid} đ) chưa đủ cho đơn hàng ({total} đ).\nĐã cộng {paid} đ vào ví của bạn (số dư: {balance} đ). Vui lòng chuyển thêm phần còn lại hoặc dùng số dư để mua. Cần hỗ trợ? @zsec_ducna",
-			EN: "⚠️ Your transfer ({paid} VND) is less than the order total ({total} VND).\nWe added {paid} VND to your wallet (balance: {balance} VND). Please transfer the remainder or pay with your balance. Need help? @zsec_ducna",
-			ZH: "⚠️ 您的转账金额（{paid} 越南盾）少于订单总额（{total} 越南盾）。\n已将 {paid} 越南盾存入您的钱包（余额：{balance} 越南盾）。请补足差额或使用余额购买。需要帮助？@zsec_ducna",
-		},
-		// PURCHASE_QR (telegram_bot.py:1490).
-		PurchaseQR: Str{
-			VI: "💳 Quét mã QR để thanh toán {total} đ.\nNội dung chuyển khoản: {des}\nĐang chờ thanh toán (tối đa 10 phút)...",
-			EN: "💳 Scan this QR to pay {total} VND.\nTransfer content: {des}\nWaiting for payment (up to 10 minutes)...",
-			ZH: "💳 扫码支付 {total} 越南盾。\n转账内容：{des}\n等待付款（最多10分钟）...",
 		},
 		// DEPOSIT_LABEL (telegram_bot.py:582).
 		Label: Str{VI: "💳 Nạp tiền ví", EN: "💳 Wallet top-up", ZH: "💳 钱包充值"},

@@ -487,7 +487,6 @@ func (b *Bot) adminCategoryMenuRows(cat string) (title string, rows [][]tg.Inlin
 	case "payments":
 		return "💳 PAYMENT METHODS", [][]tg.InlineKeyboardButton{
 			btnRow("💰 Balance (wallet): "+onOffState(b.payEnabled("balance")), "adm:togglepay:balance"),
-			btnRow("📷 Bank QR (VN): "+onOffState(b.payEnabled("qr")), "adm:togglepay:qr"),
 			btnRow("🌍 PayPal: "+onOffState(b.payEnabled("paypal")), "adm:togglepay:paypal"),
 			btnRow("🪙 Binance USDT: "+b.payMethodLabel("binance", b.binanceConfigured, "keys not set"), "adm:togglepay:binance"),
 			btnRow("🟡 USDT BEP20: "+b.payMethodLabel("bep20", b.bep20Configured, "address not set"), "adm:togglepay:bep20"),

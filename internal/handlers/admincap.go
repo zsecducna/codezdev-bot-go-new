@@ -202,7 +202,7 @@ var customerCBPrefixes = []string{
 	"buy:", "buyx:", "buygo:", "buyqty:", "tier:", "back:", "setlang:",
 	"apikey", "kiroapi",
 	"ss:", "refreq:", "hist", "redl:", "cancelord:", "keepord", "applycode:",
-	"otpkeep", "otpstop:", "dep:", "paybal", "payqr", "paypp", "paybnb",
+	"otpkeep", "otpstop:", "dep:", "paybal", "paybnb",
 	"paybsc", "paytrx", "usdtpaid:",
 }
 
