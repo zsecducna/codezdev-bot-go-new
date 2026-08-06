@@ -254,7 +254,13 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 	// any single order is only ever returned once).
 	var won []apikeyRefundMember
 	for _, m := range members {
-		w, err := b.store.ClaimOrder(m.Des, m.Status, "refunded")
+		// customer | admin_cancel (stats-fixes-spec.md §2.1): each group member is
+		// pre-gated to {delivered, paid} by apikeyRefundGroup (isRefundableStatus),
+		// so refundKindForStatus's status branch always applies. This is a REAL
+		// customer refund either way — the API-key rail never reaches
+		// adminorders.go:doRefund's own claim, doRefund branches into this path
+		// first for any isApikeyFamily product.
+		w, err := b.store.ClaimOrderKind(m.Des, m.Status, "refunded", refundKindForStatus(m.Status))
 		if err != nil {
 			log.Printf("apikey group refund: claim failed [des=%s]: %v", m.Des, err)
 			continue
@@ -272,7 +278,10 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 	// claim (its credits never reached the key, so it sits outside the maths).
 	var extra int64
 	if stuck {
-		if w, err := b.store.ClaimOrder(o.Des, o.Status, "refunded"); err == nil && w != nil {
+		// customer | admin_cancel (stats-fixes-spec.md §2.1): apikeyStuckRecharge
+		// only returns true when isRefundableStatus(o.Status) already holds, so
+		// the same {delivered, paid} branch applies as the group loop above.
+		if w, err := b.store.ClaimOrderKind(o.Des, o.Status, "refunded", refundKindForStatus(o.Status)); err == nil && w != nil {
 			extra = w.Total
 			b.dropRefundAsOf(w.Des) // telegram_bot.py:4833
 		}

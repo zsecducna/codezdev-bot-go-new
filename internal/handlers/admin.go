@@ -35,6 +35,7 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -277,9 +278,52 @@ func (b *Bot) adminDashboardText(chatID int64) string {
 			// the oldest order's age ("oldest 3h ago" invites action; a bare
 			// count invites triage-later), and is suppressed entirely at zero
 			// so its mere presence is always an exception to look at.
+			// A2 fix (stats-fixes-spec.md §5.2): the old "Refunded/expired" line
+			// summed status IN ('refunded','expired') with no deposit filter, so
+			// abandoned checkouts and rescued late top-ups (late_settled) buried
+			// the real refund count inside a much bigger number — a shop with
+			// ZERO customer refunds could report hundreds. Refunded now counts
+			// ONLY genuine refunds (customer + admin_cancel, spec §2.2); Expired,
+			// Paid-no-stock and Failed-mint are their own lines so an
+			// operational failure never masquerades as a customer refund.
+			// Denominator is DeliveredCount+RefundedCount, NOT bare DeliveredCount
+			// (review finding on this slice): DeliveredCount is CURRENT
+			// status='delivered' rows only, and a genuine refund moves a row OUT
+			// of that set into the numerator — so the bare-DeliveredCount
+			// denominator shrinks exactly as the numerator grows and can print
+			// well over 100% on a shop with several refunds (e.g. 1 still-
+			// delivered + 4 refunded => "400%"). Adding RefundedCount back
+			// approximates "orders that were ever fulfilled or paid-and-
+			// cancelled", the same Gross = Net + Refunded relationship A7
+			// (§5.5, out of scope here) formalizes properly; this is the
+			// smallest correct fix without building A7's full Gross/Net lines.
+			refundRateSuffix := ""
+			if gross := r.DeliveredCount + r.RefundedCount; gross > 0 {
+				rate := float64(r.RefundedCount) / float64(gross) * 100
+				refundRateSuffix = fmt.Sprintf(" (%.1f%%)", rate)
+			}
 			ordersBlock := "\n🧾 ORDERS\n" +
-				"   ⏳ Awaiting payment: " + itoa64(r.AwaitingPaymentCount) +
-				"    ↩️ Refunded/expired: " + itoa64(r.RefundedCount)
+				"   ⏳ Awaiting payment: " + itoa64(r.AwaitingPaymentCount) + "\n" +
+				"   ↩️ Refunded: " + itoa64(r.RefundedCount) + refundRateSuffix +
+				"    ⌛ Expired checkouts: " + itoa64(r.ExpiredCount) + "\n" +
+				// 📭 out_of_stock is NEVER suppressed at zero (spec §2.2/§5.6): it is
+				// demand the shop measurably failed to serve, and a persistent zero
+				// is itself the healthy reading worth seeing. 🛠 mint_failed is the
+				// same class of operational-outage signal and gets the same
+				// always-visible treatment.
+				"   📭 Paid, no stock: " + itoa64(r.OutOfStockCount) +
+				"    🛠 Failed mints: " + itoa64(r.MintFailedCount)
+			if r.UnclassifiedCount > 0 {
+				// ❔ Unclassified — refund_kind IS NULL rows the taxonomy cannot
+				// retroactively classify (spec §1.2). Dropped at zero: it decays
+				// naturally as old unclassified rows age out of range, and once it
+				// hits zero there is nothing left to disclose. Deliberately NOT
+				// labelled "pre-migration": TestNoBareClaimOrderToRefunded now
+				// guards every live refund path, but that guard covers the shapes
+				// it can see, not a correctness proof — a future gap here should
+				// read as an open question, not a closed migration.
+				ordersBlock += "\n   ❔ Unclassified: " + itoa64(r.UnclassifiedCount)
+			}
 			if r.PaidUndeliveredCount > 0 {
 				ordersBlock += "\n   🚨 PAID, NOT DELIVERED: " + itoa64(r.PaidUndeliveredCount)
 				// PaidUndeliveredOldestTS is 0 both when there are no matching

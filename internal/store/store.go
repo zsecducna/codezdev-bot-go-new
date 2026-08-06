@@ -192,12 +192,17 @@ func (s *Store) initSchema() error {
 	// reports MUST bucket it separately rather than defaulting it into a kind
 	// or counting it as a zero discount (spec §1.2).
 	//
-	// NOTE for whoever writes those reports: NULL does not mean "pre-migration"
-	// yet. Until the step-3 handler migration lands, newly refunded rows also
-	// come out NULL (the seven refund sites still call the plain ClaimOrder
-	// wrapper), and list_total/code_discount have no writer at all until spec
-	// §3. Labelling the bucket "pre-migration orders" before then produces a
-	// count that grows daily and reads as a failed migration.
+	// NOTE for whoever writes those reports: NULL still does not mean
+	// "pre-migration" for refund_kind, even though the step-3 handler
+	// migration has landed (all seven refund sites now call ClaimOrderKind
+	// with an explicit kind, guarded by
+	// internal/handlers.TestNoBareClaimOrderToRefunded) — that test covers the
+	// shapes it can see, not a correctness proof, so a genuinely NULL row
+	// should still read as UNCLASSIFIED rather than assumed historical.
+	// list_total/code_discount have NO writer at all until spec §3, so THEIR
+	// NULL bucket is still growing daily by construction — do not label
+	// either bucket "pre-migration orders" while that remains true, or the
+	// count will read as a failed migration instead of a pending one.
 	// `have` is reused, not re-read, matching the two migrations above.
 	if !have["refund_kind"] {
 		if _, err := tx.Exec("ALTER TABLE orders ADD COLUMN refund_kind TEXT"); err != nil {

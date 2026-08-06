@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"codezdev-bot/internal/i18n"
+	"codezdev-bot/internal/store"
 )
 
 // waitFor polls cond up to 2s (fast tick) so worker-goroutine tests aren't flaky.
@@ -93,6 +94,85 @@ func TestCbDepStaleMethodAnswersPayMethodOff(t *testing.T) {
 		if last.Text != want {
 			t.Errorf("dep:%s reply = %q, want %q", stale, last.Text, want)
 		}
+	}
+}
+
+// TestSettlePaidLateExpiredClaimKindByProduct is the HANDLER half of the
+// review-round fix on this slice: settlePaid's `o.Status == "expired"` tail
+// (a payment that lands AFTER the checkout window closed) already branched on
+// o.Product BEFORE this refund-kind work existed — a __deposit__ order gets
+// Deposit.OK, any other product gets Buy.PaidNoStock (deposit.go, both below
+// the ClaimOrderKind call). The first version of this slice tagged BOTH
+// branches late_settled; that made a real paid-not-delivered event (money
+// back, nothing shipped, on the MAIN product path) invisible on every
+// refund-kind dashboard bucket — reviewed and fixed to branch the KIND the
+// same way the MESSAGE already branches.
+//
+// No test previously exercised this code path at all: reverting the kind
+// selection back to always RefundKindLateSettled passes the full suite
+// without this test (verified before writing it, then reverted).
+//
+// Falsification: reverting deposit.go's `kind := ...; if o.Product !=
+// depositProduct { kind = store.RefundKindOutOfStock }` back to the
+// single-kind form makes the "product order" half of this test fail (its
+// RefundKind reads late_settled instead of out_of_stock); the deposit half
+// stays green either way, which is exactly why a single-branch test would not
+// have caught the bug.
+func TestSettlePaidLateExpiredClaimKindByProduct(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, _ := newBuyBot(t, "999")
+
+	// A __deposit__ order sitting 'expired': a late top-up landing after the
+	// window is a COMPLETED SUCCESS (Deposit.OK is sent) wearing a 'refunded'
+	// status — late_settled.
+	depDes := store.NewDes()
+	if err := st.CreateOrder(depDes, "100", "en", depositProduct, "", 1, 5000); err != nil {
+		t.Fatalf("CreateOrder(dep): %v", err)
+	}
+	if _, err := st.ClaimOrder(depDes, "reserved", "expired"); err != nil {
+		t.Fatalf("claim dep -> expired: %v", err)
+	}
+	if _, err := b.settlePaid(ctx, depDes); err != nil {
+		t.Fatalf("settlePaid(dep): %v", err)
+	}
+	depOrder, err := st.GetOrder(depDes)
+	if err != nil || depOrder == nil {
+		t.Fatalf("GetOrder(dep): order=%v err=%v", depOrder, err)
+	}
+	if depOrder.Status != "refunded" {
+		t.Fatalf("dep status = %q, want refunded", depOrder.Status)
+	}
+	if depOrder.RefundKind == nil || *depOrder.RefundKind != store.RefundKindLateSettled {
+		t.Errorf("dep RefundKind = %v, want %q", depOrder.RefundKind, store.RefundKindLateSettled)
+	}
+
+	// A REGULAR product order sitting 'expired': spawnOrderExpiry already
+	// released the reserved folder-stock rows back at expiry, so a payment
+	// landing after that has NOTHING to deliver against — money back,
+	// Buy.PaidNoStock sent. Identical in kind to purchase.go's out_of_stock
+	// path (customer paid, stock gone, wallet credited), not a success.
+	prodDes := store.NewDes()
+	if err := st.CreateOrder(prodDes, "101", "en", "kiro-pro", "T1", 1, 5000); err != nil {
+		t.Fatalf("CreateOrder(prod): %v", err)
+	}
+	if _, err := st.ClaimOrder(prodDes, "reserved", "expired"); err != nil {
+		t.Fatalf("claim prod -> expired: %v", err)
+	}
+	if _, err := b.settlePaid(ctx, prodDes); err != nil {
+		t.Fatalf("settlePaid(prod): %v", err)
+	}
+	prodOrder, err := st.GetOrder(prodDes)
+	if err != nil || prodOrder == nil {
+		t.Fatalf("GetOrder(prod): order=%v err=%v", prodOrder, err)
+	}
+	if prodOrder.Status != "refunded" {
+		t.Fatalf("prod status = %q, want refunded", prodOrder.Status)
+	}
+	if prodOrder.RefundKind == nil || *prodOrder.RefundKind != store.RefundKindOutOfStock {
+		t.Errorf("prod RefundKind = %v, want %q — a late payment on a non-deposit "+
+			"expired order must NOT be tagged late_settled, or it becomes invisible "+
+			"on every refund-kind dashboard bucket",
+			prodOrder.RefundKind, store.RefundKindOutOfStock)
 	}
 }
 

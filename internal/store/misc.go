@@ -322,9 +322,35 @@ type RevenueSummary struct {
 	// triage-later while "oldest 3h ago" does not. Formatting is the handler's
 	// job; the store returns the raw stamp.
 	PaidUndeliveredOldestTS float64
-	RefundedCount           int64
-	Customers               int64
-	WalletTotal             int64
+	// RefundedCount — REAL customer refunds ONLY (refund_kind IN
+	// ('customer','admin_cancel')), stats-fixes-spec.md §5.2 (finding A2). The
+	// old query summed status IN ('refunded','expired') with no deposit
+	// filter, so a rescued late top-up (late_settled) and hundreds of
+	// abandoned checkouts inflated a number that could report refunds a shop
+	// with ZERO real refunds never had. late_settled, mint_failed and
+	// out_of_stock are deliberately excluded from this field — see the
+	// sibling fields below, which give each its own visible line instead of
+	// folding it in or dropping it silently.
+	RefundedCount int64
+	// ExpiredCount — abandoned checkouts (status='expired'), split out of the
+	// old combined "Refunded/expired" line.
+	ExpiredCount int64
+	// MintFailedCount — OUR own Kiro-Go mint failing (apikey_deliver.go). An
+	// outage signal, never a customer refund.
+	MintFailedCount int64
+	// OutOfStockCount — customer paid, the reserved folder-stock rows were
+	// gone (purchase.go). OUR fulfilment failure on the main product path and
+	// a restocking signal — invisible on every surface before this fix, so it
+	// is rendered even at zero (a persistent zero is the healthy reading).
+	OutOfStockCount int64
+	// UnclassifiedCount — refunded rows with refund_kind IS NULL. These
+	// predate the taxonomy and CANNOT be retroactively classified (spec
+	// §1.2 — there is no backfill; the distinguishing information was never
+	// recorded). Reported in its own bucket, NEVER folded into RefundedCount
+	// — doing so would recreate finding A2 inside the fix for A2.
+	UnclassifiedCount int64
+	Customers         int64
+	WalletTotal       int64
 }
 
 // GetRevenueSummary computes the dashboard aggregate (store.py:905-932).
@@ -361,8 +387,41 @@ func (s *Store) GetRevenueSummary(depositProduct string) (*RevenueSummary, error
 		return nil, err
 	}
 	r.PaidUndeliveredCount, r.PaidUndeliveredOldestTS = paidN, paidOldest
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM orders WHERE status IN ('refunded','expired')").
+	// The A2 split (stats-fixes-spec.md §5.2): five queries, five disjoint
+	// buckets over status='refunded'/'expired', each with the SAME
+	// COALESCE(product,'')!=? deposit filter as PaidUndelivered above — a bare
+	// `product != ?` would silently drop a NULL-product row from every bucket
+	// (`NULL != x` is NULL, not TRUE in SQL), the exact trap already caught in
+	// A4. late_settled is deliberately in none of these: it is not a refund
+	// (§2.2) and, being a __deposit__-only kind, would need its own line if
+	// ever surfaced — not conflated with a product refund bucket.
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM orders "+
+		"WHERE status='refunded' AND COALESCE(product,'')!=? AND refund_kind IN (?,?)",
+		depositProduct, RefundKindCustomer, RefundKindAdminCancel).
 		Scan(&r.RefundedCount); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM orders "+
+		"WHERE status='refunded' AND COALESCE(product,'')!=? AND refund_kind=?",
+		depositProduct, RefundKindMintFailed).
+		Scan(&r.MintFailedCount); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM orders "+
+		"WHERE status='refunded' AND COALESCE(product,'')!=? AND refund_kind=?",
+		depositProduct, RefundKindOutOfStock).
+		Scan(&r.OutOfStockCount); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM orders "+
+		"WHERE status='refunded' AND COALESCE(product,'')!=? AND refund_kind IS NULL",
+		depositProduct).
+		Scan(&r.UnclassifiedCount); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM orders "+
+		"WHERE status='expired' AND COALESCE(product,'')!=?", depositProduct).
+		Scan(&r.ExpiredCount); err != nil {
 		return nil, err
 	}
 	if err := s.db.QueryRow("SELECT COUNT(DISTINCT chat_id) FROM orders WHERE status='delivered'").
@@ -393,14 +452,25 @@ func (s *Store) GetRevenueSummary(depositProduct string) (*RevenueSummary, error
 // filter is applied to MIN(ts) — dropping it only there still yields a correct
 // count with a wrong, overstated age.
 //
-// COALESCE(product,'') rather than a bare `product!=?`: orders.product has no
-// NOT NULL constraint (store.go's schema), and in SQL `NULL != x` is NULL, not
-// TRUE — a 'paid' row with a NULL product would silently vanish from BOTH the
-// count and MIN(ts) instead of being caught by the deposit filter, which is
-// the opposite failure direction of what this filter exists to guarantee
-// (Opus review finding on this slice). CreateOrder always writes a non-NULL
-// product today, so this guards a live-data edge, not a currently-reachable
-// application path.
+// The filter is spelled COALESCE-first rather than a bare `product!=?` —
+//
+//	COALESCE(product,'') rather than a bare `product!=?`
+//
+// — because orders.product has no NOT NULL constraint (store.go's schema),
+// and in SQL `NULL != x` is NULL, not TRUE — a 'paid' row with a NULL product
+// would silently vanish from BOTH the count and MIN(ts) instead of being
+// caught by the deposit filter, which is the opposite failure direction of
+// what this filter exists to guarantee (Opus review finding on this slice).
+// CreateOrder always writes a non-NULL product today, so this guards a
+// live-data edge, not a currently-reachable application path.
+//
+// (The SQL fragment above is deliberately an INDENTED doc-comment line, not
+// inline prose: gofmt's doc-comment formatter silently turns two adjacent
+// single-quote characters into one typographic close-quote when they appear
+// in flowing text — verified reproducible against the stock Go toolchain,
+// not a project quirk — which would corrupt this exact SQL fragment (an
+// empty-string literal) on the next `gofmt -w` of this file. An indented line
+// renders as a preformatted code block and is exempt.)
 //
 // NOTE, deliberately not folded in: a __deposit__ order stuck in 'paid' means a
 // customer's money arrived and their wallet was never credited. That is also

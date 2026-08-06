@@ -225,7 +225,10 @@ func (b *Bot) apikeyMintFailRefund(ctx context.Context, order *store.Order, des 
 	// Never log the admin key; `cause` carries only the server's error text
 	// (internal/kirogo never puts credentials in an error).
 	log.Printf("apikey mint failed [des=%s chat=%d]: %v", des, chatID, cause)
-	won, err := b.store.ClaimOrder(des, "paid", "refunded")
+	// mint_failed (stats-fixes-spec.md §2.1): OUR own Kiro-Go provisioning
+	// failed — shop's fault, not a customer-requested refund. Excluded from the
+	// customer-facing refund rate (§2.2); a rising count is an outage signal.
+	won, err := b.store.ClaimOrderKind(des, "paid", "refunded", store.RefundKindMintFailed)
 	if err != nil || won == nil {
 		// Nothing moved: the order stays 'paid' and surfaces in the stuck-paid
 		// reconcile. Crediting without the claim could double-refund on a replay.
@@ -387,7 +390,11 @@ func (b *Bot) deliverApikeyRecharge(ctx context.Context, order *store.Order, des
 func (b *Bot) apikeyRCFailRefund(ctx context.Context, order *store.Order, des string,
 	chatID int64, lang i18n.Lang, credits, total int64, cause error) bool {
 	log.Printf("apikey recharge failed [des=%s chat=%d]: %v", des, chatID, cause)
-	won, err := b.store.ClaimOrder(des, "paid", "refunded")
+	// mint_failed (stats-fixes-spec.md §2.1): the recharge twin of
+	// apikeyMintFailRefund above — OUR Kiro-Go recharge call failed, not a
+	// customer-requested refund. Excluded from the customer-facing refund rate
+	// (§2.2); a rising count is an outage signal.
+	won, err := b.store.ClaimOrderKind(des, "paid", "refunded", store.RefundKindMintFailed)
 	if err != nil || won == nil {
 		log.Printf("CRITICAL apikey recharge refund claim failed [des=%s won=%t err=%v] — order left 'paid' for reconcile, nothing credited",
 			des, won != nil, err)

@@ -9,8 +9,8 @@ package handlers
 //
 // MONEY-CRITICAL FILE (task brief): a defect here pays a customer twice or not
 // at all. THE single invariant every path below is built around is
-// store.ClaimOrder(des, from, "refunded") — ONE conditional UPDATE, proceed
-// only on RowsAffected()==1. store.CreditBalance is plain additive and NOT
+// store.ClaimOrderKind(des, from, "refunded", kind) — ONE conditional UPDATE,
+// proceed only on RowsAffected()==1. store.CreditBalance is plain additive and NOT
 // idempotent by itself; it is safe only because ClaimOrder's atomic status
 // flip is what actually prevents a double-pay. Every refund path (admin
 // adm:refund, force-full, request-approve, API-key group) goes through
@@ -198,6 +198,25 @@ type refundResult struct {
 // Returns nil when the order is not currently refundable (deposit / wrong
 // status) OR when the atomic claim was LOST (status changed under us) — the
 // caller must not act as if anything moved in either case.
+// refundKindForStatus classifies a genuine admin-issued refund by the
+// order's status AT THE MOMENT OF THE CLAIM (stats-fixes-spec.md §2.1): a
+// 'delivered' order means goods already went out and money came back (a
+// completed-sale refund); a 'paid' order means money was taken and cancelled
+// before delivery (no goods ever shipped). Both count toward the
+// customer-facing refund rate (§2.2) — they are kept distinct because "how
+// often do we refund after delivering" and "how often do we cancel before
+// delivering" are different shop-health signals. Callers must pass the
+// PRE-transition status (the same value used as ClaimOrderKind's fromStatus);
+// isRefundableStatus/refundableStatuses already gate the input to
+// {delivered, paid}, so any other value is a caller bug — default to
+// admin_cancel rather than mint an invalid kind.
+func refundKindForStatus(status string) string {
+	if status == "delivered" {
+		return store.RefundKindCustomer
+	}
+	return store.RefundKindAdminCancel
+}
+
 func (b *Bot) doRefund(ctx context.Context, o *store.Order, method string, forceFull bool) *refundResult {
 	if !isRefundableStatus(o.Status) || o.Product == depositProduct {
 		return nil
@@ -230,7 +249,7 @@ func (b *Bot) doRefund(ctx context.Context, o *store.Order, method string, force
 	// THE double-refund guard: one conditional UPDATE, proceed only on
 	// RowsAffected()==1. A nil return means another path already flipped
 	// this order's status — we must not act as if we won.
-	won, err := b.store.ClaimOrder(o.Des, o.Status, "refunded")
+	won, err := b.store.ClaimOrderKind(o.Des, o.Status, "refunded", refundKindForStatus(o.Status))
 	if err != nil {
 		log.Println("adminorders: ClaimOrder failed:", err)
 		return nil

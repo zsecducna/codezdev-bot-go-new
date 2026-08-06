@@ -30,13 +30,16 @@ type Order struct {
 	// §2.1). nil on every non-refunded order — that is the invariant
 	// ClaimOrderKind enforces.
 	//
-	// nil on a REFUNDED row means UNCLASSIFIED, which is broader than
-	// "pre-migration" and will stay broader until the step-3 handler migration
-	// lands: today the seven forward-to-'refunded' sites still call the plain
-	// ClaimOrder wrapper, so newly refunded rows also come out nil. Reports
-	// must bucket nil separately and must NOT label that bucket
-	// "pre-migration" until step 3 ships, or the count will keep growing and
-	// look like the migration never took.
+	// nil on a REFUNDED row means UNCLASSIFIED. The step-3 handler migration
+	// has landed — all seven forward-to-'refunded' sites in internal/handlers
+	// call ClaimOrderKind with an explicit kind, and
+	// internal/handlers.TestNoBareClaimOrderToRefunded fails the build if a
+	// future eighth site slips back onto the plain wrapper. So today a nil
+	// here means a genuine pre-existing row (no backfill possible, spec §1.2).
+	// Reports must still bucket nil separately and must NOT relabel it
+	// "pre-migration": that guard test covers the shape it can see, not a
+	// correctness proof, so nil staying UNCLASSIFIED (rather than assumed
+	// historical) is the conservative reading if it is ever wrong.
 	RefundKind *string
 }
 
@@ -203,6 +206,14 @@ const (
 	// credited to the wallet. For a __deposit__ order the customer is sent
 	// Deposit.OK: this is a SUCCESS wearing a refund's status, and counting it
 	// as a refund is the exact defect this taxonomy exists to remove.
+	//
+	// CURRENTLY UNREACHABLE, kept as correct defensive code: settlePaid's
+	// expired-tail branch (deposit.go) is the only writer, and settlePaid's
+	// own deposit branch is bypassed entirely by usdt.go's deposit settle path
+	// (which credits directly and never calls settlePaid, to avoid a double
+	// credit) — so no LIVE __deposit__ order reaches this kind today. If a
+	// future rail routes deposits back through settlePaid, this kind is ready;
+	// until then, treat this as aspirational rather than an observed case.
 	RefundKindLateSettled = "late_settled"
 )
 
@@ -252,7 +263,7 @@ func IsRealRefundOrder(o *Order) bool {
 // It is enforced structurally rather than by convention — the one UPDATE sets
 // the kind when toStatus=="refunded" and NULLs it for every other status. That
 // matters because three call sites REVERT a refund
-// (apikey_deliver.go:247,404 and purchase.go:339 all do
+// (apikey_deliver.go:250,411 and purchase.go:343 all do
 // ClaimOrder(des, "refunded", "paid")); if the kind survived such a revert, a
 // status='paid' row would carry a stale kind and every GROUP BY refund_kind
 // report would count an order that is not refunded at all.
@@ -262,26 +273,41 @@ func IsRealRefundOrder(o *Order) bool {
 // Only the forward-to-'refunded' sites need to change. There are SEVEN of them
 // (spec §2.1) — not five; the API-key rail refunds through its OWN path, since
 // doRefund branches at adminorders.go:206 into doRefundApikeyGroup for any
-// isApikeyFamily product and never reaches adminorders.go:233:
+// isApikeyFamily product and never reaches adminorders.go:233. STEP 3 HAS
+// LANDED — all seven now call ClaimOrderKind (line numbers below drift with
+// unrelated edits; treat them as approximate, the test below is the source of
+// truth):
 //
-//	adminorders.go:233     customer | admin_cancel   (branch on o.Status)
-//	apikey_refund.go:257   customer | admin_cancel   (branch on m.Status)
-//	apikey_refund.go:275   customer | admin_cancel   (branch on o.Status)
-//	apikey_deliver.go:228  mint_failed
-//	apikey_deliver.go:390  mint_failed
-//	purchase.go:324        out_of_stock
-//	deposit.go:263         late_settled
+//	adminorders.go:252     customer | admin_cancel   (branch on o.Status)
+//	apikey_refund.go:263   customer | admin_cancel   (branch on m.Status)
+//	apikey_refund.go:284   customer | admin_cancel   (branch on o.Status)
+//	apikey_deliver.go:231  mint_failed
+//	apikey_deliver.go:397  mint_failed
+//	purchase.go:328        out_of_stock
+//	deposit.go:~285        late_settled (product==depositProduct) |
+//	                       out_of_stock (any other product — the reserved
+//	                       stock already released at expiry, so a late
+//	                       payment on a non-deposit order has nothing to
+//	                       deliver against either; tagging it late_settled
+//	                       would make a paid-not-delivered event invisible on
+//	                       every refund-kind bucket, review finding on this
+//	                       slice)
 //
 // The three dynamic-`from` sites are pre-gated by refundableStatuses
 // {delivered, paid} (apikey_refund.go:33), so each is a REAL refund: delivered
 // -> customer, paid -> admin_cancel.
 //
-// Completeness check for step 3: grep ClaimOrderKind for exactly SEVEN hits AND
-// confirm `grep -rn 'ClaimOrder(' internal/handlers/ | grep '"refunded")'`
-// returns nothing left on the plain wrapper. Do not trust the count alone —
-// this list was wrong twice (it missed purchase.go, then the two apikey_refund
-// sites), and both misses would have silently dropped real refunds into the
-// unclassified bucket.
+// Completeness is now enforced by a test, not just a checklist:
+// internal/handlers.TestNoBareClaimOrderToRefunded parses the module's AST on
+// every `go test` and fails the build if any call site anywhere reaches
+// status='refunded' through the plain ClaimOrder wrapper — catching a future
+// eighth site the moment it is written rather than at the next manual audit.
+// The manual cross-check for a reviewer without a Go toolchain handy is still
+// `grep -rn 'ClaimOrder(' internal/handlers/ | grep '"refunded")'` returning
+// nothing. Do not trust either check alone without reading the diff — this
+// list was wrong twice before step 3 landed (missed purchase.go, then both
+// apikey_refund.go sites), and a THIRD miss surfaced only in review after
+// step 3 "landed": deposit.go's site used one kind for two different events.
 //
 // refundKind must be "" or one of the RefundKind* constants; anything else is
 // rejected WITHOUT moving the order. Passing a kind with a non-refunded

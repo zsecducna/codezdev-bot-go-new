@@ -144,7 +144,7 @@ func TestMigrationAddsStatsColumnsToOldSchema(t *testing.T) {
 }
 
 // TestRefundKindClearedOnRevert is spec T2 — THE revert trap. Three handler
-// sites do ClaimOrder(des, "refunded", "paid") (apikey_deliver.go:247,404 and
+// sites do ClaimOrder(des, "refunded", "paid") (apikey_deliver.go:250,411 and
 // purchase.go:343). If refund_kind survived that revert, a status='paid' row
 // would keep a stale kind and every GROUP BY refund_kind report would count an
 // order that is not refunded at all.
@@ -191,12 +191,16 @@ func TestRefundKindClearedOnRevert(t *testing.T) {
 // SCOPE LIMIT, deliberate — and the name says only what the test can prove.
 // The real refund call sites (SEVEN of them, see ClaimOrderKind's doc comment)
 // live in internal/handlers, which this change does not touch. So this pins the
-// STORE-side contract only. The final leg — that no handler reaches 'refunded'
-// without a kind — lands when those sites migrate in spec step 3. Until then
-// the plain wrapper still writes NULL on a refunded transition, and the last
-// sub-test below pins that this degrades into the UNCLASSIFIED bucket rather
-// than being counted as a real refund. An earlier name for this test
-// ("TestEveryRefundedWriteSetsAKind") overclaimed exactly that missing leg.
+// STORE-side contract only. The last sub-test below pins that the plain
+// wrapper degrades a refunded transition into the UNCLASSIFIED bucket rather
+// than a real refund, which is still true today for any caller that reaches
+// for the wrapper by mistake. An earlier name for this test
+// ("TestEveryRefundedWriteSetsAKind") overclaimed the handler-side leg below.
+//
+// The handler-side leg — that no handler call site reaches 'refunded' without
+// a kind — landed in spec step 3 as
+// internal/handlers.TestNoBareClaimOrderToRefunded, a structural scan of every
+// non-test .go file in internal/handlers for the invariant-breaking shape.
 //
 // Falsification: against pre-change code, ClaimOrderKind and the RefundKind*
 // constants are undefined.
@@ -434,6 +438,140 @@ func TestRevenueSummarySplitsReservedFromPaid(t *testing.T) {
 	}
 	if r.PaidUndeliveredOldestTS != 1200 {
 		t.Errorf("PaidUndeliveredOldestTS = %v, want 1200", r.PaidUndeliveredOldestTS)
+	}
+}
+
+// TestRefundCountersSeparateKinds is spec T3 — the A2 counter split
+// (GetRevenueSummary, stats-fixes-spec.md §5.2). Seeds one order of each
+// real/operational refund_kind, two abandoned checkouts, and a __deposit__
+// order for every same-shaped case, then asserts each new field counts ONLY
+// its own NON-DEPOSIT bucket.
+//
+// The deposit rows are load-bearing, not decorative (review finding on this
+// slice, proven by mutation): stripping the deposit-filter clause —
+//
+//	COALESCE(product,'')!=?
+//
+// — from all five misc.go queries left an earlier version of this test
+// green, because the only deposit row it seeded used late_settled — a kind
+// every query already excludes on the kind predicate alone, so the deposit
+// filter was never actually exercised. Seeding a deposit row PER KIND
+// (customer, mint_failed, out_of_stock, NULL, expired) means removing the
+// filter now inflates a counter this test checks, for every bucket.
+//
+// (The SQL fragment above is deliberately an INDENTED doc-comment line, not
+// inline prose: gofmt's doc-comment formatter silently turns two adjacent
+// single-quote characters into one typographic close-quote when they appear
+// in flowing text — verified reproducible against the stock Go toolchain,
+// not a project quirk — which would corrupt this exact SQL fragment (an
+// empty-string literal) on the next `gofmt -w` of this file. An indented
+// line renders as a preformatted code block and is exempt.)
+//
+// Falsification: against pre-change code these fields do not exist. Verified
+// by mutation: (1) reverting the RefundedCount query to the old
+// `status IN ('refunded','expired')` (no kind filter, no deposit filter)
+// makes RefundedCount count far more than 2; (2) stripping just the deposit
+// filter from all five queries (kind/NULL/expired predicates kept) inflates
+// RefundedCount/MintFailedCount/OutOfStockCount/UnclassifiedCount/
+// ExpiredCount each by 1, from the matching deposit row.
+func TestRefundCountersSeparateKinds(t *testing.T) {
+	s := newTestStore(t)
+
+	// One order of each real/operational kind — non-deposit product (seedOrder
+	// always uses "kiro-pro").
+	cases := []struct {
+		des  string
+		from string
+		kind string
+	}{
+		{"cust1", "delivered", RefundKindCustomer},
+		{"admcxl1", "paid", RefundKindAdminCancel},
+		{"mint1", "paid", RefundKindMintFailed},
+		{"oos1", "paid", RefundKindOutOfStock},
+	}
+	for _, c := range cases {
+		seedOrder(t, s, c.des, c.from)
+		if _, err := s.ClaimOrderKind(c.des, c.from, "refunded", c.kind); err != nil {
+			t.Fatalf("claim %s: %v", c.des, err)
+		}
+	}
+	// Two abandoned checkouts — never money, never refunded.
+	seedOrder(t, s, "exp1", "expired")
+	seedOrder(t, s, "exp2", "expired")
+
+	// A __deposit__ order rescued to the wallet after the checkout window
+	// closed — the exact A2 defect: a SUCCESS wearing status='refunded'. Must
+	// not inflate RefundedCount, MintFailedCount, OutOfStockCount or
+	// ExpiredCount.
+	if err := s.CreateOrder("latedep1", "7", "en", DepositProduct, "", 1, 5000); err != nil {
+		t.Fatalf("CreateOrder(latedep1): %v", err)
+	}
+	if _, err := s.db.Exec("UPDATE orders SET status='expired' WHERE des=?", "latedep1"); err != nil {
+		t.Fatalf("seed latedep1 -> expired: %v", err)
+	}
+	if _, err := s.ClaimOrderKind("latedep1", "expired", "refunded", RefundKindLateSettled); err != nil {
+		t.Fatalf("claim latedep1: %v", err)
+	}
+
+	// One MORE deposit row per bucket below, each carrying the SAME kind (or
+	// NULL / expired) as a non-deposit row above — the deposit filter's whole
+	// job is keeping every one of these out of the count its kind would
+	// otherwise land in.
+	seedDeposit := func(des, from, kind string) {
+		t.Helper()
+		if err := s.CreateOrder(des, "7", "en", DepositProduct, "", 1, 5000); err != nil {
+			t.Fatalf("CreateOrder(%s): %v", des, err)
+		}
+		if from != "reserved" {
+			if _, err := s.db.Exec("UPDATE orders SET status=? WHERE des=?", from, des); err != nil {
+				t.Fatalf("seed %s -> %s: %v", des, from, err)
+			}
+		}
+		if _, err := s.ClaimOrderKind(des, from, "refunded", kind); err != nil {
+			t.Fatalf("claim %s: %v", des, err)
+		}
+	}
+	seedDeposit("depcust1", "delivered", RefundKindCustomer) // would-be RefundedCount leak
+	seedDeposit("depmint1", "paid", RefundKindMintFailed)    // would-be MintFailedCount leak
+	seedDeposit("depoos1", "paid", RefundKindOutOfStock)     // would-be OutOfStockCount leak
+
+	// A deposit refunded with NO kind (the shape a plain-wrapper or
+	// pre-migration row has) — would-be UnclassifiedCount leak.
+	if err := s.CreateOrder("depnull1", "7", "en", DepositProduct, "", 1, 5000); err != nil {
+		t.Fatalf("CreateOrder(depnull1): %v", err)
+	}
+	if _, err := s.db.Exec("UPDATE orders SET status='refunded' WHERE des=?", "depnull1"); err != nil {
+		t.Fatalf("seed depnull1 -> refunded (NULL kind): %v", err)
+	}
+
+	// A deposit sitting 'expired' — would-be ExpiredCount leak.
+	if err := s.CreateOrder("depexp1", "7", "en", DepositProduct, "", 1, 5000); err != nil {
+		t.Fatalf("CreateOrder(depexp1): %v", err)
+	}
+	if _, err := s.db.Exec("UPDATE orders SET status='expired' WHERE des=?", "depexp1"); err != nil {
+		t.Fatalf("seed depexp1 -> expired: %v", err)
+	}
+
+	r, err := s.GetRevenueSummary("")
+	if err != nil {
+		t.Fatalf("GetRevenueSummary: %v", err)
+	}
+	if r.RefundedCount != 2 {
+		t.Errorf("RefundedCount = %d, want 2 (customer + admin_cancel only) — "+
+			"an operational or late_settled row leaked into the customer refund count", r.RefundedCount)
+	}
+	if r.MintFailedCount != 1 {
+		t.Errorf("MintFailedCount = %d, want 1", r.MintFailedCount)
+	}
+	if r.OutOfStockCount != 1 {
+		t.Errorf("OutOfStockCount = %d, want 1", r.OutOfStockCount)
+	}
+	if r.UnclassifiedCount != 0 {
+		t.Errorf("UnclassifiedCount = %d, want 0 — every row here was classified", r.UnclassifiedCount)
+	}
+	if r.ExpiredCount != 2 {
+		t.Errorf("ExpiredCount = %d, want 2 — the rescued deposit is status='refunded', "+
+			"not 'expired', and must not be counted here either", r.ExpiredCount)
 	}
 }
 

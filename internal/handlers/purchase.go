@@ -321,7 +321,11 @@ func (b *Bot) deliverPaid(ctx context.Context, order *store.Order, des string) b
 		// stays 'paid' and surfaces in the PaidOrders reconcile for manual review
 		// (Python got this for free: a claim_order exception aborted before the
 		// credit ran).
-		won, err := b.store.ClaimOrder(des, "paid", "refunded")
+		// out_of_stock (stats-fixes-spec.md §2.1): the customer paid and the
+		// reserved folder-stock rows were gone — OUR fulfilment failure on the
+		// main product path, not a customer-requested refund. Excluded from the
+		// customer-facing refund rate (§2.2); it is a restocking signal.
+		won, err := b.store.ClaimOrderKind(des, "paid", "refunded", store.RefundKindOutOfStock)
 		if err != nil || won == nil {
 			log.Printf("CRITICAL refund claim failed [des=%s chat=%s total=%d won=%t err=%v] — order left 'paid' for reconcile, nothing credited",
 				des, chatIDStr, total, won != nil, err)

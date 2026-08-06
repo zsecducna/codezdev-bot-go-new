@@ -24,6 +24,7 @@ import (
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/pay/bep20"
 	"codezdev-bot/internal/pay/tron"
+	"codezdev-bot/internal/store"
 	"codezdev-bot/internal/tg"
 )
 
@@ -260,7 +261,28 @@ func (b *Bot) settlePaid(ctx context.Context, des string) (bool, error) {
 		return false, nil // unknown order
 	}
 	if o.Status == "expired" {
-		refunded, err := b.store.ClaimOrder(des, "expired", "refunded")
+		// Kind depends on WHICH product this is — the two branches below send
+		// different messages and are different events, not one event with two
+		// wordings (review finding on this slice):
+		//
+		//   __deposit__: late_settled (stats-fixes-spec.md §2.1) — the wallet is
+		//   credited and Deposit.OK is sent below. A SUCCESS wearing a
+		//   'refunded' status; must never count toward the customer-facing
+		//   refund rate (§2.2).
+		//
+		//   any other product: the reserved stock was already released back at
+		//   expiry (spawnOrderExpiry, purchase.go), so a payment landing after
+		//   that has nothing to deliver against — money back, Buy.PaidNoStock
+		//   sent below, IDENTICAL in kind to purchase.go's out_of_stock path
+		//   (customer paid, stock gone, wallet credited). Tagging this
+		//   late_settled would make a paid-not-delivered event invisible on
+		//   every refund-kind bucket on the dashboard — the exact A2 defect
+		//   this taxonomy exists to remove, reintroduced for product orders.
+		kind := store.RefundKindLateSettled
+		if o.Product != depositProduct {
+			kind = store.RefundKindOutOfStock
+		}
+		refunded, err := b.store.ClaimOrderKind(des, "expired", "refunded", kind)
 		if err != nil {
 			return false, err
 		}

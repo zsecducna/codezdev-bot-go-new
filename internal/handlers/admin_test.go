@@ -527,7 +527,7 @@ func TestAdminDashboardPaidUndeliveredNullTSOmitsAge(t *testing.T) {
 	// comment calls out as a real possibility: a paid, non-deposit row whose
 	// ts is NULL.
 	if _, err := st.DB().Exec(
-		"INSERT INTO orders(des, chat_id, lang, product, tier, qty, total, status, ts) "+
+		"INSERT INTO orders(des, chat_id, lang, product, tier, qty, total, status, ts) " +
 			"VALUES ('nullts','9','en','kiro-pro','T1',1,5000,'paid',NULL)"); err != nil {
 		t.Fatalf("seed NULL-ts paid order: %v", err)
 	}
@@ -542,6 +542,93 @@ func TestAdminDashboardPaidUndeliveredNullTSOmitsAge(t *testing.T) {
 	}
 	if strings.Contains(last.Text, "(oldest") {
 		t.Errorf("age clause must be omitted when the oldest ts is unknown, got:\n%s", last.Text)
+	}
+}
+
+// TestAdminDashboardRefundBucketsRender is the HANDLER half of A2
+// (stats-fixes-spec.md §5.2), closing a coverage gap a review round found:
+// no test previously read the new ORDERS block at all — reverting the
+// refund-rate denominator to the pre-fix bare DeliveredCount (a >100% bug),
+// reverting deposit.go's kind selection to always late_settled, or renaming
+// every new dashboard label to garbage each passed the full suite silently.
+//
+// Seeds ONE order of each new bucket (customer refund, mint_failed,
+// out_of_stock, an unclassified NULL-kind refund, and an expired checkout)
+// plus one delivered order, then asserts the exact rendered line for each —
+// including the refund-rate PERCENTAGE, which is the number a mutated
+// denominator changes.
+//
+// Falsification (verified by mutation, then reverted): reverting the
+// denominator from `DeliveredCount+RefundedCount` back to bare
+// `DeliveredCount` changes the seeded 1-delivered/1-refunded scenario's rate
+// from 1/2=50.0% to 1/1=100.0%, so the "(50.0%)" assertion below fails.
+func TestAdminDashboardRefundBucketsRender(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newDashboardTestBot(t, "1")
+
+	// One delivered (non-deposit) sale — DeliveredCount=1, and the refund-rate
+	// denominator (DeliveredCount+RefundedCount).
+	seedPaid(t, st, "delivered1", "kiro-pro")
+	if _, err := st.ClaimOrder("delivered1", "paid", "delivered"); err != nil {
+		t.Fatalf("claim delivered1 -> delivered: %v", err)
+	}
+
+	// One genuine customer refund of a completed sale — RefundedCount=1.
+	seedPaid(t, st, "refcust1", "kiro-pro")
+	if _, err := st.ClaimOrder("refcust1", "paid", "delivered"); err != nil {
+		t.Fatalf("claim refcust1 -> delivered: %v", err)
+	}
+	if _, err := st.ClaimOrderKind("refcust1", "delivered", "refunded", store.RefundKindCustomer); err != nil {
+		t.Fatalf("claim refcust1 -> refunded/customer: %v", err)
+	}
+
+	// One of our own mint failures — MintFailedCount=1.
+	seedPaid(t, st, "mint1", "kiro-pro")
+	if _, err := st.ClaimOrderKind("mint1", "paid", "refunded", store.RefundKindMintFailed); err != nil {
+		t.Fatalf("claim mint1 -> refunded/mint_failed: %v", err)
+	}
+
+	// One stockout refund — OutOfStockCount=1.
+	seedPaid(t, st, "oos1", "kiro-pro")
+	if _, err := st.ClaimOrderKind("oos1", "paid", "refunded", store.RefundKindOutOfStock); err != nil {
+		t.Fatalf("claim oos1 -> refunded/out_of_stock: %v", err)
+	}
+
+	// One refund with NO kind (the plain wrapper's shape) — UnclassifiedCount=1.
+	seedPaid(t, st, "unclass1", "kiro-pro")
+	if _, err := st.ClaimOrder("unclass1", "paid", "refunded"); err != nil {
+		t.Fatalf("claim unclass1 -> refunded (no kind): %v", err)
+	}
+
+	// One abandoned checkout — ExpiredCount=1.
+	seedReserved(t, st, "exp1", "kiro-pro")
+	if _, err := st.ClaimOrder("exp1", "reserved", "expired"); err != nil {
+		t.Fatalf("claim exp1 -> expired: %v", err)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "admroot"))
+	last := lastSendMsg(f)
+	if last == nil {
+		t.Fatal("admroot produced no reply")
+	}
+
+	// Gross = DeliveredCount(1) + RefundedCount(1) = 2; rate = 1/2 = 50.0%.
+	// This is the assertion a reverted (bare-DeliveredCount) denominator
+	// breaks: it would read "(100.0%)" instead.
+	if !strings.Contains(last.Text, "↩️ Refunded: 1 (50.0%)") {
+		t.Errorf("want the real (non-inflated) refund rate, got:\n%s", last.Text)
+	}
+	if !strings.Contains(last.Text, "⌛ Expired checkouts: 1") {
+		t.Errorf("want 1 expired checkout, got:\n%s", last.Text)
+	}
+	if !strings.Contains(last.Text, "📭 Paid, no stock: 1") {
+		t.Errorf("want 1 out-of-stock refund, got:\n%s", last.Text)
+	}
+	if !strings.Contains(last.Text, "🛠 Failed mints: 1") {
+		t.Errorf("want 1 mint-failed refund, got:\n%s", last.Text)
+	}
+	if !strings.Contains(last.Text, "❔ Unclassified: 1") {
+		t.Errorf("want 1 unclassified refund, got:\n%s", last.Text)
 	}
 }
 
