@@ -698,6 +698,34 @@ func TestSetTronWizard(t *testing.T) {
 // .omc/artifacts/config-audit-spec.md — capSetBep20/capSetTron are the two
 // sites where an unaudited change silently redirects 100% of incoming funds.
 
+// TestAuditOldNewClipsOversizedOld pins the review-found failure case: old
+// is an UNVALIDATED passthrough of BEP20_ADDRESS/TRON_ADDRESS (env, or a
+// past admin's raw settings.json value), unlike newVal which always passed
+// bep20.ValidAddress/tron.ValidAddress before reaching auditOldNew. Before
+// this fix, an oversized old pushed the formatted "old → new" past
+// LogAction's silent 500-rune outcome clip and could cut off the arrow and
+// the new address entirely — a row with no visible destination on the one
+// field where that matters most. This asserts the arrow and the full new
+// address always survive, and the whole result stays comfortably inside the
+// 500-rune clip regardless of how large old is.
+func TestAuditOldNewClipsOversizedOld(t *testing.T) {
+	longOld := strings.Repeat("A", 600) // larger than any realistic address/URL
+	newVal := "0x1111111111111111111111111111111111111111"
+
+	got := auditOldNew(longOld, newVal)
+
+	if !strings.HasSuffix(got, " → "+newVal) {
+		t.Fatalf("clipped result must still end in %q, got %q", " → "+newVal, got)
+	}
+	wantOldPrefix := strings.Repeat("A", auditOldClipRunes) + "…"
+	if !strings.HasPrefix(got, wantOldPrefix) {
+		t.Fatalf("old side must clip to %d runes + an ellipsis, got %q", auditOldClipRunes, got)
+	}
+	if n := len([]rune(got)); n > 500 {
+		t.Fatalf("clipped result is %d runes, still over LogAction's 500-rune outcome clip", n)
+	}
+}
+
 // newAuditTestBot builds a Bot wired to BOTH a real *config.Config (so
 // SaveSettings persists) AND a real *store.Store (so LogAction/RecentAudit
 // actually round-trip) — newSettingsTestBot only wires the former.
