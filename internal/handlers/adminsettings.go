@@ -805,6 +805,35 @@ func (b *Bot) cbSetBep20(cc *cbCtx) {
 	b.send(cc.Ctx, cc.ChatID, text, backKB("admcat:payments"))
 }
 
+// auditOldClipRunes bounds the UNVALIDATED "old" side of an audit outcome.
+// newVal always passed bep20.ValidAddress/tron.ValidAddress before reaching
+// auditOldNew, so it is capped at ~42 runes by construction — but old comes
+// straight from BEP20_ADDRESS/TRON_ADDRESS (env, or a settings.json value a
+// past admin typed), and nothing in this codebase validates its shape. An
+// oversized old value could otherwise push the formatted outcome past
+// LogAction's silent 500-rune clip (store/misc.go's truncRunes), cutting off
+// the " → <new>" tail entirely — a row with no arrow and no destination
+// address left in it, on the one field where getting the destination right
+// matters most. 64 runes is generously past any realistic address/URL while
+// still leaving the clip itself legible.
+const auditOldClipRunes = 64
+
+// auditOldNew formats a config mutator's "old → new" forensic payload for
+// LogAction's outcome field (task #13 Tier 1, .omc/artifacts/config-audit-spec.md
+// §4.1). A never-before-set field renders as "(unset)" rather than an empty
+// string, so a first-ever /setbep20 or /settron doesn't read as "the address
+// was blank" — it must read as "there was no address at all". old is clipped
+// defensively per auditOldClipRunes above; newVal is not re-clipped here
+// since every current caller already validated it before calling in.
+func auditOldNew(old, newVal string) string {
+	if old == "" {
+		old = "(unset)"
+	} else if r := []rune(old); len(r) > auditOldClipRunes {
+		old = string(r[:auditOldClipRunes]) + "…"
+	}
+	return old + " → " + newVal
+}
+
 // capSetBep20 is the "setbep20" capture (#21, POP semantics —
 // telegram_bot.py:18625).
 func (b *Bot) capSetBep20(c *Ctx) bool {
@@ -833,12 +862,47 @@ func (b *Bot) capSetBep20(c *Ctx) bool {
 		b.send(c.Ctx, c.ChatID, settingsNotConfigured, admNav("admcat:payments"))
 		return true
 	}
+	// Tier 1 (task #13): capture the effective pre-change value BEFORE it is
+	// overwritten — cfg.BEP20Address() (settings.json override, falling back
+	// to env), the SAME resolution cbSetBep20 already shows the admin as
+	// "Current ... address" above. This deliberately deviates from spec
+	// §4.4's literal "read from the s map already in hand": a bare map read
+	// would report "(unset)" for a shop whose address was only ever supplied
+	// via env, which is a wrong "old" value, not merely an imprecise one.
+	// NOTE: this getter's env fallback is currently the LIVE customer-facing
+	// value in name only — internal/pay/bep20.Address() (the function the
+	// actual pay screen/QR/deposit-matching code calls) reads raw os.Getenv
+	// directly and does NOT consult *config.Config at all, so it never sees a
+	// settings.json write from this wizard either. That gap is real, tracked
+	// separately (task #17), and out of Tier 1's scope — it does not change
+	// which value is correct to record as "old" here, since the getter is
+	// still the shop's own source of truth for what capSetBep20 believes it
+	// is replacing.
+	oldAddr := b.cfg.BEP20Address()
 	s := b.cfg.Settings()
 	s["bep20_address"] = addr
 	if err := b.cfg.SaveSettings(s); err != nil {
 		log.Println("adminsettings: save failed:", err)
 		b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:payments"))
 		return true
+	}
+	// Audit AFTER the save succeeds, never before (spec §4.3): a row written
+	// on the failure path would record a payout-address change that never
+	// actually happened. This row proves WHO changed the CONFIGURED
+	// bep20_address, FROM WHAT to WHAT, and WHEN — it does NOT prove funds
+	// moved (see the oldAddr comment above: whether this write currently
+	// reaches the customer pay screen is task #17's business, and belongs in
+	// the code, not in a permanent audit record that would go stale the
+	// moment #17 lands). Config mutators of this class are exactly why Tier 1
+	// exists — an unaudited change to the configured address is how a shop's
+	// incoming BEP20 funds get silently redirected once a write does take
+	// effect — so old→new (both PUBLIC, safe to log verbatim per spec §3) is
+	// the row's whole payload. Once #17 closes the config→pay-screen gap,
+	// this trail becomes the only record of which addresses were ever
+	// configured and when, including every one set before #17 shipped.
+	if b.store != nil {
+		b.store.LogAction(fmtInt(c.ChatID), "admin", "config_set_bep20_address",
+			"bep20_address", auditOldNew(oldAddr, addr), "")
 	}
 	b.send(c.Ctx, c.ChatID,
 		"✅ USDT BEP20 address set:\n"+addr+"\n\nEnable it under 💳 Payment methods to show it at checkout.",
@@ -887,12 +951,32 @@ func (b *Bot) capSetTron(c *Ctx) bool {
 		b.send(c.Ctx, c.ChatID, settingsNotConfigured, admNav("admcat:payments"))
 		return true
 	}
+	// Tier 1 (task #13): capture the effective pre-change value BEFORE it is
+	// overwritten — cfg.TRONAddress() (settings.json override, falling back
+	// to env). Same deliberate §4.4 deviation and same caveat about
+	// internal/pay/tron.Address() not consulting *config.Config (task #17,
+	// out of Tier 1's scope) as capSetBep20 above.
+	oldAddr := b.cfg.TRONAddress()
 	s := b.cfg.Settings()
 	s["tron_address"] = addr
 	if err := b.cfg.SaveSettings(s); err != nil {
 		log.Println("adminsettings: save failed:", err)
 		b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:payments"))
 		return true
+	}
+	// Audit AFTER the save succeeds, never before (spec §4.3). Same reasoning
+	// as capSetBep20 above: this row proves WHO changed the CONFIGURED
+	// tron_address, FROM WHAT to WHAT, and WHEN — it does NOT prove funds
+	// moved (task #17's business, kept out of this permanent record — see
+	// the oldAddr comment above). Config mutators of this class are exactly
+	// why Tier 1 exists — an unaudited change to the configured address is
+	// how a shop's incoming TRON funds get silently redirected once a write
+	// does take effect — so old→new (both PUBLIC) is the row's whole
+	// payload, and becomes the only record of every configured address once
+	// #17 closes the gap.
+	if b.store != nil {
+		b.store.LogAction(fmtInt(c.ChatID), "admin", "config_set_tron_address",
+			"tron_address", auditOldNew(oldAddr, addr), "")
 	}
 	b.send(c.Ctx, c.ChatID,
 		"✅ USDT TRC20 (TRON) address set:\n"+addr+"\n\nEnable it under 💳 Payment methods to show it at checkout.",

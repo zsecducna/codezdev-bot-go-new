@@ -9,6 +9,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -690,6 +691,268 @@ func TestSetTronWizard(t *testing.T) {
 	}
 	if cfg.TRONAddress() != addr {
 		t.Errorf("TRONAddress() = %q, want %q", cfg.TRONAddress(), addr)
+	}
+}
+
+// ---- task #13 Tier 1: payout-address audit logging -------------------------
+// .omc/artifacts/config-audit-spec.md — capSetBep20/capSetTron are the two
+// sites where an unaudited change silently redirects 100% of incoming funds.
+
+// newAuditTestBot builds a Bot wired to BOTH a real *config.Config (so
+// SaveSettings persists) AND a real *store.Store (so LogAction/RecentAudit
+// actually round-trip) — newSettingsTestBot only wires the former.
+func newAuditTestBot(t *testing.T, adminID string) (*Bot, *fakeTG, *store.Store) {
+	t.Helper()
+	dir := t.TempDir()
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, Config: cfg, AdminID: adminID})
+	t.Cleanup(b.Shutdown)
+	return b, f, st
+}
+
+// latestAuditRow returns the newest RecentAudit row with the given action, or
+// nil. RecentAudit orders newest-first (store/misc.go), so the first match
+// walking the slice is the most recent one. Passing action itself as
+// RecentAudit's substring query (rather than "" + a Go-side filter) matters
+// for the NoAudit tests below: an unfiltered LIMIT 20 could let a real
+// regression row scroll out of the window and read as "absent" — filtering
+// server-side removes that blind spot regardless of how many other rows
+// exist.
+func latestAuditRow(t *testing.T, st *store.Store, action string) *store.AuditRow {
+	t.Helper()
+	rows, err := st.RecentAudit(20, action)
+	if err != nil {
+		t.Fatalf("RecentAudit: %v", err)
+	}
+	for i := range rows {
+		if rows[i].Action == action {
+			return &rows[i]
+		}
+	}
+	return nil
+}
+
+// TestSetBep20WizardAuditsAddressChange proves capSetBep20 writes a row shaped
+// per spec §4.1/§4.4: action="config_set_bep20_address", target="bep20_address",
+// actor = the admin who made the change, and outcome="<old> → <new>" with the
+// never-set case rendered "(unset)" rather than an empty string. The SECOND
+// assertion (old value on a follow-up change) is the one that actually
+// falsifies a new-value-only regression: a row that only ever recorded the
+// new address would still satisfy "a row with this action exists" but would
+// fail here, because its "old" side would be the wrong (or missing) address.
+func TestSetBep20WizardAuditsAddressChange(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newAuditTestBot(t, "1")
+
+	// First-ever set: no prior settings.json/env value, so old side = "(unset)".
+	b.Process(ctx, callbackUpdate(1, "adm:setbep20"))
+	addr1 := "0x1111111111111111111111111111111111111111"
+	b.Process(ctx, textUpdate(1, addr1))
+	if last := lastSendMsg(f); last == nil || !strings.HasPrefix(last.Text, "✅ USDT BEP20 address set:\n"+addr1) {
+		t.Fatalf("valid reply = %+v", last)
+	}
+	row1 := latestAuditRow(t, st, "config_set_bep20_address")
+	if row1 == nil {
+		t.Fatal("no audit row written for first bep20_address change")
+	}
+	if row1.Target != "bep20_address" {
+		t.Errorf("Target = %q, want bep20_address", row1.Target)
+	}
+	if row1.ActorChat != "1" || row1.ActorKind != "admin" {
+		t.Errorf("actor = %q/%q, want 1/admin", row1.ActorChat, row1.ActorKind)
+	}
+	if want := "(unset) → " + addr1; row1.Outcome != want {
+		t.Errorf("Outcome = %q, want %q", row1.Outcome, want)
+	}
+
+	// Second change: the outcome's OLD side must be addr1, proving the row
+	// actually captured the pre-mutation value rather than re-deriving "old"
+	// from thin air (or from the new value, which would make old==new).
+	b.Process(ctx, callbackUpdate(1, "adm:setbep20"))
+	addr2 := "0x2222222222222222222222222222222222222222"
+	b.Process(ctx, textUpdate(1, addr2))
+	row2 := latestAuditRow(t, st, "config_set_bep20_address")
+	if row2 == nil {
+		t.Fatal("no audit row written for second bep20_address change")
+	}
+	if want := addr1 + " → " + addr2; row2.Outcome != want {
+		t.Errorf("second Outcome = %q, want %q", row2.Outcome, want)
+	}
+}
+
+// TestSetBep20WizardNoAuditOnSaveFailure proves the audit row is emitted only
+// AFTER SaveSettings succeeds (spec §4.3): a read-only settings dir forces
+// every SaveSettings call to fail, and no "config_set_bep20_address" row may
+// appear despite the admin having sent a fully valid address.
+func TestSetBep20WizardNoAuditOnSaveFailure(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	roDir := filepath.Join(dir, "ro")
+	if err := os.Mkdir(roDir, 0o500); err != nil { // read+execute, no write
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) }) // let TempDir cleanup remove it
+
+	cfg, err := config.Load(roDir)
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	st, err := store.Open(filepath.Join(dir, "store.db")) // store.db lives OUTSIDE roDir
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, Config: cfg, AdminID: "1"})
+	t.Cleanup(b.Shutdown)
+
+	b.Process(ctx, callbackUpdate(1, "adm:setbep20"))
+	b.Process(ctx, textUpdate(1, "0x3333333333333333333333333333333333333333"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+	if row := latestAuditRow(t, st, "config_set_bep20_address"); row != nil {
+		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
+	}
+}
+
+// TestSetTronWizardAuditsAddressChange is capSetTron's counterpart to
+// TestSetBep20WizardAuditsAddressChange above — same row shape, same
+// old-value-on-second-change falsification.
+func TestSetTronWizardAuditsAddressChange(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newAuditTestBot(t, "1")
+
+	addr1 := "T" + strings.Repeat("1", 33)
+	b.Process(ctx, callbackUpdate(1, "adm:settron"))
+	b.Process(ctx, textUpdate(1, addr1))
+	if last := lastSendMsg(f); last == nil || !strings.HasPrefix(last.Text, "✅ USDT TRC20 (TRON) address set:\n"+addr1) {
+		t.Fatalf("valid reply = %+v", last)
+	}
+	row1 := latestAuditRow(t, st, "config_set_tron_address")
+	if row1 == nil {
+		t.Fatal("no audit row written for first tron_address change")
+	}
+	if row1.Target != "tron_address" {
+		t.Errorf("Target = %q, want tron_address", row1.Target)
+	}
+	if row1.ActorChat != "1" || row1.ActorKind != "admin" {
+		t.Errorf("actor = %q/%q, want 1/admin", row1.ActorChat, row1.ActorKind)
+	}
+	if want := "(unset) → " + addr1; row1.Outcome != want {
+		t.Errorf("Outcome = %q, want %q", row1.Outcome, want)
+	}
+
+	addr2 := "T" + strings.Repeat("2", 33)
+	b.Process(ctx, callbackUpdate(1, "adm:settron"))
+	b.Process(ctx, textUpdate(1, addr2))
+	row2 := latestAuditRow(t, st, "config_set_tron_address")
+	if row2 == nil {
+		t.Fatal("no audit row written for second tron_address change")
+	}
+	if want := addr1 + " → " + addr2; row2.Outcome != want {
+		t.Errorf("second Outcome = %q, want %q", row2.Outcome, want)
+	}
+}
+
+// TestSetTronWizardNoAuditOnSaveFailure is capSetTron's counterpart to
+// TestSetBep20WizardNoAuditOnSaveFailure above.
+func TestSetTronWizardNoAuditOnSaveFailure(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	roDir := filepath.Join(dir, "ro")
+	if err := os.Mkdir(roDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) })
+
+	cfg, err := config.Load(roDir)
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, Config: cfg, AdminID: "1"})
+	t.Cleanup(b.Shutdown)
+
+	b.Process(ctx, callbackUpdate(1, "adm:settron"))
+	b.Process(ctx, textUpdate(1, "T"+strings.Repeat("9", 33)))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+	if row := latestAuditRow(t, st, "config_set_tron_address"); row != nil {
+		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
+	}
+}
+
+// TestSetBep20WizardAuditOldValueUsesEnvFallback pins the one deliberate
+// deviation from spec §4.4's literal instruction ("read old from the s map
+// already in hand"): capSetBep20 captures oldAddr via cfg.BEP20Address(),
+// which layers settings.json over an env fallback, not a bare settings-map
+// read. Without an ambient BEP20_ADDRESS the two approaches are
+// indistinguishable — every other test in this file would pass unchanged
+// under either implementation. This test sets the env var BEFORE
+// config.Load (Config.Env is a Load-time-frozen snapshot, config.go:46-52,
+// so setting it after Load would have no effect) so the two approaches
+// diverge: a bare map read would still render "(unset)" here, which would be
+// a wrong "old" value for a shop whose address was only ever supplied via
+// env.
+func TestSetBep20WizardAuditOldValueUsesEnvFallback(t *testing.T) {
+	ctx := context.Background()
+	envAddr := "0x9999999999999999999999999999999999999999"
+	t.Setenv("BEP20_ADDRESS", envAddr)
+	b, f, st := newAuditTestBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:setbep20"))
+	newAddr := "0x1111111111111111111111111111111111111111"
+	b.Process(ctx, textUpdate(1, newAddr))
+	if last := lastSendMsg(f); last == nil || !strings.HasPrefix(last.Text, "✅ USDT BEP20 address set:\n"+newAddr) {
+		t.Fatalf("valid reply = %+v", last)
+	}
+	row := latestAuditRow(t, st, "config_set_bep20_address")
+	if row == nil {
+		t.Fatal("no audit row written")
+	}
+	if want := envAddr + " → " + newAddr; row.Outcome != want {
+		t.Errorf(`Outcome = %q, want %q (old side must be the env-configured address, not "(unset)")`, row.Outcome, want)
+	}
+}
+
+// TestSetTronWizardAuditOldValueUsesEnvFallback is capSetTron's counterpart
+// to TestSetBep20WizardAuditOldValueUsesEnvFallback above.
+func TestSetTronWizardAuditOldValueUsesEnvFallback(t *testing.T) {
+	ctx := context.Background()
+	envAddr := "T" + strings.Repeat("9", 33)
+	t.Setenv("TRON_ADDRESS", envAddr)
+	b, f, st := newAuditTestBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:settron"))
+	newAddr := "T" + strings.Repeat("1", 33)
+	b.Process(ctx, textUpdate(1, newAddr))
+	if last := lastSendMsg(f); last == nil || !strings.HasPrefix(last.Text, "✅ USDT TRC20 (TRON) address set:\n"+newAddr) {
+		t.Fatalf("valid reply = %+v", last)
+	}
+	row := latestAuditRow(t, st, "config_set_tron_address")
+	if row == nil {
+		t.Fatal("no audit row written")
+	}
+	if want := envAddr + " → " + newAddr; row.Outcome != want {
+		t.Errorf(`Outcome = %q, want %q (old side must be the env-configured address, not "(unset)")`, row.Outcome, want)
 	}
 }
 
