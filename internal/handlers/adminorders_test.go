@@ -801,8 +801,10 @@ func TestRefundAsOfNotConsumedOnLostClaim(t *testing.T) {
 // entra_create_users.py, matching the exact filename internal/entra's runner
 // resolves — the same technique internal/entra's own tests use
 // (writeStubScript, users_test.go), invoked here since entraRunRefundDelete
-// resolves the script directory / interpreter via KIRO_SCRIPT_DIR /
-// KIRO_LOGIN_PYTHON at call time.
+// resolves the script directory via KIRO_SCRIPT_DIR (live, at call time) and
+// the interpreter via b.loginPythonStr() -> config.Config.KiroLoginPython(),
+// which reads config.Load's frozen env snapshot — so KIRO_LOGIN_PYTHON must
+// be set before the Bot is built, unlike KIRO_SCRIPT_DIR.
 func writeEntraStub(t *testing.T, dir, body string) {
 	t.Helper()
 	path := filepath.Join(dir, "entra_create_users.py")
@@ -818,11 +820,19 @@ func TestEntraRunRefundDeleteNotCleanMarksNothing(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("stub is a POSIX shell script")
 	}
-	b, f, st, _, _, _, _ := newOrdersTestBot(t, "1")
+	// KIRO_LOGIN_PYTHON must be set BEFORE newOrdersTestBot builds the Bot:
+	// entraRunRefundDelete now resolves the interpreter through
+	// b.loginPythonStr() -> config.Config.KiroLoginPython(), which reads
+	// config.Load's frozen env snapshot (task #16), not a live os.Getenv —
+	// same reason newUSDTBot sets its env before calling New(). KIRO_SCRIPT_DIR
+	// is unaffected (scriptDir() still reads live ambient env at call time)
+	// but is set here too so both interpreter and script directory come from
+	// the one fixture setup.
 	scriptDir := t.TempDir()
 	writeEntraStub(t, scriptDir, `echo '{"ok":true,"targeted":2,"deleted":1,"purged":0,"not_found":0,"protected":0,"failed":1,"deleted_upns":["a@x.com"]}'`)
 	t.Setenv("KIRO_SCRIPT_DIR", scriptDir)
 	t.Setenv("KIRO_LOGIN_PYTHON", "sh")
+	b, f, st, _, _, _, _ := newOrdersTestBot(t, "1")
 
 	des := store.NewDes()
 	if err := st.CreateOrder(des, "42", "en", "prodx", "BH7D", 1, 7000); err != nil {
@@ -841,5 +851,74 @@ func TestEntraRunRefundDeleteNotCleanMarksNothing(t *testing.T) {
 	last := lastSendMsg(f)
 	if last == nil || !strings.Contains(last.Text, "wasn't fully clean") {
 		t.Errorf("expected the not-clean warning, got %+v", last)
+	}
+}
+
+// TestEntraRunRefundDeleteUsesEnvOnlyLoginPython pins task #16's
+// KIRO_LOGIN_PYTHON fix at this file's SoftDeleteByUPN call site: the
+// interpreter must reach the subprocess from dir/.env alone, with
+// KIRO_LOGIN_PYTHON never touching the ambient process environment
+// (os.Setenv/t.Setenv is deliberately avoided here, unlike
+// TestEntraRunRefundDeleteNotCleanMarksNothing above, which pins a
+// different behaviour and is free to use the simpler t.Setenv fixture).
+// config.Load(dir) is called directly here — not through newOrdersTestBot,
+// which owns its own temp dir — so the .env write below happens BEFORE the
+// Bot's cfg snapshot is built.
+//
+// The stub script is POSIX shell, not Python. If entraRunRefundDelete still
+// resolved the interpreter via provision.LoginPythonFromEnv's raw
+// os.Getenv (which finds nothing here — .env-only, no ambient var), it
+// would fall back to "python3" and choke trying to parse the shell script
+// as Python, surfacing as "Entra delete failed" instead of the clean-run
+// success this test asserts.
+func TestEntraRunRefundDeleteUsesEnvOnlyLoginPython(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("stub is a POSIX shell script")
+	}
+	if _, ok := os.LookupEnv("KIRO_LOGIN_PYTHON"); ok {
+		t.Fatal("fixture broken: KIRO_LOGIN_PYTHON is set in the ambient environment, so this test would pass even if the fix read raw env")
+	}
+
+	dir := t.TempDir()
+	scriptDir := t.TempDir()
+	writeEntraStub(t, scriptDir, `echo '{"ok":true,"targeted":1,"deleted":1,"purged":0,"not_found":0,"protected":0,"failed":0,"deleted_upns":["a@x.com"]}'`)
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("KIRO_LOGIN_PYTHON=sh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// KIRO_SCRIPT_DIR is a separate, still-live os.Getenv read (scriptDir(),
+	// otp.go) untouched by this fix — set it ambient, matching its own
+	// resolution rule, not through .env.
+	t.Setenv("KIRO_SCRIPT_DIR", scriptDir)
+
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	rs, err := refund.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("refund open: %v", err)
+	}
+	stk := stock.New(filepath.Join(dir, "accounts"), filepath.Join(dir, "orders"))
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, Stock: stk, RefundStore: rs, Config: cfg, AdminID: "1"})
+	t.Cleanup(func() { b.Shutdown(); st.Close(); rs.Close() })
+
+	des := store.NewDes()
+	if err := st.CreateOrder(des, "42", "en", "prodx", "BH7D", 1, 7000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOrder(des, "reserved", "refunded"); err != nil {
+		t.Fatal(err)
+	}
+
+	b.entraRunRefundDelete(context.Background(), 1, []string{des}, []string{"a@x.com"})
+
+	got, _ := st.GetOrder(des)
+	if got.EntraDeletedTS == nil {
+		t.Fatalf("order not marked entra_deleted after a clean run — want the .env-only KIRO_LOGIN_PYTHON=sh to reach SoftDeleteByUPN; last message: %+v", lastSendMsg(f))
 	}
 }

@@ -410,6 +410,62 @@ func TestTRONAddressFallsBackToEnvWhenSettingsUnset(t *testing.T) {
 	}
 }
 
+// TestTRONAPIKeyReadsEnvSnapshotNotAmbient pins task #16's fix for
+// tron.go:225: a value that exists ONLY in dir/.env — never touching
+// os.Setenv, so a raw os.Getenv("TRON_API_KEY") in this same process would
+// find nothing — must still reach TRONAPIKey() through the .env snapshot
+// Load() built. No settings.json is written here on purpose: no wizard
+// exists for this key, so precedence never gets past the .env/ambient layer.
+func TestTRONAPIKeyReadsEnvSnapshotNotAmbient(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, ".env"), "TRON_API_KEY=envkey123\n")
+	c := mustLoad(t, dir)
+	if got := c.TRONAPIKey(); got != "envkey123" {
+		t.Errorf("TRONAPIKey() = %q, want the .env value %q", got, "envkey123")
+	}
+	if _, ok := os.LookupEnv("TRON_API_KEY"); ok {
+		t.Fatal("fixture broken: TRON_API_KEY is set in the ambient environment, so this test would pass even if TRONAPIKey() ignored the .env snapshot")
+	}
+}
+
+// TestTRONAPIKeyEmptyWhenUnset pins the keyless fallback: TronGrid's free
+// tier works without a key, so an absent TRON_API_KEY must resolve to ""
+// (apiGet then sends no TRON-PRO-API-KEY header) rather than a compiled
+// placeholder that would be sent as a bogus credential.
+func TestTRONAPIKeyEmptyWhenUnset(t *testing.T) {
+	c := mustLoad(t, t.TempDir())
+	if got := c.TRONAPIKey(); got != "" {
+		t.Errorf("TRONAPIKey() = %q, want empty when unset", got)
+	}
+}
+
+// TestKiroLoginPythonReadsEnvSnapshotNotAmbient is TRON_API_KEY's twin for
+// task #16's other live instance, internal/provision/login.go:79: a
+// KIRO_LOGIN_PYTHON set only in dir/.env (never os.Setenv) must reach
+// KiroLoginPython() through the .env snapshot, the same way it must reach
+// TRONAPIKey() above.
+func TestKiroLoginPythonReadsEnvSnapshotNotAmbient(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, ".env"), "KIRO_LOGIN_PYTHON=/venv/bin/python3\n")
+	c := mustLoad(t, dir)
+	if got := c.KiroLoginPython(); got != "/venv/bin/python3" {
+		t.Errorf("KiroLoginPython() = %q, want the .env value %q", got, "/venv/bin/python3")
+	}
+	if _, ok := os.LookupEnv("KIRO_LOGIN_PYTHON"); ok {
+		t.Fatal("fixture broken: KIRO_LOGIN_PYTHON is set in the ambient environment, so this test would pass even if KiroLoginPython() ignored the .env snapshot")
+	}
+}
+
+// TestKiroLoginPythonFallsBackToPython3WhenUnset pins the compiled default:
+// no KIRO_LOGIN_PYTHON anywhere resolves to "python3" (resolved through
+// PATH), matching provision.LoginPythonFromEnv's own fallback.
+func TestKiroLoginPythonFallsBackToPython3WhenUnset(t *testing.T) {
+	c := mustLoad(t, t.TempDir())
+	if got := c.KiroLoginPython(); got != "python3" {
+		t.Errorf("KiroLoginPython() = %q, want the python3 fallback", got)
+	}
+}
+
 func TestKiroGoSettingsOverrideEnv(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, ".env"), strings.Join([]string{

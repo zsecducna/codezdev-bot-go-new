@@ -1025,7 +1025,7 @@ func TestUSDTRealClientsByHash(t *testing.T) {
 		return bep20.GetTransferToSellerByHash(b.bep20AddrStr(), txhash)
 	}
 	b.tronByHash = func(txhash string, minTSMS int64) (*tron.Transfer, error) {
-		return tron.FindConfirmedTransferByHash(b.tronAddrStr(), txhash, minTSMS)
+		return tron.FindConfirmedTransferByHash(b.tronAddrStr(), txhash, minTSMS, b.tronAPIKeyStr())
 	}
 
 	tx, err := b.bep20ByHash("0x" + hash64("8"))

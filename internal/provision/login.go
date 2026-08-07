@@ -70,11 +70,24 @@ type LoginRunner interface {
 // LoginPythonFromEnv resolves the Python interpreter that has Playwright +
 // CloakBrowser installed. Port of login_python (kiro_provision.py:99-105).
 //
-// KIRO_LOGIN_PYTHON is read LAZILY, at call time, because the bot loads .env
-// into the environment AFTER this code is linked in; capturing at init would
-// silently miss a .env-set venv path. Python falls back to sys.executable
-// (correct when the bot itself has the browser stack); a Go binary has no such
-// notion, so the fallback is a plain "python3" resolved through PATH.
+// This reads the RAW ambient environment only — it does NOT see a
+// KIRO_LOGIN_PYTHON set via .env, because internal/config's snapshot is
+// never copied back into os.Environ (config.Load's doc comment) and this
+// package deliberately does not import internal/config to read it directly.
+// Production code with a *config.Config available (internal/handlers) must
+// resolve the interpreter through config.Config.KiroLoginPython() instead
+// (bridged via Bot.loginPythonStr()) and pass the result to NewScriptRunner/
+// entra.SoftDeleteByUPN as a parameter, the same way tron.Address's doc
+// comment describes for that package's own raw-env primitive. This function
+// survives for callers with no Config to resolve from (e.g. tests) and as
+// the low-level primitive that seam builds on — do not call it directly
+// from a code path that has cfg.
+//
+// KIRO_LOGIN_PYTHON is read LAZILY, at call time, rather than captured once
+// at init, so a change to the ambient environment before this runs is not
+// silently missed. Python falls back to sys.executable (correct when the
+// bot itself has the browser stack); a Go binary has no such notion, so the
+// fallback is a plain "python3" resolved through PATH.
 func LoginPythonFromEnv() string {
 	if v := os.Getenv("KIRO_LOGIN_PYTHON"); v != "" {
 		return v

@@ -97,6 +97,30 @@ func (c *Config) EnvOr(key, def string) string {
 	return def
 }
 
+// TRONAPIKey returns the TronGrid API key sent as the TRON-PRO-API-KEY
+// header on every TronGrid call (raises TronGrid's per-caller rate limit;
+// the free tier works keyless, just harder-limited). Unlike
+// BEP20Address/TRONAddress, no settings.json wizard writes this key today —
+// the effective value is the .env/ambient snapshot only, falling back to ""
+// (keyless). Add a settings.json layer here first if one is ever built,
+// rather than at a call site: this is the one place internal/pay/tron's
+// callers should resolve it from (internal/pay/tron itself does not import
+// this package — see tron.Address's doc comment for why — so the resolved
+// value is passed into its functions as a parameter instead).
+func (c *Config) TRONAPIKey() string {
+	return strings.TrimSpace(c.Env("TRON_API_KEY"))
+}
+
+// KiroLoginPython returns the Python interpreter with Playwright +
+// CloakBrowser installed, used to launch the vendored browser-login scripts
+// (internal/provision). No settings.json wizard writes this key today — the
+// effective value is the .env/ambient snapshot, falling back to "python3"
+// resolved through PATH (correct only when the bot's own interpreter has the
+// browser stack, which a dedicated venv usually does not).
+func (c *Config) KiroLoginPython() string {
+	return c.EnvOr("KIRO_LOGIN_PYTHON", "python3")
+}
+
 // BootGuard enforces the multi-tenant money-safety check from main()
 // (telegram_bot.py:18957-18971): refuse to boot when the ambient/.env value
 // for envKey disagrees with boundValue, the value this binary/instance was

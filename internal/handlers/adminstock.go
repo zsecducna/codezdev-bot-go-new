@@ -1924,7 +1924,9 @@ func (b *Bot) runPoolProvision(ctx context.Context, chatID int64, accountsText s
 	}
 	mix := strings.Join(mixParts, ", ")
 
-	runner := provision.NewScriptRunner(provision.LoginPythonFromEnv(), scriptDir())
+	// b.loginPythonStr() resolves through cfg (.env/ambient, task #16) rather
+	// than provision.LoginPythonFromEnv's raw os.Getenv, which never sees .env.
+	runner := provision.NewScriptRunner(b.loginPythonStr(), scriptDir())
 	if nIDC+nM365 > 0 {
 		if errText := runner.BrowserStackError(ctx); errText != "" {
 			b.send(ctx, chatID,

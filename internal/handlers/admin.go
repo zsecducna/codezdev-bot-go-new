@@ -976,6 +976,28 @@ func (b *Bot) tronAddrStr() string {
 	return b.cfg.TRONAddress()
 }
 
+// tronAPIKeyStr resolves the TronGrid API key through cfg — see
+// config.Config.TRONAPIKey's doc comment; internal/pay/tron does not import
+// internal/config, so this is the bridge that lets b.tronByHash pass a
+// resolved key in rather than the package reading raw env itself.
+func (b *Bot) tronAPIKeyStr() string {
+	if b.cfg == nil {
+		return ""
+	}
+	return b.cfg.TRONAPIKey()
+}
+
+// loginPythonStr resolves the browser-login Python interpreter through cfg
+// — see config.Config.KiroLoginPython's doc comment — instead of
+// provision.LoginPythonFromEnv's raw os.Getenv, which only ever sees the
+// ambient environment, never .env (task #16).
+func (b *Bot) loginPythonStr() string {
+	if b.cfg == nil {
+		return "python3"
+	}
+	return b.cfg.KiroLoginPython()
+}
+
 // isAllDigits reports whether s is a bare number — the `removed.isdigit()` test
 // deciding whether a whitelist entry renders as an @handle or a chat id.
 func isAllDigits(s string) bool {

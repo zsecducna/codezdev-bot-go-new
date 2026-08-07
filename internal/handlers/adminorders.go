@@ -41,7 +41,6 @@ import (
 
 	"codezdev-bot/internal/entra"
 	"codezdev-bot/internal/i18n"
-	"codezdev-bot/internal/provision"
 	"codezdev-bot/internal/refund"
 	"codezdev-bot/internal/store"
 	"codezdev-bot/internal/tg"
@@ -1285,7 +1284,9 @@ func (b *Bot) entraRunRefundDelete(ctx context.Context, chatID int64, orders, em
 		b.send(ctx, chatID, "ℹ️ No Entra account is linked to the selected order(s) — nothing to delete.", admNav("admcat:orders"))
 		return
 	}
-	res, err := entra.SoftDeleteByUPN(ctx, scriptDir(), provision.LoginPythonFromEnv(), emails, 0)
+	// b.loginPythonStr() resolves through cfg (.env/ambient, task #16) rather
+	// than provision.LoginPythonFromEnv's raw os.Getenv, which never sees .env.
+	res, err := entra.SoftDeleteByUPN(ctx, scriptDir(), b.loginPythonStr(), emails, 0)
 	if err != nil {
 		b.send(ctx, chatID, "⛔ Entra delete failed: "+err.Error(), admNav("admcat:orders"))
 		return

@@ -221,8 +221,13 @@ func ratToIntegral(r *big.Rat) int64 {
 	return q.Int64()
 }
 
-func apiGet(path string, params url.Values) (map[string]any, error) {
-	key := strings.TrimSpace(os.Getenv("TRON_API_KEY"))
+// apiKey is the caller-resolved TronGrid API key (sent as the
+// TRON-PRO-API-KEY header, raising TronGrid's rate limit; "" sends no
+// header, using the free keyless tier). This package deliberately does not
+// read TRON_API_KEY itself — see Address's doc comment for why — so the
+// caller must resolve it (config.Config.TRONAPIKey()) and pass it in.
+func apiGet(path string, params url.Values, apiKey string) (map[string]any, error) {
+	key := strings.TrimSpace(apiKey)
 	reqURL := fmt.Sprintf("%s%s?%s", apiBase(), path, params.Encode())
 	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
 	if err != nil {
@@ -271,8 +276,8 @@ type Transfer struct {
 // GetIncomingTransfers returns confirmed incoming USDT (TRC20) transfers to
 // addr since minTSMS (epoch ms). Only `transfer`-type, only_to,
 // only_confirmed — so every row is a finalised credit to us
-// (tron_pay.py:128-162).
-func GetIncomingTransfers(addr string, minTSMS int64) ([]Transfer, error) {
+// (tron_pay.py:128-162). apiKey is forwarded to apiGet — see its doc comment.
+func GetIncomingTransfers(addr string, minTSMS int64, apiKey string) ([]Transfer, error) {
 	params := url.Values{}
 	params.Set("only_to", "true")
 	params.Set("only_confirmed", "true")
@@ -281,7 +286,7 @@ func GetIncomingTransfers(addr string, minTSMS int64) ([]Transfer, error) {
 	params.Set("limit", strconv.Itoa(PageLimit()))
 	params.Set("order_by", "block_timestamp,asc")
 
-	d, err := apiGet(fmt.Sprintf("/v1/accounts/%s/transactions/trc20", addr), params)
+	d, err := apiGet(fmt.Sprintf("/v1/accounts/%s/transactions/trc20", addr), params, apiKey)
 	if err != nil {
 		return nil, err
 	}
@@ -397,7 +402,9 @@ func absInt64(n int64) int64 {
 // older than the payment window, unknown, not yet confirmed, or not to the
 // seller all return (nil, nil). Hash compare is case-insensitive and
 // tolerant of a 0x prefix (TRON ids are bare 64-hex, tron_pay.py:188-213).
-func FindConfirmedTransferByHash(addr, txhash string, minTSMS int64) (*Transfer, error) {
+// apiKey is forwarded to GetIncomingTransfers/apiGet — see apiGet's doc
+// comment; the caller resolves it via config.Config.TRONAPIKey().
+func FindConfirmedTransferByHash(addr, txhash string, minTSMS int64, apiKey string) (*Transfer, error) {
 	if txhash == "" || !ValidAddress(addr) {
 		return nil, nil
 	}
@@ -409,7 +416,7 @@ func FindConfirmedTransferByHash(addr, txhash string, minTSMS int64) (*Transfer,
 	if !hashRE.MatchString(want) {
 		return nil, nil
 	}
-	transfers, err := GetIncomingTransfers(addr, minTSMS)
+	transfers, err := GetIncomingTransfers(addr, minTSMS, apiKey)
 	if err != nil {
 		return nil, err
 	}

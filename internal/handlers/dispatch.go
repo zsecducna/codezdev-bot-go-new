@@ -337,8 +337,14 @@ func New(d Deps) *Bot {
 		return bep20.GetTransferToSellerByHash(b.bep20AddrStr(), txhash)
 	}
 	b.tronConfigured = func() bool { return tron.ValidAddress(b.tronAddrStr()) }
+	// b.tronAPIKeyStr() is read per call, same as the address above — task
+	// #16: the raw os.Getenv("TRON_API_KEY") apiGet used to read only ever
+	// saw the ambient environment, never .env, so TronGrid calls went out
+	// unauthenticated on the deposit-verification path. config.Config.
+	// TRONAPIKey() is the bridge; internal/pay/tron stays free of an
+	// internal/config import (see apiGet's doc comment).
 	b.tronByHash = func(txhash string, minTSMS int64) (*tron.Transfer, error) {
-		return tron.FindConfirmedTransferByHash(b.tronAddrStr(), txhash, minTSMS)
+		return tron.FindConfirmedTransferByHash(b.tronAddrStr(), txhash, minTSMS, b.tronAPIKeyStr())
 	}
 	// The USD->VND rate is bridged the same way, and for the same reason —
 	// task #22, another instance of this port keeping a config reader while
