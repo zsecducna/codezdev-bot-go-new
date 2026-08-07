@@ -103,9 +103,20 @@ var addrRE = regexp.MustCompile(`^0x[0-9a-fA-F]{40}$`)
 // hashRE is a 32-byte hex tx hash, 0x-prefixed (bep20_pay.py:211).
 var hashRE = regexp.MustCompile(`^0x[0-9a-fA-F]{64}$`)
 
-// Address is the seller's receiving BSC address ("" if unset). Admin-set
-// value (synced into the env by the bot's apply_saved_bep20) wins over the
-// .env default (bep20_pay.py:63-66).
+// Address reads the RAW .env/ambient BEP20_ADDRESS ("" if unset) — nothing
+// more. It does NOT see an admin's settings.json address change (task #17):
+// unlike the Python original, which mutated os.environ in-process on every
+// /setbep20 (apply_saved_bep20, telegram_bot.py:5294-5306) so a bare getenv
+// stayed live, Go's config.Config deliberately never touches the real
+// process environment (config.Load's doc comment) — the admin-set value only
+// ever lives in settings.json. The customer-facing address, deposit
+// matching, and Configured() gate must all resolve through
+// config.Config.BEP20Address() (settings.json overriding this env snapshot),
+// not this function; internal/handlers passes that resolved value into the
+// functions in this package that need it (GetTransferToSellerByHash) instead
+// of letting them call Address() themselves. This function survives only as
+// the low-level env primitive those call sites build on — do not call it
+// directly for anything customer-facing.
 func Address() string {
 	return strings.TrimSpace(os.Getenv("BEP20_ADDRESS"))
 }
@@ -117,8 +128,11 @@ func ValidAddress(a string) bool {
 	return a != "" && addrRE.MatchString(a)
 }
 
-// Configured reports whether a valid receiving address is set (gate the pay
-// button, bep20_pay.py:74-76).
+// Configured reports whether Address() (the raw env snapshot, NOT
+// settings.json — see Address's doc comment) looks like a valid receiving
+// address. Kept for parity with bep20_pay.py:74-76; internal/handlers gates
+// the pay button on ValidAddress(config.Config.BEP20Address()) instead, so
+// an admin-set address is honoured (task #17).
 func Configured() bool {
 	return ValidAddress(Address())
 }
@@ -443,11 +457,20 @@ type receiptFull struct {
 }
 
 // GetTransferToSellerByHash looks up ONE BSC transaction by hash and returns
-// the USDT (BEP20) transfer it makes TO the seller address, with
-// confirmation status — for the customer-submitted payment-verification
-// flow (the customer pastes their tx hash; there is no background poller).
-// Returns (nil, nil) when the hash is malformed, unknown, not yet mined, or
-// carries no USDT transfer to the seller.
+// the USDT (BEP20) transfer it makes TO seller, with confirmation status —
+// for the customer-submitted payment-verification flow (the customer pastes
+// their tx hash; there is no background poller). Returns (nil, nil) when the
+// hash is malformed, unknown, not yet mined, or carries no USDT transfer to
+// seller.
+//
+// seller is passed in by the caller rather than read from this package's own
+// Address() (task #17): the live receiving address is admin-settable via
+// settings.json (config.Config.BEP20Address(), which layers settings.json
+// over .env/ambient BEP20_ADDRESS), and this package deliberately does not
+// import internal/config to consult it — that would make a payment-rail
+// package depend on the bot's config layer for no reason beyond reading one
+// string. The caller (internal/handlers) already holds the resolved *Config
+// and is the right place to resolve "which address is live right now".
 //
 // Confirmed is true only when the receipt SUCCEEDED and the tx is at least
 // MinConfirmations deep AND the block timestamp is known — so the caller
@@ -456,8 +479,7 @@ type receiptFull struct {
 // transfers to the seller inside one tx are summed (defensive; normally
 // one). Stdlib-only JSON-RPC over the same endpoint pool as the poller path
 // (bep20_pay.py:189-259).
-func GetTransferToSellerByHash(txhash string) (*TransferByHash, error) {
-	seller := Address()
+func GetTransferToSellerByHash(seller, txhash string) (*TransferByHash, error) {
 	if txhash == "" || !ValidAddress(seller) {
 		return nil, nil
 	}

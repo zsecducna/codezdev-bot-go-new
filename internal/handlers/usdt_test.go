@@ -1018,10 +1018,14 @@ func TestUSDTRealClientsByHash(t *testing.T) {
 	// clients against the fakes.
 	b, _, _, _, _ := newUSDTBot(t)
 	// newUSDTBot replaces the chain seams with scripted fakes; restore the real
-	// bindings so this test exercises the production path.
-	b.bep20ByHash = bep20.GetTransferToSellerByHash
+	// bindings so this test exercises the production path — same closure shape
+	// New() installs (dispatch.go), resolving the seller address through
+	// b.cfg on every call rather than a raw env read (task #17).
+	b.bep20ByHash = func(txhash string) (*bep20.TransferByHash, error) {
+		return bep20.GetTransferToSellerByHash(b.bep20AddrStr(), txhash)
+	}
 	b.tronByHash = func(txhash string, minTSMS int64) (*tron.Transfer, error) {
-		return tron.FindConfirmedTransferByHash(tron.Address(), txhash, minTSMS)
+		return tron.FindConfirmedTransferByHash(b.tronAddrStr(), txhash, minTSMS)
 	}
 
 	tx, err := b.bep20ByHash("0x" + hash64("8"))
@@ -1038,5 +1042,227 @@ func TestUSDTRealClientsByHash(t *testing.T) {
 	}
 	if tr.Units != 600 {
 		t.Errorf("tron transfer units = %d, want 600", tr.Units)
+	}
+}
+
+// ---- task #17: the payout-address wizard must reach the customer screen ---
+//
+// Before this fix, sendUSDTScreen rendered internal/pay/bep20.Address()/
+// tron.Address() — a raw os.Getenv read that never sees a settings.json
+// write — so an admin who "successfully" ran /setbep20 or /settron kept
+// showing every customer the STALE address forever. These tests drive the
+// REAL admin wizard (adm:setbep20 / adm:settron, the same capSetBep20/
+// capSetTron TestSetBep20Wizard/TestSetTronWizard exercise) and then call
+// the REAL customer-facing sendUSDTScreen, asserting the rendered caption
+// carries the NEW address and not the stale env one. Reverting usdt.go's
+// b.bep20AddrStr()/b.tronAddrStr() calls back to bep20.Address()/
+// tron.Address() reproduces the original bug and fails this test — verified
+// by hand while writing this fix (not committed, since a self-reverting test
+// would defeat itself the moment the revert lands back on top of it).
+
+// TestBep20PayoutAddressWizardReachesCustomerPayScreen is the BEP20 half.
+func TestBep20PayoutAddressWizardReachesCustomerPayScreen(t *testing.T) {
+	ctx := context.Background()
+	oldAddr := testSellerBSC                   // the .env/ambient value, set BEFORE Load below
+	newAddr := "0x" + strings.Repeat("cd", 20) // admin rotates to this via the wizard
+	t.Setenv("BEP20_ADDRESS", oldAddr)
+
+	b, f, _ := newSettingsTestBot(t, "1") // super-admin id "1"
+
+	// Run the REAL admin wizard end-to-end, exactly like TestSetBep20Wizard.
+	b.Process(ctx, callbackUpdate(1, "adm:setbep20"))
+	b.Process(ctx, textUpdate(1, newAddr))
+	if last := lastSendMsg(f); last == nil || !strings.HasPrefix(last.Text, "✅ USDT BEP20 address set:\n"+newAddr) {
+		t.Fatalf("wizard did not confirm the new address, got %+v", last)
+	}
+
+	// The customer-facing pay screen must now show newAddr, never oldAddr.
+	b.sendUSDTScreen(ctx, 1, i18n.Lang("en"), chainBSC, "test-des", "5.23")
+	screen := lastSendMsg(f)
+	if screen == nil {
+		t.Fatal("sendUSDTScreen sent nothing")
+	}
+	if !strings.Contains(screen.Text, newAddr) {
+		t.Errorf("pay screen caption = %q, want it to contain the admin-set address %q", screen.Text, newAddr)
+	}
+	if strings.Contains(screen.Text, oldAddr) {
+		t.Errorf("pay screen caption = %q, still contains the STALE env address %q — task #17 regressed", screen.Text, oldAddr)
+	}
+}
+
+// TestTronPayoutAddressWizardReachesCustomerPayScreen is the TRON twin.
+func TestTronPayoutAddressWizardReachesCustomerPayScreen(t *testing.T) {
+	ctx := context.Background()
+	oldAddr := testSellerTRX
+	newAddr := "T" + strings.Repeat("9", 33)
+	t.Setenv("TRON_ADDRESS", oldAddr)
+
+	b, f, _ := newSettingsTestBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:settron"))
+	b.Process(ctx, textUpdate(1, newAddr))
+	if last := lastSendMsg(f); last == nil || !strings.HasPrefix(last.Text, "✅ USDT TRC20 (TRON) address set:\n"+newAddr) {
+		t.Fatalf("wizard did not confirm the new address, got %+v", last)
+	}
+
+	b.sendUSDTScreen(ctx, 1, i18n.Lang("en"), chainTRX, "test-des", "5.23")
+	screen := lastSendMsg(f)
+	if screen == nil {
+		t.Fatal("sendUSDTScreen sent nothing")
+	}
+	if !strings.Contains(screen.Text, newAddr) {
+		t.Errorf("pay screen caption = %q, want it to contain the admin-set address %q", screen.Text, newAddr)
+	}
+	if strings.Contains(screen.Text, oldAddr) {
+		t.Errorf("pay screen caption = %q, still contains the STALE env address %q — task #17 regressed", screen.Text, oldAddr)
+	}
+}
+
+// TestPayoutAddressWizardFlipsConfiguredGate covers the OTHER half of task
+// #17 the two pay-screen tests above don't reach: New()'s b.bep20Configured/
+// b.tronConfigured closures (dispatch.go), which gate cmdDeposit, the buy
+// screen, and cbTogglePay's last-deposit-rail guard. sendUSDTScreen never
+// calls Configured() itself, so a regression back to the pre-fix
+// `b.bep20Configured = bep20.Configured` binding (raw env, task #17's
+// original bug) would leave those two tests green while every Configured()
+// gate stayed broken. This uses NO env address at all (an admin who
+// configures purely through the wizard, never .env) so Configured() can only
+// become true by actually reading settings.json through b.cfg.
+func TestPayoutAddressWizardFlipsConfiguredGate(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("BEP20_ADDRESS", "") // explicitly unset regardless of ambient env
+	t.Setenv("TRON_ADDRESS", "")
+
+	b, _, _ := newSettingsTestBot(t, "1")
+
+	if b.bep20Configured() {
+		t.Fatal("bep20Configured() = true before any address is set (env or settings.json)")
+	}
+	if b.tronConfigured() {
+		t.Fatal("tronConfigured() = true before any address is set (env or settings.json)")
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:setbep20"))
+	b.Process(ctx, textUpdate(1, "0x"+strings.Repeat("ef", 20)))
+	if !b.bep20Configured() {
+		t.Error("bep20Configured() = false after the wizard set a settings.json-only address — task #17 regressed")
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:settron"))
+	b.Process(ctx, textUpdate(1, "T"+strings.Repeat("8", 33)))
+	if !b.tronConfigured() {
+		t.Error("tronConfigured() = false after the wizard set a settings.json-only address — task #17 regressed")
+	}
+}
+
+// ---- task #17 follow-up (independent review): the QR-consistency guard ----
+//
+// sendUSDTScreen's QR image knobs (*_QR_URL/*_QR_PATH) are env-only — no
+// admin wizard writes them to settings.json — so once the caption started
+// resolving through cfg (this task) a QR image became a SEPARATE source that
+// can silently disagree with the address the caption shows. The guard drops
+// the QR (falls back to the always-correct text-only caption) the instant
+// its raw-env address stops matching the live cfg one. These three tests
+// were flagged as missing by an independent review: the reviewer deleted
+// both guard `if` blocks and got zero test failures across the whole module
+// — proof the pre-fix caption tests alone don't cover this path.
+
+// TestQRGuardShowsMatchingQR is the "no rotation" case: env and settings.json
+// agree (settings.json was never touched), so the QR is exactly as
+// trustworthy as it always was and must still be sent.
+func TestQRGuardShowsMatchingQR(t *testing.T) {
+	ctx := context.Background()
+	addr := testSellerBSC
+	qrURL := "https://example.com/bep20.png"
+	t.Setenv("BEP20_ADDRESS", addr)
+	t.Setenv("BEP20_QR_URL", qrURL)
+
+	b, f, _, _, _ := newBuyBot(t, "1")
+
+	b.sendUSDTScreen(ctx, 1, i18n.Lang("en"), chainBSC, "test-des", "5.23")
+
+	if len(f.Photos) != 1 {
+		t.Fatalf("Photos = %d, want exactly 1 (QR must still show when the address is unrotated)", len(f.Photos))
+	}
+	if f.Photos[0].PhotoURL != qrURL {
+		t.Errorf("QR URL = %q, want %q", f.Photos[0].PhotoURL, qrURL)
+	}
+	if !strings.Contains(f.Photos[0].Caption, addr) {
+		t.Errorf("QR caption = %q, want it to contain %q", f.Photos[0].Caption, addr)
+	}
+}
+
+// TestQRGuardDropsQROnRotation is the "rotated" case: the mutation this
+// whole follow-up exists to catch. An admin rotates the BEP20 address via
+// the real wizard; BEP20_QR_URL (env, untouched by the wizard) still encodes
+// the OLD address. Without the guard this would send photos=1 with a QR for
+// the wrong address next to correct-looking NEW-address text — worse than no
+// fix at all, since a customer trusts the QR over reading the caption.
+func TestQRGuardDropsQROnRotation(t *testing.T) {
+	ctx := context.Background()
+	oldAddr := testSellerBSC
+	newAddr := "0x" + strings.Repeat("cd", 20)
+	t.Setenv("BEP20_ADDRESS", oldAddr)
+	t.Setenv("BEP20_QR_URL", "https://example.com/bep20.png")
+
+	b, f, _, _, _ := newBuyBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:setbep20"))
+	b.Process(ctx, textUpdate(1, newAddr))
+
+	b.sendUSDTScreen(ctx, 1, i18n.Lang("en"), chainBSC, "test-des", "5.23")
+
+	if len(f.Photos) != 0 {
+		t.Fatalf("Photos = %d, want 0 — a stale-address QR must never be sent (photos = %+v)", len(f.Photos), f.Photos)
+	}
+	screen := lastSendMsg(f)
+	if screen == nil {
+		t.Fatal("no text fallback sent after the QR was dropped")
+	}
+	if !strings.Contains(screen.Text, newAddr) {
+		t.Errorf("fallback caption = %q, want it to contain the NEW address %q", screen.Text, newAddr)
+	}
+	if strings.Contains(screen.Text, oldAddr) {
+		t.Errorf("fallback caption = %q, still contains the STALE address %q", screen.Text, oldAddr)
+	}
+}
+
+// TestQRGuardNoLeakAcrossChains proves the BEP20 QR URL can never leak onto
+// a TRON screen. BEP20 is left CORRECT (matches, so its half of the guard
+// would set qrURL/qrPath to the BEP20 QR) while TRON is ROTATED (mismatch),
+// which is exactly the state that would expose a missing `qrURL, qrPath =
+// "", ""` reset ahead of the TRON check: without that reset, a leftover
+// BEP20 QR value from the unconditional first assignment would survive into
+// the TRON branch's failed-match case.
+func TestQRGuardNoLeakAcrossChains(t *testing.T) {
+	ctx := context.Background()
+	bep20QRURL := "https://example.com/bep20.png"
+	oldTron := testSellerTRX
+	newTron := "T" + strings.Repeat("9", 33)
+	t.Setenv("BEP20_ADDRESS", testSellerBSC) // left untouched -> BEP20 half of the guard matches
+	t.Setenv("BEP20_QR_URL", bep20QRURL)
+	t.Setenv("TRON_ADDRESS", oldTron)
+
+	b, f, _, _, _ := newBuyBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:settron"))
+	b.Process(ctx, textUpdate(1, newTron)) // rotate TRON only
+
+	b.sendUSDTScreen(ctx, 1, i18n.Lang("en"), chainTRX, "test-des", "5.23")
+
+	for _, p := range f.Photos {
+		if p.PhotoURL == bep20QRURL {
+			t.Fatalf("the BEP20 QR (%q) leaked onto the TRON screen: %+v", bep20QRURL, p)
+		}
+	}
+	screen := lastSendMsg(f)
+	if screen == nil {
+		t.Fatal("no text fallback sent")
+	}
+	if !strings.Contains(screen.Text, newTron) {
+		t.Errorf("fallback caption = %q, want it to contain the NEW TRON address %q", screen.Text, newTron)
+	}
+	if strings.Contains(screen.Text, oldTron) {
+		t.Errorf("fallback caption = %q, still contains the STALE TRON address %q", screen.Text, oldTron)
 	}
 }

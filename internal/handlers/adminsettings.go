@@ -748,12 +748,35 @@ func (b *Bot) cbTogglePay(cc *cbCtx, method string) {
 	// <rail>.Configured() gate — see the WORKING-RAIL note above. Only
 	// bep20/tron have a Configured() concept; "balance" never reaches this
 	// map since it's excluded from depositMethodNames below.
+	//
+	// Both lookups below go through the two-value form (f, ok := map[key])
+	// rather than a bare map[key](), even though every CURRENT
+	// depositMethodNames entry has a map entry by construction: a bare lookup
+	// on a key the map doesn't hold returns a nil func value, and calling a
+	// nil func panics the whole handler on an admin's tap. depositMethodNames
+	// and this map are two separately-maintained literals a few lines apart —
+	// a third on-chain rail added to one and not the other would panic here
+	// instead of failing a test, which is the wrong way to find out.
+	//
+	// An unmapped rail (ok==false) is treated as "not working" in BOTH roles
+	// below, which is asymmetric in effect: as an OTHER rail in the loop it's
+	// conservative (undercounts working rails, so the guard is if anything
+	// MORE likely to refuse a toggle — a false refusal, not a money-safety
+	// gap); as the toggle TARGET itself, ok==false skips the guard entirely
+	// and the toggle proceeds unblocked. That second case is intentional, not
+	// an oversight: it's the same "an unmapped/unconfigured rail was never
+	// counted as working, so blocking its toggle is noise" rationale the
+	// EDGE CASE note above already documents for enabled-but-unconfigured
+	// bep20/tron. It only matters in practice if depositMethodNames grows a
+	// rail this map doesn't — a state the comment above already flags as a
+	// bug to avoid shipping, not a state to design further defenses around.
 	railConfigured := map[string]func() bool{"bep20": b.bep20Configured, "tron": b.tronConfigured}
 	cur := b.payEnabled(method)
-	if cur && slices.Contains(depositMethodNames, method) && railConfigured[method]() {
+	methodWorking, ok := railConfigured[method]
+	if cur && slices.Contains(depositMethodNames, method) && ok && methodWorking() {
 		anyOtherWorking := false
 		for _, m := range depositMethodNames {
-			if m != method && b.payEnabled(m) && railConfigured[m]() {
+			if f, ok := railConfigured[m]; m != method && ok && b.payEnabled(m) && f() {
 				anyOtherWorking = true
 				break
 			}
@@ -869,15 +892,12 @@ func (b *Bot) capSetBep20(c *Ctx) bool {
 	// §4.4's literal "read from the s map already in hand": a bare map read
 	// would report "(unset)" for a shop whose address was only ever supplied
 	// via env, which is a wrong "old" value, not merely an imprecise one.
-	// NOTE: this getter's env fallback is currently the LIVE customer-facing
-	// value in name only — internal/pay/bep20.Address() (the function the
-	// actual pay screen/QR/deposit-matching code calls) reads raw os.Getenv
-	// directly and does NOT consult *config.Config at all, so it never sees a
-	// settings.json write from this wizard either. That gap is real, tracked
-	// separately (task #17), and out of Tier 1's scope — it does not change
-	// which value is correct to record as "old" here, since the getter is
-	// still the shop's own source of truth for what capSetBep20 believes it
-	// is replacing.
+	// Task #17 (fixed): the customer pay screen (usdt.go's sendUSDTScreen) and
+	// the by-hash verify path (b.bep20ByHash, dispatch.go) now both resolve
+	// through b.bep20AddrStr() -> cfg.BEP20Address(), the SAME getter used
+	// here — so this "old" value is not merely the shop's notional source of
+	// truth, it is the actual live customer-facing address a write here
+	// replaces.
 	oldAddr := b.cfg.BEP20Address()
 	s := b.cfg.Settings()
 	s["bep20_address"] = addr
@@ -889,17 +909,14 @@ func (b *Bot) capSetBep20(c *Ctx) bool {
 	// Audit AFTER the save succeeds, never before (spec §4.3): a row written
 	// on the failure path would record a payout-address change that never
 	// actually happened. This row proves WHO changed the CONFIGURED
-	// bep20_address, FROM WHAT to WHAT, and WHEN — it does NOT prove funds
-	// moved (see the oldAddr comment above: whether this write currently
-	// reaches the customer pay screen is task #17's business, and belongs in
-	// the code, not in a permanent audit record that would go stale the
-	// moment #17 lands). Config mutators of this class are exactly why Tier 1
-	// exists — an unaudited change to the configured address is how a shop's
-	// incoming BEP20 funds get silently redirected once a write does take
-	// effect — so old→new (both PUBLIC, safe to log verbatim per spec §3) is
-	// the row's whole payload. Once #17 closes the config→pay-screen gap,
-	// this trail becomes the only record of which addresses were ever
-	// configured and when, including every one set before #17 shipped.
+	// bep20_address, FROM WHAT to WHAT, and WHEN — and, since task #17 closed
+	// the config->pay-screen gap (see the oldAddr comment above), that
+	// CONFIGURED address is now also the LIVE one every customer is shown.
+	// Config mutators of this class are exactly why Tier 1 exists — an
+	// unaudited change to the configured address is how a shop's incoming
+	// BEP20 funds get silently redirected — so old→new (both PUBLIC, safe to
+	// log verbatim per spec §3) is the row's whole payload, and is the only
+	// record of which addresses were ever configured and when.
 	if b.store != nil {
 		b.store.LogAction(fmtInt(c.ChatID), "admin", "config_set_bep20_address",
 			"bep20_address", auditOldNew(oldAddr, addr), "")
@@ -953,9 +970,9 @@ func (b *Bot) capSetTron(c *Ctx) bool {
 	}
 	// Tier 1 (task #13): capture the effective pre-change value BEFORE it is
 	// overwritten — cfg.TRONAddress() (settings.json override, falling back
-	// to env). Same deliberate §4.4 deviation and same caveat about
-	// internal/pay/tron.Address() not consulting *config.Config (task #17,
-	// out of Tier 1's scope) as capSetBep20 above.
+	// to env). Same deliberate §4.4 deviation as capSetBep20 above. Task #17
+	// (fixed): this is also now the LIVE customer-facing address — see the
+	// matching comment on capSetBep20's oldAddr above.
 	oldAddr := b.cfg.TRONAddress()
 	s := b.cfg.Settings()
 	s["tron_address"] = addr
@@ -966,14 +983,13 @@ func (b *Bot) capSetTron(c *Ctx) bool {
 	}
 	// Audit AFTER the save succeeds, never before (spec §4.3). Same reasoning
 	// as capSetBep20 above: this row proves WHO changed the CONFIGURED
-	// tron_address, FROM WHAT to WHAT, and WHEN — it does NOT prove funds
-	// moved (task #17's business, kept out of this permanent record — see
-	// the oldAddr comment above). Config mutators of this class are exactly
-	// why Tier 1 exists — an unaudited change to the configured address is
-	// how a shop's incoming TRON funds get silently redirected once a write
-	// does take effect — so old→new (both PUBLIC) is the row's whole
-	// payload, and becomes the only record of every configured address once
-	// #17 closes the gap.
+	// tron_address, FROM WHAT to WHAT, and WHEN, and — since #17 closed the
+	// config->pay-screen gap — that address is also the live one every
+	// customer is shown. Config mutators of this class are exactly why Tier 1
+	// exists — an unaudited change to the configured address is how a shop's
+	// incoming TRON funds get silently redirected — so old→new (both PUBLIC)
+	// is the row's whole payload, and is the only record of every configured
+	// address.
 	if b.store != nil {
 		b.store.LogAction(fmtInt(c.ChatID), "admin", "config_set_tron_address",
 			"tron_address", auditOldNew(oldAddr, addr), "")

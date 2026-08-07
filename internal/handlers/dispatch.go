@@ -318,15 +318,28 @@ func New(d Deps) *Bot {
 	b.usdtConfirmWait = time.Duration(b.envInt("USDT_CONFIRM_WAIT_S", 300)) * time.Second
 	b.usdtConfirmPoll = time.Duration(b.envInt("USDT_CONFIRM_POLL_S", 20)) * time.Second
 	b.maxUSDTPolls = max(b.envInt("USDT_MAX_POLLS", 200), 1)
-	// Chain/exchange clients. Each package reads its own credentials/addresses
-	// from the process env at call time (bep20_pay.py / tron_pay.py parity),
-	// so nothing is snapshotted here.
-	b.bep20Configured = bep20.Configured
-	b.bep20ByHash = bep20.GetTransferToSellerByHash
+	// Chain/exchange clients. The receiving address is resolved LIVE on every
+	// call through b.bep20AddrStr()/b.tronAddrStr() (settings.json's admin-set
+	// address overriding .env/ambient, config.Config.BEP20Address()/
+	// TRONAddress()) rather than read by the pay packages themselves from raw
+	// env — task #17: the admin address wizards (capSetBep20/capSetTron,
+	// adminsettings.go) only ever write settings.json, and internal/pay/bep20
+	// and internal/pay/tron deliberately do not import internal/config (see
+	// their Address() doc comments), so this closure is the one place that
+	// bridges the two. The pre-fix binding (`b.bep20Configured =
+	// bep20.Configured`) was ALSO re-evaluated per call — a Go func value
+	// doesn't freeze anything at assignment — so the bug was never about
+	// staleness from binding-once; it was that every one of those per-call
+	// reads consulted the wrong source (raw os.Getenv, which never sees a
+	// settings.json write) instead of this getter.
+	b.bep20Configured = func() bool { return bep20.ValidAddress(b.bep20AddrStr()) }
+	b.bep20ByHash = func(txhash string) (*bep20.TransferByHash, error) {
+		return bep20.GetTransferToSellerByHash(b.bep20AddrStr(), txhash)
+	}
 	b.bep20UsdtToVND = bep20.UsdtToVND
-	b.tronConfigured = tron.Configured
+	b.tronConfigured = func() bool { return tron.ValidAddress(b.tronAddrStr()) }
 	b.tronByHash = func(txhash string, minTSMS int64) (*tron.Transfer, error) {
-		return tron.FindConfirmedTransferByHash(tron.Address(), txhash, minTSMS)
+		return tron.FindConfirmedTransferByHash(b.tronAddrStr(), txhash, minTSMS)
 	}
 	b.tronUsdtToVND = tron.UsdtToVND
 

@@ -108,9 +108,20 @@ var addrRE = regexp.MustCompile(`^T[1-9A-HJ-NP-Za-km-z]{33}$`)
 // hashRE is a 32-byte hex tx id (tron_pay.py:207).
 var hashRE = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 
-// Address is the seller's receiving TRON address ("" if unset). Admin-set
-// value (synced into the env by the bot's apply_saved_tron) wins over the
-// .env default (tron_pay.py:65-68).
+// Address reads the RAW .env/ambient TRON_ADDRESS ("" if unset) — nothing
+// more. It does NOT see an admin's settings.json address change (task #17):
+// unlike the Python original, which mutated os.environ in-process on every
+// /settron (apply_saved_tron, telegram_bot.py:5309-5321) so a bare getenv
+// stayed live, Go's config.Config deliberately never touches the real
+// process environment (config.Load's doc comment) — the admin-set value only
+// ever lives in settings.json. The customer-facing address, deposit
+// matching, and Configured() gate must all resolve through
+// config.Config.TRONAddress() (settings.json overriding this env snapshot),
+// not this function; internal/handlers passes that resolved value into the
+// functions in this package that need it (FindConfirmedTransferByHash)
+// instead of letting them call Address() themselves. This function survives
+// only as the low-level env primitive those call sites build on — do not
+// call it directly for anything customer-facing.
 func Address() string {
 	return strings.TrimSpace(os.Getenv("TRON_ADDRESS"))
 }
@@ -122,8 +133,11 @@ func ValidAddress(a string) bool {
 	return a != "" && addrRE.MatchString(a)
 }
 
-// Configured reports whether a valid receiving address is set (gate the pay
-// button, tron_pay.py:76-78).
+// Configured reports whether Address() (the raw env snapshot, NOT
+// settings.json — see Address's doc comment) looks like a valid receiving
+// address. Kept for parity with tron_pay.py:76-78; internal/handlers gates
+// the pay button on ValidAddress(config.Config.TRONAddress()) instead, so an
+// admin-set address is honoured (task #17).
 func Configured() bool {
 	return ValidAddress(Address())
 }

@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"codezdev-bot/internal/i18n"
-	"codezdev-bot/internal/pay/bep20"
-	"codezdev-bot/internal/pay/tron"
 	"codezdev-bot/internal/stock"
 	"codezdev-bot/internal/store"
 	"codezdev-bot/internal/tg"
@@ -194,10 +192,10 @@ func (b *Bot) sendPayScreen(ctx context.Context, chatID int64, des, note string)
 	if b.payEnabled("balance") {
 		rows = append(rows, btnRow(c.PayBtnBalance.T(lang), cbData("paybal", des)))
 	}
-	if b.payEnabled("bep20") && bep20.Configured() {
+	if b.payEnabled("bep20") && b.bep20Configured() {
 		rows = append(rows, styledBtnRow(c.PayBtnBEP20.T(lang), cbData("paybsc", des), "primary"))
 	}
-	if b.payEnabled("tron") && tron.Configured() {
+	if b.payEnabled("tron") && b.tronConfigured() {
 		rows = append(rows, styledBtnRow(c.PayBtnTRON.T(lang), cbData("paytrx", des), "danger"))
 	}
 	// Apply- or remove-code button (@10197-10206). The apply/remove handlers are

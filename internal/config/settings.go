@@ -258,10 +258,13 @@ func (c *Config) ReferralEnabled() bool {
 // _PAY_DEFAULT_OFF (telegram_bot.py:5147) — the idea being an admin who
 // hasn't set a receiving address yet shouldn't advertise the rail. That
 // rationale is already enforced, independently and more precisely, by
-// bep20.Configured()/tron.Configured(): every render site (cmdDeposit in
-// deposit.go, the admin payments menu, the buy screen) gates on
-// PayEnabled(method) && <rail>.Configured(), so an unconfigured rail can
-// NEVER appear regardless of what this function returns. Defaulting the
+// Bot.bep20Configured()/Bot.tronConfigured() (internal/handlers/dispatch.go;
+// thin closures over ValidAddress(this package's BEP20Address()/
+// TRONAddress()), not internal/pay/bep20.Configured()/tron.Configured()
+// directly — see task #17): every render site (cmdDeposit in deposit.go, the
+// admin payments menu, the buy screen) gates on PayEnabled(method) &&
+// Bot.<rail>Configured(), so an unconfigured rail can NEVER appear
+// regardless of what this function returns. Defaulting the
 // setting OFF therefore added nothing but a silent failure mode: PayPal and
 // BEP20/TRON were removed from defaultSettings() and pay_bep20/pay_tron were
 // never written into an already-running instance's settings.json (PayPal

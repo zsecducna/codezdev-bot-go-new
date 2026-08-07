@@ -451,11 +451,46 @@ func (b *Bot) sendUSDTScreen(ctx context.Context, chatID int64, lang i18n.Lang, 
 	markup := &tg.InlineKeyboardMarkup{InlineKeyboard: [][]tg.InlineKeyboardButton{
 		{{Text: c.USDTPaidBtn.T(lang), CallbackData: cbData("usdtpaid", chain, des)}},
 	}}
-	caption := i18n.F(c.BEP20Pay.T(lang), "usdt", amount, "address", bep20.Address())
-	qrURL, qrPath := bep20.QRURL(), bep20.QRPath()
+	// The receiving address MUST be the config-layered value (settings.json's
+	// admin-set address overriding .env/ambient), not bep20.Address()/
+	// tron.Address() — those read raw env only and never see a /setbep20 or
+	// /settron write, which is exactly task #17 (a customer would keep being
+	// shown the stale address after an admin "successfully" rotated it).
+	//
+	// The QR image knobs stay env-only: no admin wizard writes *_QR_URL/
+	// *_QR_PATH to settings.json, so there is nothing for a config getter to
+	// layer over. But that means a QR image is now a SEPARATE source from the
+	// caption text, and before this fix both read the same raw env — always
+	// consistent with each other, even though both could be stale. A wizard
+	// rotation now makes the caption correct while a configured QR image
+	// still encodes the OLD address: a customer who scans the code pays the
+	// wrong address, and the by-hash verify (also on the NEW address) would
+	// never find that payment. Rather than ship a QR that can silently
+	// disagree with the text next to it, drop the QR the moment its raw-env
+	// address stops matching the effective one, falling back to the
+	// text-only caption below (which is always correct) until the operator
+	// updates the QR to match.
+	addr := b.bep20AddrStr()
+	caption := i18n.F(c.BEP20Pay.T(lang), "usdt", amount, "address", addr)
+	qrURL, qrPath := "", ""
+	// EqualFold, not ==: a BSC/EVM address (0x + 40 hex) is case-insensitive
+	// on-chain, so an operator's QR encoded from a same-address-different-case
+	// env value (e.g. checksummed "0xABab…" vs a lowercase settings.json
+	// write) must still be trusted, not dropped to text-only over a casing
+	// difference that isn't a real address mismatch.
+	if strings.EqualFold(addr, bep20.Address()) {
+		qrURL, qrPath = bep20.QRURL(), bep20.QRPath()
+	}
 	if chain == chainTRX {
-		caption = i18n.F(c.TronPay.T(lang), "usdt", amount, "address", tron.Address())
-		qrURL, qrPath = tron.QRURL(), tron.QRPath()
+		addr = b.tronAddrStr()
+		caption = i18n.F(c.TronPay.T(lang), "usdt", amount, "address", addr)
+		qrURL, qrPath = "", ""
+		// Exact compare here, deliberately NOT EqualFold: TRON addresses are
+		// base58, which IS case-sensitive on-chain — folding case could match
+		// two genuinely different addresses and wrongly keep a stale QR.
+		if addr == tron.Address() {
+			qrURL, qrPath = tron.QRURL(), tron.QRPath()
+		}
 	}
 	b.sendOnchainQR(ctx, chatID, caption, qrURL, qrPath, markup)
 }

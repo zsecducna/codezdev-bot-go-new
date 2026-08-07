@@ -22,8 +22,6 @@ import (
 
 	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
-	"codezdev-bot/internal/pay/bep20"
-	"codezdev-bot/internal/pay/tron"
 	"codezdev-bot/internal/store"
 	"codezdev-bot/internal/tg"
 )
@@ -94,10 +92,10 @@ func (b *Bot) usdtToVND(usdt float64) int64 {
 func (b *Bot) cmdDeposit(ctx context.Context, chatID int64, lang i18n.Lang) {
 	c := &i18n.C().Deposit
 	var rows [][]tg.InlineKeyboardButton
-	if b.payEnabled("bep20") && bep20.Configured() {
+	if b.payEnabled("bep20") && b.bep20Configured() {
 		rows = append(rows, styledBtnRow(c.BtnBEP20.T(lang), "dep:bsc", "primary"))
 	}
-	if b.payEnabled("tron") && tron.Configured() {
+	if b.payEnabled("tron") && b.tronConfigured() {
 		rows = append(rows, styledBtnRow(c.BtnTRON.T(lang), "dep:trx", "danger"))
 	}
 	if len(rows) == 0 { // every funding method disabled
@@ -118,13 +116,13 @@ func (b *Bot) cbDep(cc *cbCtx) {
 
 	switch method {
 	case "bsc":
-		if !b.payEnabled("bep20") || !bep20.Configured() {
+		if !b.payEnabled("bep20") || !b.bep20Configured() {
 			b.send(cc.Ctx, cc.ChatID, i18n.C().Buy.PayMethodOff.T(lang), nil)
 			return
 		}
 		b.armDeposit(cc, "bsc", i18n.F(c.BEP20Amount.T(lang), "min", b.minDepositStr()))
 	case "trx":
-		if !b.payEnabled("tron") || !tron.Configured() {
+		if !b.payEnabled("tron") || !b.tronConfigured() {
 			b.send(cc.Ctx, cc.ChatID, i18n.C().Buy.PayMethodOff.T(lang), nil)
 			return
 		}
