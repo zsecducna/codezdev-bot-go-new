@@ -149,23 +149,61 @@ func QRPath() string {
 	return strings.TrimSpace(os.Getenv("BEP20_QR_PATH"))
 }
 
-// UsdtToVND converts a received USDT amount to VND via USD_TO_VND (USDT ~
-// USD). Used to credit the wallet by the value ACTUALLY received on a
-// second payment. Returns an error if the rate is missing/invalid
-// (bep20_pay.py:89-94).
+// UsdtToVND converts a received USDT amount to VND (USDT ~ USD) at the
+// VND-per-USD rate the CALLER supplies. Used to credit the wallet by the
+// value ACTUALLY received on a second payment (bep20_pay.py:89-94).
+//
+// rateStr is passed in rather than read from the process environment, for the
+// same reason the seller address is (see Address() above): this package
+// deliberately does not import internal/config, and the admin rate wizard
+// (adm:setrate, internal/handlers/adminsettings.go) only ever writes
+// settings.json. internal/handlers resolves the effective rate — settings.json's
+// usd_to_vnd over the .env/ambient USD_TO_VND snapshot, else
+// config.DefaultUSDToVND — and hands the result here, so the VND a customer is
+// CREDITED comes from the same resolution as the quote they were charged. The
+// previous version read os.LookupEnv("USD_TO_VND") directly, which saw neither
+// a settings.json write nor config's compiled fallback.
+//
+// An empty, unparseable, or non-positive rate returns an error rather than
+// converting, so verifyUSDTTxid re-arms instead of acting on a value it
+// cannot trust. Every other consumer of this rate in internal/handlers
+// (usdtDisp, deposit's usdtToVND, vndToUSD) already refuses a non-positive
+// rate the same way; this converter was the one that did not.
+//
+// What the guard actually protects, stated precisely because the obvious
+// reading is too broad:
+//
+//   - A deposit paid WITHIN the band tolerance was never at risk either way:
+//     bands.DepositCredit returns the order's desiredVND inside tolerance
+//     regardless of the converted recvVND. Only an OFF-BAND payment credits
+//     the converted value, so that is the whole blast radius on this path.
+//   - For an off-band deposit, a rate of 0 credits 0. A NEGATIVE rate is
+//     worse than nothing: the deposit path's store.Credit upserts with
+//     "amount = amount + excluded.amount" (internal/store/balance.go), so a
+//     real payment would REDUCE the customer's balance. Money moving the
+//     wrong direction is why this is an error and not a clamp to zero.
+//   - On the PAY (non-deposit) path the damage is accounting, not the
+//     customer: recvVND feeds only MarkTxn, while the delivery decision comes
+//     from `matched`, a band comparison on USDT units. The customer still
+//     receives their accounts and the shop still received the USDT — what
+//     breaks is a processed-ledger row recording 0 for a payment that was
+//     really made.
 //
 // NOTE: like the Python original (float(usdt) * rate), this conversion is
 // float-based, not big.Int — VND has no sub-unit so the drift is at most a
 // rounding of the final integer VND amount, matching Python's behavior
 // exactly rather than "improving" on it and changing observable amounts.
-func UsdtToVND(usdt *big.Rat) (int64, error) {
-	rateStr, ok := os.LookupEnv("USD_TO_VND")
-	if !ok {
-		return 0, fmt.Errorf("bep20: USD_TO_VND is not set")
+func UsdtToVND(usdt *big.Rat, rateStr string) (int64, error) {
+	rateStr = strings.TrimSpace(rateStr)
+	if rateStr == "" {
+		return 0, fmt.Errorf("bep20: no USD_TO_VND rate supplied")
 	}
 	rate, err := strconv.ParseFloat(rateStr, 64)
 	if err != nil {
 		return 0, fmt.Errorf("bep20: invalid USD_TO_VND %q: %w", rateStr, err)
+	}
+	if rate <= 0 {
+		return 0, fmt.Errorf("bep20: non-positive USD_TO_VND %q", rateStr)
 	}
 	f, _ := usdt.Float64()
 	return int64(math.Round(f * rate)), nil

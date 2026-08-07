@@ -336,12 +336,33 @@ func New(d Deps) *Bot {
 	b.bep20ByHash = func(txhash string) (*bep20.TransferByHash, error) {
 		return bep20.GetTransferToSellerByHash(b.bep20AddrStr(), txhash)
 	}
-	b.bep20UsdtToVND = bep20.UsdtToVND
 	b.tronConfigured = func() bool { return tron.ValidAddress(b.tronAddrStr()) }
 	b.tronByHash = func(txhash string, minTSMS int64) (*tron.Transfer, error) {
 		return tron.FindConfirmedTransferByHash(b.tronAddrStr(), txhash, minTSMS)
 	}
-	b.tronUsdtToVND = tron.UsdtToVND
+	// The USD->VND rate is bridged the same way, and for the same reason —
+	// task #22, another instance of this port keeping a config reader while
+	// dropping the config source. These two converters value the amount a
+	// customer is CREDITED for an on-chain payment; the amount that same
+	// customer was QUOTED comes from vndToUSD/usdtDisp/usdtToVND, which all
+	// resolve b.cfg.USDToVND(). Before this binding the converters read
+	// os.LookupEnv("USD_TO_VND") instead, so the two sides could disagree in
+	// two ways: an admin running adm:setrate moved the quote and left
+	// crediting on the environment value, and a process with no USD_TO_VND set
+	// at all quoted at config.DefaultUSDToVND while crediting returned an
+	// error, which verifyUSDTTxid turns into a re-arm — a refusal to credit a
+	// payment that had already been made at a correctly quoted amount.
+	//
+	// The rate concept itself is slated to disappear in the USDT migration's
+	// slice S5, when the ledger flips to micro-USDT and there is nothing left
+	// to convert (see vndToUSD in usdt.go, which S5 deletes outright). Until
+	// that lands, the two sides have to agree.
+	b.bep20UsdtToVND = func(usdt *big.Rat) (int64, error) {
+		return bep20.UsdtToVND(usdt, b.usdRateStr())
+	}
+	b.tronUsdtToVND = func(usdt *big.Rat) (int64, error) {
+		return tron.UsdtToVND(usdt, b.usdRateStr())
+	}
 
 	// ---- login-code (OTP) suite (M2.6) --------------------------------------
 	// ONE semaphore for the whole process (telegram_bot.py:680) and the real node

@@ -40,6 +40,7 @@ import (
 	"strings"
 	"time"
 
+	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/tg"
 )
@@ -920,6 +921,23 @@ func (b *Bot) pendingRefundCount() int64 {
 func (b *Bot) rateStr() string {
 	if b.cfg == nil {
 		return "(not set)"
+	}
+	return b.cfg.USDToVND()
+}
+
+// usdRateStr is the same effective USD→VND rate as rateStr, but for
+// ARITHMETIC rather than for a settings label: with no config it answers the
+// compiled default instead of rateStr's human "(not set)", which no converter
+// could parse. The fallback chain is the one every other money converter in
+// this package already uses (usdtDisp in money.go, usdtToVND in deposit.go,
+// vndToUSD in usdt.go): settings.json's admin-set usd_to_vnd, then the
+// .env/ambient USD_TO_VND snapshot frozen at config.Load, then
+// config.DefaultUSDToVND. Matching them matters — a quote priced at the
+// compiled default and a credit priced from somewhere else is exactly the
+// divergence task #22 removed.
+func (b *Bot) usdRateStr() string {
+	if b.cfg == nil {
+		return config.DefaultUSDToVND
 	}
 	return b.cfg.USDToVND()
 }

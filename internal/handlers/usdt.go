@@ -905,9 +905,23 @@ func (b *Bot) verifyUSDTTxid(ctx context.Context, chatID int64, chain, des, txha
 	}
 	recvVND, verr := b.usdtToVNDFor(p, recv)
 	if verr != nil {
-		// No USD_TO_VND rate -> we cannot value the credit. Crediting 0 (or
-		// delivering against an unpriced payment) would lose the customer's money;
-		// re-arm instead so a fixed rate settles it on the next attempt.
+		// No usable USD_TO_VND rate -> we cannot value the credit. Crediting 0
+		// (or delivering against an unpriced payment) would lose the customer's
+		// money; re-arm instead so a fixed rate settles it on the next attempt.
+		//
+		// Since task #22 the rate resolves through b.usdRateStr()
+		// (config.Config.USDToVND), which always answers something — an absent
+		// USD_TO_VND now falls back to config.DefaultUSDToVND rather than
+		// erroring here, which is the point: quoting at the compiled default
+		// while refusing to credit at it was the worse half of that bug.
+		//
+		// What can still reach this branch, traced through USDToVND rather
+		// than assumed: a hand-edited settings.json usd_to_vnd that is
+		// negative, or positive but under 1 and so truncated to "0"; or, when
+		// settings.json carries no usable value, an environment-snapshot
+		// USD_TO_VND that is non-numeric, zero, or negative. A NON-NUMERIC
+		// settings.json value does NOT reach here — truthyFloat reads it as 0
+		// and USDToVND falls through to the env/default instead.
 		log.Printf("usdt verify (%s) rate error for %s: %v", chain, des, verr)
 		return b.txidNotFound(ctx, chatID, lang, quiet)
 	}
