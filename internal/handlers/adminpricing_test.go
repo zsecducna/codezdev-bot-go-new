@@ -890,17 +890,15 @@ func TestKiroToggleNoAuditOnSaveFailure(t *testing.T) {
 // ---- apikey/kiro rate + credit-bound setters -------------------------------
 //
 // capSetApiPrice/capSetApiMin/capSetApiMax/capSetApiCap/capSetKiroPrice/
-// capSetKiroMin/capSetKiroMax all predate the H1 stop-on-failure fix: none of
-// them stop when SaveSettings fails, they just log and fall through to the
-// same success text a real save would have earned (a pre-existing gap outside
-// this task's scope — flagged separately, not fixed here). Task #13's own
-// requirement ("audit only after success", spec §4.3/§6.2) is still met at
-// every site: each audit call is gated on err == nil from that same
-// SaveSettings call, independent of what the surrounding function does with
-// its user-facing reply on failure. TestCapSetApiPriceNoAuditOnSaveFailure
-// below is the one test that actually exercises that gate; every sibling
-// site added the identical gate and is covered by construction — see that
-// test's own doc for why one representative proves the mechanism.
+// capSetKiroMin/capSetKiroMax all now follow the H1 stop-on-failure shape:
+// on a SaveSettings error they log, send the shared settingsSaveFailed reply,
+// and return early — never falling through to the ✅ success text. The audit
+// row is emitted only AFTER the save succeeds (spec §4.3/§6.2), so it now
+// sits on the straight-line path after the early-return gate rather than in
+// an `else` branch. This matches capDiscount's own two branches exactly.
+// TestCapSetApiPriceNoAuditOnSaveFailure and TestCapSetApiMinNoAuditOnSaveFailure
+// below exercise both the audit gate AND the new settingsSaveFailed reply;
+// every sibling site added the identical gate and is covered by construction.
 
 // TestCapSetApiPriceAuditsChange is the representative test for the
 // "float rate + legacy twin" code path (capSetApiPrice only — capSetKiroPrice
@@ -933,25 +931,31 @@ func TestCapSetApiPriceAuditsChange(t *testing.T) {
 	}
 }
 
-// TestCapSetApiPriceNoAuditOnSaveFailure is the ONE test in this file proving
-// the err == nil audit gate documented above actually works — the shared
-// mechanism every sibling pricing setter (capSetApiMin/Max/Cap,
-// capSetKiroPrice/Min/Max) added identically.
+// TestCapSetApiPriceNoAuditOnSaveFailure proves the H1 stop-on-failure shape
+// for capSetApiPrice: on a failed SaveSettings the audit row is NOT emitted
+// AND the reply is the shared settingsSaveFailed text (not the ✅ success
+// text a real save would have earned). The same shape holds for every sibling
+// pricing setter (capSetApiMin/Max/Cap, capSetKiroPrice/Min/Max) by
+// construction — they share the identical early-return + audit-after-success
+// block.
 //
-// Falsification: dropping the `else` (auditing unconditionally after
-// SaveSettings, ignoring its error) makes this test fail with an unwanted
-// audit row — verified by mutation (temporarily hoisting the auditConfigSet
-// call out of the else branch, confirming this test fails, then restoring
-// the gate).
+// Falsification: dropping the `return true` on save error (so the handler
+// falls through to the ✅ text) makes the settingsSaveFailed assertion fail;
+// hoisting the auditConfigSet call out of the post-save path (auditing
+// unconditionally) makes the audit-row assertion fail — both verified by
+// mutation against this test.
 func TestCapSetApiPriceNoAuditOnSaveFailure(t *testing.T) {
 	ctx := context.Background()
-	b, _, st := newReadOnlyCfgAuditBot(t)
+	b, f, st := newReadOnlyCfgAuditBot(t)
 
 	b.Process(ctx, callbackUpdate(1, "adm:apiprice"))
 	b.Process(ctx, textUpdate(1, "4"))
-	// This site predates H1: SaveSettings fails silently (logged only) and
-	// the ✅ success text still fires — that pre-existing behavior is NOT
-	// what this test is pinning. What matters here is the audit row.
+	// H1 fix: a failed SaveSettings now surfaces as settingsSaveFailed rather
+	// than the ✅ "API-key price set to ..." success text a silent failure
+	// used to produce.
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
 	if row := latestAuditRow(t, st, "config_set_apikey_usdt_per_100"); row != nil {
 		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
 	}
@@ -1015,16 +1019,20 @@ func TestCapSetApiMinAuditsChange(t *testing.T) {
 	}
 }
 
-// TestCapSetApiMinNoAuditOnSaveFailure proves the same err == nil audit gate
-// (documented above capSetApiPrice's tests) holds for the int-setter shape
-// too — a second, independent instance of the mechanism, not just the
-// rate-setter one.
+// TestCapSetApiMinNoAuditOnSaveFailure proves the same H1 stop-on-failure
+// shape (documented above capSetApiPrice's tests) holds for the int-setter
+// path too — a second, independent instance of the mechanism, not just the
+// rate-setter one. Both the settingsSaveFailed reply AND the missing audit
+// row are asserted.
 func TestCapSetApiMinNoAuditOnSaveFailure(t *testing.T) {
 	ctx := context.Background()
-	b, _, st := newReadOnlyCfgAuditBot(t)
+	b, f, st := newReadOnlyCfgAuditBot(t)
 
 	b.Process(ctx, callbackUpdate(1, "adm:apimin"))
 	b.Process(ctx, textUpdate(1, "200"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
 	if row := latestAuditRow(t, st, "config_set_apikey_min_credits"); row != nil {
 		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
 	}

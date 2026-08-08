@@ -832,20 +832,23 @@ func (b *Bot) capPromo(c *Ctx) bool {
 	}
 	code := b.genUniqueCode()
 	if b.store != nil {
+		// H1 stop-on-failure: a CreatePromo error (genuine DB/constraint
+		// failure) must never be reported as the "✅ Promo code created:"
+		// success text — that would tell the admin a discount is live while
+		// no code was inserted. Stop here with the shared save-failed reply,
+		// exactly like the SaveSettings sites below.
 		if err := b.store.CreatePromo(code, float64(pct), int64(uses), stack); err != nil {
 			log.Println("adminpricing: create promo failed:", err)
-		} else {
-			// Task #13 Tier 4: audit only after a successful create — this
-			// site pre-dates the H1 stop-on-failure fix (still just logs and
-			// falls through to the ✅ text on a CreatePromo error), so gating
-			// strictly on err == nil keeps the row truthful regardless of
-			// that surrounding gap. A promo code is always FRESH
-			// (genUniqueCode above), so old is always "(unset)" — there is
-			// no prior state for a code that didn't exist a moment ago. A
-			// promo is a discount bounded by max_uses (spec §2 Tier 4).
-			b.auditConfigSet(fmtInt(c.ChatID), "config_set_promo_create", code,
-				"", promoAuditDesc(float64(pct), int64(uses), stack))
+			b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
+			return true
 		}
+		// Task #13 Tier 4: audit AFTER the create succeeds, never before
+		// (spec §4.3). A promo code is always FRESH (genUniqueCode above),
+		// so old is always "(unset)" — there is no prior state for a code
+		// that didn't exist a moment ago. A promo is a discount bounded by
+		// max_uses (spec §2 Tier 4).
+		b.auditConfigSet(fmtInt(c.ChatID), "config_set_promo_create", code,
+			"", promoAuditDesc(float64(pct), int64(uses), stack))
 	}
 	mode := "REPLACES the volume discount"
 	if stack {
@@ -880,13 +883,19 @@ func (b *Bot) cbPromoDel(cc *cbCtx) {
 				}
 			}
 		}
+		// H1 stop-on-failure: a DeletePromo error (genuine DB failure, not a
+		// missing-code no-op which DeletePromo reports as success) must never
+		// fall through to re-rendering the list as if the delete landed. Stop
+		// here with the shared save-failed reply instead of renderPromoList,
+		// mirroring capPromo's create path above and the SaveSettings sites.
 		if err := b.store.DeletePromo(code); err != nil {
 			log.Println("adminpricing: delete promo failed:", err)
-		} else {
-			// Audit only after a successful delete (same err == nil gating
-			// as capPromo's create above).
-			b.auditConfigSet(fmtInt(cc.ChatID), "config_set_promo_delete", code, oldDesc, "(deleted)")
+			b.send(cc.Ctx, cc.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
+			return
 		}
+		// Audit AFTER the delete succeeds, never before (spec §4.3) — same
+		// post-success audit shape as capPromo's create above.
+		b.auditConfigSet(fmtInt(cc.ChatID), "config_set_promo_delete", code, oldDesc, "(deleted)")
 	}
 	b.renderPromoList(cc.Ctx, cc.ChatID)
 }
@@ -976,19 +985,21 @@ func (b *Bot) capSetApiPrice(c *Ctx) bool {
 		// separately: it carries no information the primary rate doesn't
 		// already convey.
 		s["apikey_usdt_per_1k"] = rate * 10
+		// H1 stop-on-failure: a SaveSettings error (read-only dir, full disk)
+		// must never be reported as the ✅ "API-key price set to ..." success
+		// text — that would tell the admin the literal sale price of the SKU
+		// changed while the old rate stayed live. Stop here with the shared
+		// save-failed reply, exactly like capDiscount's own branches.
 		if err := b.cfg.SaveSettings(s); err != nil {
 			log.Println("adminpricing: save failed:", err)
-		} else {
-			// Task #13 Tier 3: audit only after a successful save. This site
-			// pre-dates the H1 stop-on-failure fix (still just logs and falls
-			// through to the ✅ text on a SaveSettings error), so gating
-			// strictly on err == nil keeps the row truthful regardless of
-			// that surrounding gap. The literal sale price of the SKU — an
-			// unaudited change under-prices it (loss) or over-prices it
-			// (lost sales).
-			b.auditConfigSet(fmtInt(c.ChatID), "config_set_apikey_usdt_per_100", "apikey_usdt_per_100",
-				fmtRate(old), fmtRate(rate))
+			b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
+			return true
 		}
+		// Audit AFTER the save succeeds, never before (spec §4.3). The
+		// literal sale price of the SKU — an unaudited change under-prices
+		// it (loss) or over-prices it (lost sales).
+		b.auditConfigSet(fmtInt(c.ChatID), "config_set_apikey_usdt_per_100", "apikey_usdt_per_100",
+			fmtRate(old), fmtRate(rate))
 	}
 	text := "✅ API-key price set to " + fmtRate(rate) + " USDT per 100 credits (" + fmtRate(rate*10) + " per 1000)."
 	if rate == 0 {
@@ -1057,16 +1068,22 @@ func (b *Bot) capSetApiMin(c *Ctx) bool {
 		old := b.apikeyMinCredits(saleClassBedrock)
 		s := b.cfg.Settings()
 		s["apikey_min_credits"] = n
+		// H1 stop-on-failure: a SaveSettings error must never be reported
+		// as the ✅ "Min API credits per order set to ..." success text —
+		// the floor is the minimum a customer must spend to buy this SKU,
+		// so a silent failure would leave the old floor live while the
+		// admin believes they changed it. Stop here with the shared
+		// save-failed reply (same shape as capSetApiPrice above).
 		if err := b.cfg.SaveSettings(s); err != nil {
 			log.Println("adminpricing: save failed:", err)
-		} else {
-			// Audit only after a successful save (this site predates H1's
-			// stop-on-failure fix; see capSetApiPrice's identical note above).
-			// Bounds exposure per order — raising the floor changes what a
-			// customer must spend to buy this SKU at all.
-			b.auditConfigSet(fmtInt(c.ChatID), "config_set_apikey_min_credits", "apikey_min_credits",
-				itoa64(old), itoa(n))
+			b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
+			return true
 		}
+		// Audit AFTER the save succeeds, never before (spec §4.3). Bounds
+		// exposure per order — raising the floor changes what a customer
+		// must spend to buy this SKU at all.
+		b.auditConfigSet(fmtInt(c.ChatID), "config_set_apikey_min_credits", "apikey_min_credits",
+			itoa64(old), itoa(n))
 	}
 	b.send(c.Ctx, c.ChatID,
 		"✅ Min API credits per order set to "+commaInt(n)+".\nBuyable range is now "+
@@ -1124,15 +1141,22 @@ func (b *Bot) capSetApiMax(c *Ctx) bool {
 		old := b.apikeyMaxCredits(saleClassBedrock)
 		s := b.cfg.Settings()
 		s["apikey_max_credits"] = n
+		// H1 stop-on-failure: a SaveSettings error must never be reported
+		// as the ✅ "Max API credits per order set to ..." success text —
+		// raising the ceiling raises the loss ceiling of any other
+		// pricing error, so a silent failure would leave the admin
+		// believing the old (lower) cap is gone while it still holds.
+		// Stop here with the shared save-failed reply (same shape as
+		// capSetApiPrice above).
 		if err := b.cfg.SaveSettings(s); err != nil {
 			log.Println("adminpricing: save failed:", err)
-		} else {
-			// Audit only after a successful save (predates H1 — see
-			// capSetApiPrice's identical note above). Raising the ceiling
-			// raises the loss ceiling of any other pricing error.
-			b.auditConfigSet(fmtInt(c.ChatID), "config_set_apikey_max_credits", "apikey_max_credits",
-				itoa64(old), itoa(n))
+			b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
+			return true
 		}
+		// Audit AFTER the save succeeds, never before (spec §4.3). Raising
+		// the ceiling raises the loss ceiling of any other pricing error.
+		b.auditConfigSet(fmtInt(c.ChatID), "config_set_apikey_max_credits", "apikey_max_credits",
+			itoa64(old), itoa(n))
 	}
 	b.send(c.Ctx, c.ChatID, "✅ Max API credits per order set to "+commaInt(n)+".", admNav("admcat:pricing"))
 	return true
@@ -1189,15 +1213,22 @@ func (b *Bot) capSetApiCap(c *Ctx) bool {
 		old := b.apikeyMaxPerCustomer()
 		s := b.cfg.Settings()
 		s["apikey_max_per_customer"] = n
+		// H1 stop-on-failure: a SaveSettings error must never be reported
+		// as the ✅ "Max API keys per customer set to ..." success text —
+		// raising the cap raises the support surface and the loss ceiling
+		// of any other pricing error, so a silent failure would leave the
+		// admin believing the old cap is gone while it still holds. Stop
+		// here with the shared save-failed reply (same shape as
+		// capSetApiPrice above).
 		if err := b.cfg.SaveSettings(s); err != nil {
 			log.Println("adminpricing: save failed:", err)
-		} else {
-			// Audit only after a successful save (predates H1 — see
-			// capSetApiPrice's identical note above). Raising the cap raises
-			// the loss ceiling of any other pricing error.
-			b.auditConfigSet(fmtInt(c.ChatID), "config_set_apikey_max_per_customer", "apikey_max_per_customer",
-				itoa64(old), itoa(n))
+			b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
+			return true
 		}
+		// Audit AFTER the save succeeds, never before (spec §4.3). Raising
+		// the cap raises the loss ceiling of any other pricing error.
+		b.auditConfigSet(fmtInt(c.ChatID), "config_set_apikey_max_per_customer", "apikey_max_per_customer",
+			itoa64(old), itoa(n))
 	}
 	text := "✅ API keys per customer set to unlimited."
 	if n != 0 {
@@ -1325,14 +1356,20 @@ func (b *Bot) capSetKiroPrice(c *Ctx) bool {
 		old := b.apikeyRateUSDT(saleClassKiro)
 		s := b.cfg.Settings()
 		s["kiro_apikey_usdt_per_100"] = rate
+		// H1 stop-on-failure: a SaveSettings error must never be reported
+		// as the ✅ "Kiro-credit price set to ..." success text — that
+		// would tell the admin the Kiro SKU's literal sale price changed
+		// while the old rate stayed live. Stop here with the shared
+		// save-failed reply (same shape as capSetApiPrice above).
 		if err := b.cfg.SaveSettings(s); err != nil {
 			log.Println("adminpricing: save failed:", err)
-		} else {
-			// Audit only after a successful save (same err == nil gating as
-			// capSetApiPrice above — this site predates H1 too).
-			b.auditConfigSet(fmtInt(c.ChatID), "config_set_kiro_apikey_usdt_per_100", "kiro_apikey_usdt_per_100",
-				fmtRate(old), fmtRate(rate))
+			b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
+			return true
 		}
+		// Audit AFTER the save succeeds, never before (spec §4.3) — same
+		// post-success audit shape as capSetApiPrice above.
+		b.auditConfigSet(fmtInt(c.ChatID), "config_set_kiro_apikey_usdt_per_100", "kiro_apikey_usdt_per_100",
+			fmtRate(old), fmtRate(rate))
 	}
 	text := "✅ Kiro-credit price set to " + fmtRate(rate) + " USDT per 100 Kiro credits."
 	if rate == 0 {
@@ -1403,14 +1440,21 @@ func (b *Bot) capSetKiroMin(c *Ctx) bool {
 		old := b.apikeyMinCredits(saleClassKiro)
 		s := b.cfg.Settings()
 		s["kiro_apikey_min_credits"] = n
+		// H1 stop-on-failure: a SaveSettings error must never be reported
+		// as the ✅ "Min KIRO credits per order set to ..." success text —
+		// the floor is the minimum a customer must spend to buy the Kiro
+		// SKU, so a silent failure would leave the old floor live while
+		// the admin believes they changed it. Stop here with the shared
+		// save-failed reply (same shape as capSetApiPrice above).
 		if err := b.cfg.SaveSettings(s); err != nil {
 			log.Println("adminpricing: save failed:", err)
-		} else {
-			// Audit only after a successful save (predates H1 — see
-			// capSetApiPrice's identical note above).
-			b.auditConfigSet(fmtInt(c.ChatID), "config_set_kiro_apikey_min_credits", "kiro_apikey_min_credits",
-				itoa64(old), itoa(n))
+			b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
+			return true
 		}
+		// Audit AFTER the save succeeds, never before (spec §4.3) — same
+		// post-success audit shape as capSetApiPrice above.
+		b.auditConfigSet(fmtInt(c.ChatID), "config_set_kiro_apikey_min_credits", "kiro_apikey_min_credits",
+			itoa64(old), itoa(n))
 	}
 	b.send(c.Ctx, c.ChatID,
 		"✅ Min KIRO credits per order set to "+commaInt(n)+".\nBuyable range is now "+
@@ -1467,14 +1511,21 @@ func (b *Bot) capSetKiroMax(c *Ctx) bool {
 		old := b.apikeyMaxCredits(saleClassKiro)
 		s := b.cfg.Settings()
 		s["kiro_apikey_max_credits"] = n
+		// H1 stop-on-failure: a SaveSettings error must never be reported
+		// as the ✅ "Max KIRO credits per order set to ..." success text —
+		// raising the ceiling raises the loss ceiling of any other pricing
+		// error, so a silent failure would leave the admin believing the
+		// old (lower) cap is gone while it still holds. Stop here with the
+		// shared save-failed reply (same shape as capSetApiPrice above).
 		if err := b.cfg.SaveSettings(s); err != nil {
 			log.Println("adminpricing: save failed:", err)
-		} else {
-			// Audit only after a successful save (predates H1 — see
-			// capSetApiPrice's identical note above).
-			b.auditConfigSet(fmtInt(c.ChatID), "config_set_kiro_apikey_max_credits", "kiro_apikey_max_credits",
-				itoa64(old), itoa(n))
+			b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
+			return true
 		}
+		// Audit AFTER the save succeeds, never before (spec §4.3) — same
+		// post-success audit shape as capSetApiPrice above.
+		b.auditConfigSet(fmtInt(c.ChatID), "config_set_kiro_apikey_max_credits", "kiro_apikey_max_credits",
+			itoa64(old), itoa(n))
 	}
 	b.send(c.Ctx, c.ChatID, "✅ Max KIRO credits per order set to "+commaInt(n)+".", admNav("admcat:pricing"))
 	return true
