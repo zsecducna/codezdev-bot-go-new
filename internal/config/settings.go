@@ -304,13 +304,31 @@ const DefaultUSDToVND = "25000"
 // which lets a non-numeric settings value raise inside apply_saved_rate,
 // this falls through to the env/default instead of erroring — a deliberate
 // hardening, not a behavior this package needs to reproduce.
+//
+// TrimSpace on the returned string, structurally, not as a per-caller
+// convention: EnvOr/Env read straight from the Load-time snapshot, and that
+// snapshot copies the AMBIENT process environment VERBATIM (config.go:42-53
+// — only .env-FILE lines go through parseEnvLines's own trim). An
+// operator-exported `USD_TO_VND=" 25000 "` therefore used to reach every
+// caller of this method with its whitespace intact, and strconv.ParseFloat
+// rejects surrounding whitespace outright. Every one of this method's five
+// callers across the handlers package parses the result with ParseFloat, so
+// a single un-trimmed rate silently broke five independent call sites the
+// same way — two were display-only ("— USDT"), but two were FUNCTIONAL
+// rejections (a customer's deposit refused outright, an admin's price
+// refused outright). Trimming once here, at the one place both paths
+// (settings.json's typed float and the raw env string) converge, retires
+// the whole class instead of requiring every future ParseFloat(cfg.
+// USDToVND()) call site to remember to do it too. (The settings.json branch
+// above never needs this: strconv.Itoa on a parsed float64 never produces
+// surrounding whitespace.)
 func (c *Config) USDToVND() string {
 	if v, ok := c.Settings()["usd_to_vnd"]; ok {
 		if f := truthyFloat(v); f != 0 {
 			return strconv.Itoa(int(f))
 		}
 	}
-	return c.EnvOr("USD_TO_VND", DefaultUSDToVND)
+	return strings.TrimSpace(c.EnvOr("USD_TO_VND", DefaultUSDToVND))
 }
 
 // BEP20Address returns the effective USDT-BEP20 receiving address:

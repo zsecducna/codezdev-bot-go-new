@@ -15,6 +15,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"codezdev-bot/internal/config"
+	"codezdev-bot/internal/store"
 )
 
 // withDiscountsFile points the package-level discountsFilePath at a fresh
@@ -608,5 +611,442 @@ func TestPricingCategorySuperAdminOnly(t *testing.T) {
 		f.Sends, f.Answers = nil, nil
 		b.Process(ctx, callbackUpdate(7, data))
 		wantAdminCapDenied(t, f, data)
+	}
+}
+
+// ---- Task #13 Tiers 3-4: pricing/discount/promo audit logging -------------
+// .omc/artifacts/config-audit-spec.md — the money-defining set: product
+// prices, apikey pricing, credit floors/ceilings/caps, volume discounts,
+// promo codes, max_qty (adminsettings.go), the Kiro SKU toggle. capSetRate is
+// deliberately NOT audited — the USDT migration's S5 deletes it outright.
+
+// newReadOnlyCfgAuditBot builds a Bot with cfg rooted in a directory with no
+// write permission, so every SaveSettings call fails — the shared setup this
+// file's several "no audit row on a failed save" tests (spec §4.3/§6.2) need,
+// factored out once rather than duplicated at each call site (identical
+// boilerplate to adminsettings_test.go's newAuditTestBot, minus stock, which
+// none of these handlers touch).
+func newReadOnlyCfgAuditBot(t *testing.T) (*Bot, *fakeTG, *store.Store) {
+	t.Helper()
+	dir := t.TempDir()
+	roDir := filepath.Join(dir, "ro")
+	if err := os.Mkdir(roDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) })
+	cfg, err := config.Load(roDir)
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, Config: cfg, AdminID: "1"})
+	t.Cleanup(b.Shutdown)
+	return b, f, st
+}
+
+// ---- product price (capTier / capPrice): SAME underlying stock mutation ---
+
+// TestCapTierAndCapPriceAuditProductPriceChanges covers BOTH code paths that
+// funnel into stock.SetProductPrice + the shared audit call: capTier
+// (tieradd:, brand-new tier -> old side is "(unset)") and capPrice
+// (pricetier:, editing an existing tier -> old side is the real prior
+// price). One test, since the fixture setup (a seeded product) is shared and
+// the scenario is a natural lifecycle, matching TestPriceTierLifecycle's own
+// add-then-edit shape.
+func TestCapTierAndCapPriceAuditProductPriceChanges(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, dir := newBuyBot(t, "1")
+	seedProduct(t, dir, "prod1", 90000, 1)
+
+	// tieradd:0 -> "BH30D 9": a BRAND NEW tier, so old must read "(unset)".
+	b.Process(ctx, callbackUpdate(1, "priceprod:0"))
+	b.Process(ctx, callbackUpdate(1, "tieradd:0"))
+	b.Process(ctx, textUpdate(1, "BH30D 9"))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "Added tier") {
+		t.Fatalf("expected an Added-tier confirmation, got %+v", last)
+	}
+	row1 := latestAuditRow(t, st, "config_set_product_price")
+	if row1 == nil {
+		t.Fatal("no audit row written for new tier creation")
+	}
+	if row1.Target != "prod1/BH30D" {
+		t.Errorf("Target = %q, want prod1/BH30D", row1.Target)
+	}
+	if want := "(unset) → " + b.usdtDisp(225000); row1.Outcome != want { // 9 USDT * 25000
+		t.Errorf("Outcome = %q, want %q", row1.Outcome, want)
+	}
+
+	// pricetier:0:BH30D -> "5": editing the tier just created, so old must be
+	// the REAL prior price (225000), not "(unset)" again.
+	b.Process(ctx, callbackUpdate(1, "pricetier:0:BH30D"))
+	b.Process(ctx, textUpdate(1, "5"))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "set to") {
+		t.Fatalf("expected a set-to confirmation, got %+v", last)
+	}
+	row2 := latestAuditRow(t, st, "config_set_product_price")
+	if row2 == nil {
+		t.Fatal("no audit row written for tier edit")
+	}
+	if want := b.usdtDisp(225000) + " → " + b.usdtDisp(125000); row2.Outcome != want {
+		t.Errorf("second Outcome = %q, want %q", row2.Outcome, want)
+	}
+}
+
+// TestCapTierNoAuditOnSaveFailure proves the audit row is emitted only AFTER
+// stock.SetProductPrice succeeds (spec §4.3). Unlike the cfg-based sites, a
+// product price write fails via a read-only PRODUCT directory (SetProductPrice
+// writes a plain file, not settings.json), so this can't reuse
+// newReadOnlyCfgAuditBot above.
+func TestCapTierNoAuditOnSaveFailure(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, dir := newBuyBot(t, "1")
+	seedProduct(t, dir, "prod1", 90000, 1)
+
+	productDir := filepath.Join(dir, "accounts", "prod1")
+	if err := os.Chmod(productDir, 0o500); err != nil { // read+execute, no write
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(productDir, 0o700) })
+
+	b.Process(ctx, callbackUpdate(1, "priceprod:0"))
+	b.Process(ctx, callbackUpdate(1, "tieradd:0"))
+	b.Process(ctx, textUpdate(1, "BH30D 9"))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "Failed to write price") {
+		t.Fatalf("expected a write-failure reply, got %+v", last)
+	}
+	if row := latestAuditRow(t, st, "config_set_product_price"); row != nil {
+		t.Fatalf("audit row written despite a failed price write: %+v", *row)
+	}
+}
+
+// ---- volume discounts (capDiscount) ---------------------------------------
+
+// TestCapDiscountAuditsSetAndClear covers BOTH branches capDiscount can take
+// — a real tier set and the "0 clears everything" branch — asserting the
+// compact fmtDiscountTiers rendering on both sides of each row.
+func TestCapDiscountAuditsSetAndClear(t *testing.T) {
+	ctx := context.Background()
+	withDiscountsFile(t)
+	b, f, st := newAuditTestBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:setdiscount"))
+	b.Process(ctx, textUpdate(1, "10:5, 20:15, 50:25"))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "updated") {
+		t.Fatalf("expected success confirmation, got %+v", last)
+	}
+	row1 := latestAuditRow(t, st, "config_set_discounts")
+	if row1 == nil {
+		t.Fatal("no audit row written for discount set")
+	}
+	if row1.Target != "discounts.json" {
+		t.Errorf("Target = %q, want discounts.json", row1.Target)
+	}
+	// withDiscountsFile points at a fresh, nonexistent file -> loadDiscounts
+	// falls back to discountsDefaultTiers (spec: file absent is a real
+	// default state, not "(unset)").
+	if want := "50:30,20:20,10:10 → 50:25,20:15,10:5"; row1.Outcome != want {
+		t.Errorf("Outcome = %q, want %q", row1.Outcome, want)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:setdiscount"))
+	b.Process(ctx, textUpdate(1, "0"))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "cleared") {
+		t.Fatalf("expected clear confirmation, got %+v", last)
+	}
+	row2 := latestAuditRow(t, st, "config_set_discounts")
+	if row2 == nil {
+		t.Fatal("no audit row written for discount clear")
+	}
+	if want := "50:25,20:15,10:5 → (none)"; row2.Outcome != want {
+		t.Errorf("second Outcome = %q, want %q", row2.Outcome, want)
+	}
+}
+
+// TestCapDiscountNoAuditOnSaveFailure proves the audit row is emitted only
+// AFTER saveDiscounts succeeds (spec §4.3) — capDiscount already has the H1
+// stop-on-failure shape (settingsSaveFailed + return true), unlike the
+// apikey/kiro pricing setters below.
+func TestCapDiscountNoAuditOnSaveFailure(t *testing.T) {
+	ctx := context.Background()
+	dir := withDiscountsFile(t)
+	if err := os.Chmod(dir, 0o500); err != nil { // discountsFilePath.tmp can't be created here
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	b, f, st := newAuditTestBot(t, "1")
+	b.Process(ctx, callbackUpdate(1, "adm:setdiscount"))
+	b.Process(ctx, textUpdate(1, "10:5"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+	if row := latestAuditRow(t, st, "config_set_discounts"); row != nil {
+		t.Fatalf("audit row written despite failed saveDiscounts: %+v", *row)
+	}
+}
+
+// ---- promo codes (capPromo / cbPromoDel) -----------------------------------
+
+// TestCapPromoAuditsCreateAndDelete covers both promo code paths. A promo's
+// code is auto-generated (genUniqueCode) rather than admin-typed, so the
+// created code is read back off the audit row's OWN Target field — no
+// separate list-rendering round-trip needed to learn it.
+//
+// No-audit-on-failure case deliberately NOT added for either path: CreatePromo
+// only fails on a genuine DB error (its inputs are validated by capPromo
+// before the call), and DeletePromo's DELETE is a no-op success on a
+// nonexistent code rather than an error — neither has a way to force a
+// deterministic failure through the bot's own validated call surface without
+// reaching into store internals, unlike the read-only-directory trick that
+// works for every settings.json/file-based site in this package.
+func TestCapPromoAuditsCreateAndDelete(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, _ := newBuyBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:promonew"))
+	b.Process(ctx, textUpdate(1, "20 100 off"))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "Promo code created") {
+		t.Fatalf("expected promo-created confirmation, got %+v", last)
+	}
+	rowCreate := latestAuditRow(t, st, "config_set_promo_create")
+	if rowCreate == nil {
+		t.Fatal("no audit row written for promo create")
+	}
+	code := rowCreate.Target
+	if code == "" {
+		t.Fatal("audit row Target must be the new promo's code")
+	}
+	if want := "(unset) → 20% / 100 uses / stack=off"; rowCreate.Outcome != want {
+		t.Errorf("create Outcome = %q, want %q", rowCreate.Outcome, want)
+	}
+
+	b.Process(ctx, callbackUpdate(1, cbData("promodel", code)))
+	rowDelete := latestAuditRow(t, st, "config_set_promo_delete")
+	if rowDelete == nil {
+		t.Fatal("no audit row written for promo delete")
+	}
+	if rowDelete.Target != code {
+		t.Errorf("delete Target = %q, want %q", rowDelete.Target, code)
+	}
+	if want := "20% / 100 uses / stack=off → (deleted)"; rowDelete.Outcome != want {
+		t.Errorf("delete Outcome = %q, want %q", rowDelete.Outcome, want)
+	}
+}
+
+// ---- Kiro SKU toggle (cbKiroToggle) -----------------------------------------
+
+// TestKiroToggleAuditsChange proves cbKiroToggle's boolean flip is audited
+// with the "config_toggle_" action prefix (the established convention for
+// every toggle in this codebase — toggleSetting, cbToggleSales,
+// cbTogglePrivate), not "config_set_".
+func TestKiroToggleAuditsChange(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, _ := newBuyBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:kirotoggle")) // fresh config: OFF -> ON
+	row := latestAuditRow(t, st, "config_toggle_kiro_apikey_enabled")
+	if row == nil {
+		t.Fatal("no audit row written for kiro_apikey_enabled toggle")
+	}
+	if row.Target != "kiro_apikey_enabled" {
+		t.Errorf("Target = %q, want kiro_apikey_enabled", row.Target)
+	}
+	if want := "false → true"; row.Outcome != want {
+		t.Errorf("Outcome = %q, want %q", row.Outcome, want)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:kirotoggle")) // ON -> OFF
+	row2 := latestAuditRow(t, st, "config_toggle_kiro_apikey_enabled")
+	if row2 == nil {
+		t.Fatal("no audit row written for second kiro_apikey_enabled toggle")
+	}
+	if want := "true → false"; row2.Outcome != want {
+		t.Errorf("second Outcome = %q, want %q", row2.Outcome, want)
+	}
+}
+
+// TestKiroToggleNoAuditOnSaveFailure proves cbKiroToggle's audit row is
+// emitted only after SaveSettings succeeds — this handler DOES have the H1
+// stop-on-failure shape (returns early on a save error), unlike the pricing
+// setters below.
+func TestKiroToggleNoAuditOnSaveFailure(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newReadOnlyCfgAuditBot(t)
+
+	b.Process(ctx, callbackUpdate(1, "adm:kirotoggle"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsNotConfigured {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsNotConfigured)
+	}
+	if row := latestAuditRow(t, st, "config_toggle_kiro_apikey_enabled"); row != nil {
+		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
+	}
+}
+
+// ---- apikey/kiro rate + credit-bound setters -------------------------------
+//
+// capSetApiPrice/capSetApiMin/capSetApiMax/capSetApiCap/capSetKiroPrice/
+// capSetKiroMin/capSetKiroMax all predate the H1 stop-on-failure fix: none of
+// them stop when SaveSettings fails, they just log and fall through to the
+// same success text a real save would have earned (a pre-existing gap outside
+// this task's scope — flagged separately, not fixed here). Task #13's own
+// requirement ("audit only after success", spec §4.3/§6.2) is still met at
+// every site: each audit call is gated on err == nil from that same
+// SaveSettings call, independent of what the surrounding function does with
+// its user-facing reply on failure. TestCapSetApiPriceNoAuditOnSaveFailure
+// below is the one test that actually exercises that gate; every sibling
+// site added the identical gate and is covered by construction — see that
+// test's own doc for why one representative proves the mechanism.
+
+// TestCapSetApiPriceAuditsChange is the representative test for the
+// "float rate + legacy twin" code path (capSetApiPrice only — capSetKiroPrice
+// is the sibling shape minus the twin, covered separately below).
+func TestCapSetApiPriceAuditsChange(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, _ := newBuyBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:apiprice"))
+	b.Process(ctx, textUpdate(1, "4"))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "API-key price set to 4") {
+		t.Fatalf("valid reply = %+v", last)
+	}
+	row1 := latestAuditRow(t, st, "config_set_apikey_usdt_per_100")
+	if row1 == nil {
+		t.Fatal("no audit row written for first apikey_usdt_per_100 change")
+	}
+	if want := "0 → 4"; row1.Outcome != want {
+		t.Errorf("Outcome = %q, want %q", row1.Outcome, want)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:apiprice"))
+	b.Process(ctx, textUpdate(1, "6"))
+	row2 := latestAuditRow(t, st, "config_set_apikey_usdt_per_100")
+	if row2 == nil {
+		t.Fatal("no audit row written for second apikey_usdt_per_100 change")
+	}
+	if want := "4 → 6"; row2.Outcome != want {
+		t.Errorf("second Outcome = %q, want %q", row2.Outcome, want)
+	}
+}
+
+// TestCapSetApiPriceNoAuditOnSaveFailure is the ONE test in this file proving
+// the err == nil audit gate documented above actually works — the shared
+// mechanism every sibling pricing setter (capSetApiMin/Max/Cap,
+// capSetKiroPrice/Min/Max) added identically.
+//
+// Falsification: dropping the `else` (auditing unconditionally after
+// SaveSettings, ignoring its error) makes this test fail with an unwanted
+// audit row — verified by mutation (temporarily hoisting the auditConfigSet
+// call out of the else branch, confirming this test fails, then restoring
+// the gate).
+func TestCapSetApiPriceNoAuditOnSaveFailure(t *testing.T) {
+	ctx := context.Background()
+	b, _, st := newReadOnlyCfgAuditBot(t)
+
+	b.Process(ctx, callbackUpdate(1, "adm:apiprice"))
+	b.Process(ctx, textUpdate(1, "4"))
+	// This site predates H1: SaveSettings fails silently (logged only) and
+	// the ✅ success text still fires — that pre-existing behavior is NOT
+	// what this test is pinning. What matters here is the audit row.
+	if row := latestAuditRow(t, st, "config_set_apikey_usdt_per_100"); row != nil {
+		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
+	}
+}
+
+// TestCapSetKiroPriceAuditsChange is capSetApiPrice's sibling for the Kiro
+// SKU — same rate-setter shape, minus the legacy per-1k twin.
+func TestCapSetKiroPriceAuditsChange(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, _ := newBuyBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:kiroprice"))
+	b.Process(ctx, textUpdate(1, "0.7"))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "Kiro-credit price set to 0.7") {
+		t.Fatalf("valid reply = %+v", last)
+	}
+	row := latestAuditRow(t, st, "config_set_kiro_apikey_usdt_per_100")
+	if row == nil {
+		t.Fatal("no audit row written for kiro_apikey_usdt_per_100 change")
+	}
+	if want := "0 → 0.7"; row.Outcome != want {
+		t.Errorf("Outcome = %q, want %q", row.Outcome, want)
+	}
+}
+
+// TestCapSetApiMinAuditsChange is the representative test for the
+// "cross-validated int credit-bound setter" code path shared by
+// capSetApiMin/capSetApiMax/capSetApiCap/capSetKiroMin/capSetKiroMax — same
+// (read effective old via the existing accessor, write, gate audit on
+// err == nil) shape with only the settings key and accessor varying.
+// TestCapSetKiroMinAuditsChange below proves the shape also holds across the
+// bedrock/kiro saleClass boundary; capSetApiMax/capSetApiCap/capSetKiroMax
+// are covered by construction (identical code added at each site) rather
+// than retested individually — spec review guidance: test at the
+// granularity of the code path, not per setting.
+func TestCapSetApiMinAuditsChange(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, _ := newBuyBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:apimin"))
+	b.Process(ctx, textUpdate(1, "200"))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "Min API credits per order set to 200") {
+		t.Fatalf("valid reply = %+v", last)
+	}
+	row1 := latestAuditRow(t, st, "config_set_apikey_min_credits")
+	if row1 == nil {
+		t.Fatal("no audit row written for first apikey_min_credits change")
+	}
+	if want := "100 → 200"; row1.Outcome != want { // apikeyMinCredits' env-less default is 100
+		t.Errorf("Outcome = %q, want %q", row1.Outcome, want)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:apimin"))
+	b.Process(ctx, textUpdate(1, "300"))
+	row2 := latestAuditRow(t, st, "config_set_apikey_min_credits")
+	if row2 == nil {
+		t.Fatal("no audit row written for second apikey_min_credits change")
+	}
+	if want := "200 → 300"; row2.Outcome != want {
+		t.Errorf("second Outcome = %q, want %q", row2.Outcome, want)
+	}
+}
+
+// TestCapSetApiMinNoAuditOnSaveFailure proves the same err == nil audit gate
+// (documented above capSetApiPrice's tests) holds for the int-setter shape
+// too — a second, independent instance of the mechanism, not just the
+// rate-setter one.
+func TestCapSetApiMinNoAuditOnSaveFailure(t *testing.T) {
+	ctx := context.Background()
+	b, _, st := newReadOnlyCfgAuditBot(t)
+
+	b.Process(ctx, callbackUpdate(1, "adm:apimin"))
+	b.Process(ctx, textUpdate(1, "200"))
+	if row := latestAuditRow(t, st, "config_set_apikey_min_credits"); row != nil {
+		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
+	}
+}
+
+// TestCapSetKiroMinAuditsChange proves the int-setter audit shape transfers
+// correctly to the kiro_ prefixed keys / saleClassKiro accessor — the one
+// genuine boundary capSetApiMin's coverage above doesn't reach.
+func TestCapSetKiroMinAuditsChange(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, _ := newBuyBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:kiromin"))
+	b.Process(ctx, textUpdate(1, "1000"))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "Min KIRO credits per order set to 1,000") {
+		t.Fatalf("valid reply = %+v", last)
+	}
+	row := latestAuditRow(t, st, "config_set_kiro_apikey_min_credits")
+	if row == nil {
+		t.Fatal("no audit row written for kiro_apikey_min_credits change")
+	}
+	if want := "500 → 1000"; row.Outcome != want { // apikeyMinCredits' kiro env-less default is 500
+		t.Errorf("Outcome = %q, want %q", row.Outcome, want)
 	}
 }

@@ -389,6 +389,24 @@ func TestUSDToVNDPrecedence(t *testing.T) {
 			t.Errorf("USDToVND() = %q, want env value %q (falsy settings value ignored)", got, "26000")
 		}
 	})
+
+	// TestUSDToVNDPrecedence/whitespace-padded ambient rate is trimmed: the
+	// structural half of task #25's follow-up. Load's env snapshot copies the
+	// AMBIENT process environment verbatim (config.go:42-53) — only .env-FILE
+	// lines go through parseEnvLines's own trim — so an operator-exported
+	// `USD_TO_VND=" 25000 "` used to reach every caller of USDToVND() with its
+	// whitespace intact, and every caller parses the result with
+	// strconv.ParseFloat, which rejects surrounding whitespace outright.
+	// t.Setenv (not a .env-file fixture) is deliberate: the defect lives
+	// specifically in the un-trimmed AMBIENT path.
+	t.Run("whitespace-padded ambient rate is trimmed", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("USD_TO_VND", " 25000 ")
+		c := mustLoad(t, dir)
+		if got := c.USDToVND(); got != "25000" {
+			t.Errorf("USDToVND() = %q, want trimmed %q", got, "25000")
+		}
+	})
 }
 
 func TestBEP20AddressPrecedence(t *testing.T) {

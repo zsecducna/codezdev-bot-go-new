@@ -281,12 +281,11 @@ func (s *Store) CountHeld(product string) int {
 	return len(listTxt(filepath.Join(s.productDir(product), "held")))
 }
 
-// countReservedLocked — reserved-account count; caller MUST already hold the
-// locks. Sweeps expired reservations first so only live in-flight holds count
-// — Python `_count_reserved_locked` (accounts.py:1454-1468).
-func (s *Store) countReservedLocked(product string) int {
-	_, reserved, _ := s.dirs(product)
-	s.sweepExpiredLocked(product)
+// reservedCountLocked tallies reserved/*/*.txt WITHOUT sweeping — caller must
+// already hold the locks and have swept (or deliberately not swept) first.
+// Split out of countReservedLocked so CountsSnapshot can share it without
+// paying for a second sweep pass (see CountsSnapshot).
+func (s *Store) reservedCountLocked(reserved string) int {
 	n := 0
 	entries, err := os.ReadDir(reserved)
 	if err != nil {
@@ -296,6 +295,15 @@ func (s *Store) countReservedLocked(product string) int {
 		n += len(listTxt(filepath.Join(reserved, e.Name())))
 	}
 	return n
+}
+
+// countReservedLocked — reserved-account count; caller MUST already hold the
+// locks. Sweeps expired reservations first so only live in-flight holds count
+// — Python `_count_reserved_locked` (accounts.py:1454-1468).
+func (s *Store) countReservedLocked(product string) int {
+	_, reserved, _ := s.dirs(product)
+	s.sweepExpiredLocked(product)
+	return s.reservedCountLocked(reserved)
 }
 
 // CountReserved — how many accounts are RESERVED right now (in-flight
@@ -309,6 +317,64 @@ func (s *Store) CountReserved(product string) (int, error) {
 	}
 	defer unlock()
 	return s.countReservedLocked(product), nil
+}
+
+// ProductCounts is the paired Available/Reserved result of CountsSnapshot —
+// see that function for why the pair must come from ONE read, not two.
+type ProductCounts struct {
+	Available int
+	Reserved  int
+}
+
+// CountsSnapshot returns a product's Available and Reserved counts together,
+// from a SINGLE lock acquisition and a SINGLE expiry sweep — task #19.
+//
+// Two defects in calling CountAvailable then CountReserved separately (the
+// shape every render path used before this): first, each call takes its own
+// lock and runs its own sweep, so building one rendered line that shows both
+// numbers pays the lock/sweep cost TWICE per product — on the
+// most-frequently-opened admin screen (the dashboard), that is now visible
+// cost, not just a theoretical one. Second, and subtler: the two calls judge
+// the SAME reservation's expiry against two DIFFERENT clock reads. If a
+// reservation ticks from live to expired in the gap between them,
+// CountAvailable's (earlier) sweep does not yet reclaim it — it is still
+// live at that instant, so it is not counted as available — and
+// CountReserved's (later) sweep DOES reclaim it back to active before
+// counting reserved/ — so it is not counted as reserved either. The
+// reservation is real, but the one render line it lands on shows it in
+// NEITHER bucket: the product under-reports its total stock by one,
+// display-only, and self-corrects on the very next render (nothing about
+// the stock itself is lost — only that single rendered line's numbers).
+// This is not a concurrency hazard requiring another goroutine — a single
+// caller making two sequential calls can hit it purely from wall-clock time
+// passing between them.
+//
+// CountsSnapshot closes both gaps: one lockProduct call, one
+// sweepExpiredLocked call, then both directory reads while still holding the
+// lock — so no reservation's expiry can be judged twice against two
+// different instants, and the SAME sweep result backs both numbers.
+//
+// This still sweeps (it is not a read-only path) deliberately: nothing else
+// in this bot sweeps a product's expired reservations periodically — Reserve
+// and Hold sweep lazily at their own call sites, and the exported
+// SweepExpired has no periodic caller — so for a product nobody is actively
+// buying or holding, a render calling this IS how an abandoned reservation
+// ever gets reclaimed. Trading that reclaim path away for a purely
+// read-only render would trade a display quirk for a real stock leak on any
+// product between purchases; CountsSnapshot keeps the reclaim but pays its
+// lock/sweep cost once instead of twice.
+func (s *Store) CountsSnapshot(product string) (ProductCounts, error) {
+	active, reserved, _ := s.dirs(product)
+	unlock, err := s.lockProduct(product)
+	if err != nil {
+		return ProductCounts{}, err
+	}
+	defer unlock()
+	s.sweepExpiredLocked(product)
+	return ProductCounts{
+		Available: len(listTxt(active)),
+		Reserved:  s.reservedCountLocked(reserved),
+	}, nil
 }
 
 // CountSold — how many accounts have been SOLD (files in sold/), lock-free

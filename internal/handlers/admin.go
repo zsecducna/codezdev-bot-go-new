@@ -409,34 +409,27 @@ func (b *Bot) adminDashboardText(chatID int64) string {
 			// screen was stale. Distinct icons now (🔒 held / ⏳ reserved), and
 			// both counts render on both surfaces.
 			//
-			// NOT fixed, by design — reported instead: CountAvailable and
-			// CountReserved both call sweepExpiredLocked before counting, so
-			// rendering THIS report mutates state (expired reservations get swept
-			// back to active/ as a side effect of loading the dashboard). Two
-			// admins opening the panel seconds apart can legitimately see
-			// different Available/Reserved numbers with no sale or admin action
-			// in between. That behaviour is correct; a read-only render path
-			// would be its own slice of work.
-			//
-			// Adding the Reserved count here (this A5 fix) makes it WORSE, not
-			// just visible: the dashboard used to call CountAvailable (sweeps)
-			// + CountHeld (no sweep) — one sweep, one lock acquisition per
-			// product. It now also calls CountReserved (sweeps), so this loop
-			// takes TWO separate lock/sweep cycles per product on the
-			// most-frequently-opened admin screen. A second consequence beyond
-			// the mutation itself: `a` and the reserved count below are each
-			// read from a DIFFERENT sweep instant, so on the SAME rendered line
-			// Available and Reserved can reflect two different moments in time
-			// (an expiry could fall between the two calls). /stock has always
-			// had this shape; it is new to the DASHBOARD as of this fix.
-			a, err := b.stock.CountAvailable(p)
+			// Task #19 fix: this used to call CountAvailable then CountReserved
+			// separately — TWO lock/sweep cycles per product on the
+			// most-frequently-opened admin screen, AND the two numbers on this
+			// SAME rendered line could come from two different sweep instants (a
+			// reservation's expiry landing between the calls made it count in
+			// NEITHER bucket for that one render — display-only, self-correcting
+			// on the next render, but still a torn snapshot). CountsSnapshot
+			// (internal/stock) takes ONE lock, runs ONE sweep, and reads both
+			// directories before releasing it, so the pair is always consistent
+			// and the cost is back to one cycle per product. It still sweeps —
+			// see CountsSnapshot's doc comment for why a read-only render would
+			// trade this display quirk for a real stock leak (nothing else sweeps
+			// a product nobody is actively buying or holding).
+			counts, err := b.stock.CountsSnapshot(p)
 			if err != nil {
 				continue
 			}
-			total += a
-			line := "   • " + p + ": 🟢 " + itoa(a)
-			if res, err := b.stock.CountReserved(p); err == nil && res > 0 {
-				line += "  ⏳ " + itoa(res) + " reserved"
+			total += counts.Available
+			line := "   • " + p + ": 🟢 " + itoa(counts.Available)
+			if counts.Reserved > 0 {
+				line += "  ⏳ " + itoa(counts.Reserved) + " reserved"
 			}
 			if h := b.stock.CountHeld(p); h > 0 {
 				line += "  🔒 " + itoa(h) + " held"
@@ -488,28 +481,29 @@ func ageString(ts float64) string {
 // entirely (the dashboard omitted Reserved) so neither screen is a partial
 // view of the other.
 //
-// NOT fixed, by design — see the matching comment on the dashboard's stock
-// loop in adminDashboardText: CountAvailable and CountReserved both sweep
-// expired reservations before counting, so rendering this report mutates
-// state. Two admins loading /stock seconds apart can legitimately see
-// different numbers with no sale in between.
+// Task #19 fix: this used to call CountAvailable then CountReserved
+// separately, the same two-lock-cycles / torn-snapshot shape the dashboard's
+// stock loop had (see adminDashboardText's comment for the full mechanism).
+// Now backed by stock.CountsSnapshot — one lock, one sweep, both numbers from
+// the same instant. Rendering still sweeps expired reservations (see
+// CountsSnapshot's doc comment for why), so two admins loading /stock seconds
+// apart can still legitimately see different numbers with no sale in
+// between — that part is unchanged and correct; what's fixed is that it now
+// costs one sweep instead of two, and the pair on each line can no longer
+// straddle two different sweep instants.
 func (b *Bot) adminStockText() string {
 	if b.stock == nil {
 		return "📊 STOCK OVERVIEW\n" + strings.Repeat("─", 24) + "\n\nNo products."
 	}
 	var blocks []string
 	for _, p := range b.listProducts() {
-		a, err := b.stock.CountAvailable(p)
+		counts, err := b.stock.CountsSnapshot(p)
 		if err != nil {
 			continue
 		}
-		r, err := b.stock.CountReserved(p)
-		if err != nil {
-			r = 0
-		}
 		block := "📦 " + p + "\n" +
-			"   🟢 Available: " + itoa(a) +
-			"    ⏳ Reserved: " + itoa(r) +
+			"   🟢 Available: " + itoa(counts.Available) +
+			"    ⏳ Reserved: " + itoa(counts.Reserved) +
 			"    🔒 Held: " + itoa(b.stock.CountHeld(p)) +
 			"    ✅ Sold: " + itoa(b.stock.CountSold(p))
 		for _, t := range b.stock.ProductTiers(p) {

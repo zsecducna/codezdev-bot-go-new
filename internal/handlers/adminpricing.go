@@ -369,11 +369,24 @@ func (b *Bot) capTier(c *Ctx) bool {
 	c.st.mu.Lock()
 	c.st.Tier = ""
 	c.st.mu.Unlock()
+	// Task #13 Tier 3: capture the prior price (if any) BEFORE it is
+	// overwritten — "" when the tier never existed, so auditOldNew renders
+	// "(unset) -> <price>" rather than a misleading blank price.
+	oldVnd, hadOld := b.stock.ProductPrice(product, code)
 	existed, err := b.stock.SetProductPrice(product, code, int(vnd))
 	if err != nil {
 		b.send(c.Ctx, c.ChatID, "❌ Failed to write price: "+err.Error(), admNav("admcat:pricing"))
 		return true
 	}
+	// Audit AFTER the write succeeds, never before (spec §4.3). The literal
+	// sale price — an unaudited change under-prices stock (loss) or
+	// over-prices it (lost sales). Target is product/tier-code, not a
+	// settings.json key, since this writes a price file (spec §2 Tier 3).
+	oldStr := ""
+	if hadOld {
+		oldStr = b.usdtDisp(int64(oldVnd))
+	}
+	b.auditConfigSet(fmtInt(c.ChatID), "config_set_product_price", product+"/"+code, oldStr, b.usdtDisp(vnd))
 	verb := "Added"
 	if existed {
 		verb = "Updated"
@@ -406,10 +419,19 @@ func (b *Bot) capPrice(c *Ctx) bool {
 	c.st.mu.Lock()
 	c.st.Price = nil
 	c.st.mu.Unlock()
+	// Task #13 Tier 3: same before/after capture as capTier above — this is
+	// the SAME underlying stock.SetProductPrice mutation, reached via the
+	// edit-existing-tier wizard (pricetier:) instead of add-new (tieradd:).
+	oldVnd, hadOld := b.stock.ProductPrice(armed.Product, armed.Code)
 	if _, err := b.stock.SetProductPrice(armed.Product, armed.Code, int(vnd)); err != nil {
 		b.send(c.Ctx, c.ChatID, "❌ Failed to write price: "+err.Error(), admNav("admcat:pricing"))
 		return true
 	}
+	oldStr := ""
+	if hadOld {
+		oldStr = b.usdtDisp(int64(oldVnd))
+	}
+	b.auditConfigSet(fmtInt(c.ChatID), "config_set_product_price", armed.Product+"/"+armed.Code, oldStr, b.usdtDisp(vnd))
 	b.send(c.Ctx, c.ChatID,
 		"✅ "+armed.Product+" — "+b.tierLabel(armed.Code, i18n.EN)+" set to "+b.usdtDisp(vnd),
 		admNavRetry("admcat:pricing", "🏷️ Prices & tiers", "adm:setprice"))
@@ -520,6 +542,24 @@ func saveDiscounts(tiers []discountTier) error {
 	return os.Rename(tmp, discountsFilePath)
 }
 
+// fmtDiscountTiers renders a tier set compactly for an audit row (task #13
+// Tier 3, spec §3: "10:5,50:10") — minQty:percent pairs, comma-separated, in
+// whatever order tiers is already in (both loadDiscounts and saveDiscounts
+// leave it sorted descending by MinQty). An empty/nil set renders "(none)",
+// not auditOldNew's "(unset)" — a shop can genuinely have zero discounts
+// configured (the admin's own "send 0 to clear" state), which is a real
+// value, not "never touched this setting".
+func fmtDiscountTiers(tiers []discountTier) string {
+	if len(tiers) == 0 {
+		return "(none)"
+	}
+	parts := make([]string, len(tiers))
+	for i, t := range tiers {
+		parts[i] = itoa(t.MinQty) + ":" + itoa(int(math.Round(t.Frac*100)))
+	}
+	return strings.Join(parts, ",")
+}
+
 // parseDiscountInput parses "minQty:percent" comma/semicolon-separated pairs
 // — the setdiscount validator (telegram_bot.py:18967-19001). ok is false on
 // ANY malformed pair (not exactly 2 digit-string parts split on ':', a
@@ -606,6 +646,10 @@ func (b *Bot) capDiscount(c *Ctx) bool {
 	c.st.mu.Lock()
 	c.st.Discount = false
 	c.st.mu.Unlock()
+	// Task #13 Tier 3: capture the prior tier set BEFORE either branch below
+	// overwrites discounts.json, so the audit row's old side reflects what
+	// was actually replaced regardless of which branch runs.
+	oldTiers := loadDiscounts()
 	body := strings.TrimSpace(c.Text)
 	if body == "0" {
 		// A save failure here (read-only dir, full disk) must never be
@@ -617,6 +661,11 @@ func (b *Bot) capDiscount(c *Ctx) bool {
 			b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
 			return true
 		}
+		// Audit AFTER the save succeeds, never before (spec §4.3). A
+		// percentage applied to every order at or above a threshold — a bad
+		// tier discounts everything.
+		b.auditConfigSet(fmtInt(c.ChatID), "config_set_discounts", "discounts.json",
+			fmtDiscountTiers(oldTiers), fmtDiscountTiers(nil))
 		b.send(c.Ctx, c.ChatID, "✅ All volume discounts cleared.", admNav("admcat:pricing"))
 		return true
 	}
@@ -635,6 +684,11 @@ func (b *Bot) capDiscount(c *Ctx) bool {
 		b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
 		return true
 	}
+	// Audit AFTER the save succeeds, never before (spec §4.3). tiers is
+	// already sorted descending by saveDiscounts above, matching oldTiers'
+	// own sort order from loadDiscounts.
+	b.auditConfigSet(fmtInt(c.ChatID), "config_set_discounts", "discounts.json",
+		fmtDiscountTiers(oldTiers), fmtDiscountTiers(tiers))
 	shown := make([]string, 0, len(tiers))
 	for _, t := range tiers {
 		shown = append(shown, "  • "+itoa(t.MinQty)+"+ → "+itoa(int(math.Round(t.Frac*100)))+"%")
@@ -717,6 +771,18 @@ func (b *Bot) cbPromoNew(cc *cbCtx) {
 	b.send(cc.Ctx, cc.ChatID, text, backKB("admcat:pricing"))
 }
 
+// promoAuditDesc renders a promo's percent/uses/stack as one compact string
+// for an audit row (task #13 Tier 4, spec §3) — shared by capPromo (new) and
+// cbPromoDel (deleted) below so both sides of a promo's audit trail use the
+// identical format.
+func promoAuditDesc(percent float64, maxUses int64, stack bool) string {
+	stackStr := "off"
+	if stack {
+		stackStr = "on"
+	}
+	return itoa(int(math.Round(percent))) + "% / " + itoa64(maxUses) + " uses / stack=" + stackStr
+}
+
 // isStackOn reports whether a typed 3rd word means "stack" — the
 // on/stack/yes/true/1 (case-insensitive) recognizer, anything else (or
 // absent) defaulting to false (telegram_bot.py:19040-19042).
@@ -768,6 +834,17 @@ func (b *Bot) capPromo(c *Ctx) bool {
 	if b.store != nil {
 		if err := b.store.CreatePromo(code, float64(pct), int64(uses), stack); err != nil {
 			log.Println("adminpricing: create promo failed:", err)
+		} else {
+			// Task #13 Tier 4: audit only after a successful create — this
+			// site pre-dates the H1 stop-on-failure fix (still just logs and
+			// falls through to the ✅ text on a CreatePromo error), so gating
+			// strictly on err == nil keeps the row truthful regardless of
+			// that surrounding gap. A promo code is always FRESH
+			// (genUniqueCode above), so old is always "(unset)" — there is
+			// no prior state for a code that didn't exist a moment ago. A
+			// promo is a discount bounded by max_uses (spec §2 Tier 4).
+			b.auditConfigSet(fmtInt(c.ChatID), "config_set_promo_create", code,
+				"", promoAuditDesc(float64(pct), int64(uses), stack))
 		}
 	}
 	mode := "REPLACES the volume discount"
@@ -789,8 +866,26 @@ func (b *Bot) cbPromoDel(cc *cbCtx) {
 	}
 	code := strings.TrimPrefix(cc.Data, "promodel:")
 	if b.store != nil {
+		// Task #13 Tier 4: look up the promo's live state BEFORE deleting it
+		// — once DeletePromo succeeds there is nothing left to read. A
+		// lookup miss (stale button, already-deleted code) leaves oldDesc
+		// "(unset)" rather than fabricating a description for a promo that
+		// no longer existed to begin with.
+		oldDesc := ""
+		if promos, err := b.store.ListPromos(); err == nil {
+			for _, p := range promos {
+				if p.Code == code {
+					oldDesc = promoAuditDesc(p.Percent, p.MaxUses, p.Stack)
+					break
+				}
+			}
+		}
 		if err := b.store.DeletePromo(code); err != nil {
 			log.Println("adminpricing: delete promo failed:", err)
+		} else {
+			// Audit only after a successful delete (same err == nil gating
+			// as capPromo's create above).
+			b.auditConfigSet(fmtInt(cc.ChatID), "config_set_promo_delete", code, oldDesc, "(deleted)")
 		}
 	}
 	b.renderPromoList(cc.Ctx, cc.ChatID)
@@ -869,13 +964,30 @@ func (b *Bot) capSetApiPrice(c *Ctx) bool {
 		return true
 	}
 	if b.cfg != nil {
+		// Task #13 Tier 3: capture the effective pre-change rate BEFORE it is
+		// overwritten (apikeyRateUSDT already resolves the settings-vs-legacy-
+		// twin fallback, so this is the SAME rate the admin was just shown as
+		// "Current" above).
+		old := b.apikeyRateUSDT(saleClassBedrock)
 		s := b.cfg.Settings()
 		s["apikey_usdt_per_100"] = rate
 		// Legacy twin kept in lockstep, WRITE-ONLY — never authoritative once
-		// apikey_usdt_per_100 is set (apikeyRateUSDT, apikey.go).
+		// apikey_usdt_per_100 is set (apikeyRateUSDT, apikey.go). Not audited
+		// separately: it carries no information the primary rate doesn't
+		// already convey.
 		s["apikey_usdt_per_1k"] = rate * 10
 		if err := b.cfg.SaveSettings(s); err != nil {
 			log.Println("adminpricing: save failed:", err)
+		} else {
+			// Task #13 Tier 3: audit only after a successful save. This site
+			// pre-dates the H1 stop-on-failure fix (still just logs and falls
+			// through to the ✅ text on a SaveSettings error), so gating
+			// strictly on err == nil keeps the row truthful regardless of
+			// that surrounding gap. The literal sale price of the SKU — an
+			// unaudited change under-prices it (loss) or over-prices it
+			// (lost sales).
+			b.auditConfigSet(fmtInt(c.ChatID), "config_set_apikey_usdt_per_100", "apikey_usdt_per_100",
+				fmtRate(old), fmtRate(rate))
 		}
 	}
 	text := "✅ API-key price set to " + fmtRate(rate) + " USDT per 100 credits (" + fmtRate(rate*10) + " per 1000)."
@@ -940,10 +1052,20 @@ func (b *Bot) capSetApiMin(c *Ctx) bool {
 		return true
 	}
 	if b.cfg != nil {
+		// Task #13 Tier 4: capture the effective pre-change floor BEFORE it
+		// is overwritten.
+		old := b.apikeyMinCredits(saleClassBedrock)
 		s := b.cfg.Settings()
 		s["apikey_min_credits"] = n
 		if err := b.cfg.SaveSettings(s); err != nil {
 			log.Println("adminpricing: save failed:", err)
+		} else {
+			// Audit only after a successful save (this site predates H1's
+			// stop-on-failure fix; see capSetApiPrice's identical note above).
+			// Bounds exposure per order — raising the floor changes what a
+			// customer must spend to buy this SKU at all.
+			b.auditConfigSet(fmtInt(c.ChatID), "config_set_apikey_min_credits", "apikey_min_credits",
+				itoa64(old), itoa(n))
 		}
 	}
 	b.send(c.Ctx, c.ChatID,
@@ -997,10 +1119,19 @@ func (b *Bot) capSetApiMax(c *Ctx) bool {
 		return true
 	}
 	if b.cfg != nil {
+		// Task #13 Tier 4: capture the effective pre-change ceiling BEFORE
+		// it is overwritten.
+		old := b.apikeyMaxCredits(saleClassBedrock)
 		s := b.cfg.Settings()
 		s["apikey_max_credits"] = n
 		if err := b.cfg.SaveSettings(s); err != nil {
 			log.Println("adminpricing: save failed:", err)
+		} else {
+			// Audit only after a successful save (predates H1 — see
+			// capSetApiPrice's identical note above). Raising the ceiling
+			// raises the loss ceiling of any other pricing error.
+			b.auditConfigSet(fmtInt(c.ChatID), "config_set_apikey_max_credits", "apikey_max_credits",
+				itoa64(old), itoa(n))
 		}
 	}
 	b.send(c.Ctx, c.ChatID, "✅ Max API credits per order set to "+commaInt(n)+".", admNav("admcat:pricing"))
@@ -1051,10 +1182,21 @@ func (b *Bot) capSetApiCap(c *Ctx) bool {
 	}
 	n, _ := strconv.Atoi(raw)
 	if b.cfg != nil {
+		// Task #13 Tier 4: capture the effective pre-change cap BEFORE it is
+		// overwritten. 0 (unlimited) is a real value here, never "(unset)" —
+		// itoa64 never returns an empty string, so auditOldNew's "(unset)"
+		// rendering can't misfire on it.
+		old := b.apikeyMaxPerCustomer()
 		s := b.cfg.Settings()
 		s["apikey_max_per_customer"] = n
 		if err := b.cfg.SaveSettings(s); err != nil {
 			log.Println("adminpricing: save failed:", err)
+		} else {
+			// Audit only after a successful save (predates H1 — see
+			// capSetApiPrice's identical note above). Raising the cap raises
+			// the loss ceiling of any other pricing error.
+			b.auditConfigSet(fmtInt(c.ChatID), "config_set_apikey_max_per_customer", "apikey_max_per_customer",
+				itoa64(old), itoa(n))
 		}
 	}
 	text := "✅ API keys per customer set to unlimited."
@@ -1089,6 +1231,12 @@ func (b *Bot) cbKiroToggle(cc *cbCtx) {
 		b.send(cc.Ctx, cc.ChatID, settingsNotConfigured, admNav("admcat:pricing"))
 		return
 	}
+	// Task #13 Tier 4: audit AFTER the save succeeds, never before (spec
+	// §4.3). Enabling this SKU against a pre-saleClass Kiro-Go server is a
+	// ~5.7x giveaway (this function's own doc above) — a money event, so it
+	// gets a row like every other Tier 4 toggle.
+	b.auditConfigSet(fmtInt(cc.ChatID), "config_toggle_kiro_apikey_enabled", "kiro_apikey_enabled",
+		strconv.FormatBool(!turningOn), strconv.FormatBool(turningOn))
 	state := "OFF"
 	if turningOn {
 		state = "ON"
@@ -1173,10 +1321,17 @@ func (b *Bot) capSetKiroPrice(c *Ctx) bool {
 		return true
 	}
 	if b.cfg != nil {
+		// Task #13 Tier 3: same effective-rate capture as capSetApiPrice above.
+		old := b.apikeyRateUSDT(saleClassKiro)
 		s := b.cfg.Settings()
 		s["kiro_apikey_usdt_per_100"] = rate
 		if err := b.cfg.SaveSettings(s); err != nil {
 			log.Println("adminpricing: save failed:", err)
+		} else {
+			// Audit only after a successful save (same err == nil gating as
+			// capSetApiPrice above — this site predates H1 too).
+			b.auditConfigSet(fmtInt(c.ChatID), "config_set_kiro_apikey_usdt_per_100", "kiro_apikey_usdt_per_100",
+				fmtRate(old), fmtRate(rate))
 		}
 	}
 	text := "✅ Kiro-credit price set to " + fmtRate(rate) + " USDT per 100 Kiro credits."
@@ -1243,10 +1398,18 @@ func (b *Bot) capSetKiroMin(c *Ctx) bool {
 		return true
 	}
 	if b.cfg != nil {
+		// Task #13 Tier 4: capture the effective pre-change floor BEFORE it
+		// is overwritten.
+		old := b.apikeyMinCredits(saleClassKiro)
 		s := b.cfg.Settings()
 		s["kiro_apikey_min_credits"] = n
 		if err := b.cfg.SaveSettings(s); err != nil {
 			log.Println("adminpricing: save failed:", err)
+		} else {
+			// Audit only after a successful save (predates H1 — see
+			// capSetApiPrice's identical note above).
+			b.auditConfigSet(fmtInt(c.ChatID), "config_set_kiro_apikey_min_credits", "kiro_apikey_min_credits",
+				itoa64(old), itoa(n))
 		}
 	}
 	b.send(c.Ctx, c.ChatID,
@@ -1299,10 +1462,18 @@ func (b *Bot) capSetKiroMax(c *Ctx) bool {
 		return true
 	}
 	if b.cfg != nil {
+		// Task #13 Tier 4: capture the effective pre-change ceiling BEFORE
+		// it is overwritten.
+		old := b.apikeyMaxCredits(saleClassKiro)
 		s := b.cfg.Settings()
 		s["kiro_apikey_max_credits"] = n
 		if err := b.cfg.SaveSettings(s); err != nil {
 			log.Println("adminpricing: save failed:", err)
+		} else {
+			// Audit only after a successful save (predates H1 — see
+			// capSetApiPrice's identical note above).
+			b.auditConfigSet(fmtInt(c.ChatID), "config_set_kiro_apikey_max_credits", "kiro_apikey_max_credits",
+				itoa64(old), itoa(n))
 		}
 	}
 	b.send(c.Ctx, c.ChatID, "✅ Max KIRO credits per order set to "+commaInt(n)+".", admNav("admcat:pricing"))

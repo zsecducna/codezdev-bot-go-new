@@ -9,10 +9,45 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/store"
 )
+
+// TestProdRmRefusesWithLiveReservation is the sharper framing task #19's
+// follow-up review gave cbProdRm: the Reserved count CountsSnapshot returns
+// here is not a cosmetic number the way it is on a plain render — it is the
+// ONLY guard standing between an admin tapping "Remove product" and a LIVE
+// in-flight order's stock being deleted out from under it. Seeds a real
+// reservation via stock.Reserve (the exact path a customer's checkout
+// takes), drives the REAL cbProdRm callback, and asserts the removal is
+// refused with the reserved count named — never reaching the
+// delete-confirm screen, which would let a follow-up tap actually erase the
+// product's folder while an order is still holding stock in it.
+func TestProdRmRefusesWithLiveReservation(t *testing.T) {
+	ctx := context.Background()
+	b, f, _, stk, dir := newBuyBot(t, "1")
+	seedProduct(t, dir, "prodA", 5000, 3)
+
+	if _, err := stk.Reserve("prodA", 1, "ord1", time.Hour); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+
+	// showManageProducts assigns callback indices in listProducts() order;
+	// with exactly one product seeded, index 0 is unambiguous.
+	b.Process(ctx, callbackUpdate(1, "prodrm:0"))
+	last := lastSendMsg(f)
+	if last == nil {
+		t.Fatal("prodrm produced no reply")
+	}
+	if !strings.Contains(last.Text, "1 reserved (in-flight)") {
+		t.Errorf("prodrm with a live reservation = %q, want the reserved-count refusal naming it", last.Text)
+	}
+	if strings.Contains(last.Text, "DELETE") {
+		t.Errorf("prodrm reached the delete-confirm screen despite a live reservation: %q", last.Text)
+	}
+}
 
 // TestRunPoolProvisionUsesEnvOnlyLoginPython pins task #24's second
 // b.loginPythonStr() migration (commit b3fa3a1) at ITS call site:

@@ -36,6 +36,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -126,6 +127,40 @@ func newUSDTBot(t *testing.T) (*Bot, *fakeTG, *store.Store, string, *usdtFakes) 
 	b.usdtConfirmWait = 2 * time.Second
 	b.expirySweepInterval = 5 * time.Millisecond
 	return b, f, st, dir, fk
+}
+
+// TestUSDToVNDTrimPropagatesToOtherRateConsumers is the follow-up to task
+// #25's whitespace-padded-ambient-rate fix. The original fix trimmed at two
+// call sites (money.go's usdtDisp, usdt.go's vndToUSD); a review swept every
+// ParseFloat(cfg.USDToVND()) call site in the handlers package and found
+// THREE more that read the exact same un-trimmed rate — deposit.go's
+// usdtToVND, apikey.go's usdtStrCfg, and adminpricing.go's adminUsdtToVnd.
+// Two of those three are FUNCTIONAL rejections, not cosmetic: a padded rate
+// used to make usdtToVND return 0, which fails capDeposit's >0 bound and
+// refuses the customer's deposit outright, and made adminUsdtToVnd return
+// (0,false), refusing an admin's typed price outright.
+//
+// The fix moved to the STRUCTURAL source instead of a fourth/fifth call-site
+// trim: config.USDToVND() (internal/config/settings.go) now trims once,
+// where the env-derived and settings.json-derived branches converge, so
+// every current AND future ParseFloat(cfg.USDToVND()) caller is correct by
+// construction rather than by each remembering to trim. This test verifies
+// — not assumes — that the source fix actually reaches all three other
+// consumers (adminpricing.go belongs to a different lane; this only CALLS
+// its existing method to verify behavior, it does not modify that file).
+func TestUSDToVNDTrimPropagatesToOtherRateConsumers(t *testing.T) {
+	t.Setenv("USD_TO_VND", " 25000 ")
+	b, _, _, _, _ := newBuyBot(t, "999")
+
+	if got := b.usdtToVND(6); got != 150000 {
+		t.Errorf("deposit.go usdtToVND(6) = %d, want 150000 (6 USDT at the padded-but-trimmed 25,000) — 0 means the rate is still un-trimmed and a real deposit would be REJECTED OUTRIGHT", got)
+	}
+	if got := b.usdtStrCfg(150000); got != "6.00" {
+		t.Errorf("apikey.go usdtStrCfg(150000) = %q, want %q — empty means the rate is still un-trimmed", got, "6.00")
+	}
+	if vnd, ok := b.adminUsdtToVnd("6"); !ok || vnd != 150000 {
+		t.Errorf("adminpricing.go adminUsdtToVnd(\"6\") = (%d,%t), want (150000,true) — (0,false) means the rate is still un-trimmed and a real admin price edit would be REJECTED OUTRIGHT", vnd, ok)
+	}
 }
 
 // usdtOrder creates ONE reserved product order for `chat` at `totalVND` without
@@ -686,6 +721,118 @@ func TestUSDTDepositReplayCreditsOnce(t *testing.T) {
 	}
 	if lastSend(f) != i18n.C().Pay.TxidAlreadyUsed.T(i18n.EN) {
 		t.Errorf("last send = %q, want TXID_ALREADY_USED", lastSend(f))
+	}
+}
+
+// TestUSDTDepositOKRendersAmountAtWhitespacePaddedAmbientRate is task #25: a
+// customer must see the actual credited/balance amounts on a successful
+// deposit, not "credited — USDT, balance — USDT".
+//
+// Root cause, found by review and confirmed by probe before this test was
+// written: config.Load's env snapshot copies the AMBIENT process environment
+// verbatim (config.go:42-53) — only .env-FILE lines are trimmed, by
+// parseEnvLines. So an operator-exported `USD_TO_VND=" 25000 "` used to reach
+// every caller of cfg.USDToVND() with its whitespace intact. strconv.
+// ParseFloat rejects surrounding whitespace outright, so before this fix
+// usdtDisp/vndToUSD treated the padded-but-otherwise-valid rate as "no rate
+// configured" and fell back to "— USDT" — while bep20.UsdtToVND/tron.
+// UsdtToVND already TrimSpace the SAME rate string before parsing, so the
+// wallet credit itself was (and remains) correct. That asymmetry is exactly
+// what made the bug invisible to anyone checking the balance: the money was
+// always right, only the two customer-facing renders in Deposit.OK ("amount"
+// and "balance") were broken.
+//
+// Fixed at the SOURCE now, not just here: a follow-up review swept every
+// ParseFloat(cfg.USDToVND()) call site and found three MORE with the exact
+// same gap (deposit.go, apikey.go, adminpricing.go — two of them functional
+// rejections, not display bugs), so config.USDToVND() itself trims
+// (internal/config/settings.go). The trims in money.go/usdt.go are kept as
+// deliberate defence in depth on this money path but are now redundant —
+// this end-to-end test still passes through the real config chain, so it
+// exercises the source fix regardless of which layer is doing the trimming.
+//
+// t.Setenv is the deliberate, correct fixture shape HERE — unlike the
+// .env-FILE tests elsewhere in this package — because the defect lives
+// specifically in the un-trimmed AMBIENT path; a .env-file fixture would be
+// trimmed by parseEnvLines before it ever reached the bug. This bypasses
+// newUSDTBot (which hardcodes an unpadded "25000" and calls newBuyBot, i.e.
+// config.Load, before a caller could override it) so the padded value is in
+// place when config.Load builds its snapshot.
+func TestUSDTDepositOKRendersAmountAtWhitespacePaddedAmbientRate(t *testing.T) {
+	ctx := context.Background()
+
+	t.Setenv("USD_TO_VND", " 25000 ")
+	t.Setenv("BEP20_ADDRESS", testSellerBSC)
+	t.Setenv("TRON_ADDRESS", testSellerTRX)
+
+	b, f, st, _, _ := newBuyBot(t, "999")
+	s := b.cfg.Settings()
+	s["pay_bep20"] = true
+	if err := b.cfg.SaveSettings(s); err != nil {
+		t.Fatalf("save settings: %v", err)
+	}
+	fk := &usdtFakes{}
+	b.bep20ByHash = func(txhash string) (*bep20.TransferByHash, error) {
+		fk.mu.Lock()
+		defer fk.mu.Unlock()
+		return fk.bscByHash[strings.ToLower(strings.TrimPrefix(txhash, "0x"))], nil
+	}
+	b.usdtConfirmPoll = 2 * time.Millisecond
+	b.usdtConfirmWait = 2 * time.Second
+	b.expirySweepInterval = 5 * time.Millisecond
+
+	// Fixture guard: confirm the padding is genuinely present in the AMBIENT
+	// environment (not e.g. lost to shell quoting), so this test can't pass
+	// for the wrong reason. Checked against os.Getenv directly, deliberately
+	// NOT against b.cfg.USDToVND() — an earlier version of this guard
+	// asserted cfg.USDToVND() == " 25000 " (the raw, un-trimmed value), which
+	// broke the moment the fix moved to the structural source (config.
+	// USDToVND() itself now trims, internal/config/settings.go): that
+	// intermediate value became unreachable BY CONSTRUCTION, and the test
+	// correctly refused to pass on a premise that had silently gone false.
+	// This test's job is the END-TO-END property — a padded ambient rate
+	// still produces a correct Deposit.OK — which survives regardless of
+	// which layer does the trimming, so the only fixture assertion left is
+	// that the padding genuinely reached the ambient environment; where it
+	// gets trimmed is pinned separately in config_test.go
+	// (TestUSDToVNDPrecedence/whitespace-padded_ambient_rate_is_trimmed).
+	if env := os.Getenv("USD_TO_VND"); env != " 25000 " {
+		t.Fatalf("fixture broken: ambient USD_TO_VND = %q, want the padded %q", env, " 25000 ")
+	}
+
+	const chat = 4840
+	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
+	b.Process(ctx, textUpdate(chat, "6"))
+	o := reservedDeposit(t, st, chat)
+	armTxid(t, ctx, b, chat, chainBSC, o.Des)
+
+	// Overpay outside tolerance, same reasoning as
+	// TestUSDTDepositCreditBoundaries's "way off" case: an exact/near-exact
+	// payment would credit the order total regardless of which rate the
+	// credit path used, proving nothing about the rate resolution itself.
+	h := hash64("f")
+	fk.setBSC(h, bscTx(h, "8.00", time.Now().Unix()))
+	b.Process(ctx, textUpdate(chat, "0x"+h))
+
+	// Sanity: the wallet math must be unaffected by this bug — 8 USDT at the
+	// padded-but-parseable 25,000 = 200,000 VND. bep20.UsdtToVND already
+	// TrimSpace-s, so this should pass whether or not the display fix is in
+	// place; if it fails, the fixture itself is broken.
+	bal, _ := st.GetBalance(fmtInt(chat))
+	if bal != 200000 {
+		t.Fatalf("fixture broken: credited %d VND, want 200000 (wallet crediting should be unaffected by this bug)", bal)
+	}
+
+	last := lastSendMsg(f)
+	if last == nil {
+		t.Fatal("no deposit confirmation sent")
+	}
+	if strings.Contains(last.Text, "— USDT") {
+		t.Errorf("Deposit.OK = %q — the whitespace-padded ambient rate made usdtDisp fall back to its empty-rate placeholder even though the deposit credited correctly", last.Text)
+	}
+	want := i18n.F(i18n.C().Deposit.OK.T(i18n.EN), "amount", "8.00 USDT", "balance", "8.00 USDT")
+	if last.Text != want {
+		t.Errorf("Deposit.OK = %q, want %q", last.Text, want)
 	}
 }
 

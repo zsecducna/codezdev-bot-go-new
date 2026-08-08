@@ -392,6 +392,12 @@ func (b *Bot) capSetMaxQty(c *Ctx) bool {
 		b.send(c.Ctx, c.ChatID, settingsNotConfigured, admNav("admcat:settings"))
 		return true
 	}
+	// Task #13 Tier 4: capture the effective pre-change limit BEFORE it is
+	// overwritten. 0 is a real saved value here (unlimited), never "never
+	// configured", so it is passed through as the literal string "0" —
+	// auditOldNew's "(unset)" rendering only fires on an EMPTY old string,
+	// which a numeric setting like this one never produces.
+	oldQty := b.maxBulk()
 	s := b.cfg.Settings()
 	s["max_qty"] = n
 	if err := b.cfg.SaveSettings(s); err != nil {
@@ -399,6 +405,8 @@ func (b *Bot) capSetMaxQty(c *Ctx) bool {
 		b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:settings"))
 		return true
 	}
+	// Audit AFTER the save succeeds, never before (spec §4.3).
+	b.auditConfigSet(fmtInt(c.ChatID), "config_set_max_qty", "max_qty", itoa(oldQty), itoa(n))
 	text := "✅ Max bulk buy set to unlimited."
 	if n != 0 {
 		text = "✅ Max bulk buy set to " + itoa(n) + " accounts per order."
@@ -484,6 +492,52 @@ func (b *Bot) capSetRate(c *Ctx) bool {
 // an absolute http(s) URL with no whitespace.
 var kiroURLRE = regexp.MustCompile(`^https?://[^\s/]+\S*$`)
 
+// kiroURLUserinfoRE strips `scheme://user:pass@` (or `scheme://user@`)
+// userinfo from a Kiro-Go base URL before it may ever reach an audit row
+// (task #13 Tier 2, .omc/artifacts/config-audit-spec.md §3): kiroURLRE above
+// accepts userinfo in the host segment (it excludes only whitespace and "/",
+// not "@"/":"), so an admin-typed URL can legitimately carry embedded
+// credentials, and those must not survive into a row the audit viewer
+// displays and /audit can substring-search.
+//
+// DIVERGES from internal/entra/redact.go:17's urlUserinfoRE
+// (`://[^\s"']*?@` -> `://***@`) on purpose, not by oversight — reimplemented
+// locally rather than imported since that identifier is unexported and
+// handlers importing entra just for one regex would be a worse dependency
+// than three lines of regex, but the PATTERN itself had to change with the
+// requirement:
+//   - entra's is non-greedy (`*?`) and unbounded, fine for redacting
+//     free-form log lines where over-redaction costs nothing.
+//   - here the HOST is load-bearing (it is the whole forensic reason this
+//     field is audited — Tier 2 ranks it above the admin key precisely
+//     because repointing this URL steals the key on the next call), so
+//     over-redaction is a real defect, not a safe default. A non-greedy,
+//     unbounded match stops at the FIRST "@" it sees, which is the query
+//     string's "@" in "https://kiro.example.com/api?token=a@b" — that
+//     consumes the host along with the token, leaving an audit row that
+//     answers nothing about which server was configured.
+//   - this version is GREEDY and slash-bounded (`[^\s"'/]*@`): the "/"
+//     exclusion stops the match at the path boundary so a query-string "@"
+//     is never reached, and greedy-to-slash-boundary consumes through the
+//     LAST "@" in the authority, so an admin-pasted unencoded "@" inside the
+//     userinfo itself (e.g. "u:p@ss@host", RFC 3986 says to percent-encode
+//     that but a redactor exists precisely because admins don't always) is
+//     fully redacted rather than leaving a password fragment ("ss") behind.
+//
+// Residual, accepted: a query string with NO path slash at all
+// ("https://host?x=a@b") still mangles the host, since there is no "/" to
+// bound the match before the query's "@". Full net/url parsing would close
+// this but is more machinery than a Kiro-Go base URL (which always resolves
+// to an origin, never a bare query) warrants.
+var kiroURLUserinfoRE = regexp.MustCompile(`://[^\s"'/]*@`)
+
+// redactKiroURL applies kiroURLUserinfoRE so a kiro_go_base_url audit row can
+// never carry embedded userinfo credentials while still recording the host —
+// the part that answers "which server did this admin point the bot at".
+func redactKiroURL(url string) string {
+	return kiroURLUserinfoRE.ReplaceAllString(url, "://***@")
+}
+
 // kiroKeyStateStr renders the Kiro-Go admin key's set/unset state using the
 // plain "not set" wording py_settings_spec.md specifies for these wizard
 // prompts (L7 fix). admin.go's shared setUnsetState renders "not set 🚫"
@@ -540,6 +594,11 @@ func (b *Bot) capSetKiroURL(c *Ctx) bool {
 		b.send(c.Ctx, c.ChatID, settingsNotConfigured, admNav("admcat:settings"))
 		return true
 	}
+	// Task #13 Tier 2: capture the effective pre-change URL BEFORE it is
+	// overwritten — same settings.json-over-env resolution as
+	// capSetBep20/capSetTron's oldAddr, via the same getter cbSetKiroURL
+	// showed the admin above.
+	oldURL := b.cfg.KiroGoBaseURL()
 	s := b.cfg.Settings()
 	s["kiro_go_base_url"] = url
 	if err := b.cfg.SaveSettings(s); err != nil {
@@ -547,6 +606,15 @@ func (b *Bot) capSetKiroURL(c *Ctx) bool {
 		b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:settings"))
 		return true
 	}
+	// Audit AFTER the save succeeds, never before (spec §4.3). Ranked ABOVE
+	// the admin key itself (spec §2, Tier 2): repointing this URL hands the
+	// admin key to whatever host is configured on the NEXT Kiro-Go call, so
+	// an unaudited change here is credential exfiltration via config, not
+	// merely a broken integration. Both sides go through redactKiroURL
+	// first — a URL can carry user:pass@ userinfo, and the host (the
+	// forensically useful part) survives the redaction.
+	b.auditConfigSet(fmtInt(c.ChatID), "config_set_kiro_go_base_url", "kiro_go_base_url",
+		redactKiroURL(oldURL), redactKiroURL(url))
 	probe := b.kiroGoProbe(c.Ctx)
 	b.send(c.Ctx, c.ChatID, "✅ Kiro-Go server URL set to "+url+"\n"+probe, admNav("admcat:settings"))
 	return true
@@ -636,6 +704,26 @@ func (b *Bot) capSetKiroKey(c *Ctx) bool {
 		b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:settings"))
 		return true
 	}
+	// Task #13 Tier 2 (spec §3.1): deliberately NOT auditConfigSet — that
+	// helper's whole job is formatting an "old -> new" outcome string, and
+	// for this ONE field no function of the value may ever reach a row in
+	// either direction. Not the new key (a second store an admin can
+	// substring-search via /audit would be a credential-leak regression
+	// introduced by a security fix), not the old key (retaining a
+	// superseded credential extends its blast radius past rotation — the
+	// whole point of rotating is that the old value stops mattering), and
+	// not a length or prefix (internal/tg/client.go:128-131's ruling,
+	// adopted verbatim: "a partial token is still a partial token"). Outcome
+	// is the set/unset boolean only, the same convention admin.go's own
+	// kirogoKeySet already uses for its menu label — never the raw key.
+	// key is non-empty here (the "" case returned above before reaching
+	// this line), so the event is always "set", never "cleared". Guarded on
+	// b.store != nil like every other direct LogAction call site in this
+	// file (auditConfigSet's own nil guard isn't in play since this
+	// deliberately bypasses that helper).
+	if b.store != nil {
+		b.store.LogAction(fmtInt(c.ChatID), "admin", "config_set_kiro_go_admin_key", "kiro_go_admin_key", "set", "")
+	}
 	probe := b.kiroGoProbe(c.Ctx)
 	b.send(c.Ctx, c.ChatID, "✅ Kiro-Go admin password saved. "+probe, admNav("admcat:settings"))
 	return true
@@ -694,6 +782,11 @@ func (b *Bot) capSetKiroAcct(c *Ctx) bool {
 		b.send(c.Ctx, c.ChatID, settingsNotConfigured, admNav("admcat:settings"))
 		return true
 	}
+	// Task #13 Tier 3: capture the effective pre-change account id BEFORE it
+	// is overwritten — an identifier, not a credential (spec §3), so it is
+	// logged verbatim like bep20_address/tron_address rather than
+	// set/unset-only like kiro_go_admin_key.
+	oldAcct := b.cfg.KiroGoAccountID()
 	s := b.cfg.Settings()
 	s["kiro_go_account_id"] = acct
 	if err := b.cfg.SaveSettings(s); err != nil {
@@ -701,6 +794,10 @@ func (b *Bot) capSetKiroAcct(c *Ctx) bool {
 		b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:settings"))
 		return true
 	}
+	// Audit AFTER the save succeeds, never before (spec §4.3). Which
+	// upstream account is billed — a wrong value mints against someone
+	// else's quota, or silently fails every API-key sale.
+	b.auditConfigSet(fmtInt(c.ChatID), "config_set_kiro_go_account_id", "kiro_go_account_id", oldAcct, acct)
 	text := "✅ Kiro-Go account id set to " + acct + "\n"
 	if b.kiroGoConfigured() {
 		text += "API-key selling is now configured."

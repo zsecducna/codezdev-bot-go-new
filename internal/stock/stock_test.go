@@ -6,6 +6,7 @@ package stock
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -118,6 +119,133 @@ func TestReserveExpirySweep(t *testing.T) {
 	// A finalize on the swept order finds nothing (reservation lost).
 	if d, err := s.Finalize("p1", "ORDX", "", "en"); err != nil || d != nil {
 		t.Fatalf("Finalize after sweep = %v %v, want nil,nil", d, err)
+	}
+}
+
+// TestCountsSnapshotConsistentPair — task #19: CountsSnapshot's Available and
+// Reserved must add up to the product's known total, unlike the
+// CountAvailable+CountReserved pair the render paths used before this (see
+// stock.go's CountsSnapshot doc comment for why that pair could disagree).
+func TestCountsSnapshotConsistentPair(t *testing.T) {
+	s := newTestStore(t, "p1", "u1", "u2", "u3")
+	if _, err := s.Reserve("p1", 1, "ord1", time.Hour); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	c, err := s.CountsSnapshot("p1")
+	if err != nil {
+		t.Fatalf("CountsSnapshot: %v", err)
+	}
+	if c.Available != 2 || c.Reserved != 1 {
+		t.Fatalf("CountsSnapshot = %+v, want {Available:2 Reserved:1}", c)
+	}
+}
+
+// TestCountsSnapshotStillSweepsExpired pins that CountsSnapshot is NOT a
+// read-only path: an expired reservation must still be reclaimed to active/
+// as a side effect of the render, because nothing else in this bot sweeps a
+// product nobody is actively buying or holding (Reserve/Hold sweep lazily at
+// their own call sites; the exported SweepExpired has no periodic caller). A
+// naive "make it read-only" fix for task #19 would pass
+// TestCountsSnapshotConsistentPair above while silently leaking reserved
+// slots on an idle product forever — this test is what catches that.
+func TestCountsSnapshotStillSweepsExpired(t *testing.T) {
+	s := newTestStore(t, "p1", "u1", "u2")
+	if _, err := s.Reserve("p1", 2, "ORDX", time.Minute); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	// Backdate .expiry so the reservation is already expired, same technique
+	// as TestReserveExpirySweep.
+	odir := filepath.Join(s.AccountsDir, "p1", "reserved", "ORDX")
+	if err := os.WriteFile(filepath.Join(odir, ".expiry"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.CountsSnapshot("p1")
+	if err != nil {
+		t.Fatalf("CountsSnapshot: %v", err)
+	}
+	if c.Available != 2 || c.Reserved != 0 {
+		t.Fatalf("CountsSnapshot after expiry = %+v, want {Available:2 Reserved:0} — the lazy sweep must still run inside CountsSnapshot", c)
+	}
+}
+
+// TestCountsSnapshotAtomicUnderConcurrentReserveRelease is the mutation-proof
+// pin for CountsSnapshot's core guarantee: Available+Reserved must equal the
+// product's fixed account total at EVERY read, even while another goroutine
+// is actively moving accounts between active/ and reserved/. Before task
+// #19's fix, the render paths called CountAvailable then CountReserved as
+// two SEPARATE lock acquisitions; a concurrent Reserve/Release landing in the
+// gap between those two calls could make one account count in neither bucket
+// (or, depending on timing, get double-counted) for that one read — a torn
+// snapshot. CountsSnapshot closes the gap by taking the package-level lock
+// (`mu`, stock.go) ONCE and reading both directories before releasing it, so
+// no other lockProduct-guarded operation — on ANY product, since the lock is
+// process-wide — can run between the two reads.
+//
+// Falsification: replacing CountsSnapshot's body with sequential
+// `a, _ := s.CountAvailable(product); r, _ := s.CountReserved(product)` calls
+// (the exact pre-fix shape) makes this test fail reliably — verified by
+// mutation (see the executor report).
+//
+// Scope boundary, stated so nobody widens this into a flake: the guarantee
+// this test pins is EXACTLY "Available+Reserved read inside one
+// CountsSnapshot call is atomic" — nothing broader. It does NOT extend to:
+//   - CountHeld or CountSold folded into the same invariant. Both are
+//     unlocked readers (no lockProduct call at all — see their own doc
+//     comments in stock.go) precisely because held/sold state isn't part of
+//     what CountsSnapshot's lock protects; asserting "and Held is stable
+//     too" here would be asserting a guarantee the code never made, and
+//     would flake under exactly this test's own concurrent writer.
+//   - Summing across TWO separate CountsSnapshot calls. Each call is
+//     internally atomic, but nothing prevents a Reserve/Release from
+//     running in the gap BETWEEN two separate calls — that gap is the same
+//     shape of hole CountsSnapshot was built to close for CountAvailable/
+//     CountReserved in the first place.
+func TestCountsSnapshotAtomicUnderConcurrentReserveRelease(t *testing.T) {
+	const n = 6
+	users := make([]string, n)
+	for i := range users {
+		users[i] = "u" + strconv.Itoa(i)
+	}
+	s := newTestStore(t, "p1", users...)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			des := "ord-" + strconv.Itoa(i)
+			if reserved, err := s.Reserve("p1", 1, des, time.Hour); err == nil && len(reserved) == 1 {
+				if _, err := s.Release("p1", des); err != nil {
+					t.Errorf("release %s: %v", des, err)
+				}
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	samples := 0
+	for time.Now().Before(deadline) {
+		c, err := s.CountsSnapshot("p1")
+		if err != nil {
+			t.Fatalf("CountsSnapshot: %v", err)
+		}
+		samples++
+		if c.Available+c.Reserved != n {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("Available(%d)+Reserved(%d) = %d, want %d — CountsSnapshot returned a torn (non-atomic) pair while a concurrent Reserve/Release was in flight", c.Available, c.Reserved, c.Available+c.Reserved, n)
+		}
+	}
+	close(stop)
+	wg.Wait()
+	if samples == 0 {
+		t.Fatal("test bug: CountsSnapshot was never sampled")
 	}
 }
 

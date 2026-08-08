@@ -161,7 +161,12 @@ func ledgerPrefix(p bands.Provider) string {
 // "". "" is still possible on an actually INVALID configured rate (the
 // resolved string fails to parse as a float, or parses to <=0) — e.g. a
 // broken ambient USD_TO_VND env var, since capSetRate already range-guards
-// the admin-set path.
+// the admin-set path. A whitespace-padded-but-otherwise-valid ambient rate
+// (e.g. `USD_TO_VND=" 25000 "`) used to land in this same "" bucket — Go's
+// ParseFloat rejects surrounding whitespace outright — but vndToUSD now
+// TrimSpaces before parsing (task #25), so that specific trigger is closed;
+// this branch still fires for a rate that is invalid on its merits (garbage
+// text, zero, negative).
 //
 // That branch is real, not dead, but it is only CHECKED at two of its three
 // call sites: startOnchainDeposit (usdtStr at ~line 433) and cbPayOnchain
@@ -202,6 +207,18 @@ func (b *Bot) vndToUSD(vnd int64) (string, error) {
 	if b.cfg != nil {
 		rateStr = b.cfg.USDToVND()
 	}
+	// TrimSpace: see money.go's usdtDisp for why — cfg.USDToVND() can return an
+	// un-trimmed AMBIENT env value, and ParseFloat rejects surrounding
+	// whitespace, so this must match the trim bep20/tron's UsdtToVND already
+	// apply to the same rate for the two sides (quote vs. credit) to agree.
+	//
+	// config.USDToVND() itself now trims too (internal/config/settings.go) —
+	// this line is REDUNDANT, kept for defence in depth on a money path. Do
+	// not delete the SOURCE trim on the theory that this call site (or
+	// money.go's matching one) covers it: deposit.go, apikey.go and
+	// adminpricing.go each call cfg.USDToVND() directly with no trim of
+	// their own and depend entirely on the source fix.
+	rateStr = strings.TrimSpace(rateStr)
 	rate, err := strconv.ParseFloat(rateStr, 64)
 	if err != nil || rate <= 0 {
 		return "", fmt.Errorf("usdt: no USD_TO_VND rate configured")

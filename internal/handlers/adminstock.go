@@ -973,10 +973,15 @@ func (b *Bot) showProductActions(ctx context.Context, chatID int64, product stri
 	if allowed, isPriv := b.productPrivateAllowed(product); isPriv {
 		visLine = "🔒 Visibility: PRIVATE (" + itoa(len(allowed)) + " customer(s) allowed)"
 	}
+	// Task #19 follow-up: Available and Reserved must come from the SAME
+	// sweep instant on this rendered line, not two separate CountAvailable/
+	// CountReserved lock acquisitions (see stock.CountsSnapshot's doc
+	// comment for the full mechanism — an expiry landing between two
+	// separate calls can drop an account from both buckets for one render).
 	avail, resv, sold := 0, 0, 0
 	if b.stock != nil {
-		avail, _ = b.stock.CountAvailable(product)
-		resv, _ = b.stock.CountReserved(product)
+		counts, _ := b.stock.CountsSnapshot(product)
+		avail, resv = counts.Available, counts.Reserved
 		sold = b.stock.CountSold(product)
 	}
 	text := "🗂️ " + product + "\n" +
@@ -1456,11 +1461,21 @@ func (b *Bot) cbProdRm(cc *cbCtx) {
 		b.send(cc.Ctx, cc.ChatID, "⚠️ Product no longer exists.", admNav("adm:mngprod"))
 		return
 	}
+	// Task #19 follow-up — same reasoning as the prod-detail screen above:
+	// Available/Reserved must share one sweep instant via CountsSnapshot.
+	//
+	// Noted, not fixed: the error from CountsSnapshot is discarded below
+	// (`_`), same as this function discarded two separate errors pre-fix. A
+	// lock failure now silently yields resv==0, which — unlike the
+	// pre-fix behaviour on adjacent screens — skips the very guard right
+	// below that stands between an admin and deleting a product with LIVE
+	// reservations. Not a regression introduced by this fix, but this guard
+	// is now one discarded error away from not firing on a destructive path.
 	avail, sold, resv := 0, 0, 0
 	if b.stock != nil {
-		avail, _ = b.stock.CountAvailable(product)
+		counts, _ := b.stock.CountsSnapshot(product)
+		avail, resv = counts.Available, counts.Reserved
 		sold = b.stock.CountSold(product)
-		resv, _ = b.stock.CountReserved(product)
 	}
 	if resv > 0 {
 		b.send(cc.Ctx, cc.ChatID,

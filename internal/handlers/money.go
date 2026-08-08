@@ -21,6 +21,26 @@ func (b *Bot) usdtDisp(vnd int64) string {
 	if b.cfg != nil {
 		rateStr = b.cfg.USDToVND()
 	}
+	// TrimSpace: cfg.USDToVND() can surface an AMBIENT env value verbatim —
+	// config.Load only trims .env-file lines (parseEnvLines), never the
+	// process environment, so a whitespace-padded ambient USD_TO_VND (e.g.
+	// `export USD_TO_VND=" 25000 "`) reaches here un-trimmed. strconv.ParseFloat
+	// rejects surrounding whitespace outright, so without this the rate looked
+	// "invalid" and every customer-facing render fell back to "— USDT" even
+	// though the wallet was credited correctly (bep20/tron's own UsdtToVND
+	// already TrimSpace their rate string, which is what let this asymmetry
+	// hide: the money path worked while the display path silently didn't).
+	//
+	// config.USDToVND() itself now trims too (internal/config/settings.go) —
+	// a review found THREE more callers of that method with this same gap,
+	// two of them functional (a customer's deposit / an admin's price
+	// rejected outright, not merely mis-displayed), so the fix moved to the
+	// source rather than staying a per-caller convention. This line is now
+	// REDUNDANT, kept deliberately for defence in depth on a money path — do
+	// not delete the SOURCE trim on the theory that this one (or usdt.go's
+	// matching one) covers it; every other caller of cfg.USDToVND() has only
+	// the source trim protecting it.
+	rateStr = strings.TrimSpace(rateStr)
 	rate, err := strconv.ParseFloat(rateStr, 64)
 	if err != nil || rate <= 0 {
 		return "— USDT"

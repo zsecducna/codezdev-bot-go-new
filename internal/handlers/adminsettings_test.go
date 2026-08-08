@@ -1261,6 +1261,355 @@ func TestSetKiroAcctWizard(t *testing.T) {
 	}
 }
 
+// ---- Task #13 Tier 2: Kiro-Go credential/redirection audit logging --------
+// .omc/artifacts/config-audit-spec.md §2-3 — kiro_go_base_url ranks ABOVE the
+// admin key (repointing the URL steals the key on the next call), the key
+// itself is a SECRET audited as set/unset only, kiro_go_account_id is a
+// plain identifier audited in full.
+
+// TestRedactKiroURLPreservesHostAndFullyRedactsEmbeddedAt pins the two
+// defects an independent review found in kiroURLUserinfoRE's first version
+// (non-greedy and unbounded: `://[^\s"']*?@`), both reachable through inputs
+// kiroURLRE itself already accepts (it excludes only whitespace and "/"):
+//   - a query-string "@" (e.g. "?token=a@b") must NOT eat the host — the
+//     non-greedy/unbounded version stopped at the FIRST "@" it saw, which
+//     is the query's, consuming the host along with it. The host is the
+//     entire forensic point of auditing this field (see kiroURLUserinfoRE's
+//     doc comment) — losing it here defeats the reason the row exists.
+//   - an admin-pasted UNENCODED "@" inside the userinfo itself (e.g.
+//     "u:p@ss@host") must be FULLY redacted, not leave a password fragment
+//     ("ss") behind — the old pattern's non-greedy match stopped at the
+//     FIRST "@", leaving everything from the second "@" onward untouched.
+func TestRedactKiroURLPreservesHostAndFullyRedactsEmbeddedAt(t *testing.T) {
+	cases := []struct{ in, want string }{
+		// No "/" appears before the query's "@", so the slash-bounded class
+		// can't reach past the path boundary to find an "@" to redact —
+		// unchanged, host fully intact.
+		{"https://kiro.example.com/api?token=a@b", "https://kiro.example.com/api?token=a@b"},
+		// Greedy + slash-bounded consumes through the LAST "@" in the
+		// authority, so both the username and the embedded "@" in the
+		// password are swallowed — no "ss" fragment survives.
+		{"https://u:p@ss@host/", "https://***@host/"},
+	}
+	for _, tc := range cases {
+		if got := redactKiroURL(tc.in); got != tc.want {
+			t.Errorf("redactKiroURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestSetKiroURLWizardAuditsChangeWithRedaction pins the one field in this
+// tier that needs structural redaction rather than a verbatim old->new: a
+// Kiro-Go base URL can carry `user:pass@` userinfo (kiroURLRE's own character
+// class permits it — it excludes only whitespace and "/"), and that userinfo
+// must never reach a row the audit viewer renders or /audit can
+// substring-search. Both mandatory assertions from spec §6.1 apply to the
+// SECOND change (old side), not just the first, since redactKiroURL runs on
+// both old and new.
+func TestSetKiroURLWizardAuditsChangeWithRedaction(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newAuditTestBot(t, "1")
+
+	const secret1 = "s3cr3t-pass-one"
+	url1 := "http://admin:" + secret1 + "@host1.example.com:8080"
+	b.Process(ctx, callbackUpdate(1, "adm:setkirourl"))
+	b.Process(ctx, textUpdate(1, url1))
+	if last := lastSendMsg(f); last == nil || !strings.HasPrefix(last.Text, "✅ Kiro-Go server URL set to "+url1) {
+		t.Fatalf("valid reply = %+v", last)
+	}
+	row1 := latestAuditRow(t, st, "config_set_kiro_go_base_url")
+	if row1 == nil {
+		t.Fatal("no audit row written for first kiro_go_base_url change")
+	}
+	if row1.Target != "kiro_go_base_url" {
+		t.Errorf("Target = %q, want kiro_go_base_url", row1.Target)
+	}
+	wantOutcome1 := "(unset) → http://***@host1.example.com:8080"
+	if row1.Outcome != wantOutcome1 {
+		t.Errorf("Outcome = %q, want %q", row1.Outcome, wantOutcome1)
+	}
+	if !strings.Contains(row1.Outcome, "host1.example.com") {
+		t.Error("the host must survive redaction — it's the forensically useful part")
+	}
+
+	// Second change: the OLD side must ALSO be redacted (old is the
+	// PREVIOUS url, which still carries secret1) while its host survives.
+	const secret2 = "s3cr3t-pass-two"
+	url2 := "http://user2:" + secret2 + "@host2.example.com"
+	b.Process(ctx, callbackUpdate(1, "adm:setkirourl"))
+	b.Process(ctx, textUpdate(1, url2))
+	row2 := latestAuditRow(t, st, "config_set_kiro_go_base_url")
+	if row2 == nil {
+		t.Fatal("no audit row written for second kiro_go_base_url change")
+	}
+	wantOutcome2 := "http://***@host1.example.com:8080 → http://***@host2.example.com"
+	if row2.Outcome != wantOutcome2 {
+		t.Errorf("Outcome = %q, want %q", row2.Outcome, wantOutcome2)
+	}
+
+	// Mandatory assertion 2 (spec §6.1): sweep EVERY field of EVERY row for
+	// EITHER secret — a redactor that only cleans the new side but not a
+	// later row's old side would otherwise slip through.
+	rows, err := st.RecentAudit(20, "")
+	if err != nil {
+		t.Fatalf("RecentAudit: %v", err)
+	}
+	for _, r := range rows {
+		for _, f := range []string{r.Action, r.Target, r.Outcome, r.Detail, r.ActorChat, r.ActorKind} {
+			if strings.Contains(f, secret1) || strings.Contains(f, secret2) {
+				t.Fatalf("a Kiro-Go URL secret leaked into audit row field %q", f)
+			}
+		}
+	}
+}
+
+// TestSetKiroURLWizardNoAuditOnSaveFailure mirrors
+// TestSetBep20WizardNoAuditOnSaveFailure — audit only after SaveSettings
+// succeeds (spec §4.3).
+func TestSetKiroURLWizardNoAuditOnSaveFailure(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	roDir := filepath.Join(dir, "ro")
+	if err := os.Mkdir(roDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) })
+
+	cfg, err := config.Load(roDir)
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, Config: cfg, AdminID: "1"})
+	t.Cleanup(b.Shutdown)
+
+	b.Process(ctx, callbackUpdate(1, "adm:setkirourl"))
+	b.Process(ctx, textUpdate(1, "http://example.com"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+	if row := latestAuditRow(t, st, "config_set_kiro_go_base_url"); row != nil {
+		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
+	}
+}
+
+// TestSetKiroKeyWizardAuditsSetNeverLeaksValue proves capSetKiroKey's audit
+// row (spec §3.1) records ONLY the set/unset event — never the key, its
+// length, or a prefix, in EITHER direction. This is the SECRET-class site the
+// spec singles out as the one field this whole tier must get right.
+func TestSetKiroKeyWizardAuditsSetNeverLeaksValue(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newAuditTestBot(t, "1")
+
+	const secret = "KIRO-ADMIN-VERY-SECRET-9f8e7d6c5b4a3210"
+	b.Process(ctx, callbackUpdate(1, "adm:setkirokey"))
+	b.Process(ctx, textUpdate(1, secret))
+	if last := lastSendMsg(f); last == nil || !strings.HasPrefix(last.Text, "✅ Kiro-Go admin password saved.") {
+		t.Fatalf("valid reply = %+v", last)
+	}
+
+	row := latestAuditRow(t, st, "config_set_kiro_go_admin_key")
+	if row == nil {
+		t.Fatal("no audit row written for kiro_go_admin_key set")
+	}
+	if row.Target != "kiro_go_admin_key" {
+		t.Errorf("Target = %q, want kiro_go_admin_key", row.Target)
+	}
+	if row.Outcome != "set" {
+		t.Errorf("Outcome = %q, want %q (never the key, its length, or a prefix)", row.Outcome, "set")
+	}
+	// Mandatory assertion 2 (spec §6.1): the secret must appear in NO field,
+	// including Detail — an oracle via /audit is worse than rendering it.
+	for _, r := range []struct{ name, val string }{
+		{"Action", row.Action}, {"Target", row.Target}, {"Outcome", row.Outcome},
+		{"Detail", row.Detail}, {"ActorChat", row.ActorChat}, {"ActorKind", row.ActorKind},
+	} {
+		if strings.Contains(r.val, secret) {
+			t.Fatalf("kiro_go_admin_key leaked into audit row field %s: %q", r.name, r.val)
+		}
+	}
+}
+
+// TestSetKiroKeyWizardNoAuditOnSaveFailure mirrors the bep20/tron
+// no-audit-on-failure tests for the admin-key wizard.
+func TestSetKiroKeyWizardNoAuditOnSaveFailure(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	roDir := filepath.Join(dir, "ro")
+	if err := os.Mkdir(roDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) })
+
+	cfg, err := config.Load(roDir)
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, Config: cfg, AdminID: "1"})
+	t.Cleanup(b.Shutdown)
+
+	b.Process(ctx, callbackUpdate(1, "adm:setkirokey"))
+	b.Process(ctx, textUpdate(1, "some-admin-key"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+	if row := latestAuditRow(t, st, "config_set_kiro_go_admin_key"); row != nil {
+		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
+	}
+}
+
+// TestSetKiroAcctWizardAuditsChange proves kiro_go_account_id is audited in
+// full (spec §3: an identifier, not a credential) — same old-value-on-
+// second-change falsification as the bep20/tron tests above.
+func TestSetKiroAcctWizardAuditsChange(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newAuditTestBot(t, "1")
+
+	uuid1 := "11111111-1111-4111-8111-111111111111"
+	b.Process(ctx, callbackUpdate(1, "adm:setkiroacct"))
+	b.Process(ctx, textUpdate(1, uuid1))
+	if last := lastSendMsg(f); last == nil || !strings.HasPrefix(last.Text, "✅ Kiro-Go account id set to "+uuid1) {
+		t.Fatalf("valid reply = %+v", last)
+	}
+	row1 := latestAuditRow(t, st, "config_set_kiro_go_account_id")
+	if row1 == nil {
+		t.Fatal("no audit row written for first kiro_go_account_id change")
+	}
+	if want := "(unset) → " + uuid1; row1.Outcome != want {
+		t.Errorf("Outcome = %q, want %q", row1.Outcome, want)
+	}
+
+	uuid2 := "22222222-2222-4222-8222-222222222222"
+	b.Process(ctx, callbackUpdate(1, "adm:setkiroacct"))
+	b.Process(ctx, textUpdate(1, uuid2))
+	row2 := latestAuditRow(t, st, "config_set_kiro_go_account_id")
+	if row2 == nil {
+		t.Fatal("no audit row written for second kiro_go_account_id change")
+	}
+	if want := uuid1 + " → " + uuid2; row2.Outcome != want {
+		t.Errorf("second Outcome = %q, want %q", row2.Outcome, want)
+	}
+}
+
+// TestSetKiroAcctWizardNoAuditOnSaveFailure mirrors the bep20/tron
+// no-audit-on-failure tests for the account-id wizard.
+func TestSetKiroAcctWizardNoAuditOnSaveFailure(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	roDir := filepath.Join(dir, "ro")
+	if err := os.Mkdir(roDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) })
+
+	cfg, err := config.Load(roDir)
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, Config: cfg, AdminID: "1"})
+	t.Cleanup(b.Shutdown)
+
+	b.Process(ctx, callbackUpdate(1, "adm:setkiroacct"))
+	b.Process(ctx, textUpdate(1, "33333333-3333-4333-8333-333333333333"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+	if row := latestAuditRow(t, st, "config_set_kiro_go_account_id"); row != nil {
+		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
+	}
+}
+
+// ---- Task #13 Tier 4: adm:setmaxqty audit logging --------------------------
+
+// TestSetMaxQtyWizardAuditsChange proves max_qty is audited with its literal
+// numeric value, including "0" — 0 means unlimited (a REAL configured value
+// here, per cbSetMaxQty's own "unlimited" label), never auditOldNew's
+// "(unset)" fallback (which only fires on an EMPTY old string).
+func TestSetMaxQtyWizardAuditsChange(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newAuditTestBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:setmaxqty"))
+	b.Process(ctx, textUpdate(1, "10"))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "10 accounts per order") {
+		t.Fatalf("valid reply = %+v", last)
+	}
+	row1 := latestAuditRow(t, st, "config_set_max_qty")
+	if row1 == nil {
+		t.Fatal("no audit row written for first max_qty change")
+	}
+	if want := "0 → 10"; row1.Outcome != want {
+		t.Errorf("Outcome = %q, want %q (fresh config starts at 0/unlimited, not \"(unset)\")", row1.Outcome, want)
+	}
+
+	// Second change, back to 0 (unlimited): old side must be "10", proving
+	// the row captured the real prior value rather than re-deriving it.
+	b.Process(ctx, callbackUpdate(1, "adm:setmaxqty"))
+	b.Process(ctx, textUpdate(1, "0"))
+	row2 := latestAuditRow(t, st, "config_set_max_qty")
+	if row2 == nil {
+		t.Fatal("no audit row written for second max_qty change")
+	}
+	if want := "10 → 0"; row2.Outcome != want {
+		t.Errorf("second Outcome = %q, want %q", row2.Outcome, want)
+	}
+}
+
+// TestSetMaxQtyWizardNoAuditOnSaveFailure mirrors the bep20/tron
+// no-audit-on-failure tests for the max-qty wizard.
+func TestSetMaxQtyWizardNoAuditOnSaveFailure(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	roDir := filepath.Join(dir, "ro")
+	if err := os.Mkdir(roDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) })
+
+	cfg, err := config.Load(roDir)
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, Config: cfg, AdminID: "1"})
+	t.Cleanup(b.Shutdown)
+
+	b.Process(ctx, callbackUpdate(1, "adm:setmaxqty"))
+	b.Process(ctx, textUpdate(1, "10"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+	if row := latestAuditRow(t, st, "config_set_max_qty"); row != nil {
+		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
+	}
+}
+
 // ---- broadcast --------------------------------------------------------------
 
 // fakeBroadcastTG lets the broadcast fan-out test selectively fail specific
