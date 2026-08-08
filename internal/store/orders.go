@@ -366,10 +366,19 @@ func (s *Store) ClaimOrderKind(des, fromStatus, toStatus, refundKind string) (*O
 // ReservedOrderForChat returns this chat's currently-reserved (unpaid) order,
 // or nil (store.py:273-285). Used to detect a checkout still awaiting payment
 // when the customer starts a new action. Wallet top-ups excluded.
+//
+// The deposit filter is spelled COALESCE-first, matching misc.go's five
+// statistics queries (audit A1): a bare `product!=?` reads as NULL, not TRUE,
+// against a NULL-product row, so it would silently DEFLATE — drop that row
+// out of the WHERE clause — never inflate. CreateOrder always writes a
+// non-NULL product today, so this guards a live-data edge, not a
+// currently-reachable app path. The exact fragment:
+//
+//	COALESCE(product,'')!=?
 func (s *Store) ReservedOrderForChat(chatID string) (*Order, error) {
 	o, err := scanOrder(s.db.QueryRow(
 		"SELECT "+orderCols+" FROM orders WHERE chat_id=? AND status='reserved' "+
-			"AND product!=? ORDER BY ts DESC LIMIT 1", chatID, DepositProduct))
+			"AND COALESCE(product,'')!=? ORDER BY ts DESC LIMIT 1", chatID, DepositProduct))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -441,11 +450,17 @@ func (s *Store) ReservedOrdersBefore(tsCutoff float64) ([]*Order, error) {
 // HasDeliveredOrder reports whether this chat has any DELIVERED account order
 // (i.e. is not a first-time buyer). Wallet top-ups are excluded
 // (store.py:1150-1157).
+//
+// COALESCE-first filter, same reasoning as ReservedOrderForChat above (a bare
+// `product!=?` would silently DEFLATE past a NULL-product row). This function
+// has zero callers in this repo today, so the fix is applied for uniformity
+// with the other two sites in this file, not because it closes an observed
+// bug.
 func (s *Store) HasDeliveredOrder(chatID string) (bool, error) {
 	var one int
 	err := s.db.QueryRow(
 		"SELECT 1 FROM orders WHERE chat_id=? AND status='delivered' "+
-			"AND product!=? LIMIT 1", chatID, DepositProduct).Scan(&one)
+			"AND COALESCE(product,'')!=? LIMIT 1", chatID, DepositProduct).Scan(&one)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
@@ -465,11 +480,24 @@ type ProductSummary struct {
 // the /history summary (store.py:485-500). Aggregates in SQL over ALL
 // delivered orders (no row cap), excluding wallet top-ups; ordered by amount
 // paid desc.
+//
+// COALESCE-first filter (audit A1), same as misc.go's statistics queries and
+// this file's other two sites: a bare `product!=?` silently DEFLATES past a
+// NULL-product row instead of matching it. This site is the one that matters
+// most of the three — it feeds historySummaryText (handlers/history.go), so a
+// bare filter here means a customer's /history and the admin dashboard's
+// revenue queries (already COALESCE-first, misc.go) could disagree about the
+// very same NULL-product delivered row. That is the identical cross-surface
+// inconsistency GetRevenueMatrix's own fix cites as its justification.
+// CreateOrder always writes a non-NULL product today, so this guards a
+// live-data edge, not a currently-reachable app path. The exact fragment:
+//
+//	COALESCE(product,'')!=?
 func (s *Store) DeliveredProductSummary(chatID string) ([]ProductSummary, error) {
 	rows, err := s.db.Query(
 		"SELECT product, COALESCE(SUM(qty),0) AS accounts, "+
 			"COALESCE(SUM(total),0) AS paid, COUNT(*) AS orders "+
-			"FROM orders WHERE chat_id=? AND status='delivered' AND product!=? "+
+			"FROM orders WHERE chat_id=? AND status='delivered' AND COALESCE(product,'')!=? "+
 			"GROUP BY product ORDER BY paid DESC", chatID, DepositProduct)
 	if err != nil {
 		return nil, err

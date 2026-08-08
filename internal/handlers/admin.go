@@ -1184,13 +1184,3 @@ func (b *Bot) cbAdmAction(cc *cbCtx) {
 		b.send(cc.Ctx, cc.ChatID, adminNotPorted, admNav("admroot"))
 	}
 }
-
-// cbAdmTodo answers a panel button whose flow belongs to a later slice. It
-// exists so every button the panel renders produces a reply — the failure this
-// file fixes was precisely a tap that produced nothing.
-func (b *Bot) cbAdmTodo(cc *cbCtx) {
-	if !b.isAdmin(cc.ChatID) {
-		return
-	}
-	b.send(cc.Ctx, cc.ChatID, adminNotPorted, admNav("admroot"))
-}

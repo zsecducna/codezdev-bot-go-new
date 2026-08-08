@@ -957,8 +957,22 @@ func (b *Bot) verifyUSDTTxid(ctx context.Context, chatID int64, chain, des, txha
 			log.Printf("usdt deposit delivered-claim failed [des=%s]: %v", des, cerr)
 		}
 		b.dropUSDTPending(p, des)
+		// usdtStr's own doc comment flags this exact gap: it returns "" on an
+		// invalid (not merely missing) configured rate, and unlike
+		// startOnchainDeposit/cbPayOnchain this audit line never checked for
+		// that. The wallet above is already credited correctly (that math
+		// never calls usdtStr), so silence here would only cost the audit
+		// trail its number, not the customer's money — but a money record
+		// that LOOKS well-formed while missing its amount ("+ USDT") is worse
+		// than one that visibly says the rate broke. Fall back to the raw VND
+		// figure plus an explicit marker so the amount is never silently gone.
+		creditUSDT := b.usdtStr(creditVND)
+		creditDesc := "+" + creditUSDT + " USDT"
+		if creditUSDT == "" {
+			creditDesc = fmt.Sprintf("+%d VND (usdt rate unavailable)", creditVND)
+		}
 		b.audit(chatStr, "usdt_"+chain+"_deposit", ledgerID,
-			"+"+b.usdtStr(creditVND)+" USDT",
+			creditDesc,
 			fmt.Sprintf("from=%s recv=%s balance=%d", frm, recvStr, bal))
 		b.send(ctx, chatID, i18n.F(i18n.C().Deposit.OK.T(lang),
 			"amount", b.usdtDisp(creditVND), "balance", b.usdtDisp(bal)), nil)
