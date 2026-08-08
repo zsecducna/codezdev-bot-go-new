@@ -546,6 +546,49 @@ func TestResellerAddRemoveDiscount(t *testing.T) {
 	}
 }
 
+// TestCapResellerDiscountDemotedAdminClearsArm proves capResellerDiscount's
+// G2 isSuperAdmin re-check (adminusers.go) sits AFTER the pop, not before —
+// the only ordering that can be correct here. c.st.ResellerDiscount carries
+// the target reseller's USERNAME, not a plain bool, so a guard placed above
+// the pop would consume the demoted admin's reply (the nav/slash carve-out
+// already passed) without ever clearing the slot: the wizard stays armed
+// forever, wedging every later message from that chat behind a capture that
+// can now never again return false.
+//
+// The wizard can only be armed for real through cbResDisc, which is
+// fullAdminOnly-gated, so there is no live path for a chat that was NEVER
+// super-admin to arm it itself. This test sets the pending state directly to
+// stand in for the scenario the sibling captures' own comments describe as
+// real: a super admin arms it, then loses super-admin status before typing
+// the reply (mid-flow revocation).
+func TestCapResellerDiscountDemotedAdminClearsArm(t *testing.T) {
+	ctx := context.Background()
+	b, _, cfg, _ := newUsersTestBot(t, "1") // super admin is chat 1
+	s := cfg.Settings()
+	s["resellers"] = []any{map[string]any{"u": "myreseller", "note": "", "disc": 0}}
+	if err := cfg.SaveSettings(s); err != nil {
+		t.Fatal(err)
+	}
+
+	const demoted = int64(7) // never super-admin — adminID is "1"
+	st := b.states.Get(demoted)
+	st.mu.Lock()
+	st.ResellerDiscount = "myreseller"
+	st.mu.Unlock()
+
+	b.Process(ctx, textUpdate(demoted, "42"))
+
+	st.mu.Lock()
+	armed := st.ResellerDiscount
+	st.mu.Unlock()
+	if armed != "" {
+		t.Errorf("ResellerDiscount = %q after a demoted admin's reply, want \"\" — arm left wedged, every later message from this chat is now dead on arrival", armed)
+	}
+	if r := b.findReseller("myreseller"); r == nil || r.Disc != 0 {
+		t.Errorf("reseller discount mutated by a demoted admin's reply: %+v, want unchanged disc=0", r)
+	}
+}
+
 // ============================================================================
 // Permission split — customers_view/toggle_sales (grantable) vs full-admin-only
 // ============================================================================
@@ -604,9 +647,12 @@ func TestAdminUsersPermissionSplit(t *testing.T) {
 	// even earlier — pre-ack, via alert — so the assertion style changes
 	// from lastSendMsg to wantAdminCapDenied even though the SECURITY
 	// outcome (denied) is unchanged. This is Python's real, single-chokepoint
-	// behavior (telegram_bot.py:12403-12415): every one of these callbacks is
-	// absent from _std_admin_cb_cap, so the alert fires before Python's own
-	// per-handler is_super_admin checks would ever run either.
+	// behavior — handle_callback's gate (telegram_bot.py
+	// `_is_admin_cb`/`_cb_allowed_for` call site, ≈:12496-12497 @3069329 —
+	// cite by symbol, not just line; see admincap.go's port-shape doc for
+	// why): every one of these callbacks is absent from _std_admin_cb_cap,
+	// so the alert fires before Python's own per-handler is_super_admin
+	// checks would ever run either.
 	t.Run("standard admin CANNOT reach full-admin-only actions", func(t *testing.T) {
 		full := []string{"adm:addbal", "adm:listadmins", "adm:addadmin", "adm:rmadmin", "adm:addreseller"}
 		for _, cb := range full {

@@ -128,8 +128,11 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tg.CallbackQuery) {
 	}
 
 	// Standard-admin capability gate (H1 fix, admincap.go) — the chokepoint
-	// telegram_bot.py:12403-12415 runs BEFORE any adm:/admcat:/resmng:/
-	// resdisc:/rmreseller:/rmwl: branch executes, and BEFORE the ack below:
+	// inside handle_callback (telegram_bot.py `_is_admin_cb`/
+	// `_cb_allowed_for` call site, ≈:12496-12497 @3069329 — cite by symbol,
+	// not just line; see admincap.go's port-shape doc for why) runs BEFORE
+	// any adm:/admcat:/resmng:/resdisc:/rmreseller:/rmwl: branch executes,
+	// and BEFORE the ack below:
 	// full admins and plain customers skip this (non-admins are blocked by
 	// the per-handler isAdmin checks further down the dispatch chain); a
 	// granted-but-not-super admin tapping a privileged callback outside their

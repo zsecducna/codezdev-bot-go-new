@@ -341,7 +341,16 @@ func (b *Bot) cbAddBal(cc *cbCtx) {
 // (restored by the M3/M4 merge — the old standalone slot invented
 // admdo:addbalconfirm/admdo:addbalcancel specifically to avoid colliding with
 // this same executor, a constraint that no longer applies).
+//
+// G2 fix: re-checks isSuperAdmin on entry — redundant defence-in-depth given
+// cbAddBal (above) only arms this wizard behind fullAdminOnly and
+// capAdminInput (adminsettings.go) doesn't itself gate by admin status
+// before dispatching here, matching capAddAdmin/capRmAdmin/capAddReseller's
+// own precedent for a full-admin-only capture in this file.
 func (b *Bot) capAddBalStep(c *Ctx, armed *AdminAction, step string) bool {
+	if !b.isSuperAdmin(c.ChatID) {
+		return true
+	}
 	switch step {
 	case "collecting_chatid":
 		c.st.mu.Lock()
@@ -1196,6 +1205,11 @@ func (b *Bot) cbResDisc(cc *cbCtx) {
 // value carries the target USERNAME, not a plain bool, so the guard checks
 // presence before popping) — behaviourally still abort-on-attempt like every
 // sibling capture in this file.
+//
+// G2 fix: re-checks isSuperAdmin after popping — redundant defence-in-depth
+// given cbResDisc (above) only arms this wizard behind fullAdminOnly,
+// matching capAddAdmin/capRmAdmin/capAddReseller's own precedent for a
+// full-admin-only capture in this file.
 func (b *Bot) capResellerDiscount(c *Ctx) bool {
 	c.st.mu.Lock()
 	target := c.st.ResellerDiscount
@@ -1209,6 +1223,9 @@ func (b *Bot) capResellerDiscount(c *Ctx) bool {
 	c.st.mu.Lock()
 	c.st.ResellerDiscount = ""
 	c.st.mu.Unlock()
+	if !b.isSuperAdmin(c.ChatID) {
+		return true
+	}
 	body := strings.TrimSpace(c.Text)
 	n, convErr := strconv.Atoi(body)
 	if !isDigits(body) || convErr != nil || n > 95 {

@@ -984,6 +984,197 @@ func TestSetTronWizardAuditOldValueUsesEnvFallback(t *testing.T) {
 	}
 }
 
+// ---- Task #13 Tier 2-5: toggle audit pinning -------------------------------
+
+// TestToggleSalesAuditsOneRowNamingBothTransitions pins the sharpest gap an
+// independent review found in this file: cbToggleSales's own comment says a
+// two-row emit "would misrepresent one admin tap as two independent
+// actions", but nothing enforced that ONE tap actually produces one row.
+// This drives the handler through a scenario where BOTH keys genuinely
+// change value — private_sale force-pauses sales_paused as a side effect,
+// then unpausing force-clears private_sale back — and asserts the audit
+// trail grows by exactly one row for the tap under test, and that row names
+// both transitions.
+//
+// The row-count delta (not a filtered latestAuditRow lookup) is the
+// assertion that actually catches a two-row regression regardless of what
+// action string the second row would use.
+//
+// Falsification: reverting cbToggleSales to write two LogAction calls (one
+// per key) instead of one still passes every other test in this file, but
+// fails HERE — the row-count delta becomes 2, not 1. Verified by mutation
+// (temporarily splitting the emit, confirming this test fails, then
+// restoring the single call).
+func TestToggleSalesAuditsOneRowNamingBothTransitions(t *testing.T) {
+	ctx := context.Background()
+	b, _, st := newAuditTestBot(t, "1")
+
+	// Arm private_sale ON first: its own side effect force-pauses
+	// sales_paused (private_sale: false→true; sales_paused: false→true), so
+	// both keys start the tap under test already TRUE.
+	b.Process(ctx, callbackUpdate(1, "adm:toggleprivate"))
+	before, err := st.RecentAudit(20, "")
+	if err != nil {
+		t.Fatalf("RecentAudit (before): %v", err)
+	}
+
+	// The tap under test: unpausing sales_paused ALSO clears private_sale as
+	// a side effect (sales_paused: true→false; private_sale: true→false) —
+	// two real transitions from one admin tap.
+	b.Process(ctx, callbackUpdate(1, "adm:togglesales"))
+	after, err := st.RecentAudit(20, "")
+	if err != nil {
+		t.Fatalf("RecentAudit (after): %v", err)
+	}
+
+	if got, want := len(after)-len(before), 1; got != want {
+		t.Fatalf("audit rows added by one adm:togglesales tap = %d, want %d (rows: %+v)",
+			got, want, after)
+	}
+	row := after[0] // RecentAudit orders newest-first
+	if row.Action != "config_toggle_sales_paused" {
+		t.Errorf("Action = %q, want config_toggle_sales_paused", row.Action)
+	}
+	wantOutcome := "sales_paused: true → false; private_sale: true → false"
+	if row.Outcome != wantOutcome {
+		t.Errorf("Outcome = %q, want %q (must name BOTH key transitions in the ONE row)",
+			row.Outcome, wantOutcome)
+	}
+}
+
+// TestTogglePrivateAuditsOneRowNamingBothTransitions is cbTogglePrivate's
+// counterpart to TestToggleSalesAuditsOneRowNamingBothTransitions above —
+// same one-row invariant, same row-count-delta assertion, the OTHER two-key
+// site in this file.
+//
+// Falsification: same shape as the sales test — splitting cbTogglePrivate's
+// single LogAction call into two makes the row-count delta 2, not 1.
+// Verified by mutation (temporarily splitting the emit, confirming this test
+// fails, then restoring the single call).
+func TestTogglePrivateAuditsOneRowNamingBothTransitions(t *testing.T) {
+	ctx := context.Background()
+	b, _, st := newAuditTestBot(t, "1")
+
+	before, err := st.RecentAudit(20, "")
+	if err != nil {
+		t.Fatalf("RecentAudit (before): %v", err)
+	}
+
+	// Fresh store: sales_paused and private_sale both start false. Enabling
+	// private_sale force-pauses sales_paused as a side effect — two real
+	// transitions from one admin tap.
+	b.Process(ctx, callbackUpdate(1, "adm:toggleprivate"))
+	after, err := st.RecentAudit(20, "")
+	if err != nil {
+		t.Fatalf("RecentAudit (after): %v", err)
+	}
+
+	if got, want := len(after)-len(before), 1; got != want {
+		t.Fatalf("audit rows added by one adm:toggleprivate tap = %d, want %d (rows: %+v)",
+			got, want, after)
+	}
+	row := after[0]
+	if row.Action != "config_toggle_private_sale" {
+		t.Errorf("Action = %q, want config_toggle_private_sale", row.Action)
+	}
+	wantOutcome := "private_sale: false → true; sales_paused: false → true"
+	if row.Outcome != wantOutcome {
+		t.Errorf("Outcome = %q, want %q (must name BOTH key transitions in the ONE row)",
+			row.Outcome, wantOutcome)
+	}
+}
+
+// TestToggleDepNotifyAuditsViaToggleSetting pins Task #13 Tier 5:
+// toggleSetting is the SINGLE instrumentation point cbToggleSimple's four
+// bell toggles and cbToggleMaint all reduce to (adminsettings.go's own doc
+// comment on toggleSetting). admin_deposit_notify is the toggle picked here
+// over the other three bell toggles because it is the one tied directly to
+// money-movement visibility — a super-admin silently losing deposit alerts
+// is a real-money blind spot, not just a cosmetic notification miss — and it
+// also exercises the shared cbToggleSimple wrapper that 4 of the 5
+// toggleSetting callers route through (cbToggleMaint is the one bespoke
+// caller). The row shape asserted below is generic across all five callers,
+// since every one of them shares this exact code path with only
+// (key, default, prefix) varying.
+//
+// admin_deposit_notify defaults to true (unset reads as ON), so a fresh
+// config's first tap flips it OFF — old=true, new=false.
+//
+// Falsification: reverting toggleSetting to skip its auditConfigSet call
+// fails this test with "no audit row written" — verified by mutation
+// (temporarily commenting out the auditConfigSet call inside toggleSetting,
+// confirming this test fails, then restoring it).
+func TestToggleDepNotifyAuditsViaToggleSetting(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newAuditTestBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:toggledepnotify"))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "New-deposit admin alerts are now OFF") {
+		t.Fatalf("toggle reply = %+v", last)
+	}
+
+	row := latestAuditRow(t, st, "config_toggle_admin_deposit_notify")
+	if row == nil {
+		t.Fatal("no audit row written for admin_deposit_notify toggle")
+	}
+	if row.Target != "admin_deposit_notify" {
+		t.Errorf("Target = %q, want admin_deposit_notify", row.Target)
+	}
+	if row.ActorChat != "1" || row.ActorKind != "admin" {
+		t.Errorf("actor = %q/%q, want 1/admin", row.ActorChat, row.ActorKind)
+	}
+	if want := "true → false"; row.Outcome != want {
+		t.Errorf("Outcome = %q, want %q", row.Outcome, want)
+	}
+}
+
+// TestToggleMaintAuditsViaToggleSetting pins the THIRD of toggleSetting's
+// three call PATHS — not the same thing as "every toggle", which is why this
+// test exists separately from TestToggleDepNotifyAuditsViaToggleSetting
+// above. cbToggleMaint calls toggleSetting directly; it does NOT go through
+// the shared cbToggleSimple wrapper the four bell toggles share. Pinning
+// dep-notify alone proves the cbToggleSimple path is wired; it says nothing
+// about cbToggleMaint's own direct call, which is a separate call site that
+// could regress independently (e.g. a future edit that inlines
+// Settings()/SaveSettings directly into cbToggleMaint for a maintenance-mode
+// special case, bypassing toggleSetting and its audit call, while every
+// other test in this file — none of which touch maintenance — stays green).
+//
+// Deliberately NOT adding this for togglebcast/togglestockbcast/
+// togglesalenotify: those three are the literal same cbToggleSimple call
+// with a different key string already covered by dep-notify's pin of that
+// shared path — testing them too would exercise the payMethodNames-style map
+// literal, not new code. One test per PATH, not per toggle.
+//
+// Falsification: rewriting cbToggleMaint to save the setting directly
+// instead of calling b.toggleSetting fails this test with "no audit row
+// written for maintenance toggle" — verified by mutation (temporarily
+// inlining the save and dropping the toggleSetting/auditConfigSet call,
+// confirming this test fails, then restoring it).
+func TestToggleMaintAuditsViaToggleSetting(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newAuditTestBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:togglemaint"))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "Maintenance mode is now ON") {
+		t.Fatalf("toggle reply = %+v", last)
+	}
+
+	row := latestAuditRow(t, st, "config_toggle_maintenance")
+	if row == nil {
+		t.Fatal("no audit row written for maintenance toggle")
+	}
+	if row.Target != "maintenance" {
+		t.Errorf("Target = %q, want maintenance", row.Target)
+	}
+	if row.ActorChat != "1" || row.ActorKind != "admin" {
+		t.Errorf("actor = %q/%q, want 1/admin", row.ActorChat, row.ActorKind)
+	}
+	if want := "false → true"; row.Outcome != want {
+		t.Errorf("Outcome = %q, want %q", row.Outcome, want)
+	}
+}
+
 func TestSetKiroURLWizard(t *testing.T) {
 	ctx := context.Background()
 	b, f, cfg := newSettingsTestBot(t, "1")

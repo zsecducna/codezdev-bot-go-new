@@ -16,11 +16,21 @@ package handlers
 // history (with PayPal order ids), and every owned-account username — none of
 // which Python allows a standard admin to see by default.
 //
-// Port shape: Python's chokepoint (telegram_bot.py:12403-12415) classifies
-// EVERY inline-button tap via _is_admin_cb + _cb_allowed_for, which in turn
-// call _std_admin_cb_cap + _CAT_CAPS (:204-328) — ONE central classification
-// that runs BEFORE any adm:/admcat:/resmng:/resdisc:/rmreseller:/rmwl: branch
-// executes, and BEFORE Telegram's answerCallbackQuery ack. That ordering
+// Port shape: Python's chokepoint — the standard-admin gate inside
+// handle_callback (telegram_bot.py `_is_admin_cb`/`_cb_allowed_for` call
+// site, ≈:12496-12497 @3069329; cite by symbol, not just line — this
+// chokepoint has already moved twice across upstream commits, 12258 ->
+// 12412 -> 12497, so a line-only cite silently rots the next time
+// telegram_bot.py changes above it. This is the ONE place that history is
+// spelled out — command.go and adminusers_test.go cite the same symbol +
+// line + revision but point back here for the "why a line number alone
+// isn't enough" rationale, so a third move doesn't require editing three
+// copies of this paragraph, only this one) — classifies EVERY inline-button tap via
+// _is_admin_cb + _cb_allowed_for, which in turn call _std_admin_cb_cap +
+// _CAT_CAPS (telegram_bot.py `_std_admin_cb_cap`/`_CAT_CAPS`, ≈:243-318
+// @3069329) — ONE central classification that runs BEFORE any
+// adm:/admcat:/resmng:/resdisc:/rmreseller:/rmwl: branch executes, and
+// BEFORE Telegram's answerCallbackQuery ack. That ordering
 // matters: the refusal alert IS that update's one and only callback answer
 // (Telegram allows exactly one answerCallbackQuery per callback_query_id; a
 // second call is silently dropped by a real server — which is exactly why

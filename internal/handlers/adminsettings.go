@@ -137,17 +137,28 @@ func commaInt(n int) string {
 // tests, or a genuinely unconfigured install): a Go map write panics on a nil
 // map, unlike Python's dict.get default, so callers must check ok before
 // trusting next.
-func (b *Bot) toggleSetting(key string, def bool) (next, ok bool) {
+//
+// Task #13 Tier 5 (config-audit-spec.md §2): this is the SINGLE
+// instrumentation point for every toggle that routes through it —
+// cbToggleSimple's four bell toggles plus cbToggleMaint — rather than
+// auditing each of the five wrappers separately. actorChat must already be
+// formatted (fmtInt(cc.ChatID)) since this has no cbCtx of its own; a future
+// toggle wired through this helper is audited by construction with zero
+// extra code at its own call site.
+func (b *Bot) toggleSetting(actorChat, key string, def bool) (next, ok bool) {
 	if b.cfg == nil {
 		return false, false
 	}
 	s := b.cfg.Settings()
-	next = !settingBool(s, key, def)
+	old := settingBool(s, key, def)
+	next = !old
 	s[key] = next
 	if err := b.cfg.SaveSettings(s); err != nil {
 		log.Println("adminsettings: save failed:", err)
 		return false, false
 	}
+	b.auditConfigSet(actorChat, "config_toggle_"+key, key,
+		strconv.FormatBool(old), strconv.FormatBool(next))
 	return next, true
 }
 
@@ -161,7 +172,7 @@ func (b *Bot) cbToggleSimple(cc *cbCtx, key string, def bool, prefix string) {
 	if !b.settingsSuperAdminOnly(cc) {
 		return
 	}
-	next, ok := b.toggleSetting(key, def)
+	next, ok := b.toggleSetting(fmtInt(cc.ChatID), key, def)
 	if !ok {
 		b.send(cc.Ctx, cc.ChatID, settingsNotConfigured, admNav("admcat:settings"))
 		return
@@ -200,7 +211,7 @@ func (b *Bot) cbToggleMaint(cc *cbCtx) {
 	if !b.settingsSuperAdminOnly(cc) {
 		return
 	}
-	next, ok := b.toggleSetting("maintenance", false)
+	next, ok := b.toggleSetting(fmtInt(cc.ChatID), "maintenance", false)
 	if !ok {
 		b.send(cc.Ctx, cc.ChatID, settingsNotConfigured, admNav("admcat:settings"))
 		return
@@ -224,7 +235,9 @@ func (b *Bot) cbToggleSales(cc *cbCtx) {
 		return
 	}
 	s := b.cfg.Settings()
-	next := !settingBool(s, "sales_paused", false)
+	oldPaused := settingBool(s, "sales_paused", false)
+	oldPrivate := settingBool(s, "private_sale", false)
+	next := !oldPaused
 	s["sales_paused"] = next
 	if !next {
 		s["private_sale"] = false
@@ -233,6 +246,20 @@ func (b *Bot) cbToggleSales(cc *cbCtx) {
 		log.Println("adminsettings: save failed:", err)
 		b.send(cc.Ctx, cc.ChatID, settingsNotConfigured, admNav("admcat:settings"))
 		return
+	}
+	// Task #13 Tier 5, two-key site (spec §2): unpausing also clears
+	// private_sale as a side effect, so ONE row must name BOTH transitions —
+	// two rows would misrepresent one admin tap as two independent actions.
+	newPrivate := oldPrivate
+	if !next {
+		newPrivate = false
+	}
+	if b.store != nil {
+		b.store.LogAction(fmtInt(cc.ChatID), "admin", "config_toggle_sales_paused",
+			"sales_paused,private_sale",
+			"sales_paused: "+auditOldNew(strconv.FormatBool(oldPaused), strconv.FormatBool(next))+
+				"; private_sale: "+auditOldNew(strconv.FormatBool(oldPrivate), strconv.FormatBool(newPrivate)),
+			"")
 	}
 	state := "ON 🟢 (buying allowed)"
 	if next {
@@ -252,7 +279,9 @@ func (b *Bot) cbTogglePrivate(cc *cbCtx) {
 		return
 	}
 	s := b.cfg.Settings()
-	next := !settingBool(s, "private_sale", false)
+	oldPrivate := settingBool(s, "private_sale", false)
+	oldPaused := settingBool(s, "sales_paused", false)
+	next := !oldPrivate
 	s["private_sale"] = next
 	if next {
 		s["sales_paused"] = true
@@ -261,6 +290,20 @@ func (b *Bot) cbTogglePrivate(cc *cbCtx) {
 		log.Println("adminsettings: save failed:", err)
 		b.send(cc.Ctx, cc.ChatID, settingsNotConfigured, admNav("admcat:settings"))
 		return
+	}
+	// Task #13 Tier 5, two-key site (spec §2): same rationale as
+	// cbToggleSales above — enabling private sale force-pauses public sale as
+	// a side effect, so ONE row names both transitions.
+	newPaused := oldPaused
+	if next {
+		newPaused = true
+	}
+	if b.store != nil {
+		b.store.LogAction(fmtInt(cc.ChatID), "admin", "config_toggle_private_sale",
+			"private_sale,sales_paused",
+			"private_sale: "+auditOldNew(strconv.FormatBool(oldPrivate), strconv.FormatBool(next))+
+				"; sales_paused: "+auditOldNew(strconv.FormatBool(oldPaused), strconv.FormatBool(newPaused)),
+			"")
 	}
 	var text string
 	if next {
@@ -855,6 +898,28 @@ func auditOldNew(old, newVal string) string {
 		old = string(r[:auditOldClipRunes]) + "…"
 	}
 	return old + " → " + newVal
+}
+
+// auditConfigSet is the shared "config_set"-shaped audit row every Tier 2-5
+// config mutator in this file and adminpricing.go reduces to (task #13,
+// .omc/artifacts/config-audit-spec.md §4.1): actor + "admin", action, target,
+// old→new via auditOldNew, empty detail. Tier 1 (capSetBep20/capSetTron) was
+// written before this helper existed and is left untouched — its shape is
+// identical, just inlined; not touching already-shipped, already-tested code
+// for a pure refactor. b.store==nil (unit tests with no store wired) is a
+// silent no-op, matching every existing LogAction call site's own nil guard.
+//
+// SECRET WARNING: never pass a secret as oldVal/newVal — outcome, unlike
+// detail, IS displayed by the audit viewer. kiro_go_admin_key is the one
+// Tier 2-5 field this applies to: it must be audited as a set/unset boolean
+// only, via kirogoKeySet, the same convention admin.go:945 already uses for
+// its own menu label, never routed through this helper with the raw key
+// text.
+func (b *Bot) auditConfigSet(actorChat, action, target, oldVal, newVal string) {
+	if b.store == nil {
+		return
+	}
+	b.store.LogAction(actorChat, "admin", action, target, auditOldNew(oldVal, newVal), "")
 }
 
 // capSetBep20 is the "setbep20" capture (#21, POP semantics —
