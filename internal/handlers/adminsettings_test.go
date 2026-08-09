@@ -1684,6 +1684,43 @@ func TestBroadcastFanOut(t *testing.T) {
 			t.Errorf("recipient %d: got text %q, want %q", cid, gotText[cid], "hello everyone")
 		}
 	}
+
+	// Task #14: the fan-out must leave exactly one audit row behind — before
+	// this fix it left none at all. This is an ABSOLUTE row count (this
+	// test's store is fresh, so 1 total row after == 1 row added), not a
+	// before/after delta — asserting the count at all (not just "a row with
+	// the right Action exists") is still deliberate: a future edit that
+	// renamed/split this into two LogAction calls would still satisfy a
+	// filtered lookup while silently doubling the trail. Fragile in one way:
+	// if any seeding helper this test starts sharing ever writes its own
+	// audit row, this and the other two broadcast row-count assertions break
+	// for a reason unrelated to broadcasting at all.
+	rows, err := st.RecentAudit(10, "")
+	if err != nil {
+		t.Fatalf("RecentAudit: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("audit rows after broadcast = %d, want exactly 1: %+v", len(rows), rows)
+	}
+	row := rows[0]
+	if row.Action != "broadcast_send" {
+		t.Errorf("Action = %q, want broadcast_send", row.Action)
+	}
+	if row.ActorChat != "1" || row.ActorKind != "admin" {
+		t.Errorf("actor = %q/%q, want 1/admin", row.ActorChat, row.ActorKind)
+	}
+	if row.Target != "all_chats" {
+		t.Errorf("Target = %q, want all_chats", row.Target)
+	}
+	if !strings.Contains(row.Outcome, "sent=2 fail=2") {
+		t.Errorf("Outcome = %q, want it to contain the sent/fail counts matching the fan-out's own return values", row.Outcome)
+	}
+	if !strings.Contains(row.Outcome, "hello everyone") {
+		t.Errorf("Outcome = %q, want it to contain the message excerpt", row.Outcome)
+	}
+	if row.Detail != "hello everyone" {
+		t.Errorf("Detail = %q, want the full message body", row.Detail)
+	}
 }
 
 // TestBroadcastPhotoFanOut is the L6 fix's photo-path counterpart to
@@ -1745,6 +1782,112 @@ func TestBroadcastPhotoFanOut(t *testing.T) {
 			t.Errorf("recipient %d: Caption = %q, want %q", cid, p.Caption, "sale ends soon")
 		}
 	}
+
+	// Task #14, photo path: same one-row assertion as TestBroadcastFanOut,
+	// plus the "photo" marker so a caption-less photo broadcast (no message
+	// excerpt at all) still leaves a distinguishable outcome.
+	rows, err := st.RecentAudit(10, "")
+	if err != nil {
+		t.Fatalf("RecentAudit: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("audit rows after broadcast = %d, want exactly 1: %+v", len(rows), rows)
+	}
+	row := rows[0]
+	if row.Action != "broadcast_send" {
+		t.Errorf("Action = %q, want broadcast_send", row.Action)
+	}
+	if !strings.Contains(row.Outcome, "sent=3 fail=0") {
+		t.Errorf("Outcome = %q, want it to contain the sent/fail counts", row.Outcome)
+	}
+	if !strings.Contains(row.Outcome, "photo") {
+		t.Errorf("Outcome = %q, want a photo marker", row.Outcome)
+	}
+	if !strings.Contains(row.Outcome, "sale ends soon") {
+		t.Errorf("Outcome = %q, want the caption excerpt", row.Outcome)
+	}
+	if row.Detail != "sale ends soon" {
+		t.Errorf("Detail = %q, want the full caption body", row.Detail)
+	}
+}
+
+// TestBroadcastAuditRowNoRawExcerptOverflow pins the excerpt-vs-full-body
+// split itself (task #14): outcome (displayed by sendAuditLog) must stay
+// bounded to broadcastOutcomeExcerptRunes even when the admin's message is
+// long, while detail (stored, not rendered by the current viewer) must keep
+// the complete body up to LogAction's own 2000-rune clip.
+//
+// The probe text is built from a multi-byte Vietnamese vowel, not ASCII —
+// this shop's own customer-facing copy is Vietnamese, so multi-byte
+// truncation is the live case, not a theoretical one. "ế" encodes as 3
+// UTF-8 bytes, and 200 (the cap) is not a multiple of 3, so slicing the
+// excerpt by BYTE index instead of rune index is guaranteed to cut inside a
+// character's byte sequence rather than on a boundary, producing a
+// corrupted excerpt that cannot match the exact rune-safe prefix asserted
+// below. Falsification: change auditBroadcast's `[]rune(excerpt)` cap to a
+// byte slice (`excerpt[:200]`) and this test reddens on the excerpt
+// comparison; a same-length pure-ASCII probe would not have caught that.
+func TestBroadcastAuditRowNoRawExcerptOverflow(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	if _, _, err := st.Credit("301", 1000, "LTXN-0"); err != nil {
+		t.Fatalf("seed credit: %v", err)
+	}
+
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, AdminID: "1"})
+	defer b.Shutdown()
+
+	// 250 runes: past the 200-rune outcome excerpt cap, comfortably under
+	// LogAction's 2000-rune detail clip.
+	const vnChar = "ế"
+	longMsg := strings.Repeat(vnChar, 250)
+
+	b.Process(ctx, callbackUpdate(1, "adm:broadcast"))
+	b.Process(ctx, textUpdate(1, longMsg))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "🔧 Broadcast — confirm:") {
+		t.Fatalf("confirm summary = %+v", last)
+	}
+	b.Process(ctx, callbackUpdate(1, "admdo:confirm"))
+	b.Shutdown()
+
+	rows, err := st.RecentAudit(10, "")
+	if err != nil {
+		t.Fatalf("RecentAudit: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("audit rows after broadcast = %d, want exactly 1: %+v", len(rows), rows)
+	}
+	row := rows[0]
+
+	if strings.Contains(row.Outcome, longMsg) {
+		t.Errorf("Outcome contains the FULL 250-rune message uncapped, want it truncated to %d runes", broadcastOutcomeExcerptRunes)
+	}
+
+	// Assert the excerpt on RUNE count against the exact expected prefix —
+	// a substring/byte-length check would still pass a byte-sliced
+	// (rune-unsafe) excerpt here, since a corrupted 200-byte cut is still
+	// "roughly the right size"; only an exact-string comparison against the
+	// correct 200-rune prefix catches the mid-character cut.
+	parts := strings.SplitN(row.Outcome, " · ", 2)
+	if len(parts) != 2 {
+		t.Fatalf("Outcome = %q, want a ` · <excerpt>` suffix", row.Outcome)
+	}
+	excerpt := parts[1]
+	wantExcerpt := strings.Repeat(vnChar, broadcastOutcomeExcerptRunes) + "…"
+	if excerpt != wantExcerpt {
+		t.Errorf("excerpt = %q (%d runes), want the exact %d-rune prefix %q (%d runes)",
+			excerpt, len([]rune(excerpt)), broadcastOutcomeExcerptRunes, wantExcerpt, len([]rune(wantExcerpt)))
+	}
+	if row.Detail != longMsg {
+		t.Errorf("Detail = %q (%d runes), want the FULL uncapped %d-rune body", row.Detail, len([]rune(row.Detail)), len([]rune(longMsg)))
+	}
 }
 
 // TestBroadcastCancel exercises admdo:cancel — the wizard is abandoned and
@@ -1769,6 +1912,35 @@ func TestBroadcastCancel(t *testing.T) {
 	st.mu.Unlock()
 	if armed != nil {
 		t.Error("cancel must clear the armed wizard")
+	}
+}
+
+// TestExecBroadcastNilStoreNoPanic drives execBroadcast's OWN b.store==nil
+// guard (adminsettings.go:~1372) — a unit-test-only shape (newTestBot wires
+// no Store at all). Without that guard, execBroadcast's very next line
+// (b.store.AllChatIDs()) would nil-pointer-panic, so this pins that the
+// guard stays in place and the reply still reports "0 chats". It does NOT
+// reach auditBroadcast: execBroadcast returns before the fan-out worker
+// (and therefore auditBroadcast) ever runs. auditBroadcast's own
+// b.store==nil guard was unreachable on every call path — execBroadcast
+// always returns first — so it has been removed rather than left as dead
+// code with a misleading test claiming coverage of it.
+func TestExecBroadcastNilStoreNoPanic(t *testing.T) {
+	ctx := context.Background()
+	b, f := newTestBot("1", nil)
+	defer b.Shutdown()
+
+	b.Process(ctx, callbackUpdate(1, "adm:broadcast"))
+	b.Process(ctx, textUpdate(1, "hello"))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "🔧 Broadcast — confirm:") {
+		t.Fatalf("confirm summary = %+v", last)
+	}
+	b.Process(ctx, callbackUpdate(1, "admdo:confirm"))
+
+	last := lastSendMsg(f)
+	want := "📣 Broadcast sent to 0 chats (0 failed)."
+	if last == nil || last.Text != want {
+		t.Fatalf("nil-store broadcast reply = %+v, want %q", last, want)
 	}
 }
 

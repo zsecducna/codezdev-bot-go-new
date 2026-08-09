@@ -1383,9 +1383,66 @@ func (b *Bot) execBroadcast(ctx context.Context, chatID int64, a *AdminAction) {
 	b.workers.Go(func(stop <-chan struct{}) {
 		runOnStoppableCtx(stop, func(fctx context.Context) {
 			sent, fail := b.runBroadcast(fctx, ids, msg, photo)
+			// Logged here, inside the tracked worker, because sent/fail are
+			// only known once the fan-out returns — see auditBroadcast below
+			// for why this row exists at all.
+			b.auditBroadcast(chatID, sent, fail, photo != "", msg)
 			b.send(fctx, chatID, "📣 Broadcast sent to "+itoa(sent)+" chats ("+itoa(fail)+" failed).", admNav("admcat:settings"))
 		})
 	})
+}
+
+// broadcastOutcomeExcerptRunes caps the free-text excerpt embedded in a
+// broadcast's audit outcome. outcome is the field sendAuditLog actually
+// prints (auditConfigSet's SECRET WARNING above notes the same split), and
+// LogAction itself silently clips the whole outcome string to 500 runes — an
+// uncapped admin message could alone eat that entire budget and crowd out
+// the sent/fail counts that make the row useful at a glance. 200 runes is
+// generous enough to recognize which broadcast a customer complaint is
+// about while leaving headroom for the counts and photo marker ahead of it.
+const broadcastOutcomeExcerptRunes = 200
+
+// auditBroadcast records a broadcast fan-out (task #14). Before this, the
+// single highest blast-radius action available to an admin — a message sent
+// to every chat the store has ever seen — left NO record anywhere: not who
+// sent it, not what it said, not how many people actually received it.
+// auditConfigSet's shape (old → new) does not fit a broadcast, which is not
+// a config transition, so this calls store.LogAction directly, the same
+// primitive auditConfigSet itself wraps.
+//
+// The body is split deliberately, not arbitrarily: outcome is the field
+// sendAuditLog actually displays (confirmed by reading it — the loop only
+// ever prints r.Outcome), so it carries the sent/fail counts first — the
+// cheapest, always-useful signal, even for a caption-less photo broadcast —
+// followed by a short excerpt so an investigator can identify which
+// broadcast a complaint concerns without opening the DB directly. detail is
+// NOT display-exempt, though: RecentAudit's WHERE clause matches
+// actor_chat, target, action, detail, actor_kind, and outcome alike
+// (misc.go:51-53), so it is searched even though it is never shown. The
+// practical cost of that: an /audit <query> for a term with no relation to
+// broadcasts can still match text buried inside a stored broadcast body and
+// surface the broadcast row as a false positive in an investigator's
+// filter — noise, not a leak. detail still carries the FULL body (still
+// bounded by LogAction's own 2000-rune clip), because storing the complete
+// text there loses nothing visible today and preserves it for a future
+// export/inspection path instead of discarding it a second time on top of
+// outcome's 200-rune excerpt. No redaction is applied: an admin-authored
+// broadcast body is not a secret like kiro_go_admin_key (auditConfigSet's
+// SECRET WARNING) — it is text already deliberately sent to every customer,
+// so nothing about it is hidden by also keeping it in this row.
+func (b *Bot) auditBroadcast(actorChat int64, sent, fail int, hasPhoto bool, body string) {
+	outcome := "sent=" + itoa(sent) + " fail=" + itoa(fail)
+	if hasPhoto {
+		outcome += " photo"
+	}
+	if body != "" {
+		excerpt := body
+		if r := []rune(excerpt); len(r) > broadcastOutcomeExcerptRunes {
+			excerpt = string(r[:broadcastOutcomeExcerptRunes]) + "…"
+		}
+		outcome += " · " + excerpt
+	}
+	b.store.LogAction(fmtInt(actorChat), "admin", "broadcast_send", "all_chats", outcome, body)
 }
 
 // runBroadcast is the per-recipient send loop itself — no rate limit, no
