@@ -130,6 +130,13 @@ type Bot struct {
 	usdtConfirmWait     time.Duration // USDT_CONFIRM_WAIT_S 300s
 	usdtConfirmPoll     time.Duration // USDT_CONFIRM_POLL_S 20s
 
+	// Periodic janitor intervals — wired to the worker registry's tickers in
+	// reconcile.go / stocksweep.go. Fields (not constants) so tests can shrink
+	// them to 1ms; New reads the env defaults. See reconcile.go and
+	// stocksweep.go for the money-safety rationale behind each default.
+	reconcileInterval  time.Duration // RECONCILE_STUCK_INTERVAL_S 600s (Python */10 crontab)
+	stockSweepInterval time.Duration // STOCK_SWEEP_INTERVAL_S 300s (folder-stock reclaim)
+
 	// now is the clock, overridable in tests (band deadlines and the verify window
 	// are wall-clock so they survive a restart, exactly like Python's time.time()).
 	now func() time.Time
@@ -313,6 +320,16 @@ func New(d Deps) *Bot {
 	}
 	// Timing knobs — Python's module constants, env-overridable (telegram_bot.py:9541-9558).
 	b.expirySweepInterval = time.Duration(b.envInt("EXPIRY_SWEEP_INTERVAL", 120)) * time.Second
+	// RECONCILE_STUCK_INTERVAL_S default 600s = Python's reconcile crontab
+	// `*/10 * * * *` (reconcile_stuck_orders.py:99-107). The pass is read-only
+	// (reconcile.go), so a tighter interval is cheap and harmless; the default
+	// matches Python to keep alarm cadence comparable across the ports.
+	b.reconcileInterval = time.Duration(b.envInt("RECONCILE_STUCK_INTERVAL_S", 600)) * time.Second
+	// STOCK_SWEEP_INTERVAL_S default 300s: folder-stock expiry is a cheap
+	// directory walk per product (stock.go:254), so a 5-min cadence keeps
+	// stock counts honest (abandoned reservations reclaimed to active/
+	// promptly) without burdening the DB-order sweep path. See stocksweep.go.
+	b.stockSweepInterval = time.Duration(b.envInt("STOCK_SWEEP_INTERVAL_S", 300)) * time.Second
 	b.usdtPendingGrace = time.Duration(b.envInt("USDT_PENDING_GRACE_S", 2*3600)) * time.Second
 	b.usdtVerifyGrace = time.Duration(b.envInt("USDT_VERIFY_GRACE_S", 120)) * time.Second
 	b.usdtConfirmWait = time.Duration(b.envInt("USDT_CONFIRM_WAIT_S", 300)) * time.Second

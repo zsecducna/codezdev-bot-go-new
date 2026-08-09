@@ -224,6 +224,17 @@ func main() {
 	// worker registry, so bot.Shutdown drains it.
 	bot.StartupRecovery(ctx)
 
+	// Report-only stuck-order reconcile + folder-stock expiry janitor, both
+	// on tracked worker-registry tickers so Shutdown drains them. The
+	// reconcile (reconcile.go) is READ-ONLY: it logs an OWNER ALERT for
+	// paid-but-undelivered orders and NEVER delivers/refunds/mutates them
+	// (reconcile_stuck_orders.py:25-26). The stock sweep (stocksweep.go)
+	// resolves #26 — stock.SweepExpired previously had no periodic caller, so
+	// folder-stock expiry ran only lazily; it reclaims reserved/<order>/ dirs
+	// past their .expiry back to active/ across every product.
+	bot.StartReconcileStuckOrders(ctx)
+	bot.StartStockSweep(ctx)
+
 	// Hourly owner-@username refresher so a rename propagates to customer
 	// messages without a restart — port of _support_handle_refresher
 	// (telegram_bot.py:18935-18943). Skipped when SUPPORT_HANDLE is pinned
