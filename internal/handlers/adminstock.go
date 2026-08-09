@@ -1320,19 +1320,34 @@ func (b *Bot) capRenProd(c *Ctx) bool {
 		b.send(c.Ctx, c.ChatID, "⛔ Rename failed: "+err.Error(), admNav("adm:mngprod"))
 		return true
 	}
-	b.carryProductSettings(oldProd, newName)
-	b.send(c.Ctx, c.ChatID,
-		"✅ Renamed "+oldProd+" → "+newName+".\n⚠️ Existing orders/history still reference the old name.", nil)
+	reply := "✅ Renamed " + oldProd + " → " + newName + ".\n⚠️ Existing orders/history still reference the old name."
+	// carryProductSettings's failure can't stay a log-only concern: both
+	// productSuspended and productPrivateAllowed (catalog.go) key off
+	// PRESENCE in the settings map, not a "renamed" flag. RenameProduct just
+	// moved the folder to newName on disk, so the instant the settings carry
+	// fails, the cached config still has the flag under oldProd and NOTHING
+	// under newName — a suspended product reads as sellable and a
+	// private-only product reads as public, with no restart or delay needed
+	// to trigger it. The admin who just renamed the product is the one
+	// person positioned to re-apply the flag immediately, so the reply must
+	// say so instead of quietly trusting a log line nobody is watching.
+	if err := b.carryProductSettings(oldProd, newName); err != nil {
+		reply += "\n⚠️ Suspension / private-sale flags did NOT carry over to the new name. The product may now be SELLABLE and PUBLIC. Re-apply them manually."
+	}
+	b.send(c.Ctx, c.ChatID, reply, nil)
 	b.showManageProducts(c.Ctx, c.ChatID)
 	return true
 }
 
 // carryProductSettings moves the suspended/private settings.json entries from
 // old to new after a successful rename (§4.6) — the timestamp and allow-list
-// survive the move; only the JSON's KEY changes.
-func (b *Bot) carryProductSettings(old, new string) {
+// survive the move; only the JSON's KEY changes. Returns a non-nil error only
+// when there WAS something to carry and the save failed, so the caller can
+// tell the admin the old flags are now orphaned under a folder that no
+// longer exists.
+func (b *Bot) carryProductSettings(old, new string) error {
 	if b.cfg == nil {
-		return
+		return nil
 	}
 	s := b.settings()
 	changed := false
@@ -1355,8 +1370,10 @@ func (b *Bot) carryProductSettings(old, new string) {
 	if changed {
 		if err := b.cfg.SaveSettings(s); err != nil {
 			log.Println("adminstock: carryProductSettings save failed:", err)
+			return err
 		}
 	}
+	return nil
 }
 
 // ---- §4.7 edit config/.env ----------------------------------------------------

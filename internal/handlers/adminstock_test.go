@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"codezdev-bot/internal/config"
+	"codezdev-bot/internal/stock"
 	"codezdev-bot/internal/store"
+	"codezdev-bot/internal/tg"
 )
 
 // TestProdRmRefusesWithLiveReservation is the sharper framing task #19's
@@ -131,5 +133,80 @@ func TestRunPoolProvisionUsesEnvOnlyLoginPython(t *testing.T) {
 	last := lastSendMsg(f)
 	if last == nil || !strings.Contains(last.Text, stubPython) {
 		t.Fatalf("expected the browser-stack refusal to name the .env-resolved interpreter %q; got %+v", stubPython, last)
+	}
+}
+
+// TestCapRenProdWarnsWhenSettingsCarryFails pins task #28 (HIGH): renaming a
+// SUSPENDED product must not silently put it back on sale. carryProductSettings
+// (adminstock.go) moves the "suspended"/"private_products" settings.json
+// entries from the old product name to the new one, but productSuspended and
+// productPrivateAllowed (catalog.go:77-90) key off PRESENCE of the entry
+// under the CURRENT product name — and by the time carryProductSettings
+// runs, RenameProduct has already moved the real folder on disk to the new
+// name. If the settings carry fails, the suspended entry is stranded under a
+// name that no longer exists, and the freshly-renamed folder reads as
+// unsuspended immediately (no restart, no delay). Before the fix, capRenProd
+// swallowed that failure into a log line and told the admin the rename
+// simply worked; this test proves the reply now warns instead.
+//
+// Fault injection reuses newReadOnlyCfgAuditBot's shape (a settings dir made
+// read-only so every SaveSettings call fails) rather than that helper
+// itself, because this path also needs a REAL writable stock folder for
+// RenameProduct to succeed against — newReadOnlyCfgAuditBot's Deps carries
+// no Stock at all, so RenameProduct would fail first and the settings-carry
+// path this test targets would never run.
+func TestCapRenProdWarnsWhenSettingsCarryFails(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	cfgDir := filepath.Join(dir, "cfg")
+	if err := os.Mkdir(cfgDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stk := stock.New(filepath.Join(dir, "accounts"), filepath.Join(dir, "orders"))
+	cfg, err := config.Load(cfgDir)
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, Stock: stk, Config: cfg, AdminID: "1"})
+	t.Cleanup(func() { b.Shutdown(); st.Close() })
+
+	seedProduct(t, dir, "prodA", 5000, 1)
+	if err := b.setProductSuspended("prodA", true, 1); err != nil {
+		t.Fatalf("seed suspend: %v", err)
+	}
+
+	// Make the settings dir read-only AFTER the seed write above, so the
+	// seed itself lands and only the carry triggered by the rename below
+	// fails.
+	if err := os.Chmod(cfgDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(cfgDir, 0o700) })
+
+	// showManageProducts assigns callback indices in listProducts() order;
+	// with exactly one product seeded, index 0 is unambiguous.
+	b.Process(ctx, callbackUpdate(1, "prodren:0"))
+	b.Process(ctx, textUpdate(1, "prodB"))
+
+	// capRenProd's own reply is followed by an unconditional
+	// showManageProducts send (adminstock.go), so lastSendMsg would grab the
+	// product list instead — the rename reply is the second-to-last send.
+	f.mu.Lock()
+	sends := append([]tg.SendMessageParams(nil), f.Sends...)
+	f.mu.Unlock()
+	if len(sends) < 2 {
+		t.Fatalf("expected at least 2 sends (rename reply + product list), got %d", len(sends))
+	}
+	renameReply := sends[len(sends)-2].Text
+	if !strings.Contains(renameReply, "Renamed prodA → prodB") {
+		t.Fatalf("expected the rename itself to still report success (RenameProduct did not fail), got %q", renameReply)
+	}
+	if !strings.Contains(renameReply, "did NOT carry over") {
+		t.Errorf("rename reply = %q, want it to warn that suspend/private flags did not carry over to the new name", renameReply)
 	}
 }
