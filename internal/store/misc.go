@@ -77,6 +77,73 @@ func (s *Store) RecentAudit(limit int, query string) ([]AuditRow, error) {
 	return out, rows.Err()
 }
 
+// AuditRetentionFloor is the minimum window PruneAudit will ever honor,
+// enforced INSIDE the store regardless of what cutoff the caller computed
+// upstream. Pruning an audit trail is a tradeoff with its own purpose: this
+// table is the record an investigator reaches for AFTER an incident nobody
+// flagged at the time — a disputed refund, a suspicious balance change, an
+// address swap — so an overly aggressive prune destroys exactly the
+// evidence it exists to preserve, and the DELETE below is irreversible (no
+// soft-delete, no archive-before-delete in this design).
+//
+// Exported so internal/handlers.pruneAuditOnce (auditprune.go) — which
+// resolves AUDIT_RETENTION_DAYS from the environment and applies its OWN
+// floor before ever computing a cutoff — reads this exact constant rather
+// than hardcoding 30 days a second time. Two independent literals for the
+// same invariant drift the moment either is tuned without the other; one
+// exported constant makes that impossible. A config typo
+// (AUDIT_RETENTION_DAYS=1, or 0, or negative) must not be able to
+// self-destruct the trail through EITHER layer — the store's clamp below is
+// defense-in-depth on top of the handlers layer's own check, the same
+// posture ClaimOrderKind already takes toward its callers (validate rather
+// than trust), not a replacement for it.
+//
+// Trust boundary worth naming: this floor is relative to this process's own
+// clock (now(), below), trusted unconditionally. A forward clock skew (NTP
+// misconfiguration, a hand-set system clock) would shift the floor forward
+// with it and could prune the entire table in one pass — the delete is
+// irreversible, so that failure mode has no recovery path short of a
+// pre-prune backup.
+const AuditRetentionFloor = 30 * 24 * time.Hour
+
+// PruneAudit deletes every audit row STRICTLY older than olderThanTS and
+// returns the number of rows removed (store.py has no equivalent — the
+// Python original never pruned this table at all, task #14).
+//
+// Boundary: `ts<?`, not `ts<=?` — a row whose ts exactly equals the cutoff
+// SURVIVES. This matches ReservedOrdersBefore's identical `ts<?` boundary
+// elsewhere in this package, so "older than X" reads the same way across
+// every cutoff-based query in this store rather than each picking its own
+// convention.
+//
+// The floor is applied FIRST, before the DELETE runs: if olderThanTS is
+// more recent than now()-AuditRetentionFloor, it is pushed back to that
+// floor — LOUDLY, via the log line below, not silently — so this call
+// always RETAINS at least the last 30 days of history: rows newer than 30
+// days can never be deleted, no matter what cutoff the caller asked for.
+// The log line matters because a silent rewrite of the caller's intent is
+// indistinguishable from ordinary success: an operator who (via a
+// misconfigured AUDIT_RETENTION_DAYS) asked for a 1-day retention would see
+// PruneAudit return a normal-looking count and have no way to learn their
+// setting was overridden — the exact failure mode ClaimOrderKind's own
+// loud-refusal posture exists to avoid (it returns an error instead of
+// silently correcting a bad argument; this call can't refuse, since
+// something must still get pruned, so it logs instead). idx_audit_ts
+// (store.go's initSchema) makes the DELETE an index-driven range scan, not
+// a full table scan.
+func (s *Store) PruneAudit(olderThanTS float64) (int64, error) {
+	if floor := now() - AuditRetentionFloor.Seconds(); olderThanTS > floor {
+		log.Printf("audit prune: requested cutoff %.0f is newer than the "+
+			"%s floor — using %.0f instead", olderThanTS, AuditRetentionFloor, floor)
+		olderThanTS = floor
+	}
+	res, err := s.db.Exec("DELETE FROM audit WHERE ts<?", olderThanTS)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // ---- handles (chat_id <-> @username directory) ----------------------------
 
 // SetHandle persists the latest @handle seen for a chat_id (store.py:553-568).

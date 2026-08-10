@@ -234,6 +234,12 @@ func main() {
 	// past their .expiry back to active/ across every product.
 	bot.StartReconcileStuckOrders(ctx)
 	bot.StartStockSweep(ctx)
+	// Audit-retention janitor (task #14) — store.PruneAudit previously had no
+	// caller, the same defect StartStockSweep resolved for folder-stock
+	// expiry. Deletes audit rows older than AUDIT_RETENTION_DAYS (default
+	// 180d, floored at 30d in both the handlers layer and the store itself),
+	// once a day. See auditprune.go for the full rationale.
+	bot.StartAuditPrune(ctx)
 
 	// Hourly owner-@username refresher so a rename propagates to customer
 	// messages without a restart — port of _support_handle_refresher

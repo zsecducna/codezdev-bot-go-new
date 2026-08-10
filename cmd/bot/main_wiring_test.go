@@ -1,18 +1,19 @@
 package main
 
-// main_wiring_test.go — regression guard for task #26's two periodic
-// workers, StartStockSweep (folder-stock expiry janitor) and
-// StartReconcileStuckOrders (report-only stuck-order alarm).
+// main_wiring_test.go — regression guard for the periodic workers registered
+// once from main() and never again: StartStockSweep (folder-stock expiry
+// janitor, task #26), StartReconcileStuckOrders (report-only stuck-order
+// alarm), and StartAuditPrune (audit-retention janitor, task #14).
 //
-// Both are pure registrations against the tracked worker registry, called
-// once from main() and never again. Deleting either call leaves every other
-// test in this repo green: there is no runtime observable for it —
-// workerRegistry (internal/handlers/workers.go) exposes only
-// Go/TryGo/Shutdown, no count — and main() itself cannot run in a unit test
-// (it dials live Telegram and polls forever). A silent regression here means
-// folder-stock expiry falls back to lazy-only reclaim (the exact state task
-// #26 fixed), or the stuck-order alarm never fires at all, with nothing
-// failing to say so.
+// All three are pure registrations against the tracked worker registry.
+// Deleting any one call leaves every other test in this repo green: there is
+// no runtime observable for it — workerRegistry
+// (internal/handlers/workers.go) exposes only Go/TryGo/Shutdown, no count —
+// and main() itself cannot run in a unit test (it dials live Telegram and
+// polls forever). A silent regression here means folder-stock expiry falls
+// back to lazy-only reclaim (the exact state task #26 fixed), the
+// stuck-order alarm never fires, or the audit table grows forever again
+// (the exact state task #14 fixed) — with nothing failing to say so.
 //
 // Same technique TestMainWiresRefundStoreIntoDeps (deps_wiring_test.go)
 // already uses for this exact class of bug: a static AST parse of main.go,
@@ -26,16 +27,16 @@ import (
 	"testing"
 )
 
-// TestMainWiresPeriodicWorkers asserts main.go contains both
-// bot.StartStockSweep(...) and bot.StartReconcileStuckOrders(...) as call
-// statements. Either missing means the corresponding periodic worker never
+// TestMainWiresPeriodicWorkers asserts main.go contains bot.StartStockSweep(...),
+// bot.StartReconcileStuckOrders(...), AND bot.StartAuditPrune(...) as call
+// statements. Any missing means the corresponding periodic worker never
 // starts in the real binary, even though every unit test in
 // internal/handlers builds its own *Bot and calls these methods directly —
 // so the unit suite alone never catches the omission.
 //
-// Falsification: deleting either bot.Start*(ctx) line from main() makes
-// this test's `want[...]` entry for that method stay false, and the loop at
-// the bottom reports it.
+// Falsification: deleting any bot.Start*(ctx) line from main() makes this
+// test's `want[...]` entry for that method stay false, and the loop at the
+// bottom reports it.
 func TestMainWiresPeriodicWorkers(t *testing.T) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "main.go", nil, 0)
@@ -46,6 +47,7 @@ func TestMainWiresPeriodicWorkers(t *testing.T) {
 	want := map[string]bool{
 		"StartStockSweep":           false,
 		"StartReconcileStuckOrders": false,
+		"StartAuditPrune":           false,
 	}
 
 	ast.Inspect(f, func(n ast.Node) bool {

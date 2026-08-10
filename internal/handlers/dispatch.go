@@ -136,6 +136,15 @@ type Bot struct {
 	// stocksweep.go for the money-safety rationale behind each default.
 	reconcileInterval  time.Duration // RECONCILE_STUCK_INTERVAL_S 600s (Python */10 crontab)
 	stockSweepInterval time.Duration // STOCK_SWEEP_INTERVAL_S 300s (folder-stock reclaim)
+	// auditPruneInterval is the audit-retention janitor's ticker cadence
+	// (auditprune.go). Fixed at 24h by New() — unlike its siblings above,
+	// deliberately NOT env-overridable: pruning is an irreversible delete of
+	// the investigative record, and there is no benefit to running it more
+	// than once a day, so no operator knob is offered for the cadence
+	// itself (AUDIT_RETENTION_DAYS, the actual retention window, is the
+	// intended knob — see auditprune.go). A field, not a constant, purely so
+	// tests can shrink it to 1ms like its siblings.
+	auditPruneInterval time.Duration
 
 	// now is the clock, overridable in tests (band deadlines and the verify window
 	// are wall-clock so they survive a restart, exactly like Python's time.time()).
@@ -330,6 +339,9 @@ func New(d Deps) *Bot {
 	// stock counts honest (abandoned reservations reclaimed to active/
 	// promptly) without burdening the DB-order sweep path. See stocksweep.go.
 	b.stockSweepInterval = time.Duration(b.envInt("STOCK_SWEEP_INTERVAL_S", 300)) * time.Second
+	// auditPruneInterval: fixed 24h, not env-tunable — see the field's own
+	// doc comment above for why.
+	b.auditPruneInterval = 24 * time.Hour
 	b.usdtPendingGrace = time.Duration(b.envInt("USDT_PENDING_GRACE_S", 2*3600)) * time.Second
 	b.usdtVerifyGrace = time.Duration(b.envInt("USDT_VERIFY_GRACE_S", 120)) * time.Second
 	b.usdtConfirmWait = time.Duration(b.envInt("USDT_CONFIRM_WAIT_S", 300)) * time.Second
