@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"codezdev-bot/internal/config"
+	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/store"
 )
 
@@ -26,6 +27,22 @@ import (
 // (code_test.go) keep working untouched, but that means every test that
 // exercises discounts.json must isolate its own path or risk polluting the
 // real repo cwd / racing other tests.
+// armAndCapture drives a capture handler's arming callback through the real
+// Process path (so the exact wizard-arming logic in cbApiMax/cbApiCap/etc.
+// is never duplicated here), then invokes the capture directly against a
+// freshly built Ctx carrying text — bypassing Process for that second step
+// is the only way to observe the capture's own bool return value, which
+// Process discards (first-match-wins dispatch only cares whether an update
+// was consumed). Used by the save-failure tests below, which the review
+// that opened task #29 flagged for asserting neither the reply text nor
+// this return value.
+func armAndCapture(t *testing.T, b *Bot, chatID int64, armCB, text string, capture func(*Ctx) bool) bool {
+	t.Helper()
+	b.Process(context.Background(), callbackUpdate(chatID, armCB))
+	c := &Ctx{Ctx: context.Background(), ChatID: chatID, Lang: i18n.EN, Text: text, st: b.states.Get(chatID)}
+	return capture(c)
+}
+
 func withDiscountsFile(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -649,6 +666,43 @@ func newReadOnlyCfgAuditBot(t *testing.T) (*Bot, *fakeTG, *store.Store) {
 	return b, f, st
 }
 
+// newQueryOnlyStoreBot builds a Bot wired to a real, schema-initialized
+// *store.Store, then flips the connection to SQLite's own read-only mode
+// (PRAGMA query_only=ON) so every subsequent WRITE fails while reads keep
+// working — the fault injection capPromo/cbPromoDel need, since neither
+// fails on a config write (there is none in their path): both call
+// store.CreatePromo/DeletePromo directly, and store.Store wraps a concrete
+// *sql.DB with no interface seam to substitute a fake behind. The
+// newReadOnlyCfgAuditBot technique above (chmod a directory read-only
+// before Load) does NOT transfer here — verified empirically before writing
+// this helper: store.Open keeps ONE already-open, already-writable file
+// descriptor alive for the whole test (SetMaxOpenConns(1)), and POSIX
+// permission bits are checked at open(2), not at each write(2), so
+// chmod-after-Open on the db file/directory left every write still
+// succeeding. query_only is the seam SQLite itself exposes for exactly
+// this, reached through store.go's exported DB() getter. seed, if non-nil,
+// runs BEFORE query_only is set, so a test needing an existing promo row
+// (the delete-failure path) can create it while writes still work.
+func newQueryOnlyStoreBot(t *testing.T, seed func(*store.Store)) (*Bot, *fakeTG, *store.Store) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if seed != nil {
+		seed(st)
+	}
+	if _, err := st.DB().Exec("PRAGMA query_only=ON"); err != nil {
+		t.Fatalf("set query_only: %v", err)
+	}
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, AdminID: "1"})
+	t.Cleanup(b.Shutdown)
+	return b, f, st
+}
+
 // ---- product price (capTier / capPrice): SAME underlying stock mutation ---
 
 // TestCapTierAndCapPriceAuditProductPriceChanges covers BOTH code paths that
@@ -873,14 +927,22 @@ func TestKiroToggleAuditsChange(t *testing.T) {
 // TestKiroToggleNoAuditOnSaveFailure proves cbKiroToggle's audit row is
 // emitted only after SaveSettings succeeds — this handler DOES have the H1
 // stop-on-failure shape (returns early on a save error), unlike the pricing
-// setters below.
+// setters below. It also pins task #29's error-text fix: cbKiroToggle used
+// to send settingsNotConfigured ("Settings not configured on this
+// instance") on a save failure, even though b.cfg is non-nil and settings
+// ARE configured here — only the disk write failed. That text sent the
+// admin toward re-checking setup instead of toward the real fault, and this
+// test used to assert that WRONG string as the expected reply (a fix
+// pinned as a bug). The correct reply is settingsSaveFailed, the same text
+// every sibling setter in this file already sends on the identical
+// failure.
 func TestKiroToggleNoAuditOnSaveFailure(t *testing.T) {
 	ctx := context.Background()
 	b, f, st := newReadOnlyCfgAuditBot(t)
 
 	b.Process(ctx, callbackUpdate(1, "adm:kirotoggle"))
-	if last := lastSendMsg(f); last == nil || last.Text != settingsNotConfigured {
-		t.Fatalf("reply on save failure = %+v, want %q", last, settingsNotConfigured)
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
 	}
 	if row := latestAuditRow(t, st, "config_toggle_kiro_apikey_enabled"); row != nil {
 		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
@@ -896,9 +958,18 @@ func TestKiroToggleNoAuditOnSaveFailure(t *testing.T) {
 // row is emitted only AFTER the save succeeds (spec §4.3/§6.2), so it now
 // sits on the straight-line path after the early-return gate rather than in
 // an `else` branch. This matches capDiscount's own two branches exactly.
-// TestCapSetApiPriceNoAuditOnSaveFailure and TestCapSetApiMinNoAuditOnSaveFailure
-// below exercise both the audit gate AND the new settingsSaveFailed reply;
-// every sibling site added the identical gate and is covered by construction.
+//
+// Task #29 review finding: this file used to claim the failure-path gate on
+// the five siblings below (capSetApiMax/Cap, capSetKiroPrice/Min/Max) was
+// "covered by construction" from only capSetApiPrice's and capSetApiMin's
+// two tests — identical code at a site is not evidence the code at that
+// site was ever exercised, and this repo's own rule rejects that reasoning
+// ("a fix is not done when it is correct; it is done when deleting it turns
+// something red"). Every one of the seven setters — plus capPromo/
+// cbPromoDel below, whose failure mode is a store write, not a config
+// write — now has its own dedicated NoAuditOnSaveFailure/NoAuditOnFailure
+// test, each mutation-verified by deleting that setter's early-return guard
+// and confirming its OWN test (not a neighbor's) goes red.
 
 // TestCapSetApiPriceAuditsChange is the representative test for the
 // "float rate + legacy twin" code path (capSetApiPrice only — capSetKiroPrice
@@ -932,12 +1003,14 @@ func TestCapSetApiPriceAuditsChange(t *testing.T) {
 }
 
 // TestCapSetApiPriceNoAuditOnSaveFailure proves the H1 stop-on-failure shape
-// for capSetApiPrice: on a failed SaveSettings the audit row is NOT emitted
-// AND the reply is the shared settingsSaveFailed text (not the ✅ success
-// text a real save would have earned). The same shape holds for every sibling
-// pricing setter (capSetApiMin/Max/Cap, capSetKiroPrice/Min/Max) by
-// construction — they share the identical early-return + audit-after-success
-// block.
+// for capSetApiPrice: on a failed SaveSettings the audit row is NOT emitted,
+// the reply is the shared settingsSaveFailed text (not the ✅ success text a
+// real save would have earned), and the capture itself still reports the
+// input as CONSUMED (returns true) — an admin's retyped number must not
+// fall through to a lower-priority dispatch stage just because the save
+// underneath it failed. The six sibling pricing setters each get their own
+// dedicated test below/nearby rather than relying on this one by
+// construction (task #29 review finding — see the block comment above).
 //
 // Falsification: dropping the `return true` on save error (so the handler
 // falls through to the ✅ text) makes the settingsSaveFailed assertion fail;
@@ -945,11 +1018,12 @@ func TestCapSetApiPriceAuditsChange(t *testing.T) {
 // unconditionally) makes the audit-row assertion fail — both verified by
 // mutation against this test.
 func TestCapSetApiPriceNoAuditOnSaveFailure(t *testing.T) {
-	ctx := context.Background()
 	b, f, st := newReadOnlyCfgAuditBot(t)
 
-	b.Process(ctx, callbackUpdate(1, "adm:apiprice"))
-	b.Process(ctx, textUpdate(1, "4"))
+	got := armAndCapture(t, b, 1, "adm:apiprice", "4", b.capSetApiPrice)
+	if !got {
+		t.Errorf("capSetApiPrice returned %v, want true (input consumed even on save failure)", got)
+	}
 	// H1 fix: a failed SaveSettings now surfaces as settingsSaveFailed rather
 	// than the ✅ "API-key price set to ..." success text a silent failure
 	// used to produce.
@@ -1022,14 +1096,15 @@ func TestCapSetApiMinAuditsChange(t *testing.T) {
 // TestCapSetApiMinNoAuditOnSaveFailure proves the same H1 stop-on-failure
 // shape (documented above capSetApiPrice's tests) holds for the int-setter
 // path too — a second, independent instance of the mechanism, not just the
-// rate-setter one. Both the settingsSaveFailed reply AND the missing audit
-// row are asserted.
+// rate-setter one. The settingsSaveFailed reply, the missing audit row, AND
+// the capture's own true return (input consumed) are all asserted.
 func TestCapSetApiMinNoAuditOnSaveFailure(t *testing.T) {
-	ctx := context.Background()
 	b, f, st := newReadOnlyCfgAuditBot(t)
 
-	b.Process(ctx, callbackUpdate(1, "adm:apimin"))
-	b.Process(ctx, textUpdate(1, "200"))
+	got := armAndCapture(t, b, 1, "adm:apimin", "200", b.capSetApiMin)
+	if !got {
+		t.Errorf("capSetApiMin returned %v, want true (input consumed even on save failure)", got)
+	}
 	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
 		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
 	}
@@ -1056,5 +1131,161 @@ func TestCapSetKiroMinAuditsChange(t *testing.T) {
 	}
 	if want := "500 → 1000"; row.Outcome != want { // apikeyMinCredits' kiro env-less default is 500
 		t.Errorf("Outcome = %q, want %q", row.Outcome, want)
+	}
+}
+
+// ---- task #29: the five remaining setters, individually pinned ------------
+//
+// TestCapSetApiPriceNoAuditOnSaveFailure/TestCapSetApiMinNoAuditOnSaveFailure
+// above were the only two of nine H1 stop-on-failure setters with their own
+// failure-path test; the rest were "covered by construction". Each test
+// below is mutation-verified on its OWN setter (delete that setter's
+// early-return guard, confirm THIS test — not a neighbor's — goes red,
+// restore) so a future edit that drops the guard at exactly one site can no
+// longer hide behind a passing suite.
+
+// TestCapSetApiMaxNoAuditOnSaveFailure pins capSetApiMax (adminpricing.go).
+func TestCapSetApiMaxNoAuditOnSaveFailure(t *testing.T) {
+	b, f, st := newReadOnlyCfgAuditBot(t)
+
+	got := armAndCapture(t, b, 1, "adm:apimax", "20000", b.capSetApiMax)
+	if !got {
+		t.Errorf("capSetApiMax returned %v, want true (input consumed even on save failure)", got)
+	}
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+	if row := latestAuditRow(t, st, "config_set_apikey_max_credits"); row != nil {
+		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
+	}
+}
+
+// TestCapSetApiCapNoAuditOnSaveFailure pins capSetApiCap (adminpricing.go).
+func TestCapSetApiCapNoAuditOnSaveFailure(t *testing.T) {
+	b, f, st := newReadOnlyCfgAuditBot(t)
+
+	got := armAndCapture(t, b, 1, "adm:apicap", "3", b.capSetApiCap)
+	if !got {
+		t.Errorf("capSetApiCap returned %v, want true (input consumed even on save failure)", got)
+	}
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+	if row := latestAuditRow(t, st, "config_set_apikey_max_per_customer"); row != nil {
+		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
+	}
+}
+
+// TestCapSetKiroPriceNoAuditOnSaveFailure pins capSetKiroPrice
+// (adminpricing.go).
+func TestCapSetKiroPriceNoAuditOnSaveFailure(t *testing.T) {
+	b, f, st := newReadOnlyCfgAuditBot(t)
+
+	got := armAndCapture(t, b, 1, "adm:kiroprice", "0.7", b.capSetKiroPrice)
+	if !got {
+		t.Errorf("capSetKiroPrice returned %v, want true (input consumed even on save failure)", got)
+	}
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+	if row := latestAuditRow(t, st, "config_set_kiro_apikey_usdt_per_100"); row != nil {
+		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
+	}
+}
+
+// TestCapSetKiroMinNoAuditOnSaveFailure pins capSetKiroMin (adminpricing.go).
+func TestCapSetKiroMinNoAuditOnSaveFailure(t *testing.T) {
+	b, f, st := newReadOnlyCfgAuditBot(t)
+
+	got := armAndCapture(t, b, 1, "adm:kiromin", "1000", b.capSetKiroMin)
+	if !got {
+		t.Errorf("capSetKiroMin returned %v, want true (input consumed even on save failure)", got)
+	}
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+	if row := latestAuditRow(t, st, "config_set_kiro_apikey_min_credits"); row != nil {
+		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
+	}
+}
+
+// TestCapSetKiroMaxNoAuditOnSaveFailure pins capSetKiroMax (adminpricing.go).
+func TestCapSetKiroMaxNoAuditOnSaveFailure(t *testing.T) {
+	b, f, st := newReadOnlyCfgAuditBot(t)
+
+	got := armAndCapture(t, b, 1, "adm:kiromax", "100000", b.capSetKiroMax)
+	if !got {
+		t.Errorf("capSetKiroMax returned %v, want true (input consumed even on save failure)", got)
+	}
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+	if row := latestAuditRow(t, st, "config_set_kiro_apikey_max_credits"); row != nil {
+		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
+	}
+}
+
+// ---- capPromo / cbPromoDel: store-write failures, not config-write --------
+//
+// capPromo/cbPromoDel don't touch b.cfg.SaveSettings at all — their H1
+// guard is against b.store.CreatePromo/DeletePromo failing instead
+// (adminpricing.go's own "H1 stop-on-failure" comments on both call sites).
+// newReadOnlyCfgAuditBot's directory-permission trick has no purchase here
+// (config writes never happen on this path), so these two use
+// newQueryOnlyStoreBot instead — see that helper's doc comment for why the
+// simpler filesystem trick doesn't transfer to a live SQLite connection.
+
+// TestCapPromoNoAuditOnSaveFailure pins capPromo's CreatePromo failure path
+// — was structurally unpinnable before newQueryOnlyStoreBot existed (no
+// fault-injecting store fake in this package).
+func TestCapPromoNoAuditOnSaveFailure(t *testing.T) {
+	b, f, st := newQueryOnlyStoreBot(t, nil)
+
+	got := armAndCapture(t, b, 1, "adm:promonew", "20 100 off", b.capPromo)
+	if !got {
+		t.Errorf("capPromo returned %v, want true (input consumed even on a failed create)", got)
+	}
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+	if row := latestAuditRow(t, st, "config_set_promo_create"); row != nil {
+		t.Fatalf("audit row written despite failed CreatePromo: %+v", *row)
+	}
+}
+
+// TestCbPromoDelNoAuditOnSaveFailure pins cbPromoDel's DeletePromo failure
+// path. cbPromoDel is a plain callback (cbCtx), not a capture, so it has no
+// bool to assert — instead this checks the promo the seed created is STILL
+// present after the failed delete, the same "the mutation never actually
+// landed" property the bool assertions above are standing in for on the
+// capture-shaped setters.
+func TestCbPromoDelNoAuditOnSaveFailure(t *testing.T) {
+	ctx := context.Background()
+	const code = "DELFAIL"
+	b, f, st := newQueryOnlyStoreBot(t, func(st *store.Store) {
+		if err := st.CreatePromo(code, 10, 5, false); err != nil {
+			t.Fatalf("seed promo: %v", err)
+		}
+	})
+
+	b.Process(ctx, callbackUpdate(1, cbData("promodel", code)))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+	if row := latestAuditRow(t, st, "config_set_promo_delete"); row != nil {
+		t.Fatalf("audit row written despite failed DeletePromo: %+v", *row)
+	}
+	promos, err := st.ListPromos()
+	if err != nil {
+		t.Fatalf("ListPromos: %v", err)
+	}
+	found := false
+	for _, p := range promos {
+		if p.Code == code {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("promo must still exist after a failed delete — the failure was not actually applied")
 	}
 }

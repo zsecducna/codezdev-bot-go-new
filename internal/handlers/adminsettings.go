@@ -27,6 +27,7 @@ package handlers
 // live-apply mechanism; no env write is needed or wanted.
 import (
 	"context"
+	"errors"
 	"log"
 	"regexp"
 	"slices"
@@ -131,12 +132,27 @@ func commaInt(n int) string {
 
 // ---- generic boolean toggle -------------------------------------------------
 
+// errToggleSettingNotConfigured is toggleSetting's sentinel for the b.cfg ==
+// nil case — a genuinely unconfigured install (or a unit test that wired no
+// Config at all) — kept distinguishable from a real SaveSettings failure so
+// a caller can pick the right reply string instead of collapsing both into
+// one. See toggleSetting below.
+var errToggleSettingNotConfigured = errors.New("adminsettings: no config wired")
+
 // toggleSetting flips a boolean settings key with an inline default — the
 // `s.get(key, default)` pattern every simple toggle in py_settings_spec.md §4
-// shares — and persists it. ok is false only when no config is wired (unit
-// tests, or a genuinely unconfigured install): a Go map write panics on a nil
-// map, unlike Python's dict.get default, so callers must check ok before
-// trusting next.
+// shares — and persists it. err is errToggleSettingNotConfigured when no
+// config is wired at all (a Go map write would panic on a nil map, unlike
+// Python's dict.get default, so this must be checked before trusting next);
+// otherwise err is the raw SaveSettings failure, a real config wired but the
+// WRITE itself did not land. The two used to collapse into a single (false,
+// false) return with no way for a caller to tell them apart, which meant
+// every caller reported "not configured" on a save failure too — the same
+// bug task #29 already fixed at four direct call sites elsewhere in this
+// file, just one frame further down where a grep for the call-site shape
+// couldn't see it. Callers must use errors.Is against
+// errToggleSettingNotConfigured to choose settingsNotConfigured vs
+// settingsSaveFailed.
 //
 // Task #13 Tier 5 (config-audit-spec.md §2): this is the SINGLE
 // instrumentation point for every toggle that routes through it —
@@ -145,9 +161,9 @@ func commaInt(n int) string {
 // formatted (fmtInt(cc.ChatID)) since this has no cbCtx of its own; a future
 // toggle wired through this helper is audited by construction with zero
 // extra code at its own call site.
-func (b *Bot) toggleSetting(actorChat, key string, def bool) (next, ok bool) {
+func (b *Bot) toggleSetting(actorChat, key string, def bool) (next bool, err error) {
 	if b.cfg == nil {
-		return false, false
+		return false, errToggleSettingNotConfigured
 	}
 	s := b.cfg.Settings()
 	old := settingBool(s, key, def)
@@ -155,11 +171,11 @@ func (b *Bot) toggleSetting(actorChat, key string, def bool) (next, ok bool) {
 	s[key] = next
 	if err := b.cfg.SaveSettings(s); err != nil {
 		log.Println("adminsettings: save failed:", err)
-		return false, false
+		return false, err
 	}
 	b.auditConfigSet(actorChat, "config_toggle_"+key, key,
 		strconv.FormatBool(old), strconv.FormatBool(next))
-	return next, true
+	return next, nil
 }
 
 // cbToggleSimple is the shared body for the four "bell" toggles that differ
@@ -172,9 +188,13 @@ func (b *Bot) cbToggleSimple(cc *cbCtx, key string, def bool, prefix string) {
 	if !b.settingsSuperAdminOnly(cc) {
 		return
 	}
-	next, ok := b.toggleSetting(fmtInt(cc.ChatID), key, def)
-	if !ok {
-		b.send(cc.Ctx, cc.ChatID, settingsNotConfigured, admNav("admcat:settings"))
+	next, err := b.toggleSetting(fmtInt(cc.ChatID), key, def)
+	if err != nil {
+		text := settingsSaveFailed
+		if errors.Is(err, errToggleSettingNotConfigured) {
+			text = settingsNotConfigured
+		}
+		b.send(cc.Ctx, cc.ChatID, text, admNav("admcat:settings"))
 		return
 	}
 	state := "OFF 🔕"
@@ -211,9 +231,13 @@ func (b *Bot) cbToggleMaint(cc *cbCtx) {
 	if !b.settingsSuperAdminOnly(cc) {
 		return
 	}
-	next, ok := b.toggleSetting(fmtInt(cc.ChatID), "maintenance", false)
-	if !ok {
-		b.send(cc.Ctx, cc.ChatID, settingsNotConfigured, admNav("admcat:settings"))
+	next, err := b.toggleSetting(fmtInt(cc.ChatID), "maintenance", false)
+	if err != nil {
+		text := settingsSaveFailed
+		if errors.Is(err, errToggleSettingNotConfigured) {
+			text = settingsNotConfigured
+		}
+		b.send(cc.Ctx, cc.ChatID, text, admNav("admcat:settings"))
 		return
 	}
 	state := "OFF 🟢 (normal)"
@@ -244,7 +268,7 @@ func (b *Bot) cbToggleSales(cc *cbCtx) {
 	}
 	if err := b.cfg.SaveSettings(s); err != nil {
 		log.Println("adminsettings: save failed:", err)
-		b.send(cc.Ctx, cc.ChatID, settingsNotConfigured, admNav("admcat:settings"))
+		b.send(cc.Ctx, cc.ChatID, settingsSaveFailed, admNav("admcat:settings"))
 		return
 	}
 	// Task #13 Tier 5, two-key site (spec §2): unpausing also clears
@@ -288,7 +312,7 @@ func (b *Bot) cbTogglePrivate(cc *cbCtx) {
 	}
 	if err := b.cfg.SaveSettings(s); err != nil {
 		log.Println("adminsettings: save failed:", err)
-		b.send(cc.Ctx, cc.ChatID, settingsNotConfigured, admNav("admcat:settings"))
+		b.send(cc.Ctx, cc.ChatID, settingsSaveFailed, admNav("admcat:settings"))
 		return
 	}
 	// Task #13 Tier 5, two-key site (spec §2): same rationale as
@@ -333,7 +357,7 @@ func (b *Bot) cbToggleReferral(cc *cbCtx) {
 	s["referral_enabled"] = next
 	if err := b.cfg.SaveSettings(s); err != nil {
 		log.Println("adminsettings: save failed:", err)
-		b.send(cc.Ctx, cc.ChatID, settingsNotConfigured, admNav("admcat:settings"))
+		b.send(cc.Ctx, cc.ChatID, settingsSaveFailed, admNav("admcat:settings"))
 		return
 	}
 	state := "OFF 🚫"
@@ -932,7 +956,7 @@ func (b *Bot) cbTogglePay(cc *cbCtx, method string) {
 	s["pay_"+method] = !cur
 	if err := b.cfg.SaveSettings(s); err != nil {
 		log.Println("adminsettings: save failed:", err)
-		b.send(cc.Ctx, cc.ChatID, settingsNotConfigured, admNav("admcat:payments"))
+		b.send(cc.Ctx, cc.ChatID, settingsSaveFailed, admNav("admcat:payments"))
 		return
 	}
 	b.renderPaymentsMenu(cc.Ctx, cc.ChatID)

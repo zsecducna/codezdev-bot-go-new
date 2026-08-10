@@ -287,6 +287,70 @@ func TestSettingsPermissionSplit(t *testing.T) {
 	}
 }
 
+// ---- toggleSetting: nil-cfg vs save-failure must not collapse -------------
+//
+// Task #29 continued: toggleSetting (adminsettings.go, shared by cbToggleSimple
+// and cbToggleMaint) used to return (false, false) for BOTH "no config
+// wired" and "config wired but the write failed" — the two callers could not
+// tell the difference and always sent settingsNotConfigured, the exact bug
+// already fixed at four direct call sites above (TestToggleSalesSendsSaveFailedOnWriteFailure
+// and its siblings) but one frame further down, inside this shared helper —
+// invisible to a grep for "settingsNotConfigured right after a SaveSettings
+// err check", since the SaveSettings call and the string choice are no
+// longer in the same function. toggleSetting now returns a distinguishable
+// error (errToggleSettingNotConfigured for the nil-cfg case, the raw
+// SaveSettings error otherwise) and each caller picks the reply text off
+// that. Both directions are pinned per caller below — a test asserting only
+// the failure-text case would still pass if the two strings were swapped at
+// the call site.
+
+// TestToggleSimpleSendsSaveFailedOnWriteFailure drives togglebcast, one of
+// cbToggleSimple's four callers (togglebcast/togglestockbcast/
+// togglesalenotify/toggledepnotify — cbToggleSimple's own doc comment). The
+// other three share this exact function body by construction, so they are
+// not separately driven here.
+func TestToggleSimpleSendsSaveFailedOnWriteFailure(t *testing.T) {
+	ctx := context.Background()
+	b, f, _ := newReadOnlyCfgAuditBot(t)
+	b.Process(ctx, callbackUpdate(1, "adm:togglebcast"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+}
+
+// TestToggleSimpleSendsNotConfiguredWhenCfgNil is the OTHER direction for
+// cbToggleSimple: no Config wired at all (newTestBot, same nil-cfg shape
+// TestExecBroadcastNilStoreNoPanic already uses for its own nil dependency)
+// must still get settingsNotConfigured, not settingsSaveFailed.
+func TestToggleSimpleSendsNotConfiguredWhenCfgNil(t *testing.T) {
+	ctx := context.Background()
+	b, f := newTestBot("1", nil)
+	defer b.Shutdown()
+	b.Process(ctx, callbackUpdate(1, "adm:togglebcast"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsNotConfigured {
+		t.Fatalf("reply with nil cfg = %+v, want %q", last, settingsNotConfigured)
+	}
+}
+
+func TestToggleMaintSendsSaveFailedOnWriteFailure(t *testing.T) {
+	ctx := context.Background()
+	b, f, _ := newReadOnlyCfgAuditBot(t)
+	b.Process(ctx, callbackUpdate(1, "adm:togglemaint"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+}
+
+func TestToggleMaintSendsNotConfiguredWhenCfgNil(t *testing.T) {
+	ctx := context.Background()
+	b, f := newTestBot("1", nil)
+	defer b.Shutdown()
+	b.Process(ctx, callbackUpdate(1, "adm:togglemaint"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsNotConfigured {
+		t.Fatalf("reply with nil cfg = %+v, want %q", last, settingsNotConfigured)
+	}
+}
+
 // ---- simple bell/maintenance/referral toggles -------------------------------
 
 func TestSimpleToggles(t *testing.T) {
@@ -410,6 +474,49 @@ func TestTogglePrivateBespoke(t *testing.T) {
 	wantOff := "Private sale is now OFF 🔓 — back to the normal Sale on/off rule."
 	if last := lastSendMsg(f); last == nil || last.Text != wantOff {
 		t.Fatalf("reply = %+v, want %q", last, wantOff)
+	}
+}
+
+// ---- toggle handlers: settingsSaveFailed on a genuine write failure -------
+//
+// Task #29 (Opus review of c4d4970): cbToggleSales, cbTogglePrivate, and
+// cbToggleReferral each catch their own b.cfg.SaveSettings error but replied
+// with settingsNotConfigured — "Settings not configured on this instance."
+// — instead of settingsSaveFailed. Settings ARE configured on this path (a
+// genuine nil-b.cfg reply is a separate, earlier branch in the same
+// handlers, untouched by this fix); only the WRITE failed. The wrong text
+// sent an admin off to check a config that was fine, at the exact moment
+// the real fault — a failed disk write — was what needed their attention.
+// newReadOnlyCfgAuditBot (adminpricing_test.go) forces every SaveSettings
+// call to fail by loading config from a chmod 0500 directory — exactly the
+// fault these sites need injected, so it is reused here rather than
+// duplicating the read-only-dir setup TestSetBep20WizardNoAuditOnSaveFailure
+// and TestSetTronWizardNoAuditOnSaveFailure above already inline by hand.
+
+func TestToggleSalesSendsSaveFailedOnWriteFailure(t *testing.T) {
+	ctx := context.Background()
+	b, f, _ := newReadOnlyCfgAuditBot(t)
+	b.Process(ctx, callbackUpdate(1, "adm:togglesales"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+}
+
+func TestTogglePrivateSendsSaveFailedOnWriteFailure(t *testing.T) {
+	ctx := context.Background()
+	b, f, _ := newReadOnlyCfgAuditBot(t)
+	b.Process(ctx, callbackUpdate(1, "adm:toggleprivate"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+}
+
+func TestToggleReferralSendsSaveFailedOnWriteFailure(t *testing.T) {
+	ctx := context.Background()
+	b, f, _ := newReadOnlyCfgAuditBot(t)
+	b.Process(ctx, callbackUpdate(1, "adm:togglereferral"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
 	}
 }
 
@@ -591,6 +698,22 @@ func TestTogglePayStaleMethodAnswers(t *testing.T) {
 	}
 	if last.Text != "⚠️ That payment method no longer exists." {
 		t.Errorf("reply = %q, want the removed-method notice", last.Text)
+	}
+}
+
+// TestTogglePaySendsSaveFailedOnWriteFailure is cbTogglePay's counterpart to
+// the togglesales/toggleprivate/togglereferral trio above (task #29,
+// adminsettings.go:935). "balance" is used deliberately: it is the one
+// payMethodNames entry NOT in depositMethodNames, so it never engages
+// cbTogglePay's last-working-deposit-rail guard (see the EDGE CASE note on
+// cbTogglePay) — the save-failure branch under test is reached directly,
+// with no other guard to satisfy first.
+func TestTogglePaySendsSaveFailedOnWriteFailure(t *testing.T) {
+	ctx := context.Background()
+	b, f, _ := newReadOnlyCfgAuditBot(t)
+	b.Process(ctx, callbackUpdate(1, "adm:togglepay:balance"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
 	}
 }
 

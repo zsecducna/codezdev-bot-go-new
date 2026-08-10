@@ -1259,7 +1259,14 @@ func (b *Bot) cbKiroToggle(cc *cbCtx) {
 	s["kiro_apikey_enabled"] = turningOn
 	if err := b.cfg.SaveSettings(s); err != nil {
 		log.Println("adminpricing: save failed:", err)
-		b.send(cc.Ctx, cc.ChatID, settingsNotConfigured, admNav("admcat:pricing"))
+		// settingsNotConfigured ("Settings not configured on this instance")
+		// is the WRONG string here: b.cfg is non-nil (checked above) and
+		// SETTINGS ARE configured — only the disk WRITE just failed. Sending
+		// the "not configured" text misdirects the admin toward re-checking
+		// setup when the real fault is a failed save, the exact mix-up every
+		// sibling setter in this file avoids by sending settingsSaveFailed
+		// instead.
+		b.send(cc.Ctx, cc.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
 		return
 	}
 	// Task #13 Tier 4: audit AFTER the save succeeds, never before (spec
