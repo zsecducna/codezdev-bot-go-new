@@ -383,12 +383,16 @@ func TestAddBalDebitAuditsRowWithCorrectSign(t *testing.T) {
 // never reaches the audit call in the first place). Fault injection reuses
 // newQueryOnlyStoreBot from adminpricing_test.go (read-only reference, same
 // package, not an edit to that file) rather than re-deriving the same
-// PRAGMA query_only=ON technique a third time — CreditBalance/Debit are
+// table-scoped trigger technique a third time — CreditBalance/Debit are
 // plain store writes with no config.SaveSettings step, the same shape
-// capPromo/cbPromoDel needed that helper for.
+// capPromo/cbPromoDel needed that helper for. Faults "balances" only
+// (CreditBalance's write), so — per that helper's doc comment on the trap a
+// blanket query_only fell into — the audit table stays healthy and the
+// count comparison below actually tests the guard, not the fault
+// injection.
 func TestAddBalNoAuditOnFailedMutation(t *testing.T) {
 	ctx := context.Background()
-	b, f, st := newQueryOnlyStoreBot(t, nil)
+	b, f, st := newQueryOnlyStoreBot(t, nil, "balances")
 
 	before, err := st.RecentAudit(50, "")
 	if err != nil {

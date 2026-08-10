@@ -10,6 +10,7 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -667,23 +668,47 @@ func newReadOnlyCfgAuditBot(t *testing.T) (*Bot, *fakeTG, *store.Store) {
 }
 
 // newQueryOnlyStoreBot builds a Bot wired to a real, schema-initialized
-// *store.Store, then flips the connection to SQLite's own read-only mode
-// (PRAGMA query_only=ON) so every subsequent WRITE fails while reads keep
-// working — the fault injection capPromo/cbPromoDel need, since neither
-// fails on a config write (there is none in their path): both call
-// store.CreatePromo/DeletePromo directly, and store.Store wraps a concrete
-// *sql.DB with no interface seam to substitute a fake behind. The
+// *store.Store, then injects a targeted write failure for exactly the tables
+// named in faultTables — a BEFORE INSERT and a BEFORE DELETE trigger per
+// table, each unconditionally RAISE(ABORT, ...) — the fault injection
+// capPromo/cbPromoDel/execAddBal need, since none of them fails on a config
+// write (there is none in their path): each calls a plain store.* write
+// directly (CreatePromo/DeletePromo/CreditBalance), and store.Store wraps a
+// concrete *sql.DB with no interface seam to substitute a fake behind. The
 // newReadOnlyCfgAuditBot technique above (chmod a directory read-only
 // before Load) does NOT transfer here — verified empirically before writing
 // this helper: store.Open keeps ONE already-open, already-writable file
 // descriptor alive for the whole test (SetMaxOpenConns(1)), and POSIX
 // permission bits are checked at open(2), not at each write(2), so
 // chmod-after-Open on the db file/directory left every write still
-// succeeding. query_only is the seam SQLite itself exposes for exactly
-// this, reached through store.go's exported DB() getter. seed, if non-nil,
-// runs BEFORE query_only is set, so a test needing an existing promo row
-// (the delete-failure path) can create it while writes still work.
-func newQueryOnlyStoreBot(t *testing.T, seed func(*store.Store)) (*Bot, *fakeTG, *store.Store) {
+// succeeding.
+//
+// THE TRAP an earlier version of this helper fell into, for the next site
+// that reaches for fault injection here: that version flipped the WHOLE
+// connection read-only with `PRAGMA query_only=ON`, which blocks every
+// write — including the audit trail's own INSERT. Every "no audit row was
+// written" test built on it was vacuous either way: guard present -> the
+// audited call is never reached -> no row; guard DELETED -> the audited
+// call IS reached, but its INSERT fails on the same read-only connection ->
+// still no row (store.LogAction swallows that error by contract — see its
+// own doc comment). `latestAuditRow(...) == nil` passed regardless of
+// whether the guard existed; it was only proving the fault injection itself
+// was switched on (task #32). This is the EXACT OPPOSITE of
+// newReadOnlyCfgAuditBot above: that helper's chmod'd directory breaks only
+// config SAVES, leaving the database — audit table included — fully
+// healthy, so a deleted guard there really does let a row through and the
+// assertion is real. Same-shaped `latestAuditRow` line, opposite truth
+// value, depending on which thing the harness broke underneath it — not
+// something grep can tell apart. Table-scoped triggers restore the
+// property here: the target table's write fails exactly as before, but
+// `audit` is left writable, so "no audit row" once again means the guard
+// held.
+//
+// seed, if non-nil, runs BEFORE the triggers are installed, so a test
+// needing an existing row in a table it's about to fault-inject (e.g. a
+// promo code for the delete-failure path) can create it while writes still
+// work.
+func newQueryOnlyStoreBot(t *testing.T, seed func(*store.Store), faultTables ...string) (*Bot, *fakeTG, *store.Store) {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "store.db"))
@@ -694,8 +719,15 @@ func newQueryOnlyStoreBot(t *testing.T, seed func(*store.Store)) (*Bot, *fakeTG,
 	if seed != nil {
 		seed(st)
 	}
-	if _, err := st.DB().Exec("PRAGMA query_only=ON"); err != nil {
-		t.Fatalf("set query_only: %v", err)
+	for _, table := range faultTables {
+		for _, verb := range []string{"INSERT", "DELETE"} {
+			trig := fmt.Sprintf(
+				"CREATE TRIGGER fault_%s_%s BEFORE %s ON %s BEGIN SELECT RAISE(ABORT, 'injected write failure'); END",
+				strings.ToLower(verb), table, verb, table)
+			if _, err := st.DB().Exec(trig); err != nil {
+				t.Fatalf("create fault trigger on %s/%s: %v", table, verb, err)
+			}
+		}
 	}
 	f := &fakeTG{}
 	b := New(Deps{TG: f, Store: st, AdminID: "1"})
@@ -1239,7 +1271,7 @@ func TestCapSetKiroMaxNoAuditOnSaveFailure(t *testing.T) {
 // — was structurally unpinnable before newQueryOnlyStoreBot existed (no
 // fault-injecting store fake in this package).
 func TestCapPromoNoAuditOnSaveFailure(t *testing.T) {
-	b, f, st := newQueryOnlyStoreBot(t, nil)
+	b, f, st := newQueryOnlyStoreBot(t, nil, "promo_codes")
 
 	got := armAndCapture(t, b, 1, "adm:promonew", "20 100 off", b.capPromo)
 	if !got {
@@ -1255,10 +1287,17 @@ func TestCapPromoNoAuditOnSaveFailure(t *testing.T) {
 
 // TestCbPromoDelNoAuditOnSaveFailure pins cbPromoDel's DeletePromo failure
 // path. cbPromoDel is a plain callback (cbCtx), not a capture, so it has no
-// bool to assert — instead this checks the promo the seed created is STILL
-// present after the failed delete, the same "the mutation never actually
-// landed" property the bool assertions above are standing in for on the
-// capture-shaped setters.
+// bool to assert. The real guard-deletion detector is the audit-row check
+// below (now load-bearing since newQueryOnlyStoreBot scopes the fault to
+// promo_codes and leaves audit writable — task #32). The promo-still-exists
+// check below is NOT a substitute for that, despite an earlier version of
+// this comment claiming it stood in for the bool assertions on the
+// capture-shaped setters above: with DeletePromo's write genuinely failing
+// (that's the fault injection, not the guard), the promo persists whether or
+// not the guard runs — the guard's only observable effect is whether the
+// code stops before ever reaching auditConfigSet or falls through to it.
+// Kept anyway because "the failed delete truly didn't land" is still worth
+// pinning on its own, just not as guard-deletion evidence.
 func TestCbPromoDelNoAuditOnSaveFailure(t *testing.T) {
 	ctx := context.Background()
 	const code = "DELFAIL"
@@ -1266,7 +1305,7 @@ func TestCbPromoDelNoAuditOnSaveFailure(t *testing.T) {
 		if err := st.CreatePromo(code, 10, 5, false); err != nil {
 			t.Fatalf("seed promo: %v", err)
 		}
-	})
+	}, "promo_codes")
 
 	b.Process(ctx, callbackUpdate(1, cbData("promodel", code)))
 	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
