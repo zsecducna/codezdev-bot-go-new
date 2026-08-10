@@ -1343,6 +1343,32 @@ func TestApikeyRefundFullyUsedKey(t *testing.T) {
 	}
 }
 
+// TestApikeyRefundAmount_WholeCreditPayoutUnchanged pins task #37's money
+// requirement directly: converting kirogo.KeyStat.CreditsUsed/CreditsRemaining
+// from int64 to float64 (to stop /admin/stats decode crashing on a live
+// key's fractional creditsUsed) must NOT change the computed payout for a
+// key whose live usage happens to be a whole number of credits — every key
+// this bot sold before the live deploy started returning fractional usage.
+// 1000 credits bought for 1,000,000 VND, 400 used live -> 600,000 VND,
+// numerically identical to what the old int64-typed decode would have
+// produced.
+func TestApikeyRefundAmount_WholeCreditPayoutUnchanged(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, fk, _ := newAPIKeyBot(t)
+	const chat = 100
+	const keyDes = "77880000778800007788000077880000"
+	seedKey(t, st, fk, keyDes, chat, "poolkey-whole", "sk-test-whole-0123456789abcdef", "bedrock", 1000, 1000, 400)
+
+	o, _ := st.GetOrder(keyDes)
+	amount, bought, used := b.apikeyRefundAmount(ctx, o)
+	if bought != 1000 || used != 400 {
+		t.Fatalf("bought/used = %d/%d, want 1000/400", bought, used)
+	}
+	if want := int64(600000); amount != want {
+		t.Fatalf("amount = %d, want %d (must be unchanged by the float refactor)", amount, want)
+	}
+}
+
 // TestApikeyRevokeTreats404AsRevoked: "already gone" is the desired end state,
 // so a 404 delete counts as a successful revoke and never blocks a refund.
 func TestApikeyRevokeTreats404AsRevoked(t *testing.T) {

@@ -10,12 +10,20 @@ import (
 // KIRO_GO_API.md:15 — invariant 4. Plain arithmetic on a Remaining value
 // without checking IsUnlimited first is a bug (treating -1 as "minus one
 // unit left" instead of "unlimited").
-type Remaining int64
+//
+// Backed by float64, not int64: creditsRemaining is a metered, server-computed
+// balance and the live deploy sends fractional values (observed verbatim:
+// creditsRemaining=1999.95 for a creditLimit=2000/creditsUsed=0.05 key) —
+// decoding it into an integer field crashes json.Unmarshal outright ("cannot
+// unmarshal number 0.05 into ... of type int64"), which is exactly the live
+// bug this type exists to fix. -1 (the unlimited sentinel) is exactly
+// representable in float64, so IsUnlimited below is unaffected.
+type Remaining float64
 
 // IsUnlimited reports whether this remaining-count field represents an
 // unlimited quota (wire value -1).
 func (r Remaining) IsUnlimited() bool {
-	return int64(r) == -1
+	return float64(r) == -1
 }
 
 // Upstream binding status returned by provision_customer
@@ -357,13 +365,22 @@ type RechargeKeyResponse struct {
 	ID      string `json:"id"`
 	// Enabled is true after the recharge — a top-up RE-ENABLES a key that was
 	// disabled for exhaustion (KIRO_GO_API.md:78, 90).
-	Enabled          bool      `json:"enabled"`
-	CreditLimit      int64     `json:"creditLimit"`
-	CreditsUsed      int64     `json:"creditsUsed"`
+	Enabled bool `json:"enabled"`
+	// CreditLimit / CreditsUsed are RESPONSE-side (server-computed running
+	// totals after this top-up), same fractional-credit exposure as
+	// CreditsRemaining — see the Remaining doc comment. Unlike the
+	// int64 CreditLimit line, these deal with the raw creditsUsed meter, so
+	// they carry the same float requirement independently.
+	CreditLimit      float64   `json:"creditLimit"`
+	CreditsUsed      float64   `json:"creditsUsed"`
 	CreditsRemaining Remaining `json:"creditsRemaining"`
-	TokenLimit       int64     `json:"tokenLimit"`
-	TokensUsed       int64     `json:"tokensUsed"`
-	TokensRemaining  Remaining `json:"tokensRemaining"`
+	// TokenLimit/TokensUsed/TokensRemaining stay integral: Kiro-Go meters
+	// tokens as whole units (every observed body, live and documented, carries
+	// a whole-number tokensUsed/tokensRemaining) — only credits accrue
+	// fractionally.
+	TokenLimit      int64     `json:"tokenLimit"`
+	TokensUsed      int64     `json:"tokensUsed"`
+	TokensRemaining Remaining `json:"tokensRemaining"`
 }
 
 // RechargeKey tops up an existing key's credit quota
@@ -474,20 +491,26 @@ type StatsRequest struct {
 // KeyStat is one entry of StatsResponse.Keys (KIRO_GO_API.md:114-120).
 // Status is one of "active" | "exhausted" | "disabled" (KIRO_GO_API.md:125).
 type KeyStat struct {
-	ID               string    `json:"id"`
-	Name             string    `json:"name"`
-	KeyMasked        string    `json:"keyMasked"`
-	Enabled          bool      `json:"enabled"`
-	Status           string    `json:"status"`
-	CreditLimit      int64     `json:"creditLimit"`
-	CreditsUsed      int64     `json:"creditsUsed"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	KeyMasked string `json:"keyMasked"`
+	Enabled   bool   `json:"enabled"`
+	Status    string `json:"status"`
+	// CreditLimit / CreditsUsed: RESPONSE-side, same live-deploy fractional
+	// exposure that caused this package's headline bug — the verbatim body
+	// that crashed decoding was creditLimit=2000, creditsUsed=0.05 off THIS
+	// struct. See the Remaining doc comment for the wire evidence.
+	CreditLimit      float64   `json:"creditLimit"`
+	CreditsUsed      float64   `json:"creditsUsed"`
 	CreditsRemaining Remaining `json:"creditsRemaining"`
-	TokenLimit       int64     `json:"tokenLimit"`
-	TokensUsed       int64     `json:"tokensUsed"`
-	TokensRemaining  Remaining `json:"tokensRemaining"`
-	RequestsCount    int64     `json:"requestsCount"`
-	CreatedAt        int64     `json:"createdAt"`
-	LastUsedAt       int64     `json:"lastUsedAt"`
+	// TokenLimit/TokensUsed/TokensRemaining stay integral — tokens meter in
+	// whole units on every observed body; only credits accrue fractionally.
+	TokenLimit      int64     `json:"tokenLimit"`
+	TokensUsed      int64     `json:"tokensUsed"`
+	TokensRemaining Remaining `json:"tokensRemaining"`
+	RequestsCount   int64     `json:"requestsCount"`
+	CreatedAt       int64     `json:"createdAt"`
+	LastUsedAt      int64     `json:"lastUsedAt"`
 	// SaleClass is the class the SERVER has recorded for this key ("bedrock" |
 	// "kiro" | absent on a pre-split server). It is the authority for a LEGACY
 	// row the bot stored with an empty sale_class: the server may know a class
@@ -499,11 +522,26 @@ type KeyStat struct {
 }
 
 // StatsTotals is the aggregate block of StatsResponse (KIRO_GO_API.md:122).
+//
+// Field tags are the live deploy's spelling, NOT the doc's. KIRO_GO_API.md:122
+// documents `{"keys":1,"tokens":12345,"credits":40,"requests":20}`, but a real
+// curled body (same investigation as the KeyStat fractional-credits bug) is
+// `{"creditsUsed":48752.967...,"keys":65,"requestsCount":72959,
+// "tokensUsed":9608720736}` — three of four field names differ from the doc.
+// Under the old tags ("tokens"/"credits"/"requests") those three fields
+// silently decoded as their zero value on every real response: no error, no
+// log line, just permanently-0 totals. This is the SAME failure shape as the
+// "keys" vs "apiKeys" mismatch on StatsResponse.Keys — a doc example that
+// isn't the schema. Only "keys" is confirmed correct in both doc and deploy.
 type StatsTotals struct {
-	Keys     int64 `json:"keys"`
-	Tokens   int64 `json:"tokens"`
-	Credits  int64 `json:"credits"`
-	Requests int64 `json:"requests"`
+	Keys int64 `json:"keys"`
+	// Tokens stays integral (see KeyStat's TokenLimit/TokensUsed doc comment —
+	// tokens meter in whole units on every observed body).
+	Tokens int64 `json:"tokensUsed"`
+	// Credits: RESPONSE-side aggregate over every key's fractional
+	// creditsUsed — must be float for the same reason as KeyStat.CreditsUsed.
+	Credits  float64 `json:"creditsUsed"`
+	Requests int64   `json:"requestsCount"`
 }
 
 // StatsResponse is the success body of /admin/stats (KIRO_GO_API.md:111-124).
@@ -595,10 +633,17 @@ type CustomerMeResponse struct {
 	CreatedAt  int64  `json:"createdAt"`
 	LastUsedAt int64  `json:"lastUsedAt"`
 
-	TokenLimit  int64 `json:"tokenLimit"`
-	CreditLimit int64 `json:"creditLimit"`
-	TokensUsed  int64 `json:"tokensUsed"`
-	CreditsUsed int64 `json:"creditsUsed"`
+	TokenLimit int64 `json:"tokenLimit"`
+	TokensUsed int64 `json:"tokensUsed"`
+	// CreditLimit / CreditsUsed: RESPONSE-side, same fractional-credit
+	// exposure as KeyStat/RechargeKeyResponse — this is the buyer-facing
+	// balance-check endpoint, so a fractional creditsUsed here would crash
+	// json.Unmarshal exactly like the /admin/stats bug this package now fixes.
+	// Not independently confirmed against a live /api/me body (only
+	// /admin/stats was curled) — flagged as the same doc-example risk
+	// pattern, fixed proactively rather than left to fail the same way later.
+	CreditLimit float64 `json:"creditLimit"`
+	CreditsUsed float64 `json:"creditsUsed"`
 
 	TokensRemaining  Remaining `json:"tokensRemaining"`
 	CreditsRemaining Remaining `json:"creditsRemaining"`

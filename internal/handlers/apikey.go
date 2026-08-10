@@ -751,7 +751,10 @@ func (b *Bot) rcGateMessage(g rcGate, lang i18n.Lang, cls string) string {
 		// is rejected by Kiro-Go with a 400) — one customer-facing message.
 		return c.RCDisabled.T(lang)
 	case "full":
-		return i18n.F(c.RCFull.T(lang), "remaining", itoa64(int64(g.Remaining)),
+		// Round, don't truncate: g.Remaining is fed straight from
+		// kirogo.KeyStat.CreditsRemaining, which is fractional on live keys —
+		// int64(...) would floor 1999.95 down to 1999 in this notice.
+		return i18n.F(c.RCFull.T(lang), "remaining", itoa64(roundCredits(g.Remaining)),
 			"cap", itoa64(b.apikeyMaxCredits(cls)))
 	}
 	return ""

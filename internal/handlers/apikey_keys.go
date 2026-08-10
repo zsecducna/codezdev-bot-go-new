@@ -128,12 +128,18 @@ func (b *Bot) showMyAPIKeys(ctx context.Context, chatID int64, lang i18n.Lang) {
 				label = s.T(lang)
 			}
 			// -1 = unlimited (defensive; sold keys always carry a quota).
+			// CreditsRemaining/CreditsUsed are fractional now (kirogo.Remaining
+			// and KeyStat.CreditsUsed are float64-backed — live keys accrue
+			// sub-1-credit usage), so round to the nearest whole credit for
+			// display via roundCredits rather than truncating with int64(...)
+			// (would show 1999 instead of 2000 for a 1999.95 balance) or
+			// printing the float directly (would show "1999.950000").
 			left := "∞"
 			if !stat.CreditsRemaining.IsUnlimited() && stat.CreditsRemaining >= 0 {
-				left = itoa64(int64(stat.CreditsRemaining))
+				left = itoa64(roundCredits(float64(stat.CreditsRemaining)))
 			}
 			detail := i18n.F(c.MyKeysLineStats.T(lang),
-				"used", itoa64(stat.CreditsUsed), "bought", itoa64(bought),
+				"used", itoa64(roundCredits(stat.CreditsUsed)), "bought", itoa64(bought),
 				"left", left, "when", when)
 			lines = append(lines, "\n🔑 "+masked+" · "+tag+" — "+label+"\n   "+detail)
 		} else {

@@ -246,7 +246,7 @@ func TestRemaining_IsUnlimited(t *testing.T) {
 	}{{-1, true}, {0, false}, {50, false}, {1, false}}
 	for _, tc := range cases {
 		if got := tc.v.IsUnlimited(); got != tc.want {
-			t.Errorf("Remaining(%d).IsUnlimited() = %v, want %v", tc.v, got, tc.want)
+			t.Errorf("Remaining(%v).IsUnlimited() = %v, want %v", tc.v, got, tc.want)
 		}
 	}
 }
@@ -277,10 +277,10 @@ func TestRechargeKey_UnlimitedTokensRemaining(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !resp.TokensRemaining.IsUnlimited() {
-		t.Errorf("TokensRemaining = %d, want unlimited (-1)", resp.TokensRemaining)
+		t.Errorf("TokensRemaining = %v, want unlimited (-1)", resp.TokensRemaining)
 	}
 	if resp.CreditsRemaining != 50 {
-		t.Errorf("CreditsRemaining = %d, want 50", resp.CreditsRemaining)
+		t.Errorf("CreditsRemaining = %v, want 50", resp.CreditsRemaining)
 	}
 }
 
@@ -642,7 +642,7 @@ func TestCustomerMe_UsesXApiKeyNotAdminHeader(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if resp.CreditsRemaining != 60 {
-		t.Errorf("CreditsRemaining = %d, want 60", resp.CreditsRemaining)
+		t.Errorf("CreditsRemaining = %v, want 60", resp.CreditsRemaining)
 	}
 	if !resp.TokensRemaining.IsUnlimited() {
 		t.Error("TokensRemaining should be unlimited")
@@ -983,5 +983,192 @@ func TestSend_2xxNeverRetriedRegardlessOfBody(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("server called %d times for a 2xx/pending response, want exactly 1", calls)
+	}
+}
+
+// ── task #37: fractional credits — creditsUsed/creditsRemaining are NOT
+// integral on live keys ──────────────────────────────────────────────────
+//
+// The live bug this section pins: "kiro-go stats failed for order
+// dd9cfa0f...: kirogo: decode response for /admin/stats: json: cannot
+// unmarshal number 0.05 into Go struct field KeyStat.apiKeys.creditsUsed of
+// type int64". realFractionalKeyStatBody below is the VERBATIM key that
+// triggered it (self-service refund flow on a kiro-class key). Nothing here
+// is kiro-specific — a bedrock key merely hadn't accrued fractional usage
+// yet; the field type was wrong for every sale class from day one.
+
+const realFractionalKeyStatBody = `{"creditLimit":2000,"creditsUsed":0.05,"creditsRemaining":1999.95,` +
+	`"tokensUsed":389,"tokensRemaining":-1,"requestsCount":1,` +
+	`"status":"active","saleClass":"kiro","enabled":true,` +
+	`"createdAt":1786349134,"lastUsedAt":1786349154}`
+
+// TestKeyStat_DecodesRealFractionalCreditsBody pins the fix for the live
+// crash: this body must decode cleanly, and the fractional values must
+// survive EXACTLY — no rounding/truncation at the decode layer (display-side
+// rounding happens later, at render time only).
+func TestKeyStat_DecodesRealFractionalCreditsBody(t *testing.T) {
+	var ks KeyStat
+	if err := json.Unmarshal([]byte(realFractionalKeyStatBody), &ks); err != nil {
+		t.Fatalf("unmarshal real fractional /admin/stats key body: %v — this is exactly the live crash "+
+			"(\"cannot unmarshal number 0.05 into Go struct field KeyStat.apiKeys.creditsUsed of type int64\")", err)
+	}
+	if ks.CreditsUsed != 0.05 {
+		t.Errorf("CreditsUsed = %v, want 0.05 exactly", ks.CreditsUsed)
+	}
+	if ks.CreditsRemaining != 1999.95 {
+		t.Errorf("CreditsRemaining = %v, want 1999.95 exactly", ks.CreditsRemaining)
+	}
+	if ks.CreditLimit != 2000 {
+		t.Errorf("CreditLimit = %v, want 2000", ks.CreditLimit)
+	}
+	if ks.CreditsRemaining.IsUnlimited() {
+		t.Error("CreditsRemaining.IsUnlimited() = true for 1999.95; want false")
+	}
+	if !ks.TokensRemaining.IsUnlimited() {
+		t.Error("TokensRemaining.IsUnlimited() = false for the real body's tokensRemaining:-1; want true")
+	}
+}
+
+// TestKeyStat_WholeNumberBodyStillDecodes pins that a key whose live usage
+// happens to be a round number (every key sold before this fix, and every
+// bedrock key until it accrues its first fractional charge) decodes to
+// numerically identical values as the old int64-typed struct would have
+// produced — the refactor must not perturb the whole-number case.
+func TestKeyStat_WholeNumberBodyStillDecodes(t *testing.T) {
+	body := `{"creditLimit":100,"creditsUsed":40,"creditsRemaining":60,` +
+		`"tokensUsed":12345,"tokensRemaining":-1,"requestsCount":20,"status":"active","enabled":true}`
+	var ks KeyStat
+	if err := json.Unmarshal([]byte(body), &ks); err != nil {
+		t.Fatalf("unmarshal whole-number body: %v", err)
+	}
+	if ks.CreditLimit != 100 || ks.CreditsUsed != 40 || ks.CreditsRemaining != 60 {
+		t.Errorf("CreditLimit/CreditsUsed/CreditsRemaining = %v/%v/%v, want 100/40/60",
+			ks.CreditLimit, ks.CreditsUsed, ks.CreditsRemaining)
+	}
+}
+
+// realStatsTotalsBody is the VERBATIM totals block observed on the same
+// production /admin/stats curl as realApiKeysStatsBody, further up this
+// file. KIRO_GO_API.md:122 documents `{"keys":1,"tokens":...,"credits":...,
+// "requests":...}` — three of those four names are wrong on the deployed
+// server, which is why StatsTotals's json tags were changed to match this
+// body instead of the doc (same failure shape as the "keys"/"apiKeys" split
+// on StatsResponse.Keys: a doc example mistaken for the schema).
+const realStatsTotalsBody = `{"creditsUsed":48752.967,"keys":65,"requestsCount":72959,"tokensUsed":9608720736}`
+
+// TestStatsTotals_DecodesLiveWireSpelling pins the totals-block field-name
+// fix: under the OLD tags ("tokens"/"credits"/"requests") this exact body
+// decoded Tokens/Credits/Requests to their zero value with no error at all.
+func TestStatsTotals_DecodesLiveWireSpelling(t *testing.T) {
+	var totals StatsTotals
+	if err := json.Unmarshal([]byte(realStatsTotalsBody), &totals); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if totals.Keys != 65 {
+		t.Errorf("Keys = %v, want 65", totals.Keys)
+	}
+	if totals.Tokens != 9608720736 {
+		t.Errorf("Tokens = %v, want 9608720736", totals.Tokens)
+	}
+	if totals.Credits != 48752.967 {
+		t.Errorf("Credits = %v, want 48752.967", totals.Credits)
+	}
+	if totals.Requests != 72959 {
+		t.Errorf("Requests = %v, want 72959", totals.Requests)
+	}
+}
+
+// TestStatsTotals_DocSpelledFieldsDoNotPopulate is a regression guard proving
+// the tag fix actually took: a body using the DOC's spelling for the three
+// wrong fields must leave them at zero (they never appear on the real
+// deploy), so a future edit can't silently revert the tags back to the
+// doc's names without a test noticing.
+func TestStatsTotals_DocSpelledFieldsDoNotPopulate(t *testing.T) {
+	body := `{"keys":1,"tokens":999,"credits":999,"requests":999}`
+	var totals StatsTotals
+	if err := json.Unmarshal([]byte(body), &totals); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if totals.Keys != 1 {
+		t.Errorf("Keys = %v, want 1", totals.Keys)
+	}
+	if totals.Tokens != 0 || totals.Credits != 0 || totals.Requests != 0 {
+		t.Errorf("Tokens/Credits/Requests = %v/%v/%v, want 0/0/0 (the doc's field names must not populate the live-tagged fields)",
+			totals.Tokens, totals.Credits, totals.Requests)
+	}
+}
+
+// realFractionalStatsResponseBody is a full /admin/stats response combining
+// the real fractional key body with the real totals body — the exact
+// end-to-end shape that used to crash json.Unmarshal inside Stats(), and
+// which apikeyLiveStats (handlers/apikey.go) calls on every refund preview.
+const realFractionalStatsResponseBody = `{"apiKeys":[` + realFractionalKeyStatBody + `],` +
+	`"totals":` + realStatsTotalsBody + `}`
+
+func TestStatsResponse_DecodesRealFractionalBody(t *testing.T) {
+	var resp StatsResponse
+	if err := json.Unmarshal([]byte(realFractionalStatsResponseBody), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Keys) != 1 {
+		t.Fatalf("Keys = %+v, want one entry", resp.Keys)
+	}
+	if resp.Keys[0].CreditsUsed != 0.05 || resp.Keys[0].CreditsRemaining != 1999.95 {
+		t.Errorf("Keys[0] CreditsUsed/CreditsRemaining = %v/%v, want 0.05/1999.95",
+			resp.Keys[0].CreditsUsed, resp.Keys[0].CreditsRemaining)
+	}
+	if resp.Totals.Credits != 48752.967 {
+		t.Errorf("Totals.Credits = %v, want 48752.967", resp.Totals.Credits)
+	}
+}
+
+// TestRechargeKeyResponse_DecodesFractionalCredits pins RechargeKeyResponse
+// against the same fractional-credits exposure as KeyStat: it comes off the
+// SAME server code path (/admin/recharge_api_key echoes the post-top-up
+// creditLimit/creditsUsed/creditsRemaining), so a key recharged mid-fractional-
+// usage would crash this decode exactly like /admin/stats did. No verbatim
+// production body was curled for this endpoint specifically — this body is
+// inferred by symmetry, not independently confirmed live (see the
+// CustomerMeResponse doc comment for the same caveat).
+func TestRechargeKeyResponse_DecodesFractionalCredits(t *testing.T) {
+	body := `{"success":true,"id":"uuid","enabled":true,` +
+		`"creditLimit":2000,"creditsUsed":150.25,"creditsRemaining":1849.75,` +
+		`"tokenLimit":0,"tokensUsed":0,"tokensRemaining":-1}`
+	var resp RechargeKeyResponse
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("unmarshal fractional recharge response: %v", err)
+	}
+	if resp.CreditsUsed != 150.25 {
+		t.Errorf("CreditsUsed = %v, want 150.25", resp.CreditsUsed)
+	}
+	if resp.CreditsRemaining != 1849.75 {
+		t.Errorf("CreditsRemaining = %v, want 1849.75", resp.CreditsRemaining)
+	}
+	if resp.CreditLimit != 2000 {
+		t.Errorf("CreditLimit = %v, want 2000", resp.CreditLimit)
+	}
+}
+
+// TestCustomerMeResponse_DecodesFractionalCredits: same reasoning as
+// RechargeKeyResponse above — /api/me is the buyer-facing twin of
+// /admin/stats and shares the server's credit-metering code, so it must
+// accept the same fractional creditsUsed/creditLimit.
+func TestCustomerMeResponse_DecodesFractionalCredits(t *testing.T) {
+	body := `{"id":"uuid","name":"order-1","keyMasked":"sk-abc****wxyz","status":"active",` +
+		`"createdAt":0,"lastUsedAt":0,"tokenLimit":0,"creditLimit":2000,` +
+		`"tokensUsed":389,"creditsUsed":0.05,"tokensRemaining":-1,"creditsRemaining":1999.95,` +
+		`"requestsCount":1}`
+	var resp CustomerMeResponse
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("unmarshal fractional /api/me response: %v", err)
+	}
+	if resp.CreditsUsed != 0.05 {
+		t.Errorf("CreditsUsed = %v, want 0.05", resp.CreditsUsed)
+	}
+	if resp.CreditsRemaining != 1999.95 {
+		t.Errorf("CreditsRemaining = %v, want 1999.95", resp.CreditsRemaining)
+	}
+	if resp.CreditLimit != 2000 {
+		t.Errorf("CreditLimit = %v, want 2000", resp.CreditLimit)
 	}
 }

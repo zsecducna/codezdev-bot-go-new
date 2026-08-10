@@ -334,7 +334,10 @@ func (b *Bot) deliverApikeyRecharge(ctx context.Context, order *store.Order, des
 			return b.apikeyRCFailRefund(ctx, order, des, chatID, lang, credits, total, rerr)
 		}
 		if res.CreditsRemaining >= 0 {
-			remaining = itoa64(int64(res.CreditsRemaining))
+			// Round, don't truncate: CreditsRemaining is fractional now (live
+			// keys accrue sub-1-credit usage) — int64(...) would floor a
+			// balance like 1999.95 down to 1999 on the receipt.
+			remaining = itoa64(roundCredits(float64(res.CreditsRemaining)))
 		}
 		// TOCTOU vs a concurrent whole-key refund: the group refund marks the key
 		// refunded and DELETES it on Kiro-Go. If that ran between our check above
