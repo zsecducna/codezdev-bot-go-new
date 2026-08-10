@@ -19,9 +19,16 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 )
+
+// reconcileAlertEscalate bounds how long an UNCHANGED stuck-order alert may
+// stay suppressed before reconcileShouldAlert re-fires it anyway (the
+// escalation half of the policy below). A package var, not a literal inline,
+// purely so a test can shrink it like every other timing knob in this file.
+var reconcileAlertEscalate = time.Hour
 
 // reconcileReport is the testable core of the stuck-order reconcile pass —
 // returns what the periodic worker would log. Read-only: it NEVER delivers,
@@ -54,21 +61,15 @@ func (b *Bot) reconcileReport() (count int64, oldestTS float64, err error) {
 // reconcileStuckOrdersOnce is one pass of the report-only stuck-order
 // reconcile (Python reconcile_stuck_orders.py:99-107, run every 10min by
 // crontab). Logs an OWNER ALERT with the count and the oldest order's age
-// when count > 0; quiet at zero, matching the dashboard alarm at admin.go
-// (which suppresses at 0). Log-only today: the _notify_owners channel is a
-// known deferred gap (TODO(M3.1)); swap this log.Printf for the owner-alert
-// call when that lands.
+// when count > 0, and DMs the owners (de-duped — see reconcileShouldAlert)
+// through the same channel; quiet at zero, matching the dashboard alarm at
+// admin.go (which suppresses at 0).
 //
 // Read-only: the only call is reconcileReport (a single SELECT). No settle,
 // no deliver, no ClaimOrder, no CreditBalance — re-driving a paid order
 // moves real funds (reconcile_stuck_orders.py:25-26), so this pass may only
 // surface, never act.
 func (b *Bot) reconcileStuckOrdersOnce(ctx context.Context) {
-	// ctx is unused on this read-only path; mirror expirySweepOnce
-	// (usdt.go:1310) which keeps the param for API symmetry with the worker
-	// registry's ticker shape.
-	_ = ctx
-
 	count, oldestTS, err := b.reconcileReport()
 	if err != nil {
 		// A read failure is surfaced but never fatal: the worker keeps
@@ -82,6 +83,18 @@ func (b *Bot) reconcileStuckOrdersOnce(ctx context.Context) {
 		// Healthy-shop path: dashboard suppresses the whole alarm line at 0
 		// (admin.go:ageString caller), and so do we. Logging here would be
 		// noise on every 10-min tick of a healthy shop.
+		//
+		// Also resets the alert de-dup fingerprint. Without this, a backlog
+		// that clears and later recurs with the SAME (count, oldestTS) —
+		// entirely possible, e.g. the exact same single order gets stuck
+		// again — would look "unchanged" to reconcileShouldAlert and stay
+		// silent, even though it is a brand-new incident from the operator's
+		// point of view. A recovery must always arm the NEXT backlog's first
+		// alert, matching the same first-alert rule any fresh startup gets.
+		b.reconcileAlertMu.Lock()
+		b.reconcileAlertCount, b.reconcileAlertOldest = 0, 0
+		b.reconcileAlertSentAt = time.Time{}
+		b.reconcileAlertMu.Unlock()
 		return
 	}
 
@@ -96,6 +109,63 @@ func (b *Bot) reconcileStuckOrdersOnce(ctx context.Context) {
 	}
 	log.Printf("OWNER ALERT: %d PAID-BUT-UNDELIVERED order(s)%s — MANUAL REVIEW (never auto-handled; reconcile_stuck_orders.py:25-26)",
 		count, ageSuffix)
+	// The Telegram send is DE-DUPED (reconcileShouldAlert) even though the log
+	// line above never is: this pass re-runs every 10 minutes forever, and an
+	// identical DM every tick trains the operator to ignore the channel — the
+	// exact failure the log doesn't have (nobody "ignores" a log they only
+	// read when investigating). See reconcileShouldAlert's doc comment.
+	if !b.reconcileShouldAlert(count, oldestTS) {
+		return
+	}
+	b.notifyOwners(ctx, fmt.Sprintf(
+		"⚠️ %d PAID-BUT-UNDELIVERED order(s)%s — MANUAL REVIEW (never auto-handled)",
+		count, ageSuffix))
+}
+
+// reconcileShouldAlert decides whether THIS pass's (count, oldestTS) should
+// reach the owners, given what the last alert already reported.
+//
+// Policy: alert on the FIRST nonzero pass, and again only when the situation
+// actually CHANGED — the count moved, or the oldest stuck order did. oldestTS
+// is a stable fingerprint for "same order still stuck": it is that order's own
+// creation timestamp, not an age, so unlike ageSuffix's "3h ago" -> "3h10m
+// ago" it does NOT drift tick to tick on its own, which is what makes
+// "unchanged" a meaningful, non-flapping condition here.
+//
+// KNOWN HOLE, stated because an earlier version of this comment claimed the
+// opposite: (count, oldestTS) does NOT uniquely identify the backlog, so a
+// genuinely NEW stuck order can be suppressed. PaidUndelivered reports
+// MIN(ts), so if a NON-oldest order is resolved and a newer one gets stuck in
+// the same window, the count is unchanged AND the minimum is unchanged, and
+// this returns false. Concretely: {A ts=100, B ts=200} alerts as (2, 100); B
+// is delivered while C sticks at ts=300; the pass sees {A, C} — still (2,
+// 100) — and stays quiet about C.
+//
+// It is bounded rather than unbounded: the escalation below re-alerts within
+// reconcileAlertEscalate regardless, so the blind window is at most that, not
+// forever. Closing it properly means fingerprinting the SET of stuck order ids
+// (a hash of the des list) instead of a count and a minimum, which needs
+// PaidUndelivered to return more than an aggregate — deliberately not done
+// here.
+//
+// Escalation backstop: even a genuinely unchanged backlog re-alerts after
+// reconcileAlertEscalate (1h) so a human who missed/dismissed the first DM
+// isn't left with a channel that goes silent forever on a problem that never
+// got fixed — the same worry that motivates de-duping in the first place,
+// applied in the other direction.
+func (b *Bot) reconcileShouldAlert(count int64, oldestTS float64) bool {
+	b.reconcileAlertMu.Lock()
+	defer b.reconcileAlertMu.Unlock()
+	first := b.reconcileAlertSentAt.IsZero()
+	changed := count != b.reconcileAlertCount || oldestTS != b.reconcileAlertOldest
+	stale := !first && b.now().Sub(b.reconcileAlertSentAt) >= reconcileAlertEscalate
+	if !first && !changed && !stale {
+		return false
+	}
+	b.reconcileAlertCount = count
+	b.reconcileAlertOldest = oldestTS
+	b.reconcileAlertSentAt = b.now()
+	return true
 }
 
 // StartReconcileStuckOrders runs the report-only stuck-order reconcile on a

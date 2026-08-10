@@ -176,6 +176,120 @@ func TestSettlePaidLateExpiredClaimKindByProduct(t *testing.T) {
 	}
 }
 
+// TestSettlePaidFreshDepositNotifiesAdminOwner covers deposit.go:240 (the
+// fresh reserved->paid claim branch) — notify_admin_deposit
+// (telegram_bot.py:9028-9034). AdminID "999" here is always distinct from
+// the buyer chat, so a message landing there is unambiguously the owner
+// alert.
+func TestSettlePaidFreshDepositNotifiesAdminOwner(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, _ := newBuyBot(t, "999")
+	const chat = 200
+
+	des := store.NewDes()
+	if err := st.CreateOrder(des, fmtInt(chat), "en", depositProduct, "USDT BEP20", 0, 500000); err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+	settled, err := b.settlePaid(ctx, des)
+	if err != nil || !settled {
+		t.Fatalf("settlePaid: settled=%v err=%v", settled, err)
+	}
+	alert := lastSendMsgTo(f, 999)
+	if alert == nil || !strings.Contains(alert.Text, "💰 NEW DEPOSIT") {
+		t.Fatalf("owner alert = %v, want a 💰 NEW DEPOSIT message", alert)
+	}
+	if !strings.Contains(alert.Text, "USDT BEP20") {
+		t.Errorf("deposit alert = %q, want the order's Tier as the funding-rail label", alert.Text)
+	}
+}
+
+// TestSettlePaidDepositReplayDoesNotDoubleNotify pins the CARE requirement:
+// deposits are idempotent by des/status at the storage layer, and the alert
+// must not undo that — a replayed settle on an already-delivered deposit
+// order must not produce a second "NEW DEPOSIT" alert.
+func TestSettlePaidDepositReplayDoesNotDoubleNotify(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, _ := newBuyBot(t, "999")
+	const chat = 201
+
+	des := store.NewDes()
+	if err := st.CreateOrder(des, fmtInt(chat), "en", depositProduct, "USDT TRC20", 0, 300000); err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+	if settled, err := b.settlePaid(ctx, des); err != nil || !settled {
+		t.Fatalf("first settlePaid: settled=%v err=%v", settled, err)
+	}
+	if n := countContains(f, "💰 NEW DEPOSIT"); n != 1 {
+		t.Fatalf("after first settle: NEW DEPOSIT count = %d, want 1", n)
+	}
+
+	// Replay: the order is already 'delivered', so ClaimOrder(reserved->paid)
+	// loses and settlePaid falls through to its "already handled" no-op tail.
+	if settled, err := b.settlePaid(ctx, des); err != nil || settled {
+		t.Fatalf("replay settlePaid: settled=%v err=%v, want settled=false (already handled)", settled, err)
+	}
+	if n := countContains(f, "💰 NEW DEPOSIT"); n != 1 {
+		t.Errorf("after replay: NEW DEPOSIT count = %d, want still 1 (no double-alert on a settled replay)", n)
+	}
+}
+
+// TestSettlePaidLateExpiredDepositNotifiesAdminOwner covers deposit.go:288
+// (the late-settled, post-expiry claim branch) — notify_admin_deposit
+// (telegram_bot.py:9048-9053).
+func TestSettlePaidLateExpiredDepositNotifiesAdminOwner(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, _ := newBuyBot(t, "999")
+	const chat = 202
+
+	des := store.NewDes()
+	if err := st.CreateOrder(des, fmtInt(chat), "en", depositProduct, "USDT BEP20", 0, 400000); err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+	if _, err := st.ClaimOrder(des, "reserved", "expired"); err != nil {
+		t.Fatalf("claim -> expired: %v", err)
+	}
+	// settlePaid's `settled` return only reflects the FRESH reserved->paid win
+	// (deposit.go:234/249) — the late-expired refund-credit branch always
+	// returns (false, nil) regardless of outcome (deposit.go's own "already
+	// handled, dedupe" tail), so this path is checked via order status, not
+	// the return value.
+	if _, err := b.settlePaid(ctx, des); err != nil {
+		t.Fatalf("settlePaid(late): err=%v", err)
+	}
+	if got, _ := st.GetOrder(des); got.Status != "refunded" {
+		t.Fatalf("order = %q, want refunded (the late-settled deposit path)", got.Status)
+	}
+	alert := lastSendMsgTo(f, 999)
+	if alert == nil || !strings.Contains(alert.Text, "💰 NEW DEPOSIT") {
+		t.Fatalf("owner alert = %v, want a 💰 NEW DEPOSIT message", alert)
+	}
+}
+
+// TestSettlePaidDepositSendFailureDoesNotBlockCredit is the CARE pin for the
+// deposit rails: a Telegram outage on the owner alert (or the customer's own
+// Deposit.OK) must never unwind the wallet credit that already committed.
+func TestSettlePaidDepositSendFailureDoesNotBlockCredit(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, _ := newBuyBot(t, "999")
+	f.sendErr = context.DeadlineExceeded
+	const chat = 203
+
+	des := store.NewDes()
+	if err := st.CreateOrder(des, fmtInt(chat), "en", depositProduct, "USDT TRC20", 0, 250000); err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+	settled, err := b.settlePaid(ctx, des)
+	if err != nil || !settled {
+		t.Fatalf("settlePaid under a Telegram outage: settled=%v err=%v, want settled=true (credit must complete regardless)", settled, err)
+	}
+	if got, _ := st.GetOrder(des); got.Status != "delivered" {
+		t.Errorf("order = %q, want delivered — a send failure must not roll back the deposit close", got.Status)
+	}
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 250000 {
+		t.Errorf("balance = %d, want 250000 credited despite the send failure", bal)
+	}
+}
+
 // kindStr renders a *string failure-message argument safely: RefundKind is a
 // *string, and %v on a pointer prints its ADDRESS, not the value it points
 // to — a diagnostic that degrades to noise exactly when the regression it

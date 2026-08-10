@@ -823,7 +823,11 @@ func TestUSDTDepositOKRendersAmountAtWhitespacePaddedAmbientRate(t *testing.T) {
 		t.Fatalf("fixture broken: credited %d VND, want 200000 (wallet crediting should be unaffected by this bug)", bal)
 	}
 
-	last := lastSendMsg(f)
+	// Scoped to the customer's own chat, not lastSendMsg's "most recent send
+	// overall": a settled deposit also fires notifyAdminDeposit (notify.go)
+	// to the admin chat ("999" here, never == chat), which would otherwise
+	// be mistaken for the customer's own Deposit.OK confirmation.
+	last := lastSendMsgTo(f, chat)
 	if last == nil {
 		t.Fatal("no deposit confirmation sent")
 	}
@@ -833,6 +837,42 @@ func TestUSDTDepositOKRendersAmountAtWhitespacePaddedAmbientRate(t *testing.T) {
 	want := i18n.F(i18n.C().Deposit.OK.T(i18n.EN), "amount", "8.00 USDT", "balance", "8.00 USDT")
 	if last.Text != want {
 		t.Errorf("Deposit.OK = %q, want %q", last.Text, want)
+	}
+}
+
+// TestVerifyUSDTTxidDepositNotifiesAdminOwner covers usdt.go's on-chain
+// deposit settle (the isDeposit branch inside verifyUSDTTxid) —
+// notify_admin_deposit (telegram_bot.py:9861-9862). Also pins the CARE
+// requirement for this rail specifically: replaying the SAME tx hash is
+// rejected by the processed-ledger PK BEFORE the notify call is reached, so
+// a duplicate submit must not produce a second alert.
+func TestVerifyUSDTTxidDepositNotifiesAdminOwner(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, fk := newUSDTBot(t)
+	const chat = 471
+
+	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
+	b.Process(ctx, textUpdate(chat, "5"))
+	o := reservedDeposit(t, st, chat)
+	amount := armTxid(t, ctx, b, chat, chainBSC, o.Des)
+
+	h := hash64("d")
+	fk.setBSC(h, bscTx(h, amount, time.Now().Unix()))
+	b.Process(ctx, textUpdate(chat, "0x"+h))
+
+	alert := lastSendMsgTo(f, 999)
+	if alert == nil || !strings.Contains(alert.Text, "💰 NEW DEPOSIT") {
+		t.Fatalf("owner alert = %v, want a 💰 NEW DEPOSIT message", alert)
+	}
+	if !strings.Contains(alert.Text, "USDT BEP20") {
+		t.Errorf("deposit alert = %q, want the BEP20 rail label", alert.Text)
+	}
+
+	// Replay the identical hash: MarkTxn's PK rejects it before the notify
+	// call is ever reached (TXID_ALREADY_USED), so the alert must not repeat.
+	b.Process(ctx, textUpdate(chat, "0x"+h))
+	if n := countContains(f, "💰 NEW DEPOSIT"); n != 1 {
+		t.Errorf("after replaying the same tx hash: NEW DEPOSIT count = %d, want still 1", n)
 	}
 }
 

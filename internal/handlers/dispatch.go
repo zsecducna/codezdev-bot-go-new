@@ -136,6 +136,15 @@ type Bot struct {
 	// stocksweep.go for the money-safety rationale behind each default.
 	reconcileInterval  time.Duration // RECONCILE_STUCK_INTERVAL_S 600s (Python */10 crontab)
 	stockSweepInterval time.Duration // STOCK_SWEEP_INTERVAL_S 300s (folder-stock reclaim)
+
+	// reconcileAlertMu guards the owner-alert de-duplication state for the
+	// stuck-paid reconcile pass (reconcile.go's reconcileShouldAlert): the
+	// last (count, oldestTS) that actually reached the owners, and when. See
+	// reconcileShouldAlert's doc comment for the suppress/escalate policy.
+	reconcileAlertMu     sync.Mutex
+	reconcileAlertCount  int64
+	reconcileAlertOldest float64
+	reconcileAlertSentAt time.Time
 	// auditPruneInterval is the audit-retention janitor's ticker cadence
 	// (auditprune.go). Fixed at 24h by New() — unlike its siblings above,
 	// deliberately NOT env-overridable: pruning is an irreversible delete of

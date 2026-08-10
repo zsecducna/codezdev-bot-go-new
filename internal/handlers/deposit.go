@@ -244,6 +244,13 @@ func (b *Bot) settlePaid(ctx context.Context, des string) (bool, error) {
 			chatID, _ := strconv.ParseInt(won.ChatID, 10, 64)
 			b.send(ctx, chatID, i18n.F(i18n.C().Deposit.OK.T(langSafe(won)),
 				"amount", b.usdtDisp(won.Total), "balance", b.usdtDisp(newBal)), nil)
+			// notify_admin_deposit (telegram_bot.py:9028-9034) — method falls
+			// back to "Deposit" exactly like Python's `won.get("tier") or "Deposit"`.
+			method := won.Tier
+			if method == "" {
+				method = "Deposit"
+			}
+			b.notifyAdminDeposit(ctx, chatID, won.Total, newBal, method)
 			return true, nil
 		}
 		b.deliverPaid(ctx, won, des)
@@ -293,6 +300,13 @@ func (b *Bot) settlePaid(ctx context.Context, des string) (bool, error) {
 			if o.Product == depositProduct {
 				b.send(ctx, chatID, i18n.F(i18n.C().Deposit.OK.T(langSafe(o)),
 					"amount", b.usdtDisp(o.Total), "balance", b.usdtDisp(newBal)), nil)
+				// notify_admin_deposit (telegram_bot.py:9048-9053) — the
+				// late-settled (post-expiry) twin of the fresh-claim notify above.
+				method := o.Tier
+				if method == "" {
+					method = "Deposit"
+				}
+				b.notifyAdminDeposit(ctx, chatID, o.Total, newBal, method)
 			} else {
 				b.send(ctx, chatID, i18n.F(i18n.C().Buy.PaidNoStock.T(langSafe(o)),
 					"amount", b.usdtDisp(o.Total), "balance", b.usdtDisp(newBal)), nil)

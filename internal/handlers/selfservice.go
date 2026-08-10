@@ -394,13 +394,20 @@ func (b *Bot) fileRefundRequest(ctx context.Context, chatID int64, lang i18n.Lan
 	// Confirmation to the customer.
 	b.send(ctx, chatID, i18n.F(c.RefundRequestOK.T(lang), "des", des), nil)
 
-	// Best-effort admin notification — log if no channel is wired yet.
-	// TODO(M3.1): _notify_admins with this text (@16887-16896; the call itself
-	// is @16889). Tagged the same way as the other deferred owner-alert sites in
-	// apikey_refund.go and apikey_deliver.go so one TODO(M3.1) sweep finds them
-	// all — deliberately no line numbers here, they drift.
+	// Best-effort admin notification — _notify_admins (telegram_bot.py:16978-16986).
 	log.Printf("NEW REFUND REQUEST des=%s product=%s tier=%s total=%d chat=%d",
 		des, o.Product, o.Tier, o.Total, chatID)
+	// predated (telegram_bot.py:16879 `predated = 0 if susp else 1`): the
+	// customer filed while the product was still ACTIVE when suspended is
+	// false — matches the "!suspended" the CreateRequest call above already
+	// derived, so this reuses it rather than recomputing anything.
+	statusLine := "product already suspended"
+	if !suspended {
+		statusLine = "⚡ filed while product still ACTIVE"
+	}
+	b.notifyAdmins(ctx, fmt.Sprintf(
+		"🔁 NEW REFUND REQUEST\n🧾 %s\n📦 %s (%s)\n💰 %s\n%s",
+		des, o.Product, b.tierLabel(o.Tier, i18n.Lang("en")), b.usdtDisp(o.Total), statusLine))
 }
 
 // ---- startCustReset ----------------------------------------------------------

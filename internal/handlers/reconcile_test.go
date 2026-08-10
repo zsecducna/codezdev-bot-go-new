@@ -135,8 +135,11 @@ func TestReconcileReportExcludesDeposits(t *testing.T) {
 // TestReconcileReportMutatesNothing is T3 — the money-safety pin. Snapshots
 // row counts of orders/balances/api_keys/refund_requests/audit AND the seeded
 // order's status BEFORE the pass; runs reconcileStuckOrdersOnce; asserts ALL
-// are unchanged after. Also asserts fakeTG.sendCount()==0, proving no DM was
-// sent (the report is log-only — there is no _notify_owners channel today).
+// are unchanged after. Also asserts fakeTG.sendCount() grew by exactly 1: the
+// owner-alert channel (notify.go) DOES DM on a genuinely stuck backlog now
+// (M3.1) — what money-safety actually forbids is a DB write (a settle, a
+// credit, a status flip), never a notification, so this test's real claim is
+// "the DB is untouched", not "nothing was sent".
 //
 // Falsification: add a spurious b.store.ClaimOrder(...) (or any write) inside
 // reconcileStuckOrdersOnce and the status/count assertion fails.
@@ -169,10 +172,10 @@ func TestReconcileReportMutatesNothing(t *testing.T) {
 	b.reconcileStuckOrdersOnce(ctx)
 
 	after := f.sendCount()
-	if after != before {
-		t.Errorf("fakeTG sendCount grew %d -> %d across reconcile — reconcile must "+
-			"never DM (it is log-only; _notify_owners is a deferred M3.1 gap)",
-			before, after)
+	if after != before+1 {
+		t.Errorf("fakeTG sendCount went %d -> %d across reconcile, want exactly +1 — "+
+			"a stuck backlog (2 paid-undelivered orders here) must alert the owner "+
+			"exactly once per reconcileShouldAlert's first-alert rule", before, after)
 	}
 	if got := tableRowCount(t, b, "orders"); got != ordersBefore {
 		t.Errorf("orders row count changed %d -> %d — reconcile must be read-only", ordersBefore, got)

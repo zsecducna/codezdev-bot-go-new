@@ -81,12 +81,20 @@ type fakeKiro struct {
 	// committed the top-up but before the bot's post-call re-read. It is how a
 	// test injects the concurrent whole-key refund the TOCTOU guard exists for.
 	OnRecharge func()
+
+	// DeleteUpstreamRevoked shapes handleDelete's upstreamRevoked field
+	// (default true — "revoked cleanly"). A test sets it false to model the
+	// UpstreamStillLive alert condition (kirogo/types.go's
+	// DeleteAPIKeyResponse.UpstreamStillLive) — the pool key is gone but its
+	// bound llmgate key is still live and needs manual portal cleanup.
+	DeleteUpstreamRevoked bool
 }
 
 func newFakeKiro(t *testing.T) *fakeKiro {
 	t.Helper()
 	fk := &fakeKiro{
-		keys:           map[string]*fakeKeyState{},
+		keys:                  map[string]*fakeKeyState{},
+		DeleteUpstreamRevoked: true,
 		UpstreamStatus: "bound",
 		EchoSaleClass:  true,
 	}
@@ -198,9 +206,10 @@ func (fk *fakeKiro) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if st != nil {
 		id = st.ID
 	}
+	revoked := fk.DeleteUpstreamRevoked
 	fk.mu.Unlock()
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"success": true, "id": id, "upstreamRevoked": true})
+		"success": true, "id": id, "upstreamRevoked": revoked})
 }
 
 func (fk *fakeKiro) handleStats(w http.ResponseWriter, r *http.Request) {
@@ -1847,6 +1856,240 @@ func TestApikeyRechargeDisabledAtDeliveryRefunds(t *testing.T) {
 // TestMaskAPIKey pins _mask_api_key (telegram_bot.py:4220): prefix(7) + "…" +
 // tail(4) for anything longer than 14 chars, verbatim otherwise. Lists, button
 // labels and owner alerts only ever show this masked form.
+// ---- M3.1 owner/admin alert channel (notify.go) -----------------------------
+//
+// These pin the nine deferred-alert sites this slice converted, plus the
+// sale-notice wiring (#36). Each "NotifiesOwner"/"NotifiesAdmins" test proves
+// a send was ATTEMPTED (countContains on the owner/admin chat "999", which
+// newAPIKeyBot always uses as ADMIN_ID, distinct from every test's buyer
+// chat). Each "SurvivesSendFailure" test proves the opposite direction: with
+// fakeTG forced to error on every SendMessage, the flow being reported on
+// (a refund, a revoke) still completes — asserted from the STORE, never from
+// f.Sends, because fakeTG.SendMessage returns before recording when sendErr
+// is set (so "no sends recorded" would be true whether or not the attempt
+// happened, and proves nothing about the flow).
+
+// TestApikeySoldWithoutUpstreamBindingNotifiesOwner: a BEDROCK mint that
+// completes with an anomalous (non-bound, non-pending) upstream status must
+// alert the owner — apikey_deliver.go:138, _notify_owners
+// (telegram_bot.py:7701-7711).
+func TestApikeySoldWithoutUpstreamBindingNotifiesOwner(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, fk, _ := newAPIKeyBot(t)
+	fk.UpstreamStatus = "skipped" // anomalous for bedrock (bound/pending are the only non-alert states)
+	const chat, des = 100, "0001aaaa0001aaaa0001aaaa0001aaaa"
+	o := seedOrder(t, st, des, chat, apikeyProduct, 500, 500000, "paid")
+
+	if !b.deliverApikey(ctx, o, des) {
+		t.Fatal("an anomalous (non-error) upstream status must still deliver the key")
+	}
+	if n := countContains(f, "SOLD WITHOUT UPSTREAM BINDING"); n != 1 {
+		t.Errorf("owner alert count = %d, want 1", n)
+	}
+}
+
+// TestApikeyMintFailRefundNotifiesOwnerAndSurvivesSendFailure covers
+// apikey_deliver.go:258 (apikeyMintFailRefund) both directions: the owner is
+// alerted on a normal send, and — separately — a forced Telegram outage must
+// not stop the auto-refund from completing (CARE: "a refund that succeeded
+// must not roll back because Telegram was unreachable").
+func TestApikeyMintFailRefundNotifiesOwnerAndSurvivesSendFailure(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, fk, _ := newAPIKeyBot(t)
+	fk.ProvisionStatus = 400
+	const chat, des = 100, "0002aaaa0002aaaa0002aaaa0002aaaa"
+	o := seedOrder(t, st, des, chat, apikeyProduct, 500, 500000, "paid")
+
+	if b.deliverApikey(ctx, o, des) {
+		t.Fatal("a rejected mint must not report success")
+	}
+	if n := countContains(f, "MINT FAILED"); n != 1 {
+		t.Errorf("owner alert count = %d, want 1", n)
+	}
+
+	// Same scenario again, but Telegram is down for every send (including the
+	// buyer's own refund notice) — the refund itself must still land.
+	b2, f2, st2, fk2, _ := newAPIKeyBot(t)
+	fk2.ProvisionStatus = 400
+	f2.sendErr = context.DeadlineExceeded
+	const des2 = "0003aaaa0003aaaa0003aaaa0003aaaa"
+	o2 := seedOrder(t, st2, des2, chat, apikeyProduct, 500, 500000, "paid")
+	if b2.deliverApikey(ctx, o2, des2) {
+		t.Fatal("a rejected mint must not report success")
+	}
+	if got, _ := st2.GetOrder(des2); got.Status != "refunded" {
+		t.Errorf("order = %q, want refunded — a Telegram outage on the owner alert must not block the refund", got.Status)
+	}
+	if bal, _ := st2.GetBalance(fmtInt(chat)); bal != 500000 {
+		t.Errorf("balance = %d, want 500000 back despite the send failure", bal)
+	}
+}
+
+// TestApikeyRCFailRefundNotifiesOwner covers apikey_deliver.go:422
+// (apikeyRCFailRefund), the recharge twin of the mint-fail alert above.
+func TestApikeyRCFailRefundNotifiesOwner(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, fk, _ := newAPIKeyBot(t)
+	const chat = 100
+	const keyDes = "0004aaaa0004aaaa0004aaaa0004aaaa"
+	const rcDes = "0005aaaa0005aaaa0005aaaa0005aaaa"
+	seedKey(t, st, fk, keyDes, chat, "poolkey-rcfail", "sk-test-rcfail-0123456789ab", "bedrock", 1000, 1000, 0)
+	if _, err := st.AddAPIKeyRecharge(rcDes, keyDes, chat, 500); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateOrder(rcDes, fmtInt(chat), "en", apikeyRechargeProduct, "API", 500, 500000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOrder(rcDes, "reserved", "paid"); err != nil {
+		t.Fatal(err)
+	}
+	fk.RechargeStatus = 400
+	o, _ := st.GetOrder(rcDes)
+
+	if b.deliverApikeyRecharge(ctx, o, rcDes) {
+		t.Fatal("a rejected recharge must not report success")
+	}
+	if n := countContains(f, "RECHARGE FAILED"); n != 1 {
+		t.Errorf("owner alert count = %d, want 1", n)
+	}
+}
+
+// TestApikeyRevokeUpstreamNotRevokedNotifiesOwner covers
+// apikey_deliver.go's revokeAPIKey UpstreamStillLive branch —
+// _notify_owners (telegram_bot.py:6130-6144).
+func TestApikeyRevokeUpstreamNotRevokedNotifiesOwner(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, fk, _ := newAPIKeyBot(t)
+	const chat = 100
+	const keyDes = "0006aaaa0006aaaa0006aaaa0006aaaa"
+	seedKey(t, st, fk, keyDes, chat, "poolkey-live", "sk-test-live-0123456789abcdef", "bedrock", 1000, 1000, 0)
+	fk.DeleteUpstreamRevoked = false
+
+	row, _ := st.APIKeyForOrder(keyDes)
+	ok, detail := b.revokeAPIKey(ctx, row)
+	if !ok {
+		t.Errorf("upstream-not-revoked must still count as ok=true (the pool key IS gone), got %q", detail)
+	}
+	if n := countContains(f, "UPSTREAM KEY NOT REVOKED"); n != 1 {
+		t.Errorf("owner alert count = %d, want 1", n)
+	}
+}
+
+// TestApikeyGroupRefundRevokeFailedNotifiesOwner covers apikey_refund.go:326
+// — _notify_owners (telegram_bot.py:4888-4902) — AND, in the same test,
+// that a Telegram outage on that alert must not stop the refund/claim from
+// completing (the money has already moved by the time the alert fires).
+func TestApikeyGroupRefundRevokeFailedNotifiesOwner(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, fk, _ := newAPIKeyBot(t)
+	const chat = 100
+	const keyDes = "0007aaaa0007aaaa0007aaaa0007aaaa"
+	seedKey(t, st, fk, keyDes, chat, "poolkey-revfail", "sk-test-revfail-0123456789ab", "bedrock", 1000, 1000, 200)
+	fk.DeleteStatus = 500 // a real revoke failure, not the 404 "already gone" success case
+
+	o, _ := st.GetOrder(keyDes)
+	res := b.doRefundApikeyGroup(ctx, o, "balance", false)
+	if res == nil {
+		t.Fatal("doRefundApikeyGroup returned nil — the claim must still win even though revoke fails")
+	}
+	if got, _ := st.GetOrder(keyDes); got.Status != "refunded" {
+		t.Errorf("order = %q, want refunded despite the revoke failure", got.Status)
+	}
+	if n := countContains(f, "REVOKE FAILED"); n != 1 {
+		t.Errorf("owner alert count = %d, want 1", n)
+	}
+
+	// Same scenario, Telegram down for every send: the refund must still land.
+	b2, f2, st2, fk2, _ := newAPIKeyBot(t)
+	const keyDes2 = "0008aaaa0008aaaa0008aaaa0008aaaa"
+	seedKey(t, st2, fk2, keyDes2, chat, "poolkey-revfail2", "sk-test-revfail2-0123456789", "bedrock", 1000, 1000, 200)
+	fk2.DeleteStatus = 500
+	f2.sendErr = context.DeadlineExceeded
+	o2, _ := st2.GetOrder(keyDes2)
+	res2 := b2.doRefundApikeyGroup(ctx, o2, "balance", false)
+	if res2 == nil {
+		t.Fatal("doRefundApikeyGroup returned nil under a Telegram outage — the claim must still win")
+	}
+	if got, _ := st2.GetOrder(keyDes2); got.Status != "refunded" {
+		t.Errorf("order = %q, want refunded — a send failure on the owner alert must not block the refund", got.Status)
+	}
+	if bal, _ := st2.GetBalance(fmtInt(chat)); bal <= 0 {
+		t.Errorf("balance = %d, want a positive payout credited despite the send failure", bal)
+	}
+}
+
+// TestApikeySaleNotifiesOwnersOnDeliveryAndRecharge is the #36 pin for
+// apikey_deliver.go's two notify_admin_sale call sites (fresh mint +
+// recharge, telegram_bot.py:7750-7755 / 7897-7902): each completed sale
+// alerts the owner with the SKU-correct label.
+func TestApikeySaleNotifiesOwnersOnDeliveryAndRecharge(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, fk, _ := newAPIKeyBot(t)
+	const chat = 100
+	const mintDes = "0009aaaa0009aaaa0009aaaa0009aaaa"
+	o := seedOrder(t, st, mintDes, chat, apikeyProduct, 500, 500000, "paid")
+	if !b.deliverApikey(ctx, o, mintDes) {
+		t.Fatal("mint delivery must succeed")
+	}
+	// admin chat "999" is newAPIKeyBot's fixed ADMIN_ID, always != the buyer
+	// (chat 100), so this is unambiguously the owner alert, not the buyer's
+	// own delivery DM (which ALSO contains "Bedrock API Credits" in its own
+	// customer-facing template — countContains alone would double-count it).
+	alert := lastSendMsgTo(f, 999)
+	if alert == nil || !strings.Contains(alert.Text, "💸 NEW SALE") {
+		t.Fatalf("owner alert = %v, want a 💸 NEW SALE message", alert)
+	}
+	if !strings.Contains(alert.Text, "Bedrock API Credits") {
+		t.Errorf("mint sale alert = %q, want the bedrock SKU label", alert.Text)
+	}
+
+	f.Sends = nil
+	const rcDes = "0010aaaa0010aaaa0010aaaa0010aaaa"
+	if err := st.CreateOrder(rcDes, fmtInt(chat), "en", apikeyRechargeProduct, "API", 200, 200000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddAPIKeyRecharge(rcDes, mintDes, chat, 200); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOrder(rcDes, "reserved", "paid"); err != nil {
+		t.Fatal(err)
+	}
+	fk.mu.Lock()
+	fk.RechargeStatus = 0
+	fk.mu.Unlock()
+	o2, _ := st.GetOrder(rcDes)
+	if !b.deliverApikeyRecharge(ctx, o2, rcDes) {
+		t.Fatal("recharge delivery must succeed")
+	}
+	rcAlert := lastSendMsgTo(f, 999)
+	if rcAlert == nil || !strings.Contains(rcAlert.Text, "💸 NEW SALE") {
+		t.Fatalf("owner alert = %v, want a 💸 NEW SALE message", rcAlert)
+	}
+	if !strings.Contains(rcAlert.Text, "Bedrock API Recharge") {
+		t.Errorf("recharge sale alert = %q, want the recharge SKU label", rcAlert.Text)
+	}
+}
+
+// TestApikeySelfServiceRefundNotifiesAdmins covers apikey_refund.go:464 —
+// _notify_admins (telegram_bot.py:17068-17075). Uses ADMIN recipients (not
+// owners): a self-service payout record is operational visibility, not a
+// revenue event.
+func TestApikeySelfServiceRefundNotifiesAdmins(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, fk, _ := newAPIKeyBot(t)
+	const chat = 100
+	const keyDes = "0011aaaa0011aaaa0011aaaa0011aaaa"
+	seedKey(t, st, fk, keyDes, chat, "poolkey-ssref", "sk-test-ssref-0123456789abcd", "bedrock", 1000, 1000, 200)
+
+	b.Process(ctx, callbackUpdate(chat, "apikeyrefok:"+keyDes))
+	if got, _ := st.GetOrder(keyDes); got.Status != "refunded" {
+		t.Fatalf("order = %q, want refunded", got.Status)
+	}
+	if n := countContains(f, "API-KEY REFUND (self-service)"); n != 1 {
+		t.Errorf("admin notify count = %d, want 1", n)
+	}
+}
+
 func TestMaskAPIKey(t *testing.T) {
 	if got := maskAPIKey("sk-test-0123456789abcdef"); got != "sk-test…cdef" {
 		t.Errorf("mask = %q, want %q", got, "sk-test…cdef")

@@ -233,11 +233,32 @@ func TestFileRefundRequestEligibility(t *testing.T) {
 
 			b.fileRefundRequest(context.Background(), tc.caller, i18n.EN, tc.des)
 
-			if got := lastSendText(f); got != tc.wantText {
+			// Scoped to the customer's own chat, not lastSendText's "most
+			// recent send overall": a filed request also fires notifyAdmins
+			// (notify.go) to the admin chat (id "999" here, never == owner),
+			// which would otherwise be mistaken for the customer's reply.
+			got := ""
+			if m := lastSendMsgTo(f, tc.caller); m != nil {
+				got = m.Text
+			}
+			if got != tc.wantText {
 				t.Fatalf("reply mismatch\n got:  %q\n want: %q", got, tc.wantText)
 			}
 			if got := countRefundRows(t, st, tc.des); got != tc.wantRows {
 				t.Fatalf("refund_requests rows for %s = %d, want %d", tc.des, got, tc.wantRows)
+			}
+			// #34/notify.go: a request that actually got FILED (a fresh row
+			// landed) must alert the admins — _notify_admins
+			// (telegram_bot.py:16978-16986). The ineligible/duplicate/
+			// non-refundable cases file nothing, so they must stay silent too.
+			adminAlert := lastSendMsgTo(f, 999)
+			filedNow := tc.wantRows > 0 && !tc.preExisting
+			gotAlert := adminAlert != nil && strings.Contains(adminAlert.Text, "NEW REFUND REQUEST")
+			if filedNow && !gotAlert {
+				t.Errorf("case %q filed a request but no admin NEW REFUND REQUEST alert was sent", tc.name)
+			}
+			if !filedNow && gotAlert {
+				t.Errorf("case %q filed nothing but an admin alert was sent anyway", tc.name)
 			}
 		})
 	}

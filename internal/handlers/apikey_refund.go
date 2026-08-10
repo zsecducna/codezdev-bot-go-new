@@ -18,6 +18,7 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math"
 	"strconv"
@@ -323,9 +324,13 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 		}
 		ok, detail := b.revokeAPIKey(ctx, krow)
 		if !ok {
-			// TODO(M3.1): _notify_owners with this text.
+			// _notify_owners — telegram_bot.py:4888-4902.
 			log.Printf("OWNER ALERT: REFUNDED API-KEY ORDER %s — REVOKE FAILED (%s) 🔑 %s · id %s · name tg-%d-order-%s — DELETE this key on Kiro-Go now; its remaining credits stay usable until you do",
 				rootDes, detail, maskAPIKey(krow.APIKey), orDash(krow.KeyID), krow.ChatID, rootDes)
+			b.notifyOwners(ctx, fmt.Sprintf(
+				"⚠️ REFUNDED API-KEY ORDER %s — REVOKE FAILED (%s)\n🔑 %s · id %s\n🏷 name tg-%d-order-%s\n"+
+					"DELETE this key on Kiro-Go now — its remaining credits stay usable until you do.",
+				rootDes, detail, maskAPIKey(krow.APIKey), orDash(krow.KeyID), krow.ChatID, rootDes))
 		} else {
 			log.Printf("apikey group refund: revoked key for order %s (%s)", rootDes, detail)
 		}
@@ -461,9 +466,12 @@ func (b *Bot) cbApikeyRefOK(cc *cbCtx) {
 		b.send(cc.Ctx, cc.ChatID, c.RefundRace.T(lang), nil)
 		return
 	}
-	// TODO(M3.1): _notify_admins with the self-service payout record.
+	// _notify_admins — telegram_bot.py:17068-17075.
 	log.Printf("API-KEY REFUND (self-service) [des=%s chat=%d amount=%d used=%d/%d]",
 		des, cc.ChatID, res.Amount, res.UnitNum, res.UnitsTotal)
+	b.notifyAdmins(cc.Ctx, fmt.Sprintf(
+		"↩️ API-KEY REFUND (self-service)\n🧾 %s\n👤 %d\n💰 refunded %s to wallet\n🔑 %d of %d credits used",
+		des, cc.ChatID, b.usdtDisp(res.Amount), res.UnitNum, res.UnitsTotal))
 }
 
 // cbApikeyRefNo handles apikeyrefno — the customer tapped Cancel on the preview

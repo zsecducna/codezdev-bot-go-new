@@ -993,7 +993,17 @@ func (b *Bot) verifyUSDTTxid(ctx context.Context, chatID int64, chain, des, txha
 			fmt.Sprintf("from=%s recv=%s balance=%d", frm, recvStr, bal))
 		b.send(ctx, chatID, i18n.F(i18n.C().Deposit.OK.T(lang),
 			"amount", b.usdtDisp(creditVND), "balance", b.usdtDisp(bal)), nil)
-		// notify_admin_deposit (@9767) is M3 — admin push notifications.
+		// notify_admin_deposit (telegram_bot.py:9861-9862) — method falls back
+		// to the chain's own rail label exactly like Python's
+		// `o.get("tier") or ("USDT BEP20" if chain == "bsc" else "USDT TRC20")`.
+		method := o.Tier
+		if method == "" {
+			method = "USDT TRC20"
+			if chain == chainBSC {
+				method = "USDT BEP20"
+			}
+		}
+		b.notifyAdminDeposit(ctx, chatID, creditVND, bal, method)
 		return true
 	}
 

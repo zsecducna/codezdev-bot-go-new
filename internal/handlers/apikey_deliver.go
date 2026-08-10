@@ -24,6 +24,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"html"
 	"log"
 	"math"
@@ -135,12 +136,18 @@ func (b *Bot) deliverApikey(ctx context.Context, order *store.Order, des string)
 		// the customer's key is live and paid for. Fires AFTER the persist above
 		// on purpose — anything slow between a committed mint and the api_keys
 		// row reopens the double-mint window that row exists to close.
-		// TODO(M3.1): route through _notify_owners once the owner-alert channel lands.
+		// _notify_owners — telegram_bot.py:7701-7711.
 		if saleClass != saleClassKiro &&
 			minted.UpstreamStatus != kirogo.UpstreamStatusBound &&
 			minted.UpstreamStatus != kirogo.UpstreamStatusPending {
 			log.Printf("OWNER ALERT: API-KEY SOLD WITHOUT UPSTREAM BINDING [des=%s upstreamStatus=%s] — the key works and the sale is complete, but it has no per-customer llmgate binding; check the configured provisioning account holds the llmgate credential",
 				des, minted.UpstreamStatus)
+			b.notifyOwners(ctx, fmt.Sprintf(
+				"⚠️ API-KEY SOLD WITHOUT UPSTREAM BINDING\n🧾 %s\nupstreamStatus: %s\n"+
+					"The key works and the sale is complete, but it has no per-customer llmgate binding. "+
+					"Check that the configured provisioning account is the one holding the llmgate credential "+
+					"(⚙️ Settings > 🆔 Kiro-Go Account > 🧪 Verify).",
+				des, minted.UpstreamStatus))
 		}
 	}
 
@@ -168,7 +175,14 @@ func (b *Bot) deliverApikey(ctx context.Context, order *store.Order, des string)
 		"credits", itoa64(credits),
 		"key", html.EscapeString(row.APIKey),
 		"base", base))
-	// Owner sale alert (notify_admin_sale @8022) is M3.
+	// Owner sale alert — notify_admin_sale (telegram_bot.py:7750-7755): the
+	// SKU label mirrors the delivery template split just above (Kiro vs
+	// Bedrock credits), not the raw product string.
+	saleLabel := "Bedrock API Credits"
+	if saleClass == saleClassKiro {
+		saleLabel = "Kiro Credits API"
+	}
+	b.notifyAdminSale(ctx, chatID, saleLabel, "API", credits, total, des)
 	return true
 }
 
@@ -255,10 +269,14 @@ func (b *Bot) apikeyMintFailRefund(ctx context.Context, order *store.Order, des 
 	}
 	b.send(ctx, chatID, i18n.F(i18n.C().APIKey.MintFail.T(lang),
 		"amount", b.usdtDisp(total), "balance", b.usdtDisp(newBal)), nil)
-	// TODO(M3.1): _notify_owners — paid money bounced back because Kiro-Go is
-	// down or rejected the mint; needs a look before the next sale.
+	// _notify_owners — paid money bounced back because Kiro-Go is down or
+	// rejected the mint; needs a look before the next sale (telegram_bot.py:
+	// 7628-7637).
 	log.Printf("OWNER ALERT: API-KEY MINT FAILED (auto-refunded) [des=%s chat=%d credits=%d total=%d]: %v",
 		des, chatID, credits, total, cause)
+	b.notifyOwners(ctx, fmt.Sprintf(
+		"⚠️ API-KEY MINT FAILED (auto-refunded)\n🧾 %s\n👤 %d\n🔢 %d credits · %s\nKiro-Go error: %v",
+		des, chatID, credits, b.usdtDisp(total), cause))
 }
 
 // deliverApikeyRecharge tops up the target key on Kiro-Go for a PAID recharge
@@ -383,7 +401,13 @@ func (b *Bot) deliverApikeyRecharge(ctx context.Context, order *store.Order, des
 	b.send(ctx, chatID, i18n.F(c.RCDone.T(lang),
 		"credits", itoa64(credits), "masked", maskAPIKey(krow.APIKey),
 		"remaining", remaining), nil)
-	// Owner sale alert (notify_admin_sale) is M3.
+	// Owner sale alert — notify_admin_sale (telegram_bot.py:7897-7902), the
+	// recharge twin of deliverApikey's sale alert above.
+	rcLabel := "Bedrock API Recharge"
+	if apikeyKeyClass(krow) == saleClassKiro {
+		rcLabel = "Kiro Credits API Recharge"
+	}
+	b.notifyAdminSale(ctx, chatID, rcLabel, "API", credits, total, des)
 	return true
 }
 
@@ -419,9 +443,12 @@ func (b *Bot) apikeyRCFailRefund(ctx context.Context, order *store.Order, des st
 	}
 	b.send(ctx, chatID, i18n.F(i18n.C().APIKey.RCFail.T(lang),
 		"amount", b.usdtDisp(total), "balance", b.usdtDisp(newBal)), nil)
-	// TODO(M3.1): _notify_owners.
+	// _notify_owners — the recharge twin of apikeyMintFailRefund's alert above.
 	log.Printf("OWNER ALERT: API-KEY RECHARGE FAILED (auto-refunded) [des=%s chat=%d credits=%d total=%d]: %v",
 		des, chatID, credits, total, cause)
+	b.notifyOwners(ctx, fmt.Sprintf(
+		"⚠️ API-KEY RECHARGE FAILED (auto-refunded)\n🧾 %s\n👤 %d\n🔢 %d credits · %s\nKiro-Go error: %v",
+		des, chatID, credits, b.usdtDisp(total), cause))
 	return false
 }
 
@@ -465,9 +492,14 @@ func (b *Bot) revokeAPIKey(ctx context.Context, row *store.APIKey) (bool, string
 		return false, "unexpected delete response"
 	}
 	if res.UpstreamStillLive() {
-		// TODO(M3.1): _notify_owners with this text.
+		// _notify_owners — telegram_bot.py:6130-6144.
 		log.Printf("OWNER ALERT: UPSTREAM KEY NOT REVOKED for pool key id %s (%s) — the Kiro-Go pool key is deleted, but its llmgate-side key is STILL LIVE and spending against our account; DELETE it manually in the llmgate portal now",
 			orDash(row.KeyID), maskAPIKey(row.APIKey))
+		b.notifyOwners(ctx, fmt.Sprintf(
+			"⚠️ UPSTREAM KEY NOT REVOKED for pool key id %s (%s)\n"+
+				"The Kiro-Go pool key is deleted, but its llmgate-side key is STILL LIVE and spending against our account.\n"+
+				"DELETE it manually in the llmgate portal now.",
+			orDash(row.KeyID), maskAPIKey(row.APIKey)))
 		return true, "revoked (upstream NOT revoked — manual cleanup needed)"
 	}
 	return true, "revoked"
