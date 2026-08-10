@@ -611,9 +611,20 @@ const statsTimeout = 6 * time.Second
 // the call fails / the key can't be found — _apikey_live_stats
 // (telegram_bot.py:4498-4516). Callers MUST degrade gracefully.
 //
-// Deviation: Python also accepted the original deploy's "apiKeys" response
-// spelling; internal/kirogo decodes only the documented "keys" field
-// (KIRO_GO_API.md:111-124), which is what the deployed server sends.
+// This used to carry a note claiming the opposite of the truth: that the
+// deployed server sends the documented "keys" field, so dropping Python's
+// acceptance of the original deploy's "apiKeys" spelling was safe. The
+// deployed server sends "apiKeys". The doc (KIRO_GO_API.md:111-124) says
+// "keys", the code matched the doc, and every key read came back empty --
+// which is what the comment was asserting could not happen. internal/kirogo
+// now decodes BOTH, preferring "keys", exactly as Python does
+// (telegram_bot.py:4346-4349, 4530-4545).
+//
+// Worth knowing when this returns nil: it does so SILENTLY on zero keys --
+// only a transport error is logged. A server that answers 200 with nothing
+// the decoder recognises therefore leaves no trace at all, and the customer
+// simply sees "couldn't check this key's credits". Do not read an empty log
+// as evidence the call was never made.
 func (b *Bot) apikeyLiveStats(ctx context.Context, row *store.APIKey) *kirogo.KeyStat {
 	if row == nil {
 		return nil

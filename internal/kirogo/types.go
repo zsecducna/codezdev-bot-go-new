@@ -1,6 +1,9 @@
 package kirogo
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 // Remaining models any Kiro-Go "*Remaining" field (creditsRemaining,
 // tokensRemaining). -1 means unlimited (the corresponding limit is 0) per
@@ -504,9 +507,60 @@ type StatsTotals struct {
 }
 
 // StatsResponse is the success body of /admin/stats (KIRO_GO_API.md:111-124).
+//
+// The Keys field carries a custom UnmarshalJSON (below) because the doc and
+// the live deploy disagree on the wire name for this array: KIRO_GO_API.md
+// spells it "keys", but the actually-deployed Kiro-Go server sends "apiKeys"
+// (confirmed by curling POST /admin/stats against production with Bearer
+// auth — the response has no "keys" key at all, only "apiKeys" and
+// "totals.keys", the latter being an unrelated COUNT that made the doc's
+// spelling look right at a glance). The Python original never trusted the
+// doc alone: telegram_bot.py:4349 and :4544 both do
+// `res.get("keys") or res.get("apiKeys") or []`, deliberately accepting
+// either spelling. That dual-read is not incidental — CLAUDE.md pins the
+// Python source, not KIRO_GO_API.md, as the behavioral reference for this
+// port, and the Python comments at telegram_bot.py:4346-4347 and :4535-4536
+// spell out exactly this doc-vs-deploy split. If this fallback is ever
+// removed, decoding a real response silently succeeds (Stats() returns a
+// nil error) while Keys stays permanently empty — every caller then takes
+// its zero-keys path with NO error and NO log line: apikeyLiveStats
+// (handlers/apikey.go:639) returns nil on len(res.Keys)==0 without logging
+// anything, so the failure is invisible in the server log. The customer-
+// visible symptom is Self-Service → refund an API key →
+// "⚠️ Couldn't check this key's remaining credits right now."
 type StatsResponse struct {
-	Keys   []KeyStat   `json:"keys"`
+	Keys   []KeyStat   `json:"-"`
 	Totals StatsTotals `json:"totals"`
+}
+
+// statsResponseWire is the raw decode target for StatsResponse: it captures
+// both possible spellings of the key list so UnmarshalJSON can pick the
+// right one after the fact, mirroring the Python original's
+// `res.get("keys") or res.get("apiKeys") or []`.
+type statsResponseWire struct {
+	Keys    []KeyStat   `json:"keys"`
+	APIKeys []KeyStat   `json:"apiKeys"`
+	Totals  StatsTotals `json:"totals"`
+}
+
+// UnmarshalJSON decodes a /admin/stats body accepting either the documented
+// "keys" spelling or the deployed server's "apiKeys" spelling for the key
+// list, preferring "keys" when both are present and non-empty — the same
+// precedence as Python's `res.get("keys") or res.get("apiKeys") or []` (an
+// empty/absent "keys" falls through to "apiKeys" rather than winning by mere
+// presence). See the StatsResponse doc comment for why this exists.
+func (r *StatsResponse) UnmarshalJSON(data []byte) error {
+	var wire statsResponseWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	r.Totals = wire.Totals
+	if len(wire.Keys) > 0 {
+		r.Keys = wire.Keys
+	} else {
+		r.Keys = wire.APIKeys
+	}
+	return nil
 }
 
 // Stats fetches usage info for keys matching the (optional, AND-ed) filters

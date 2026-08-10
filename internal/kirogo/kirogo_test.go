@@ -544,6 +544,76 @@ func TestStats_InvalidJSON400(t *testing.T) {
 	}
 }
 
+// ── StatsResponse "keys" vs "apiKeys" wire-spelling fallback ────────────────
+//
+// KIRO_GO_API.md:111-124 documents the key list as "keys", but the actually
+// deployed Kiro-Go server sends "apiKeys" (verified by curling POST
+// /admin/stats against production). Python's original never trusted the doc
+// alone (telegram_bot.py:4349, :4544: `res.get("keys") or res.get("apiKeys")
+// or []`), so StatsResponse.UnmarshalJSON must carry the same fallback. These
+// three tests pin: decoding the real "apiKeys" body, decoding a "keys" body,
+// and precedence when both are present.
+
+// realApiKeysStatsBody is the VERBATIM response body observed curling the
+// live, deployed Kiro-Go server's POST /admin/stats with Bearer auth — not a
+// simplified stand-in. It has no "keys" field at all, only "apiKeys" (plus
+// the unrelated "totals.keys" COUNT, which is what made the doc's "keys"
+// spelling look plausible at a glance).
+const realApiKeysStatsBody = `{"apiKeys":[{"id":"e51dd91c-...","name":"tg-...-order-...","keyMasked":"sk-406****16ea",
+  "saleClass":"bedrock","enabled":true,"createdAt":1786349280,"creditLimit":100,
+  "tokensUsed":0,"creditsUsed":0,"requestsCount":0,"status":"active",
+  "creditsRemaining":100,"tokensRemaining":-1}],
+ "totals":{"creditsUsed":0,"keys":1,"requestsCount":0,"tokensUsed":0}}`
+
+// TestStatsResponse_DecodesRealApiKeysSpelling pins the fix for the live bug:
+// the deployed server's actual response body must decode into a populated
+// Keys slice, not silently empty out while Stats() still reports success.
+func TestStatsResponse_DecodesRealApiKeysSpelling(t *testing.T) {
+	var resp StatsResponse
+	if err := json.Unmarshal([]byte(realApiKeysStatsBody), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Keys) != 1 {
+		t.Fatalf("Keys = %+v, want exactly one entry", resp.Keys)
+	}
+	if resp.Keys[0].ID != "e51dd91c-..." {
+		t.Errorf("Keys[0].ID = %q, want %q", resp.Keys[0].ID, "e51dd91c-...")
+	}
+	if resp.Keys[0].CreditsRemaining != 100 {
+		t.Errorf("Keys[0].CreditsRemaining = %v, want 100", resp.Keys[0].CreditsRemaining)
+	}
+	if resp.Keys[0].Status != "active" {
+		t.Errorf("Keys[0].Status = %q, want %q", resp.Keys[0].Status, "active")
+	}
+}
+
+// TestStatsResponse_DecodesKeysSpelling pins that the documented "keys"
+// spelling still works (a future/other server may send it correctly).
+func TestStatsResponse_DecodesKeysSpelling(t *testing.T) {
+	body := `{"keys":[{"id":"doc-spelled","status":"active","creditsRemaining":60}],"totals":{"keys":1}}`
+	var resp StatsResponse
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Keys) != 1 || resp.Keys[0].ID != "doc-spelled" {
+		t.Fatalf("Keys = %+v, want one entry with id doc-spelled", resp.Keys)
+	}
+}
+
+// TestStatsResponse_BothSpellingsPrefersKeys pins Python's precedence
+// (`res.get("keys") or res.get("apiKeys") or []`): when a response somehow
+// carries both, the documented "keys" spelling wins.
+func TestStatsResponse_BothSpellingsPrefersKeys(t *testing.T) {
+	body := `{"keys":[{"id":"from-keys"}],"apiKeys":[{"id":"from-apiKeys"}],"totals":{"keys":1}}`
+	var resp StatsResponse
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Keys) != 1 || resp.Keys[0].ID != "from-keys" {
+		t.Fatalf("Keys = %+v, want one entry with id from-keys", resp.Keys)
+	}
+}
+
 // ── CustomerMe (customer-realm quota) ────────────────────────────────────────
 
 func TestCustomerMe_UsesXApiKeyNotAdminHeader(t *testing.T) {
