@@ -223,3 +223,22 @@ func TestStartStockSweepDrainsOnShutdown(t *testing.T) {
 			"the ticker loop is not honoring the registry stop chan")
 	}
 }
+
+// TestSweepStockExpiredOnceNilStockIsNoop is the nil-dep guard pin (task
+// #30): sweepStockExpiredOnce is an EXPORTED entry point (via
+// StartStockSweep) that an embedder or a test can call with Stock unwired —
+// newTestBot (fake_test.go) does exactly that across most of this package's
+// other test files. Without the b.stock==nil guard, ListProducts nil-derefs;
+// safeStep recovers the panic, but the ticker then repeats that
+// panic/recover/log cycle every tick forever instead of doing nothing.
+//
+// Falsification: removing the `if b.stock == nil { return }` guard in
+// sweepStockExpiredOnce makes this call panic; a panic inside a test
+// function fails the test (Go's testing package turns an unrecovered panic
+// into a test failure), so this reddens directly rather than via an
+// assertion.
+func TestSweepStockExpiredOnceNilStockIsNoop(t *testing.T) {
+	b, _ := newTestBot("999", nil) // Stock deliberately unwired
+	ctx := context.Background()
+	b.sweepStockExpiredOnce(ctx) // must return quietly, not panic
+}

@@ -321,3 +321,25 @@ func TestStartReconcileStuckOrdersDrainsOnShutdown(t *testing.T) {
 			"the ticker loop is not honoring the registry stop chan")
 	}
 }
+
+// TestReconcileReportNilStoreReturnsZero is the nil-dep guard pin (task
+// #30): reconcileReport is an EXPORTED entry point (reachable via
+// StartReconcileStuckOrders) that an embedder or a test can call with Store
+// unwired — newTestBot (fake_test.go) does exactly that across most of this
+// package's other test files. Without the b.store==nil guard,
+// PaidUndelivered nil-derefs; safeStep recovers the panic, but the ticker
+// then repeats that panic/recover/log cycle every tick forever instead of
+// quietly reporting nothing.
+//
+// Falsification: removing the `if b.store == nil { return 0, 0, nil }`
+// guard in reconcileReport makes this call panic; a panic inside a test
+// function fails the test directly, so this reddens without needing a
+// separate assertion.
+func TestReconcileReportNilStoreReturnsZero(t *testing.T) {
+	b, _ := newTestBot("999", nil) // Store deliberately unwired
+	count, oldestTS, err := b.reconcileReport()
+	if count != 0 || oldestTS != 0 || err != nil {
+		t.Errorf("reconcileReport() with nil Store = (%d, %v, %v), want (0, 0, nil)",
+			count, oldestTS, err)
+	}
+}

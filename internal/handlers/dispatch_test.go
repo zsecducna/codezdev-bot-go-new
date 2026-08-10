@@ -2,9 +2,13 @@ package handlers
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/tg"
 )
@@ -378,5 +382,132 @@ func TestSetLangCallback(t *testing.T) {
 	b2.Process(ctx, callbackUpdate(1, "setlang:fr"))
 	if f2.sendCount() != 0 {
 		t.Errorf("unsupported lang must send nothing, sends=%d", f2.sendCount())
+	}
+}
+
+// envDurationTestBot builds a Bot from a .env file written into a fresh temp
+// dir, mirroring auditprune_test.go's below-floor/dot-env fixtures (Store and
+// Stock are nil — envDuration and the four New()-wired call sites under test
+// here never touch either).
+func envDurationTestBot(t *testing.T, envBody string) *Bot {
+	t.Helper()
+	dir := t.TempDir()
+	if envBody != "" {
+		if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(envBody), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	return New(Deps{TG: &fakeTG{}, Config: cfg, AdminID: "1"})
+}
+
+// TestEnvDurationClampsConfiguredZeroAndLogs is the pin for task #30's
+// sharpest edge: an explicit 0 parses fine under envInt's own contract
+// (dispatch.go), so without envDuration's clamp a configured
+// STOCK_SWEEP_INTERVAL_S=0 would feed time.After(0) and fire immediately,
+// spinning the folder-stock sweep against the buy-path per-product mutex on
+// every loop iteration. Also pins the log line: an operator who typed 0 and
+// silently got the floor back cannot tell that apart from "it is working as
+// configured."
+//
+// Falsification: deleting the `if d < min` clamp in envDuration makes the
+// returned duration 0 instead of the floor, and the first assertion fails;
+// deleting only the log.Printf call leaves the duration correct but the
+// second assertion fails.
+func TestEnvDurationClampsConfiguredZeroAndLogs(t *testing.T) {
+	b := envDurationTestBot(t, "MY_TEST_INTERVAL_S=0\n")
+
+	var got time.Duration
+	out := captureLog(t, func() {
+		got = b.envDuration("MY_TEST_INTERVAL_S", 300*time.Second, 5*time.Second)
+	})
+
+	if got != 5*time.Second {
+		t.Errorf("envDuration(configured 0) = %s, want the 5s floor, not 0", got)
+	}
+	if !strings.Contains(out, "MY_TEST_INTERVAL_S=0s") || !strings.Contains(out, "5s") {
+		t.Errorf("envDuration logged %q, want it to name the below-floor configured "+
+			"value AND the floor it was raised to — the only signal an operator has "+
+			"that their 0 was silently overridden", out)
+	}
+}
+
+// TestEnvDurationClampsConfiguredNegativeAndLogs is the negative-value twin
+// of the zero case: strconv.Atoi parses "-10" without error, so envInt
+// returns it as-is — time.After(negative) also fires immediately, same hot-
+// loop risk as 0.
+//
+// Falsification: same as the zero test — removing the clamp or its log line
+// reddens the matching assertion.
+func TestEnvDurationClampsConfiguredNegativeAndLogs(t *testing.T) {
+	b := envDurationTestBot(t, "MY_TEST_INTERVAL_S=-10\n")
+
+	var got time.Duration
+	out := captureLog(t, func() {
+		got = b.envDuration("MY_TEST_INTERVAL_S", 300*time.Second, 5*time.Second)
+	})
+
+	if got != 5*time.Second {
+		t.Errorf("envDuration(configured -10) = %s, want the 5s floor, not negative", got)
+	}
+	if !strings.Contains(out, "MY_TEST_INTERVAL_S=-10s") || !strings.Contains(out, "5s") {
+		t.Errorf("envDuration logged %q, want it to name the below-floor configured "+
+			"value AND the floor it was raised to", out)
+	}
+}
+
+// TestEnvDurationResolvesThroughConfigSnapshotNotAmbientEnv is the same class
+// of fix task #23 closed for TRON_API_KEY and auditprune_test.go's
+// TestPruneAuditOnceResolvesRetentionFromDotEnvSnapshot closed for
+// AUDIT_RETENTION_DAYS, applied to envDuration: config.Load merges .env into
+// a frozen snapshot that is NEVER copied back into the real process
+// environment, so a raw os.Getenv read would be blind to a value supplied
+// only via .env (production's systemd unit exports nothing else). The
+// fixture asserts its own premise first — the key really is absent from the
+// ambient environment — so this test cannot pass "by accident" if the
+// ambient shell happens to already export it.
+//
+// MY_TEST_INTERVAL_S=45 via .env, well above the 1s floor so the clamp never
+// masks the read. Under correct (b.envInt / b.cfg) resolution the result is
+// 45s; under a raw-os.Getenv mutation the ambient-blind read falls back to
+// the 300s default instead.
+//
+// Falsification: replacing b.envInt(key, ...) inside envDuration with a raw
+// os.Getenv-based read makes this resolve to the 300s default instead of the
+// .env-configured 45s, and the assertion fails.
+func TestEnvDurationResolvesThroughConfigSnapshotNotAmbientEnv(t *testing.T) {
+	if _, ok := os.LookupEnv("MY_TEST_INTERVAL_S"); ok {
+		t.Fatal("fixture broken: MY_TEST_INTERVAL_S is set in the ambient " +
+			"environment, so this test would pass even if envDuration read raw env")
+	}
+
+	b := envDurationTestBot(t, "MY_TEST_INTERVAL_S=45\n")
+
+	got := b.envDuration("MY_TEST_INTERVAL_S", 300*time.Second, 1*time.Second)
+	if got != 45*time.Second {
+		t.Errorf("envDuration = %s, want 45s (the .env-configured value) — resolving "+
+			"to the 300s default means the read fell back to the ambient-blind path", got)
+	}
+}
+
+// TestNewClampsStockSweepIntervalConfiguredZero is the wiring pin: proves
+// New() actually routes STOCK_SWEEP_INTERVAL_S through envDuration (not a
+// bare envInt*time.Second) for the sharpest-edge key named in task #30 — a
+// configured 0 must come out of New() as stockSweepMinInterval, not 0, so
+// StartStockSweep's ticker (stocksweep.go) never fires immediately against
+// the buy-path per-product mutex.
+//
+// Falsification: reverting dispatch.go's New() to
+// `time.Duration(b.envInt("STOCK_SWEEP_INTERVAL_S", 300)) * time.Second`
+// makes b.stockSweepInterval come out 0 instead of the floor, and the
+// assertion fails.
+func TestNewClampsStockSweepIntervalConfiguredZero(t *testing.T) {
+	b := envDurationTestBot(t, "STOCK_SWEEP_INTERVAL_S=0\n")
+	if b.stockSweepInterval != stockSweepMinInterval {
+		t.Errorf("b.stockSweepInterval = %s, want the %s floor — a configured 0 "+
+			"reached the ticker unclamped", b.stockSweepInterval, stockSweepMinInterval)
 	}
 }

@@ -33,6 +33,16 @@ import (
 // makes PaidUndelivered apply its DepositProduct default, excluding deposit
 // top-up orders (which are never "undelivered" — they have no product).
 func (b *Bot) reconcileReport() (count int64, oldestTS float64, err error) {
+	// b.store is nil only when an embedder or a test wires partial Deps —
+	// main.go always sets it in production. Guarded for uniformity with
+	// stocksweep.go's identical b.stock nil-check: without this,
+	// PaidUndelivered would nil-deref, safeStep would recover the panic
+	// (usdt.go:1137-1152), and reconcileStuckOrdersOnce would repeat that
+	// panic/recover/log cycle every tick forever instead of quietly
+	// reporting nothing until Store is wired.
+	if b.store == nil {
+		return 0, 0, nil
+	}
 	// Empty arg -> store.PaidUndelivered substitutes store.DepositProduct,
 	// which the SQL filters out via COALESCE(product,'')!=DepositProduct
 	// (misc.go:560-578). That is the exact split A4 introduced: deposit

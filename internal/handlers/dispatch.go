@@ -328,24 +328,28 @@ func New(d Deps) *Bot {
 		bands.ProviderTron:  {},
 	}
 	// Timing knobs — Python's module constants, env-overridable (telegram_bot.py:9541-9558).
-	b.expirySweepInterval = time.Duration(b.envInt("EXPIRY_SWEEP_INTERVAL", 120)) * time.Second
+	// envDuration (not a bare envInt*time.Second) so an operator-configured 0
+	// or negative value is clamped to a sane floor and logged rather than
+	// firing time.After immediately — see envDuration's own doc comment and
+	// the per-key *MinInterval comments above (task #30).
+	b.expirySweepInterval = b.envDuration("EXPIRY_SWEEP_INTERVAL", 120*time.Second, expirySweepMinInterval)
 	// RECONCILE_STUCK_INTERVAL_S default 600s = Python's reconcile crontab
 	// `*/10 * * * *` (reconcile_stuck_orders.py:99-107). The pass is read-only
 	// (reconcile.go), so a tighter interval is cheap and harmless; the default
 	// matches Python to keep alarm cadence comparable across the ports.
-	b.reconcileInterval = time.Duration(b.envInt("RECONCILE_STUCK_INTERVAL_S", 600)) * time.Second
+	b.reconcileInterval = b.envDuration("RECONCILE_STUCK_INTERVAL_S", 600*time.Second, reconcileMinInterval)
 	// STOCK_SWEEP_INTERVAL_S default 300s: folder-stock expiry is a cheap
 	// directory walk per product (stock.go:254), so a 5-min cadence keeps
 	// stock counts honest (abandoned reservations reclaimed to active/
 	// promptly) without burdening the DB-order sweep path. See stocksweep.go.
-	b.stockSweepInterval = time.Duration(b.envInt("STOCK_SWEEP_INTERVAL_S", 300)) * time.Second
+	b.stockSweepInterval = b.envDuration("STOCK_SWEEP_INTERVAL_S", 300*time.Second, stockSweepMinInterval)
 	// auditPruneInterval: fixed 24h, not env-tunable — see the field's own
 	// doc comment above for why.
 	b.auditPruneInterval = 24 * time.Hour
 	b.usdtPendingGrace = time.Duration(b.envInt("USDT_PENDING_GRACE_S", 2*3600)) * time.Second
 	b.usdtVerifyGrace = time.Duration(b.envInt("USDT_VERIFY_GRACE_S", 120)) * time.Second
 	b.usdtConfirmWait = time.Duration(b.envInt("USDT_CONFIRM_WAIT_S", 300)) * time.Second
-	b.usdtConfirmPoll = time.Duration(b.envInt("USDT_CONFIRM_POLL_S", 20)) * time.Second
+	b.usdtConfirmPoll = b.envDuration("USDT_CONFIRM_POLL_S", 20*time.Second, usdtConfirmPollMinInterval)
 	b.maxUSDTPolls = max(b.envInt("USDT_MAX_POLLS", 200), 1)
 	// Chain/exchange clients. The receiving address is resolved LIVE on every
 	// call through b.bep20AddrStr()/b.tronAddrStr() (settings.json's admin-set
@@ -492,6 +496,77 @@ func (b *Bot) envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// Floors for the seconds-valued env knobs envDuration resolves below. Each
+// backs one of the four periodic-janitor intervals wired in New(); the
+// comment on each explains what a hot loop at that interval would actually
+// contend, not just "burns CPU" (task #30).
+const (
+	// stockSweepMinInterval is STOCK_SWEEP_INTERVAL_S's floor — the
+	// sharpest edge of the four. Its pass (sweepStockExpiredOnce,
+	// stocksweep.go) calls stock.SweepExpired for EVERY product on EVERY
+	// tick, and SweepExpired takes the SAME per-product mutex that Reserve
+	// and Finalize take on the live customer buy path (stock.go's
+	// lockProduct). Unlike expirySweepMinInterval below, this pass is not
+	// scoped to orders that actually expired — it walks every product
+	// regardless — so it gets the HIGHEST floor of the four: a
+	// misconfiguration here can least afford to come close to a hot loop
+	// against real purchases.
+	stockSweepMinInterval = 10 * time.Second
+	// reconcileMinInterval is RECONCILE_STUCK_INTERVAL_S's floor. The pass
+	// (reconcileReport, reconcile.go) is read-only — one SELECT — but
+	// store.db is a SINGLE SQLite connection shared with every write the
+	// process makes, so a hot loop here still queues behind, and ahead of,
+	// the writer on that one connection.
+	reconcileMinInterval = 5 * time.Second
+	// expirySweepMinInterval is EXPIRY_SWEEP_INTERVAL's floor — pre-existing
+	// (predates task #30, unlike the two above). Each pass
+	// (expirySweepOnce, usdt.go) reads store.ReservedOrdersBefore, then per
+	// expired order writes via store.ClaimOrder and releases folder stock
+	// via stock.Release — which takes the SAME per-product mutex as the
+	// stock sweep above, just scoped to orders that actually expired
+	// rather than every product on every tick.
+	expirySweepMinInterval = 5 * time.Second
+	// usdtConfirmPollMinInterval is USDT_CONFIRM_POLL_S's floor —
+	// pre-existing (predates task #30). Each poll is an outbound chain RPC
+	// call (BEP20/TRON), not a local lock or the shared DB connection, so
+	// this floor can be the lowest of the four — but zero still means
+	// hammering an external chain-explorer API on every scheduler tick,
+	// risking a rate-limit ban on the very address the shop verifies
+	// deposits against.
+	usdtConfirmPollMinInterval = 2 * time.Second
+)
+
+// envDuration resolves a seconds-valued env var into a time.Duration through
+// b.envInt — NEVER os.Getenv (see envInt's own contract: config.Load's
+// frozen .env snapshot is never written back to the process environment,
+// and production's systemd unit exports nothing beyond it, so a raw env
+// read would see an empty string in production even with the key correctly
+// set in .env — the exact mistake that produced five live defects earlier
+// in this port, task #23's sweep) — then clamps the result UP to min.
+//
+// envInt's own contract is "fall back to def only when unset, blank, or
+// non-numeric" — an explicit 0 parses fine and is returned as-is, and so
+// does a negative value. Fed straight into time.After (every call site
+// below), a non-positive duration fires IMMEDIATELY, turning a periodic
+// janitor into a tight loop (task #30) — see the per-key floor comments
+// above for what each loop actually contends when that happens.
+//
+// A clamp triggered by a genuinely CONFIGURED value is logged — def is
+// always >= min by construction, so an unset/blank/non-numeric key (which
+// resolves to def) never logs here. Mirrors auditprune.go's
+// AUDIT_RETENTION_DAYS floor and its rationale: an operator who configured
+// 0 (or a negative) and silently got min back cannot tell that apart from
+// "it is working as configured."
+func (b *Bot) envDuration(key string, def, min time.Duration) time.Duration {
+	secs := b.envInt(key, int(def/time.Second))
+	d := time.Duration(secs) * time.Second
+	if d < min {
+		log.Printf("%s=%ds is below the %s floor — using %s", key, secs, min, min)
+		d = min
+	}
+	return d
 }
 
 // Shutdown drains the background expiry workers — called by cmd/bot after the

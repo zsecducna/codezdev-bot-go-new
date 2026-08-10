@@ -46,6 +46,18 @@ func (b *Bot) sweepStockExpiredOnce(ctx context.Context) {
 	// reconcileStuckOrdersOnce and usdt.go:1310 for the same _ = ctx idiom).
 	_ = ctx
 
+	// b.stock is nil only when an embedder or a test wires partial Deps —
+	// main.go always sets it in production. Guarded for uniformity with
+	// this package's other exported entry points (admin.go's
+	// adminStockText/sendRecentOrders check the same way): without this,
+	// ListProducts would nil-deref, safeStep would recover the panic
+	// (usdt.go:1137-1152), and the ticker would repeat that panic/recover/log
+	// cycle every tick forever instead of simply doing nothing until Stock
+	// is wired.
+	if b.stock == nil {
+		return
+	}
+
 	// ListProducts (catalog.go:29) returns the sorted product folders under
 	// AccountsDir, excluding hidden dot-dirs. Empty/missing is a fresh
 	// install — the loop is simply a no-op then.
