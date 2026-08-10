@@ -273,6 +273,145 @@ func TestAddBalFlow(t *testing.T) {
 	})
 }
 
+// ---- task #31: execAddBal audit rows ---------------------------------------
+//
+// execAddBal's own doc comment (adminusers.go ~394-400) flags the hazard
+// these tests pin against: store.CreditBalance writes NO ledger/txn row, so
+// before this task the audit row added here was the ONLY possible record
+// that an admin wallet adjustment ever happened — there is no second table
+// to cross-check against, unlike every other admin money mutation in this
+// codebase. Row-count DELTAS are asserted throughout (not a filtered
+// lookup) per this repo's own lesson (task #14) that a filtered query can
+// miss a row that got split or renamed.
+
+// TestAddBalCreditAuditsRow proves the credit branch writes exactly one row
+// with the signed (+) amount and the resulting balance.
+func TestAddBalCreditAuditsRow(t *testing.T) {
+	ctx := context.Background()
+	b, f, _, st := newUsersTestBot(t, "1")
+
+	before, err := st.RecentAudit(50, "")
+	if err != nil {
+		t.Fatalf("RecentAudit before: %v", err)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:addbal"))
+	b.Process(ctx, textUpdate(1, "555"))
+	b.Process(ctx, textUpdate(1, "2.5"))
+	b.Process(ctx, callbackUpdate(1, "admdo:confirm"))
+	if last := lastSendMsgTo(f, 1); last == nil || !strings.Contains(last.Text, "✅ Credited") {
+		t.Fatalf("expected a credit confirmation, got %+v", last)
+	}
+
+	after, err := st.RecentAudit(50, "")
+	if err != nil {
+		t.Fatalf("RecentAudit after: %v", err)
+	}
+	if len(after) != len(before)+1 {
+		t.Fatalf("audit row count = %d, want exactly %d (before+1): %+v", len(after), len(before)+1, after)
+	}
+	row := after[0] // RecentAudit is newest-first
+	if row.Action != "admin_credit_balance" {
+		t.Errorf("Action = %q, want admin_credit_balance", row.Action)
+	}
+	if row.ActorChat != "1" || row.ActorKind != "admin" {
+		t.Errorf("actor = %q/%q, want 1/admin", row.ActorChat, row.ActorKind)
+	}
+	if row.Target != "555" {
+		t.Errorf("Target = %q, want 555", row.Target)
+	}
+	if want := "+2.50 USDT → new balance 2.50 USDT"; row.Outcome != want {
+		t.Errorf("Outcome = %q, want %q", row.Outcome, want)
+	}
+	if want := "amount_vnd=62500 new_balance_vnd=62500"; row.Detail != want {
+		t.Errorf("Detail = %q, want %q", row.Detail, want)
+	}
+}
+
+// TestAddBalDebitAuditsRowWithCorrectSign proves the debit branch writes
+// exactly one row, and — the property that actually matters here — the
+// SIGN is "-", not "+". A debit that recorded with a "+" sign would be
+// indistinguishable from a credit to anyone scanning /audit for where a
+// customer's balance came from, which is exactly the forensic use case this
+// row exists for.
+func TestAddBalDebitAuditsRowWithCorrectSign(t *testing.T) {
+	ctx := context.Background()
+	b, f, _, st := newUsersTestBot(t, "1")
+	if _, err := st.CreditBalance("555", 100000); err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := st.RecentAudit(50, "")
+	if err != nil {
+		t.Fatalf("RecentAudit before: %v", err)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:addbal"))
+	b.Process(ctx, textUpdate(1, "555"))
+	b.Process(ctx, textUpdate(1, "-2"))
+	b.Process(ctx, callbackUpdate(1, "admdo:confirm"))
+	if last := lastSendMsgTo(f, 1); last == nil || !strings.Contains(last.Text, "✅ Deducted") {
+		t.Fatalf("expected a debit confirmation, got %+v", last)
+	}
+
+	after, err := st.RecentAudit(50, "")
+	if err != nil {
+		t.Fatalf("RecentAudit after: %v", err)
+	}
+	if len(after) != len(before)+1 {
+		t.Fatalf("audit row count = %d, want exactly %d (before+1): %+v", len(after), len(before)+1, after)
+	}
+	row := after[0]
+	if row.Action != "admin_debit_balance" {
+		t.Errorf("Action = %q, want admin_debit_balance", row.Action)
+	}
+	if strings.HasPrefix(row.Outcome, "+") {
+		t.Fatalf("Outcome = %q — a debit must NEVER carry a '+' sign", row.Outcome)
+	}
+	if want := "-2.00 USDT → new balance 2.00 USDT"; row.Outcome != want {
+		t.Errorf("Outcome = %q, want %q", row.Outcome, want)
+	}
+	if want := "amount_vnd=-50000 new_balance_vnd=50000"; row.Detail != want {
+		t.Errorf("Detail = %q, want %q", row.Detail, want)
+	}
+}
+
+// TestAddBalNoAuditOnFailedMutation proves NO row is written when the
+// underlying store write itself fails (as opposed to the "not enough
+// balance" refusal, which is a deliberate no-op already covered by
+// TestAddBalFlow's "debit-overdraw refusal persists nothing" subtest and
+// never reaches the audit call in the first place). Fault injection reuses
+// newQueryOnlyStoreBot from adminpricing_test.go (read-only reference, same
+// package, not an edit to that file) rather than re-deriving the same
+// PRAGMA query_only=ON technique a third time — CreditBalance/Debit are
+// plain store writes with no config.SaveSettings step, the same shape
+// capPromo/cbPromoDel needed that helper for.
+func TestAddBalNoAuditOnFailedMutation(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newQueryOnlyStoreBot(t, nil)
+
+	before, err := st.RecentAudit(50, "")
+	if err != nil {
+		t.Fatalf("RecentAudit before: %v", err)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:addbal"))
+	b.Process(ctx, textUpdate(1, "555"))
+	b.Process(ctx, textUpdate(1, "2.5"))
+	b.Process(ctx, callbackUpdate(1, "admdo:confirm"))
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on failed CreditBalance = %+v, want %q", last, settingsSaveFailed)
+	}
+
+	after, err := st.RecentAudit(50, "")
+	if err != nil {
+		t.Fatalf("RecentAudit after: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("audit row count = %d, want unchanged %d (no row on a failed mutation): %+v", len(after), len(before), after)
+	}
+}
+
 // ============================================================================
 // 🛡️ ADMIN ROLES
 // ============================================================================
