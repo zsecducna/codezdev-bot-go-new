@@ -54,6 +54,19 @@ func TestAdminRecipientsExcludesDevIDs(t *testing.T) {
 // true (a sale alerts unless explicitly turned off) and OFF means silent
 // sales, exactly like Python's `if not load_settings().get("admin_sale_notify",
 // True): return` (telegram_bot.py:8087-8088).
+//
+// Task #38 (U1) fix: the FIRST leg below used to be the only "default"
+// coverage, but newBuyBot's config.Load seeds admin_sale_notify=TRUE in
+// defaultSettings() (config/settings.go:22-23) — so that leg only ever
+// exercised the key PRESENT-AND-true, never genuinely ABSENT. Flipping
+// settingBool's default arg at notify.go:185 from true to false left every
+// test in the suite green. The third leg now deletes the key outright
+// (not merely sets it — b.cfg.Settings() returns a deep copy, so a bare
+// delete on it does nothing until SaveSettings writes it back) and asserts
+// the alert still fires, which is the only way to observe settingBool's
+// actual default argument. Falsification: reverting notify.go's
+// `settingBool(b.settings(), "admin_sale_notify", true)` to `..., false)`
+// turns this leg red — verified by mutation (see the executor report).
 func TestNotifyAdminSaleGatedByToggle(t *testing.T) {
 	ctx := context.Background()
 	b, f, _, _, _ := newBuyBot(t, "999")
@@ -74,10 +87,25 @@ func TestNotifyAdminSaleGatedByToggle(t *testing.T) {
 	if n := countContains(f, "NEW SALE"); n != 0 {
 		t.Fatalf("admin_sale_notify=false: got %d NEW SALE alert(s), want 0 (toggle OFF must be silent)", n)
 	}
+
+	// Third leg: the key GENUINELY ABSENT (not merely true), the only state
+	// that actually exercises settingBool's default argument.
+	s = b.cfg.Settings()
+	delete(s, "admin_sale_notify")
+	if err := b.cfg.SaveSettings(s); err != nil {
+		t.Fatal(err)
+	}
+	f.Sends = nil
+	b.notifyAdminSale(ctx, buyer, "Bedrock API Credits", "API", 500, 500000, "des-absent")
+	if n := countContains(f, "NEW SALE"); n != 1 {
+		t.Fatalf("absent admin_sale_notify key: got %d NEW SALE alert(s), want 1 (an absent key must default to ON, not silently OFF)", n)
+	}
 }
 
 // TestNotifyAdminDepositGatedByToggle is admin_deposit_notify's twin of the
-// test above (telegram_bot.py:8125-8126).
+// test above (telegram_bot.py:8125-8126). See that test's task #38 (U1)
+// comment for why the third leg below is the only one that actually
+// exercises settingBool's default argument.
 func TestNotifyAdminDepositGatedByToggle(t *testing.T) {
 	ctx := context.Background()
 	b, f, _, _, _ := newBuyBot(t, "999")
@@ -98,6 +126,20 @@ func TestNotifyAdminDepositGatedByToggle(t *testing.T) {
 	if n := countContains(f, "NEW DEPOSIT"); n != 0 {
 		t.Fatalf("admin_deposit_notify=false: got %d NEW DEPOSIT alert(s), want 0 (toggle OFF must be silent)", n)
 	}
+
+	// Third leg: the key GENUINELY ABSENT (not merely true) — the deep-copy
+	// trap is the same as the sale test above: b.cfg.Settings() must be
+	// saved back or the delete is a no-op.
+	s = b.cfg.Settings()
+	delete(s, "admin_deposit_notify")
+	if err := b.cfg.SaveSettings(s); err != nil {
+		t.Fatal(err)
+	}
+	f.Sends = nil
+	b.notifyAdminDeposit(ctx, buyer, 200000, 600000, "USDT BEP20")
+	if n := countContains(f, "NEW DEPOSIT"); n != 1 {
+		t.Fatalf("absent admin_deposit_notify key: got %d NEW DEPOSIT alert(s), want 1 (an absent key must default to ON, not silently OFF)", n)
+	}
 }
 
 // TestBuyerMentionFallsBackToChatID: with no cached handle/name and a
@@ -105,14 +147,26 @@ func TestNotifyAdminDepositGatedByToggle(t *testing.T) {
 // usable (non-empty) tappable mention keyed on the bare chat id — never an
 // empty display segment — mirroring _buyer_mention's own
 // `str(buyer_chat_id)` fallback (telegram_bot.py:8076).
+//
+// Task #38 (U2) fix: the tappable-anchor assertion used to be guarded by
+// `strings.Contains(got, "<a") && ...`, which makes the whole check OPTIONAL
+// — a buyerMention that dropped the <a href="tg://user?id=..."> wrapper
+// entirely (rendering a plain, non-tappable "12345 (12345)") would satisfy
+// the guard's false left-hand side and the test would stay green. A
+// tappable mention is the entire reason notifyAdminSale/notifyAdminDeposit
+// use parse_mode=HTML (notify.go's own doc comment), so this now asserts
+// the anchor UNCONDITIONALLY. Falsification: stripping the `<a href="tg://
+// user?id=%d">...</a>` wrapper from buyerMention (returning just
+// disp+" ("+id+")") turns this red — verified by mutation (see the
+// executor report).
 func TestBuyerMentionFallsBackToChatID(t *testing.T) {
 	b, _ := newTestBot("999", nil)
 	got := b.buyerMention(context.Background(), 12345)
 	if !strings.Contains(got, "12345") {
 		t.Errorf("buyerMention(12345) = %q, want it to contain the bare chat id as the fallback display", got)
 	}
-	if strings.Contains(got, "<a") && !strings.Contains(got, `tg://user?id=12345`) {
-		t.Errorf("buyerMention(12345) = %q, tappable link must target the same chat id", got)
+	if !strings.Contains(got, `tg://user?id=12345`) {
+		t.Errorf("buyerMention(12345) = %q, want a tappable tg://user?id=12345 link unconditionally — a bare-text mention defeats the whole reason these alerts use parse_mode=HTML", got)
 	}
 }
 
@@ -178,9 +232,28 @@ func TestReconcileAlertEscalatesAfterTimeout(t *testing.T) {
 // (count, oldestTS) is treated as a brand-new incident, not "unchanged since
 // last time" — without the reset, the exact same order getting stuck again
 // after a full recovery would stay silent forever.
+//
+// Task #38 (U3+U4) fix: this test used to end with a DIRECT
+// `b.reconcileShouldAlert(1, 3000)` call — hardcoded literals that read no
+// store and check no send. That made the "re-claim paid" ClaimOrder call
+// just above it DEAD: reconcileShouldAlert never looks at the store, so the
+// test passed identically whether or not "stuck1" was actually re-claimed.
+// It also meant the reconcile owner DM's actual CONTENT (recipient, text,
+// stuck count) was pinned nowhere in the suite — the only other coverage,
+// reconcile_test.go's TestReconcileReportMutatesNothing, only asserts a
+// send-COUNT delta (+1), which cannot detect a wrong recipient or wrong
+// text.
+//
+// Both close with the SAME edit: replace the direct reconcileShouldAlert
+// call with a real b.reconcileStuckOrdersOnce(ctx) pass (so the recreated
+// "stuck1" row is what actually drives the alert, making the ClaimOrder
+// call load-bearing) and assert on the DM itself — that the owner
+// specifically receives a message naming PAID-BUT-UNDELIVERED and the
+// stuck count — plus the de-dup half: a second, immediately-following pass
+// at the SAME (count, oldestTS) must send nothing.
 func TestReconcileAlertResetsOnRecovery(t *testing.T) {
 	ctx := context.Background()
-	b, _, _, _, _ := newBuyBot(t, "999")
+	b, f, _, _, _ := newBuyBot(t, "999") // AdminID "999", no devIDs -> the sole owner recipient is 999
 
 	seedOrderAtBot(t, b, "stuck1", "kiro-pro", "paid", 3000)
 	b.reconcileStuckOrdersOnce(ctx) // first alert fires, fingerprint = (1, 3000)
@@ -195,12 +268,32 @@ func TestReconcileAlertResetsOnRecovery(t *testing.T) {
 	// The SAME order gets stuck again with the SAME ts (adversarial but
 	// possible: a replayed settle re-lands it 'paid'). Without the reset this
 	// looks identical to the pre-recovery state and reconcileShouldAlert
-	// would wrongly suppress it.
+	// would wrongly suppress it. This ClaimOrder call is what the fix above
+	// makes load-bearing: reconcileStuckOrdersOnce below reads the store, so
+	// deleting this line drops the count back to 0 and the alert never fires.
 	if _, err := b.store.ClaimOrder("stuck1", "delivered", "paid"); err != nil {
 		t.Fatalf("re-claim paid: %v", err)
 	}
-	if !b.reconcileShouldAlert(1, 3000) {
-		t.Error("a recurrence of the identical (count, oldestTS) AFTER a full recovery " +
-			"must alert again — the fingerprint was not reset on recovery")
+
+	f.Sends = nil // isolate what THIS recurrence sends
+	b.reconcileStuckOrdersOnce(ctx)
+	last := lastSendMsgTo(f, 999)
+	if last == nil {
+		t.Fatal("a recurrence of the identical (count, oldestTS) AFTER a full recovery " +
+			"must alert the owner again — the fingerprint was not reset on recovery")
+	}
+	if !strings.Contains(last.Text, "PAID-BUT-UNDELIVERED") {
+		t.Errorf("owner alert text = %q, want it to contain PAID-BUT-UNDELIVERED", last.Text)
+	}
+	if !strings.Contains(last.Text, "1 PAID-BUT-UNDELIVERED") {
+		t.Errorf("owner alert text = %q, want the stuck count (1) in the alert", last.Text)
+	}
+
+	// De-dup half: an immediately-following pass at the SAME (count,
+	// oldestTS) must send NOTHING.
+	before := len(f.Sends)
+	b.reconcileStuckOrdersOnce(ctx)
+	if len(f.Sends) != before {
+		t.Errorf("a second immediate pass sent %d more message(s), want 0 (unchanged backlog must stay de-duped)", len(f.Sends)-before)
 	}
 }
