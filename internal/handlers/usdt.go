@@ -57,7 +57,6 @@ import (
 	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/pay/bands"
-	"codezdev-bot/internal/pay/bep20"
 	"codezdev-bot/internal/pay/tron"
 	"codezdev-bot/internal/store"
 	"codezdev-bot/internal/tg"
@@ -494,6 +493,21 @@ func (b *Bot) sendUSDTScreen(ctx context.Context, chatID int64, lang i18n.Lang, 
 	// address stops matching the effective one, falling back to the
 	// text-only caption below (which is always correct) until the operator
 	// updates the QR to match.
+	//
+	// TASK #41 FIX: that drop-on-mismatch comparison used to read
+	// bep20.Address()/tron.Address() — a bare os.Getenv, exactly like
+	// task #17's stale-address bug, and #42's shared root cause: production
+	// systemd carries NO EnvironmentFile, so ambient os.Getenv sees nothing,
+	// while config.Load parses dir/.env itself into its own snapshot. So the
+	// raw read always returned "", EqualFold(realAddress, "") was always
+	// false, and the QR was UNCONDITIONALLY dropped in production, forever —
+	// not "drop on a real rotation," just "never show." The fix below reads
+	// the same env/QR knobs through b.envAddrStr/b.envQRStr instead, both of
+	// which resolve via cfg (the .env-aware snapshot), so the comparison is
+	// between two values that both actually resolve in production: the
+	// EFFECTIVE address (settings.json-overridable) against the RAW
+	// .env-snapshot address the QR was actually generated against. The
+	// drop-on-mismatch LOGIC below is unchanged — only the operand is fixed.
 	addr := b.bep20AddrStr()
 	caption := i18n.F(c.BEP20Pay.T(lang), "usdt", amount, "address", addr)
 	qrURL, qrPath := "", ""
@@ -502,8 +516,8 @@ func (b *Bot) sendUSDTScreen(ctx context.Context, chatID int64, lang i18n.Lang, 
 	// env value (e.g. checksummed "0xABab…" vs a lowercase settings.json
 	// write) must still be trusted, not dropped to text-only over a casing
 	// difference that isn't a real address mismatch.
-	if strings.EqualFold(addr, bep20.Address()) {
-		qrURL, qrPath = bep20.QRURL(), bep20.QRPath()
+	if strings.EqualFold(addr, b.envAddrStr("BEP20_ADDRESS")) {
+		qrURL, qrPath = b.envQRStr("BEP20_QR_URL"), b.envQRStr("BEP20_QR_PATH")
 	}
 	if chain == chainTRX {
 		addr = b.tronAddrStr()
@@ -512,11 +526,40 @@ func (b *Bot) sendUSDTScreen(ctx context.Context, chatID int64, lang i18n.Lang, 
 		// Exact compare here, deliberately NOT EqualFold: TRON addresses are
 		// base58, which IS case-sensitive on-chain — folding case could match
 		// two genuinely different addresses and wrongly keep a stale QR.
-		if addr == tron.Address() {
-			qrURL, qrPath = tron.QRURL(), tron.QRPath()
+		if addr == b.envAddrStr("TRON_ADDRESS") {
+			qrURL, qrPath = b.envQRStr("TRON_QR_URL"), b.envQRStr("TRON_QR_PATH")
 		}
 	}
 	b.sendOnchainQR(ctx, chatID, caption, qrURL, qrPath, markup)
+}
+
+// envAddrStr resolves the RAW .env-snapshot value of an address env var
+// through cfg.Env — deliberately NOT the settings.json-aware
+// b.bep20AddrStr()/b.tronAddrStr(). This is the config-aware replacement
+// for bep20.Address()/tron.Address()'s raw os.Getenv (task #41): in
+// production there is no systemd EnvironmentFile, so ambient os.Getenv
+// sees nothing, but cfg already parsed dir/.env itself at Load() time, so
+// this is the only path that still resolves the value the operator's QR
+// was actually generated against. sendUSDTScreen compares this against the
+// EFFECTIVE address to detect a settings.json wizard rotation that left a
+// configured QR encoding the now-stale address.
+func (b *Bot) envAddrStr(key string) string {
+	if b.cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(b.cfg.Env(key))
+}
+
+// envQRStr resolves a *_QR_URL/*_QR_PATH knob through cfg.EnvOr — the
+// config-aware replacement for bep20.QRURL()/QRPath()/tron.QRURL()/
+// QRPath()'s raw os.Getenv (task #41, same root cause as envAddrStr
+// above). These knobs are env-only: no settings.json wizard writes them,
+// so there is nothing for a typed config getter to layer over.
+func (b *Bot) envQRStr(key string) string {
+	if b.cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(b.cfg.EnvOr(key, ""))
 }
 
 // sendOnchainQR is _send_bep20_qr / _send_tron_qr (telegram_bot.py:9457-9476,
