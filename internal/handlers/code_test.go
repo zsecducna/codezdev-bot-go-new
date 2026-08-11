@@ -28,14 +28,14 @@ import (
 // makeOrder returns a bare reserved order the tests can mutate.
 func makeOrder(des, chatID, product string, qty, total int64) *store.Order {
 	return &store.Order{
-		Des:    des,
-		ChatID: chatID,
-		Lang:   "en",
+		Des:     des,
+		ChatID:  chatID,
+		Lang:    "en",
 		Product: product,
-		Tier:   "BH30D",
-		Qty:    qty,
-		Total:  total,
-		Status: "reserved",
+		Tier:    "BH30D",
+		Qty:     qty,
+		Total:   total,
+		Status:  "reserved",
 	}
 }
 

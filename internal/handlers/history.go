@@ -207,7 +207,7 @@ func (b *Bot) historySummaryText(chatID int64, lang i18n.Lang) (string, bool) {
 // _history_text (telegram_bot.py:16211-16274). '5' shows the last N by count with
 // a "show all" toggle when older orders exist; 'all' is unbounded but capped to
 // HISTORY_MAX_ROWS rows and the char budget. Returns (text, toggleKey) where
-// toggleKey is '5'/'all'/'' (nothing more to toggle to).
+// toggleKey is '5', 'all', or the empty string (nothing more to toggle to).
 func (b *Bot) historyText(chatID int64, lang i18n.Lang, key string) (string, string) {
 	h := &i18n.C().History
 	var orders []*store.Order

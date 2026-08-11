@@ -39,15 +39,15 @@ func (b *Bot) registerCatalog() {
 
 	// Callback routes in handle_callback chain order (customer buy pipeline).
 	b.cbRoutes = append(b.cbRoutes,
-		cbRoute{key: "cancelord:", fn: (*Bot).cbCancelOrd},   // @15345
-		cbRoute{key: "keepord", exact: true, fn: (*Bot).cbKeepOrd}, // @15367
+		cbRoute{key: "cancelord:", fn: (*Bot).cbCancelOrd},                    // @15345
+		cbRoute{key: "keepord", exact: true, fn: (*Bot).cbKeepOrd},            // @15367
 		cbRoute{key: "back:products", exact: true, fn: (*Bot).cbBackProducts}, // @15019
-		cbRoute{key: "buyx:", fn: (*Bot).cbBuyX},   // @15032
-		cbRoute{key: "buy:", fn: (*Bot).cbBuy},     // @15224
-		cbRoute{key: "buygo:", fn: (*Bot).cbBuyGo}, // @15262
-		cbRoute{key: "tier:", fn: (*Bot).cbTier},   // @15281
-		cbRoute{key: "buyqty:", fn: (*Bot).cbBuyQty}, // @15330
-		cbRoute{key: "paybal:", fn: (*Bot).cbPayBalance}, // @15819
+		cbRoute{key: "buyx:", fn: (*Bot).cbBuyX},                              // @15032
+		cbRoute{key: "buy:", fn: (*Bot).cbBuy},                                // @15224
+		cbRoute{key: "buygo:", fn: (*Bot).cbBuyGo},                            // @15262
+		cbRoute{key: "tier:", fn: (*Bot).cbTier},                              // @15281
+		cbRoute{key: "buyqty:", fn: (*Bot).cbBuyQty},                          // @15330
+		cbRoute{key: "paybal:", fn: (*Bot).cbPayBalance},                      // @15819
 		// Pay-by-QR (SePay VietQR) and Pay-by-PayPal (Orders v2 API + webhook)
 		// were removed by the USDT-only migration (S1/S2) — SePay and PayPal are
 		// gone. Remaining pay-method buttons stay as stubs until their slices

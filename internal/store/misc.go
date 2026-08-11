@@ -401,9 +401,43 @@ type RevenueSummary struct {
 	RefundedCount int64
 	// RefundedRevenue — Σ total of the SAME genuine-refund set RefundedCount
 	// counts (stats-fixes-spec.md §5.5, finding A7). The A7 numerator: Gross =
-	// DeliveredRevenue + RefundedRevenue, Net = DeliveredRevenue unchanged. See
-	// GetRevenueSummary's query comment for the caveat on partial refunds.
+	// DeliveredRevenue + RefundedRevenue, Net = DeliveredRevenue unchanged.
+	// Still exact FOR GROSS — Gross sums original charges, which is what
+	// "Gross" means, and a partial refund never rewrites orders.total. Do NOT
+	// reuse this field for "cash actually credited back" — that is what the
+	// RefundedAmountKnown/RefundedUnknownUpperBound split below is for. See
+	// GetRevenueSummary's query comment for the full mechanism.
 	RefundedRevenue int64
+	// RefundedAmountKnown — Σ refunded_amount over the SAME genuine-refund set
+	// RefundedCount counts, restricted to rows where the credited-back figure
+	// was actually recorded (SetRefundedAmount, task #20 stage S2). This is
+	// the EXACT cash returned for that subset — no pro-rating residue, unlike
+	// RefundedRevenue above. Pairs with RefundedKnownCount.
+	RefundedAmountKnown int64
+	// RefundedKnownCount — how many of RefundedCount's rows have a recorded
+	// refunded_amount (IS NOT NULL). RefundedKnownCount + RefundedUnknownCount
+	// == RefundedCount.
+	RefundedKnownCount int64
+	// RefundedUnknownCount — genuine-refund rows (same population as
+	// RefundedCount) whose refunded_amount is NULL: every refund issued
+	// before task #20 stage S2 started writing the column. Stage S1's own
+	// doc comment (store.go) is explicit this is NOT backfillable — the
+	// credited figure was never persisted anywhere else queryable, and the
+	// audit table's detail strings are free text in VND, not a source to
+	// reconstruct from. PERMANENT, not scaffolding: these refund queries
+	// carry no sinceTS (unlike GetRevenueMatrix, the windowed one), so old
+	// unknown rows never age out of this report on their own.
+	RefundedUnknownCount int64
+	// RefundedUnknownUpperBound — Σ total over the SAME unknown rows: the OLD
+	// RefundedRevenue behaviour (summing the order total), restricted to just
+	// this subset and correctly relabelled as the CEILING it always was
+	// rather than presented as the actual credited figure. The renderer MUST
+	// keep this on its own line — folding it into RefundedAmountKnown via a
+	// naive SUM(refunded_amount) would silently SKIP every NULL row
+	// (SQLite's SUM() drops NULLs) and UNDERSTATE refunds, which is worse
+	// than the overstatement bug this column exists to fix: it would
+	// silently claim the shop kept money it actually returned.
+	RefundedUnknownUpperBound int64
 	// ExpiredCount — abandoned checkouts (status='expired'), split out of the
 	// old combined "Refunded/expired" line.
 	ExpiredCount int64
@@ -513,28 +547,58 @@ func (s *Store) GetRevenueSummary(depositProduct string) (*RevenueSummary, error
 	// A4. late_settled is deliberately in none of these: it is not a refund
 	// (§2.2) and, being a __deposit__-only kind, would need its own line if
 	// ever surfaced — not conflated with a product refund bucket.
-	// RefundedRevenue rides the same query as RefundedCount (one row, two
-	// columns) — it is money actually credited back on GENUINE refunds only
-	// (customer + admin_cancel), the numerator A7's Refunded line needs
-	// (stats-fixes-spec.md §5.5). CAVEAT, not fixable here, cuts BOTH ways —
-	// review finding on this slice: orders.total is the ORIGINAL charge and is
-	// never rewritten on a partial refund. adminorders.go's refundAmount
-	// pro-rates day/hour warranty tiers down from o.Total when an admin issues
-	// a non-forceFull refund; only forceFull sets amount=o.Total. The refunded
-	// order still leaves status='delivered' ENTIRELY, so DeliveredRevenue (the
-	// admin-facing Net line) loses the row's FULL total, not just the prorated
-	// amount actually credited. Net result on a partial refund: Refunded
-	// OVERSTATES cash actually returned (SUM(total) is an upper bound), and
-	// Net UNDERSTATES cash actually retained, by the exact same residue
-	// (total-amount) — Gross is unaffected either way. The actual credited
-	// amount is not persisted anywhere queryable, so neither side can be
-	// corrected from this table. Recording it would need a new column (same
-	// shape as list_total/code_discount, spec §3) and is out of this slice's
-	// scope.
-	if err := s.db.QueryRow("SELECT COUNT(*), COALESCE(SUM(total),0) FROM orders "+
-		"WHERE status='refunded' AND COALESCE(product,'')!=? AND refund_kind IN (?,?)",
+	// RefundedRevenue rides the same query as RefundedCount (one row, six
+	// columns as of task #20 stage S3 — see below) — it is Σ total on
+	// GENUINE refunds only (customer + admin_cancel), the numerator A7's
+	// Gross line needs (stats-fixes-spec.md §5.5). CAVEAT that motivated
+	// stage S3, and used to be uncorrectable — review finding from the A7
+	// slice: orders.total is the ORIGINAL charge and is never rewritten on a
+	// partial refund. adminorders.go's refundAmount pro-rates day/hour
+	// warranty tiers down from o.Total when an admin issues a non-forceFull
+	// refund; only forceFull sets amount=o.Total. The refunded order still
+	// leaves status='delivered' ENTIRELY, so DeliveredRevenue (the
+	// admin-facing Net line) loses the row's FULL total, not just the
+	// prorated amount actually credited. Net result on a partial refund
+	// reported via RefundedRevenue alone: Refunded OVERSTATES cash actually
+	// returned (SUM(total) is an upper bound), and Net UNDERSTATES cash
+	// actually retained, by the exact same residue (total-amount) — Gross is
+	// unaffected either way, since it is defined as Σ original charges.
+	//
+	// Stage S1 added orders.refunded_amount (nullable) and stage S2 (this
+	// package's SetRefundedAmount, orders.go) now writes the actual credited
+	// figure at both refund sites. That closes the caveat above for every
+	// refund issued from here on — but ONLY those: refunds that predate S2
+	// still have refunded_amount=NULL and are permanently unrecoverable (S1's
+	// own doc comment; no backfill source exists — the audit table's detail
+	// strings are free text in VND forever, not a queryable figure).
+	//
+	// SQLite's SUM() SILENTLY SKIPS NULL rows, so a naive
+	// `SUM(refunded_amount)` over this same population would reproduce the
+	// exact defect this column exists to fix, just inverted: every pre-S2
+	// row would contribute zero, UNDERSTATING refunds and OVERSTATING net —
+	// silently claiming the shop kept money it actually returned. The four
+	// columns appended below split the population the same way
+	// UnclassifiedCount already splits refund_kind further down this
+	// function — "unknown" as its own returned, renderer-visible field
+	// instead of a value a SUM() can make disappear:
+	//   - RefundedKnownCount / RefundedAmountKnown — rows with a recorded
+	//     refunded_amount; the EXACT cash returned for that subset.
+	//   - RefundedUnknownCount / RefundedUnknownUpperBound — rows with none;
+	//     RefundedUnknownUpperBound is Σ total over just those rows, i.e.
+	//     today's old RefundedRevenue behaviour, restricted to the subset
+	//     where it is still all that's knowable and labelled as the CEILING
+	//     it always was. The renderer (admin.go) must show known and unknown
+	//     as SEPARATE lines and a Net RANGE, never a single blended figure.
+	if err := s.db.QueryRow("SELECT COUNT(*), COALESCE(SUM(total),0), "+
+		"COUNT(CASE WHEN refunded_amount IS NOT NULL THEN 1 END), "+
+		"COALESCE(SUM(CASE WHEN refunded_amount IS NOT NULL THEN refunded_amount END),0), "+
+		"COUNT(CASE WHEN refunded_amount IS NULL THEN 1 END), "+
+		"COALESCE(SUM(CASE WHEN refunded_amount IS NULL THEN total END),0) "+
+		"FROM orders WHERE status='refunded' AND COALESCE(product,'')!=? AND refund_kind IN (?,?)",
 		depositProduct, RefundKindCustomer, RefundKindAdminCancel).
-		Scan(&r.RefundedCount, &r.RefundedRevenue); err != nil {
+		Scan(&r.RefundedCount, &r.RefundedRevenue,
+			&r.RefundedKnownCount, &r.RefundedAmountKnown,
+			&r.RefundedUnknownCount, &r.RefundedUnknownUpperBound); err != nil {
 		return nil, err
 	}
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM orders "+

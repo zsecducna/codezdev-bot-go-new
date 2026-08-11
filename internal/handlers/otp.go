@@ -106,7 +106,7 @@ func (b *Bot) registerOTP() {
 		stage{name: "code", fn: (*Bot).capCode}, // #36 @18341 peek
 	)
 	b.cbRoutes = append(b.cbRoutes,
-		cbRoute{key: "otpstop:", fn: (*Bot).cbOTPStop},            // @15645
+		cbRoute{key: "otpstop:", fn: (*Bot).cbOTPStop},             // @15645
 		cbRoute{key: "otpkeep", exact: true, fn: (*Bot).cbOTPKeep}, // @15656
 	)
 }

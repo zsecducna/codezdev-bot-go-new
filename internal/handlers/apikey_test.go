@@ -95,8 +95,8 @@ func newFakeKiro(t *testing.T) *fakeKiro {
 	fk := &fakeKiro{
 		keys:                  map[string]*fakeKeyState{},
 		DeleteUpstreamRevoked: true,
-		UpstreamStatus: "bound",
-		EchoSaleClass:  true,
+		UpstreamStatus:        "bound",
+		EchoSaleClass:         true,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/provision_customer", fk.handleProvision)
@@ -552,8 +552,8 @@ func TestApikeyMintFailureRefunds(t *testing.T) {
 }
 
 // TestApikeyMintLegacyEchoStoresEmptyClass: a PRE-saleClass Kiro-Go echoes no
-// class, so the bot must store '' — storing the order's "bedrock" would 409 the
-// key's first-ever recharge.
+// class, so the bot must store "" — storing the order's "bedrock" would 409
+// the key's first-ever recharge.
 func TestApikeyMintLegacyEchoStoresEmptyClass(t *testing.T) {
 	ctx := context.Background()
 	b, _, st, fk, _ := newAPIKeyBot(t)
@@ -618,9 +618,9 @@ func TestApikeyRechargeNeverSendsTokens(t *testing.T) {
 	}
 }
 
-// TestApikeyRechargeLegacyOmitsSaleClass: a legacy ('' sale_class) row must send
-// NO saleClass at all — the server's own record wins, and an explicit ""
-// could be rejected as an unrecognized class.
+// TestApikeyRechargeLegacyOmitsSaleClass: a legacy ("" sale_class) row must
+// send NO saleClass at all — the server's own record wins, and an explicit
+// "" could be rejected as an unrecognized class.
 func TestApikeyRechargeLegacyOmitsSaleClass(t *testing.T) {
 	ctx := context.Background()
 	b, _, st, fk, _ := newAPIKeyBot(t)

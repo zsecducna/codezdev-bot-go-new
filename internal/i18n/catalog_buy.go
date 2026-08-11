@@ -54,8 +54,8 @@ type BuyCatalog struct {
 	BackBtn Str
 	// TierNoWarranty / TierDaysWarranty / TierHoursWarranty — the three tier_label
 	// branches (telegram_bot.py:4659-4672). The day/hour forms carry {n}.
-	TierNoWarranty   Str
-	TierDaysWarranty Str
+	TierNoWarranty    Str
+	TierDaysWarranty  Str
 	TierHoursWarranty Str
 	// DiscountHeader / DiscountUnit — _DISCOUNT_HEADER / _DISCOUNT_UNIT
 	// (telegram_bot.py:6513-6514): rendered by discount_block into VOLUME_PROMPT's

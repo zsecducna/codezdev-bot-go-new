@@ -192,7 +192,11 @@ func TestQtyCaptureEscape(t *testing.T) {
 	const chat = 100
 	primeKB(b, chat)
 
-	arm := func() { b.states.Get(chat).mu.Lock(); b.states.Get(chat).Purchase = &PurchaseCtx{Product: "prodA", Tier: "KBH"}; b.states.Get(chat).mu.Unlock() }
+	arm := func() {
+		b.states.Get(chat).mu.Lock()
+		b.states.Get(chat).Purchase = &PurchaseCtx{Product: "prodA", Tier: "KBH"}
+		b.states.Get(chat).mu.Unlock()
+	}
 
 	// Escape via a slash command: slot stays armed, /start still runs.
 	arm()

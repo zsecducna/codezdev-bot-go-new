@@ -558,12 +558,12 @@ func qtyChoicesFor(saleClass string, lo, hi int64) []int64 {
 
 // apikeyKeyClass is the effective SKU of a stored api_keys row for pricing/
 // labels/bounds — _apikey_key_class (telegram_bot.py:6347-6354). "kiro" only
-// when the row was minted as kiro; anything else (bedrock, or the legacy '' of
-// pre-split rows) prices and labels as bedrock, because legacy keys WERE sold
-// at the bedrock rate card.
+// when the row was minted as kiro; anything else (bedrock, or the legacy ""
+// of pre-split rows) prices and labels as bedrock, because legacy keys WERE
+// sold at the bedrock rate card.
 //
 // Recharge PAYLOADS must NOT use this: they read the RAW stored value so a
-// legacy '' row omits saleClass entirely (see deliverApikeyRecharge).
+// legacy "" row omits saleClass entirely (see deliverApikeyRecharge).
 func apikeyKeyClass(row *store.APIKey) string {
 	if row != nil && row.SaleClass == saleClassKiro {
 		return saleClassKiro

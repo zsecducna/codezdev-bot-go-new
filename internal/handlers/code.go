@@ -38,18 +38,20 @@ import (
 // now delegates here; all callers remain consistent.
 //
 // Return values:
-//   total    — the charge in VND after discount
-//   effPct   — effective discount % (what the customer sees)
-//   volPct   — the baseline volume-tier % before any code (useful for stack notes)
+//
+//	total    — the charge in VND after discount
+//	effPct   — effective discount % (what the customer sees)
+//	volPct   — the baseline volume-tier % before any code (useful for stack notes)
 //
 // Rules (telegram_bot.py:10107-10135):
-//   kind=""          baseline: reseller flat rate replaces volume tier when
-//                    resellerPct>0; otherwise volume tier applies.
-//   kind="referral"  referralPct, REPLACES volume discount.
-//   kind="promo"     stack=false replaces volume with percent;
-//                    stack=true adds percent ON TOP of volume (capped).
-//   Any code (kind set) bypasses resellerPct — code wins.
-//   Effective fraction clamped to [0, 0.95] — no code can zero an order.
+//
+//	kind=""          baseline: reseller flat rate replaces volume tier when
+//	                 resellerPct>0; otherwise volume tier applies.
+//	kind="referral"  referralPct, REPLACES volume discount.
+//	kind="promo"     stack=false replaces volume with percent;
+//	                 stack=true adds percent ON TOP of volume (capped).
+//	Any code (kind set) bypasses resellerPct — code wins.
+//	Effective fraction clamped to [0, 0.95] — no code can zero an order.
 func codedTotalFull(unit, qty int, kind string, percent float64, stack bool, resellerPct int) (total, effPct, volPct int) {
 	base := max(unit*qty, 0)
 	vol := discountFor(qty)
@@ -92,8 +94,8 @@ func codedTotalFull(unit, qty int, kind string, percent float64, stack bool, res
 //
 // Deliberate differences from codedTotalFull, both forced by the product
 // (telegram_bot.py:6237-6247):
-//   • base is apikeyPriceVND — a virtual product has no folder price file;
-//   • there is no volume tier (qty is CREDITS, not units), so volumePct is
+//   - base is apikeyPriceVND — a virtual product has no folder price file;
+//   - there is no volume tier (qty is CREDITS, not units), so volumePct is
 //     always 0 and stack is a no-op: a stacking promo adds its percent to a
 //     0% volume discount, which is just the promo percent.
 func (b *Bot) apikeyCodedTotalFull(credits int64, kind string, percent float64, stack bool, resellerPct int, saleClass string) (total int64, effPct, volPct int) {

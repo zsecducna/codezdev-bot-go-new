@@ -1,8 +1,10 @@
 // Coverage for #21: the three bare `product!=?` filters in orders.go
 // (ReservedOrderForChat, HasDeliveredOrder, DeliveredProductSummary) fixed to
-// COALESCE(product,'')!=?, matching misc.go's five statistics queries
+// the COALESCE-first form, matching misc.go's five statistics queries
 // (stats_test.go's TestRevenueSummaryCustomersExcludesDepositOnly is the
-// model this file follows).
+// model this file follows). The exact fragment:
+//
+//	COALESCE(product,'')!=?
 //
 // THE DISCRIMINATION TRAP each test here is built to avoid: a bare
 // `product!=?` and a COALESCE-first filter agree on every row with a
@@ -12,8 +14,8 @@
 // raw INSERT that OMITS the product column (a state CreateOrder cannot
 // produce through the public API), because `NULL != x` evaluates to NULL,
 // not TRUE, in SQLite: a bare filter silently DROPS that row out of the WHERE
-// clause entirely (it DEFLATES, never inflates), while COALESCE(product,'')
-// turns the NULL into '', which correctly compares != DepositProduct.
+// clause entirely (it DEFLATES, never inflates), while the COALESCE turns the
+// NULL into the empty string, which correctly compares != DepositProduct.
 package store
 
 import (
