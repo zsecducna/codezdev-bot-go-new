@@ -99,9 +99,27 @@ func validateCLIFlags(rate int64, apply, haveBackup, yes bool) error {
 // and an entry that doesn't look like "table.column" is a hard error rather
 // than being silently ignored — a typo'd column name must not read to the
 // operator as "I allowed this collapse" when it did nothing.
+//
+// LOW found in the second adversarial review: the old check only asked
+// "does this contain a dot", so a misspelled entry (e.g.
+// orders.code_discont) parsed clean, matched nothing in evaluateColumns,
+// and the run refused with the exact same message as an unset flag — the
+// operator sees "I passed the flag and it still refuses" with no hint the
+// entry itself was the typo. Cross-checking against baseSpecs closes that:
+// an unknown table.column is now a hard error naming the bad entry, at the
+// same place the old "not table.column" error already lived. Checked
+// against baseSpecs rather than buildSpecs' full (DB-dependent) result
+// because this runs before any database connection is open; baseSpecs is
+// every money column except the conditionally-present binance_pending.total
+// (plan §3.1 marks that table as dropped, so it is deliberately left out of
+// the known set here rather than guessed at).
 func parseAllowZeroCollapse(s string) (map[string]bool, error) {
 	if s == "" {
 		return nil, nil
+	}
+	known := map[string]bool{}
+	for _, spec := range baseSpecs {
+		known[spec.table+"."+spec.valueCol] = true
 	}
 	allowed := map[string]bool{}
 	for _, entry := range strings.Split(s, ",") {
@@ -112,6 +130,10 @@ func parseAllowZeroCollapse(s string) (map[string]bool, error) {
 		if !strings.Contains(entry, ".") {
 			return nil, fmt.Errorf(
 				"-allow-zero-collapse entry %q is not table.column — copy the exact string out of a dry run's refusal message, e.g. orders.code_discount", entry)
+		}
+		if !known[entry] {
+			return nil, fmt.Errorf(
+				"-allow-zero-collapse entry %q names no known money column — copy the exact string out of a dry run's refusal message, e.g. orders.code_discount", entry)
 		}
 		allowed[entry] = true
 	}
@@ -162,8 +184,19 @@ func printReport(w io.Writer, r *Report) {
 		// rows is exactly convertible at this rate — the strongest statement
 		// this report can honestly make, and checkable at a glance. The line
 		// is printed either way so its absence never has to be interpreted.
-		fmt.Fprintf(w, "    rounded_rows=%d of %d%s\n", c.RoundedRows, c.RowCount,
-			map[bool]string{true: "  (exact at this rate)", false: ""}[c.RoundedRows == 0])
+		//
+		// The "(exact at this rate)" claim is suppressed when RowCount == 0:
+		// orders.list_total, orders.code_discount, and orders.refunded_amount
+		// are entirely NULL as of this writing, and "exact" is an
+		// affirmative statement about data that was actually converted —
+		// asserting it about a column with NO rows is not honest, even
+		// though it is technically vacuously true. The count line itself
+		// ("rounded_rows=0 of 0") still prints either way.
+		exactSuffix := ""
+		if c.RoundedRows == 0 && c.RowCount > 0 {
+			exactSuffix = "  (exact at this rate)"
+		}
+		fmt.Fprintf(w, "    rounded_rows=%d of %d%s\n", c.RoundedRows, c.RowCount, exactSuffix)
 		if len(c.ZeroCollapses) > 0 {
 			fmt.Fprintf(w, "    ZERO-COLLAPSE (non-zero VND -> zero micro), %d row(s):\n", len(c.ZeroCollapses))
 			for _, z := range c.ZeroCollapses {

@@ -524,21 +524,26 @@ func columnTolerance(b bucket, rate int64, rowCount int64) int64 {
 // acceptable. It cannot false-alarm, because it asserts nothing — it
 // reports.
 func rowRounded(vnd, rate int64, b bucket) bool {
+	// Did vndToMicro itself round? Applies to BOTH buckets, not just
+	// free-micro — MEDIUM found in the second adversarial review: a
+	// cent-rounded row can have vndToMicro round on the way to a value that
+	// still happens to land on a cent boundary, so roundToNearestCent alone
+	// misses it. Reachable whenever 10000*gcd(rate,100) < rate/2 — i.e. at
+	// rates roughly coprime to 100 (an earlier check here gated on the
+	// bucket FIRST and only ran this test in the free-micro branch, which
+	// is what let that case slip through — HIGH found reviewing 89469d4
+	// fixed the free-micro case alone; this fixes the cent-rounded one).
+	// big.Int because vnd*1_000_000 overflows int64 on aggregate-sized
+	// inputs, and because big.Int's Mod is Euclidean (always non-negative
+	// for a positive modulus) — a plain int64 % is truncated, not
+	// Euclidean, so this stays correct for the negative balances baseSpecs
+	// explicitly allows (e.g. the fixture's balances[222] = -50000).
+	num := new(big.Int).Mul(big.NewInt(vnd), big.NewInt(1_000_000))
+	if new(big.Int).Mod(num, big.NewInt(rate)).Sign() != 0 {
+		return true
+	}
 	if b != bucketCentRounded {
-		// bucketFreeMicro does not round to the cent at all, but its ONE
-		// step (vndToMicro) can still round — HIGH found reviewing 89469d4:
-		// this branch used to unconditionally return false here, which made
-		// every free-micro column (balances, processed) report "exact at
-		// this rate" even when vndToMicro rounded on nearly every row. The
-		// fix: exact iff rate divides vnd*1_000_000 with no remainder.
-		// big.Int because vnd*1_000_000 overflows int64 on aggregate-sized
-		// inputs, and because big.Int's Mod is Euclidean (always
-		// non-negative for a positive modulus) — a plain int64 % is
-		// truncated, not Euclidean, so this stays correct for the negative
-		// balances baseSpecs explicitly allows (e.g. the fixture's
-		// balances[222] = -50000).
-		num := new(big.Int).Mul(big.NewInt(vnd), big.NewInt(1_000_000))
-		return new(big.Int).Mod(num, big.NewInt(rate)).Sign() != 0
+		return false
 	}
 	micro, err := vndToMicro(vnd, rate)
 	if err != nil {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -823,7 +824,24 @@ func TestValidateCLIFlagsRequiresRate(t *testing.T) {
 }
 
 // TestValidateCLIFlagsRequiresConfirmationForApply is PINNED to Fix 5: a
-// bare -apply (without both -i-have-a-backup and -yes) must refuse.
+// bare -apply (without both -i-have-a-backup and -yes) must refuse. This
+// calls validateCLIFlags directly rather than exec'ing the compiled binary
+// because validateCLIFlags was deliberately pulled out of main() as a plain,
+// os.Exit-free function FOR that seam (see its doc comment) -- without that
+// extraction there would be no seam at all: flag.Parse owns argument
+// parsing and reads live os.Args, so testing "what happens with these exact
+// bare flag values" would have no way in except driving the live binary. Do
+// not inline validateCLIFlags back into main() without replacing this test
+// with one that does -- that would silently delete the only coverage these
+// guard-rails have.
+//
+// What this test does NOT cover: the missing-argument case (e.g.
+// -allow-zero-collapse with no value following it) never reaches
+// validateCLIFlags at all -- stdlib flag.Parse rejects it first ("flag
+// needs an argument", exit 2), before main() even calls this function.
+// That path is unreachable from here and was verified by hand against the
+// real binary, not by an automated test; naming the boundary here is so the
+// next reader knows the gap is known, not overlooked.
 func TestValidateCLIFlagsRequiresConfirmationForApply(t *testing.T) {
 	if err := validateCLIFlags(25000, true, false, false); err == nil {
 		t.Error("validateCLIFlags(apply=true, no confirmation flags): got nil error, want error")
@@ -1245,5 +1263,103 @@ func TestRowRoundedFreeMicroExactAtDivisorRate(t *testing.T) {
 	bal := findCol(t, report, "balances", "amount")
 	if bal.RoundedRows != 0 {
 		t.Errorf("balances.amount rounded_rows = %d at rate=25000, want 0 (1_000_000/25000 is exact, so vndToMicro cannot round)", bal.RoundedRows)
+	}
+}
+
+// ---- MEDIUM (reviewer, round 2): rowRounded gated the vndToMicro check on
+// the bucket, missing cent-rounded rows whose vndToMicro step itself rounds
+// while still landing on a cent boundary --------------------------------
+
+// TestRowRoundedCentBucketCatchesVndToMicroRounding is PINNED to the MEDIUM
+// found in the second adversarial review: rowRounded used to check the
+// bucket FIRST and only run the vndToMicro divisibility test inside the
+// free-micro branch, so a cent-rounded row could have vndToMicro round on
+// its way to a value that still happens to land on a cent boundary — missed
+// entirely, because roundToNearestCent(micro) == micro even though micro
+// itself was already rounded. This corrupts the reported rounded-row COUNT
+// only; it cannot touch the actual conversion or cause a wrong abort.
+//
+// Reachable whenever 10000*gcd(rate,100) < rate/2 -- i.e. at rates roughly
+// coprime to 100. vnd=12814, rate=26151 is one such row: gcd(26151,100)=1,
+// so d=10000, and 10000 lands within rate/2=13075 of a multiple of 1e6.
+func TestRowRoundedCentBucketCatchesVndToMicroRounding(t *testing.T) {
+	const vnd, rate = 12814, 26151
+	if got := rowRounded(vnd, rate, bucketCentRounded); !got {
+		t.Errorf("rowRounded(%d, %d, bucketCentRounded) = false, want true — vndToMicro itself rounds this row even though the rounded value still lands on a cent boundary", vnd, rate)
+	}
+}
+
+// ---- LOW (reviewer, round 2): -allow-zero-collapse accepted any string
+// containing a dot, so a misspelled table.column parsed clean, matched
+// nothing, and the run refused with the SAME message as before -- an
+// operator staring at "I passed the flag and it still refuses" with no hint
+// the entry was a typo. Fails safe (refuses either way), which is why this
+// is LOW rather than blocking. ------------------------------------------
+
+// TestParseAllowZeroCollapseRejectsUnknownColumn is PINNED to that LOW: an
+// entry that parses as table.column but names no real money column must be
+// a hard error, not silently accepted into the allowlist.
+func TestParseAllowZeroCollapseRejectsUnknownColumn(t *testing.T) {
+	if _, err := parseAllowZeroCollapse("orders.code_discont"); err == nil {
+		t.Error(`parseAllowZeroCollapse("orders.code_discont") (typo for code_discount): got nil error, want error`)
+	}
+}
+
+// TestParseAllowZeroCollapseAcceptsKnownColumn is the companion check: a
+// real money column, straight out of baseSpecs, must not be rejected by the
+// new cross-check.
+func TestParseAllowZeroCollapseAcceptsKnownColumn(t *testing.T) {
+	allowed, err := parseAllowZeroCollapse("orders.code_discount,refund_requests.total")
+	if err != nil {
+		t.Fatalf("parseAllowZeroCollapse: %v", err)
+	}
+	if !allowed["orders.code_discount"] || !allowed["refund_requests.total"] {
+		t.Errorf("allowed = %v, want both orders.code_discount and refund_requests.total set", allowed)
+	}
+}
+
+// ---- LOW (reviewer, round 2): a zero-row column printed an affirmative
+// "(exact at this rate)" claim about a column with NO DATA. orders.list_total,
+// orders.code_discount, and orders.refunded_amount are entirely NULL as of
+// this writing, so this line prints on every real run today. ------------
+
+// TestPrintReportSuppressesExactClaimOnZeroRows is PINNED to that LOW: the
+// "(exact at this rate)" suffix must not print when RowCount == 0 — the
+// count line itself ("rounded_rows=0 of 0") still prints unconditionally,
+// so its absence never has to be interpreted.
+func TestPrintReportSuppressesExactClaimOnZeroRows(t *testing.T) {
+	r := &Report{
+		DBPath: "store.db", Rate: 25000, Mode: "dry-run",
+		Columns: []ColumnReport{
+			{Table: "orders", Column: "list_total", Bucket: bucketCentRounded, RowCount: 0, RoundedRows: 0},
+		},
+	}
+	var buf bytes.Buffer
+	printReport(&buf, r)
+	out := buf.String()
+	if strings.Contains(out, "exact at this rate") {
+		t.Errorf("printReport output contains \"exact at this rate\" for a zero-row column, want it suppressed:\n%s", out)
+	}
+	if !strings.Contains(out, "rounded_rows=0 of 0") {
+		t.Errorf("printReport output missing the count line for a zero-row column:\n%s", out)
+	}
+}
+
+// TestPrintReportKeepsExactClaimOnNonZeroRows is the companion check: a
+// column that genuinely converted with zero rounded rows must keep the
+// claim — this is the strongest honest statement the report can make about
+// a column that actually has data.
+func TestPrintReportKeepsExactClaimOnNonZeroRows(t *testing.T) {
+	r := &Report{
+		DBPath: "store.db", Rate: 25000, Mode: "dry-run",
+		Columns: []ColumnReport{
+			{Table: "orders", Column: "total", Bucket: bucketCentRounded, RowCount: 5, RoundedRows: 0},
+		},
+	}
+	var buf bytes.Buffer
+	printReport(&buf, r)
+	out := buf.String()
+	if !strings.Contains(out, "exact at this rate") {
+		t.Errorf("printReport output missing \"exact at this rate\" for a non-zero-row column with RoundedRows=0:\n%s", out)
 	}
 }
