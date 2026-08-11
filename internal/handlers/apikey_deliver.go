@@ -122,6 +122,14 @@ func (b *Bot) deliverApikey(ctx context.Context, order *store.Order, des string)
 			// page loudly: without the row, a replay would double-mint.
 			log.Printf("CRITICAL apikey row persist failed [des=%s chat=%d keyId=%s]: %v — key IS minted; store the row by hand before any settle replay",
 				des, chatID, minted.ID, err)
+			// Owner alert (#39): PaidUndelivered never sees this row — the
+			// order still proceeds to 'delivered' below (the buyer holds the
+			// key), so nothing else will ever surface a missing api_keys row.
+			// keyId is non-secret; the cleartext key itself is never logged
+			// or alerted.
+			b.notifyOwners(ctx, fmt.Sprintf(
+				"🚨 API-KEY ROW PERSIST FAILED — MANUAL FIX REQUIRED\n🧾 %s\n👤 %d\n🔑 key id %s\nThe key IS minted and billable; store the row by hand before any settle replay.",
+				des, chatID, minted.ID))
 		}
 		row, err = b.store.APIKeyForOrder(des)
 		if err != nil || row == nil {
@@ -264,6 +272,12 @@ func (b *Bot) apikeyMintFailRefund(ctx context.Context, order *store.Order, des 
 		if _, rerr := b.store.ClaimOrder(des, "refunded", "paid"); rerr != nil {
 			log.Printf("CRITICAL apikey mint-fail revert ALSO failed [des=%s err=%v] — MANUAL FIX REQUIRED: customer paid %d, not credited",
 				des, rerr, total)
+			// Owner alert (#39): the order is stuck 'refunded' with NOTHING
+			// credited, and PaidUndelivered only scans status='paid' — this
+			// row is structurally invisible to that backstop forever.
+			b.notifyOwners(ctx, fmt.Sprintf(
+				"🚨 REFUND REVERT FAILED — MANUAL FIX REQUIRED\n🧾 %s\n👤 %d\n💰 customer paid %s, not credited\nCredit the wallet by hand.",
+				des, chatID, b.usdtDisp(total)))
 		}
 		return
 	}
@@ -376,6 +390,15 @@ func (b *Bot) deliverApikeyRecharge(ctx context.Context, order *store.Order, des
 		if err := b.store.MarkAPIKeyRechargeApplied(des); err != nil {
 			log.Printf("CRITICAL mark_apikey_recharge_applied failed [des=%s]: %v — credits ARE on the key; a settle replay would top it up AGAIN",
 				des, err)
+			// Owner alert (#39): the order stays 'paid' here, so it WOULD
+			// eventually surface in the stuck-paid reconcile — but that
+			// backstop runs every 10 minutes and, unlike every other failure
+			// in this file, re-driving it would DOUBLE-APPLY the credits
+			// (they are already live on the key). The alert exists so a
+			// human intervenes before any replay, not after.
+			b.notifyOwners(ctx, fmt.Sprintf(
+				"🚨 RECHARGE-APPLIED STAMP FAILED — DOUBLE-SPEND RISK\n🧾 %s\n👤 %d\n🔢 %d credits\nCredits ARE on the key; a settle replay would top it up AGAIN. Fix the stamp by hand before any replay.",
+				des, chatID, credits))
 		}
 		// Keep the locally stored quota in step with the server-side limit so the
 		// My-Keys / reveal / picker displays stay truthful after top-ups.
@@ -438,6 +461,12 @@ func (b *Bot) apikeyRCFailRefund(ctx context.Context, order *store.Order, des st
 		if _, rerr := b.store.ClaimOrder(des, "refunded", "paid"); rerr != nil {
 			log.Printf("CRITICAL apikey recharge refund revert ALSO failed [des=%s err=%v] — MANUAL FIX REQUIRED: customer paid %d, not credited",
 				des, rerr, total)
+			// Owner alert (#39): the order is stuck 'refunded' with NOTHING
+			// credited, and PaidUndelivered only scans status='paid' — this
+			// row is structurally invisible to that backstop forever.
+			b.notifyOwners(ctx, fmt.Sprintf(
+				"🚨 REFUND REVERT FAILED — MANUAL FIX REQUIRED\n🧾 %s\n👤 %d\n💰 customer paid %s, not credited\nCredit the wallet by hand.",
+				des, chatID, b.usdtDisp(total)))
 		}
 		return false
 	}

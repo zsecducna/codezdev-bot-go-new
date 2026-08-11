@@ -275,6 +275,12 @@ func (b *Bot) doRefund(ctx context.Context, o *store.Order, method string, force
 			log.Printf("CRITICAL refund credit failed [des=%s chat=%s amount=%d]: %v — order IS 'refunded'; credit the wallet by hand",
 				o.Des, won.ChatID, amount, err)
 			res.CreditFailed = true
+			// Owner alert (#39): the order is 'refunded' with NOTHING
+			// credited, and no automatic path will ever retry a 'refunded'
+			// order — the log line above was the only trace before this.
+			b.notifyOwners(ctx, "🚨 REFUND CREDIT FAILED — MANUAL FIX REQUIRED\n"+
+				"🧾 "+o.Des+"\n👤 "+won.ChatID+"\n💰 "+b.usdtDisp(amount)+"\n"+
+				"Order IS 'refunded'; credit the wallet by hand.")
 		} else {
 			res.Balance = newBal
 			balanceStr = b.usdtDisp(newBal)

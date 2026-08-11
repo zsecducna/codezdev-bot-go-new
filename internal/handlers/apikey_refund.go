@@ -353,6 +353,13 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 			log.Printf("CRITICAL apikey group refund credit failed [des=%s chat=%s amount=%d]: %v — orders ARE 'refunded'; credit the wallet by hand",
 				des, o.ChatID, amount, err)
 			res.CreditFailed = true
+			// Owner alert (#39): every order in the group is 'refunded' with
+			// NOTHING credited, and no automatic path will ever retry a
+			// 'refunded' order — the log line above was the only trace
+			// before this.
+			b.notifyOwners(ctx, fmt.Sprintf(
+				"🚨 REFUND CREDIT FAILED — MANUAL FIX REQUIRED\n🧾 %s\n👤 %s\n💰 %s\nOrders ARE 'refunded'; credit the wallet by hand.",
+				des, o.ChatID, b.usdtDisp(amount)))
 		} else {
 			res.Balance = newBal
 		}

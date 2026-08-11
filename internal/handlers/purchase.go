@@ -341,6 +341,14 @@ func (b *Bot) deliverPaid(ctx context.Context, order *store.Order, des string) b
 			if _, rerr := b.store.ClaimOrder(des, "refunded", "paid"); rerr != nil {
 				log.Printf("CRITICAL refund revert ALSO failed [des=%s err=%v] — MANUAL FIX REQUIRED: customer paid %d, not credited",
 					des, rerr, total)
+				// Owner alert (#39): the order is stuck 'refunded' with NOTHING
+				// credited, and PaidUndelivered (store.PaidUndelivered) only
+				// scans status='paid' — this row is structurally invisible to
+				// that backstop forever. The log line above was the ONLY trace
+				// until now.
+				b.notifyOwners(ctx, fmt.Sprintf(
+					"🚨 REFUND REVERT FAILED — MANUAL FIX REQUIRED\n🧾 %s\n👤 %d\n💰 customer paid %s, not credited\nCredit the wallet by hand.",
+					des, chatID, b.usdtDisp(total)))
 			}
 			return false
 		}
@@ -350,9 +358,14 @@ func (b *Bot) deliverPaid(ctx context.Context, order *store.Order, des string) b
 	}
 	if int64(len(claimed)) < qty {
 		// Partial finalize: a corrupt credential file was skipped. Audit it for a
-		// manual top-up/partial refund (admin push-notify is M3).
+		// manual top-up/partial refund, AND alert the owners now (#39) — this
+		// order still proceeds to 'delivered' below, so no backstop ever
+		// revisits it; the audit row was the only trace before this.
 		b.store.LogAction(chatIDStr, "system", "partial_delivery", des,
 			fmt.Sprintf("%d/%d delivered", len(claimed), qty), "product="+product)
+		b.notifyOwners(ctx, fmt.Sprintf(
+			"⚠️ PARTIAL DELIVERY — customer short-delivered\n🧾 %s\n👤 %d\n📦 %s: delivered %d/%d\n💰 paid %s\nTop up or partially refund the difference by hand.",
+			des, chatID, product, len(claimed), qty, b.usdtDisp(total)))
 	}
 	// Close the order. The result is unused this slice (Python only used it to
 	// gate the referral payout, M2.6) but an ERROR must not pass silently: a

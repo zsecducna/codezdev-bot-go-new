@@ -543,6 +543,41 @@ func TestDoRefundCreditBalanceFailureNeverClaimsSuccess(t *testing.T) {
 	}
 }
 
+// TestDoRefundCreditFailedNotifiesOwner covers adminorders.go:275 (#39 site
+// 4): the owner-alert twin of TestDoRefundCreditBalanceFailureNeverClaimsSuccess
+// above — CreditBalance errors AFTER the claim already committed, and no
+// automatic path will ever retry a 'refunded' order. Before #39 the CRITICAL
+// log line was the only trace. Deleting the notifyOwners call in doRefund
+// must turn this test red.
+func TestDoRefundCreditFailedNotifiesOwner(t *testing.T) {
+	b, f, st, _, _, _, _ := newOrdersTestBot(t, "1")
+	des := store.NewDes()
+	if err := st.CreateOrder(des, "42", "en", "prod", "BH7D", 1, 7000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOrder(des, "reserved", "delivered"); err != nil {
+		t.Fatal(err)
+	}
+	o, _ := st.GetOrder(des)
+	b.now = func() time.Time { return time.Unix(int64(o.TS), 0) }
+
+	if _, err := st.DB().Exec("DROP TABLE balances"); err != nil {
+		t.Fatal(err)
+	}
+
+	res := b.doRefund(context.Background(), o, "balance", false)
+	if res == nil || !res.CreditFailed {
+		t.Fatalf("res = %+v, want a claimed refund with CreditFailed=true", res)
+	}
+	alert := lastSendMsgTo(f, 1)
+	if alert == nil || !strings.Contains(alert.Text, "REFUND CREDIT FAILED") {
+		t.Fatalf("owner alert = %v, want a REFUND CREDIT FAILED message", alert)
+	}
+	if !strings.Contains(alert.Text, des) {
+		t.Errorf("owner alert missing the order des: %q", alert.Text)
+	}
+}
+
 // TestSendRefundReceiptCreditFailedHeader proves the UI-level contract: the
 // admin-facing receipt must show a LOUD failure header (never the quiet ✅
 // "balance now 0"), and the buyer must receive nothing at all.
