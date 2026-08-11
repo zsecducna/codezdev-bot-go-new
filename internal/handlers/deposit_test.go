@@ -35,11 +35,31 @@ func waitFor(t *testing.T, cond func() bool) bool {
 // deposit must stay claimable long enough for a customer to leave Telegram,
 // open a wallet app, and send — ten minutes was not enough (204 of 426
 // deposit orders expired). Pinned as a constant expectation so a future edit
-// to the default is a deliberate, visible change.
+// to the default is a deliberate, visible change. depositTimeout, NOT
+// expiryTimeout: the two were split apart because expiryTimeout is also the
+// PRODUCT-order hard payment limit, which must stay inside reserveTTL (see
+// TestProductOrderWindowStaysInsideReserveTTL below) — a deposit holds no
+// folder stock, so it alone gets the wider window.
 func TestDepositWindowIsOneHour(t *testing.T) {
 	b, _ := newTestBot("999", nil)
-	if got, want := b.expiryTimeout, time.Hour; got != want {
-		t.Fatalf("expiryTimeout = %v, want %v", got, want)
+	if got, want := b.depositTimeout, time.Hour; got != want {
+		t.Fatalf("depositTimeout = %v, want %v", got, want)
+	}
+}
+
+// TestProductOrderWindowStaysInsideReserveTTL pins the invariant that broke
+// when expiryTimeout was first widened to match the deposit window: a
+// product order holds REAL folder stock, reserved until reserveTTL. If its
+// payment window (expiryTimeout) is allowed to outlive reserveTTL, the stock
+// self-frees and can be resold to someone else while the order is still
+// shown to its original buyer as payable — they pay, stock.Finalize finds
+// nothing, and they get an out-of-stock auto-refund instead of the account
+// they bought. Assert the RELATIONSHIP, not two literals, so a future edit
+// to either constant can't silently reopen that gap.
+func TestProductOrderWindowStaysInsideReserveTTL(t *testing.T) {
+	b, _ := newTestBot("999", nil)
+	if b.expiryTimeout >= b.reserveTTL {
+		t.Fatalf("expiryTimeout (%v) must stay under reserveTTL (%v), or a payable order can outlive its own reserved stock", b.expiryTimeout, b.reserveTTL)
 	}
 }
 

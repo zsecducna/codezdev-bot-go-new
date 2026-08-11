@@ -99,6 +99,18 @@ type Bot struct {
 	expiryTimeout time.Duration
 	reserveTTL    time.Duration
 	depositPoll   time.Duration // POLL_INTERVAL @10548 — seconds between deposit polls
+	// depositTimeout is the customer-facing USDT deposit window — DELIBERATELY
+	// separate from expiryTimeout. A deposit holds no folder stock, so a long
+	// window costs nothing but a slot in the amount picker (MinGap spacing keeps
+	// cross-provider collisions impossible at this volume). A product order
+	// holds REAL stock reserved out of ./accounts, so its window must stay
+	// inside reserveTTL or the folder self-frees and gets resold while the
+	// order is still shown as payable — a customer who pays into that gap hits
+	// stock.Finalize finding nothing and gets an out-of-stock auto-refund
+	// instead of the account they bought. Only the deposit start/expiry path
+	// (startOnchainDeposit, expirySweepOnce's deposit-row check) reads this;
+	// every product-order path keeps reading expiryTimeout.
+	depositTimeout time.Duration
 
 	// ---- USDT rails (BEP20 + TRON; Binance Pay removed, S3) -----------------
 	//
@@ -297,16 +309,21 @@ func New(d Deps) *Bot {
 	b.clickLimit = max(b.envInt("PRODUCT_CLICK_LIMIT", 10), 1)
 	b.clickWindow = time.Duration(b.envInt("PRODUCT_CLICK_WINDOW_S", 60)) * time.Second
 	b.clickCooldown = time.Duration(b.envInt("PRODUCT_CLICK_COOLDOWN_S", 60)) * time.Second
+	// DEPOSIT_TIMEOUT_S=600 hard payment limit for PRODUCT orders; RESERVE_TTL_S=
+	// 600+120 slack. This stays 600s: a product order holds real folder stock,
+	// and that stock self-frees at reserveTTL, so expiryTimeout must stay
+	// inside reserveTTL or a still-"payable" order can lose its stock to
+	// another sale out from under it. Deposits (no folder stock) use the wider
+	// depositTimeout below instead — see its field comment for why.
+	b.expiryTimeout = 600 * time.Second
+	b.reserveTTL = (600 + 120) * time.Second
+	b.depositPoll = 10 * time.Second // POLL_INTERVAL @10548
 	// One hour, not the original ten minutes: a deposit has to survive the
 	// customer leaving Telegram, finding their wallet app and sending. At
 	// roughly one deposit per thirty minutes the wider window costs nothing —
 	// the only resource a live band consumes is a slot in the amount picker,
 	// and MinGap spacing keeps collisions impossible at this volume.
-	b.expiryTimeout = 3600 * time.Second
-	// RESERVE_TTL_S=600+120 slack — unrelated to the customer-facing deposit
-	// window above; this is stock-reservation TTL and stays untouched.
-	b.reserveTTL = (600 + 120) * time.Second
-	b.depositPoll = 10 * time.Second // POLL_INTERVAL @10548
+	b.depositTimeout = 3600 * time.Second
 	// ---- USDT rails ---------------------------------------------------------
 	b.now = time.Now
 	// ONE shared registry. A caller that does not inject one (unit tests) gets a

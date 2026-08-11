@@ -430,7 +430,10 @@ func (b *Bot) startOnchainDeposit(ctx context.Context, chatID int64, lang i18n.L
 		return
 	}
 	now := b.now()
-	deadline := now.Add(b.expiryTimeout) // wall-clock so it survives a restart
+	// depositTimeout, NOT expiryTimeout: a deposit reserves no folder stock, so
+	// it gets the wide customer-facing window instead of the product-order
+	// hard limit (see depositTimeout's field comment in dispatch.go).
+	deadline := now.Add(b.depositTimeout) // wall-clock so it survives a restart
 	if err := b.adoptUSDTAmount(p, amount, fmtInt(chatID), des, vnd, now.UnixMilli(), deadline); err != nil {
 		log.Printf("%s deposit band adopt failed: %v", chain, err)
 		b.abandonUSDTStub(des)
@@ -1371,12 +1374,23 @@ func (b *Bot) adoptPersisted(p bands.Provider, des, chatID, amount string, total
 // common (non-restart) case.
 func (b *Bot) expirySweepOnce(ctx context.Context) {
 	_ = ctx
-	cutoff := float64(b.now().Add(-b.expiryTimeout).UnixNano()) / 1e9
+	now := b.now()
+	// Query with the SHORTER (product-order) window so nothing that's actually
+	// due gets missed; a deposit row that's merely older than expiryTimeout but
+	// still inside its own longer depositTimeout is skipped per-row below,
+	// instead of being reaped out from under a customer who still has time to
+	// pay (that mismatch is exactly what made the deposit window widening a
+	// no-op the first time: this backstop kept expiring the DB row at the old
+	// 10-minute mark regardless of what the deposit's own deadline said).
+	cutoff := float64(now.Add(-b.expiryTimeout).UnixNano()) / 1e9
 	orders, err := b.store.ReservedOrdersBefore(cutoff)
 	if err != nil {
 		log.Println("expiry sweep: load failed:", err)
 	}
 	for _, o := range orders {
+		if o.Product == depositProduct && b.orderTS(o).Add(b.depositTimeout).After(now) {
+			continue // deposit hasn't hit its own (longer) deadline yet
+		}
 		won, cerr := b.store.ClaimOrder(o.Des, "reserved", "expired")
 		if cerr != nil {
 			log.Printf("expiry sweep: claim failed for %s: %v", o.Des, cerr)
