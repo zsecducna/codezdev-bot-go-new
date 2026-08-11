@@ -119,11 +119,17 @@ func TestApikeyRechargeFailRefundRevertFailedNotifiesOwner(t *testing.T) {
 
 // TestApikeyRechargeAppliedStampFailedNotifiesOwner covers
 // apikey_deliver.go:377 (#39 site 7): Kiro-Go CONFIRMS the top-up (credits
-// are live on the key) but the local applied_ts stamp write fails. Unlike
-// every other site in this file, the order stays 'paid' — so it WILL
-// eventually surface in the stuck-paid reconcile, but re-driving it would
-// apply the credits a SECOND time (a double-spend), which is exactly why
-// this needs an immediate alert rather than waiting for that backstop.
+// are live on the key) but the local applied_ts stamp write fails.
+//
+// The order does NOT stay 'paid' — an earlier version of this comment said
+// it did. The stamp failure does not block the orders table, so control
+// falls through and the paid->delivered claim succeeds; the row ends
+// 'delivered', which store.PaidUndelivered's WHERE status='paid' can never
+// see. So no backstop will EVER surface this: the credits are live on the
+// key, the local stamp says otherwise, and a settle replay would apply them
+// a SECOND time. The alert is the only trace. The final-status assertion
+// below exists to keep that fact pinned, since the false claim drifted in
+// unnoticed precisely because nothing asserted the status.
 func TestApikeyRechargeAppliedStampFailedNotifiesOwner(t *testing.T) {
 	ctx := context.Background()
 	b, f, st, fk, _ := newAPIKeyBot(t)
@@ -150,5 +156,19 @@ func TestApikeyRechargeAppliedStampFailedNotifiesOwner(t *testing.T) {
 	}
 	if n := countContains(f, "RECHARGE-APPLIED STAMP FAILED"); n != 1 {
 		t.Errorf("owner alert count = %d, want 1", n)
+	}
+	// The order must end 'delivered', NOT 'paid'. This is the assertion whose
+	// absence let a false comment claim the stuck-paid reconcile would cover
+	// this site. store.PaidUndelivered selects WHERE status='paid', so a
+	// 'delivered' row is invisible to it forever — which is precisely why the
+	// alert above is the only trace this failure will ever leave. If this ever
+	// flips to 'paid', the alert's justification changes and the comments
+	// above it become wrong again.
+	got, err := st.GetOrder(rcDes)
+	if err != nil {
+		t.Fatalf("GetOrder(%s): %v", rcDes, err)
+	}
+	if got.Status != "delivered" {
+		t.Errorf("order status = %q, want \"delivered\" — the stamp failure must not block the paid->delivered claim, and the reconcile's WHERE status='paid' must not be able to see this row", got.Status)
 	}
 }

@@ -390,12 +390,21 @@ func (b *Bot) deliverApikeyRecharge(ctx context.Context, order *store.Order, des
 		if err := b.store.MarkAPIKeyRechargeApplied(des); err != nil {
 			log.Printf("CRITICAL mark_apikey_recharge_applied failed [des=%s]: %v — credits ARE on the key; a settle replay would top it up AGAIN",
 				des, err)
-			// Owner alert (#39): the order stays 'paid' here, so it WOULD
-			// eventually surface in the stuck-paid reconcile — but that
-			// backstop runs every 10 minutes and, unlike every other failure
-			// in this file, re-driving it would DOUBLE-APPLY the credits
-			// (they are already live on the key). The alert exists so a
-			// human intervenes before any replay, not after.
+			// Owner alert (#39). An earlier version of this comment claimed
+			// the order stays 'paid' here and would therefore surface in the
+			// stuck-paid reconcile eventually. That is FALSE, and it was the
+			// only thing making this site look redundant: control falls
+			// through to BumpAPIKeyCredits and then to the
+			// ClaimOrder(des, "paid", "delivered") below, which SUCCEEDS —
+			// nothing in this failure path blocks the orders table. The row
+			// ends 'delivered', and store.PaidUndelivered selects
+			// WHERE status='paid', so the reconcile can NEVER see it.
+			//
+			// This is therefore the LEAST covered of the eight sites, not
+			// the most: the credits are live on the key, the local stamp
+			// says they are not, a settle replay would apply them a SECOND
+			// time, and this alert is the only trace that will ever exist.
+			// The risk is a replay, not a slow backstop.
 			b.notifyOwners(ctx, fmt.Sprintf(
 				"🚨 RECHARGE-APPLIED STAMP FAILED — DOUBLE-SPEND RISK\n🧾 %s\n👤 %d\n🔢 %d credits\nCredits ARE on the key; a settle replay would top it up AGAIN. Fix the stamp by hand before any replay.",
 				des, chatID, credits))
