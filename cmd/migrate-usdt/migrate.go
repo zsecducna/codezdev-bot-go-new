@@ -419,6 +419,14 @@ func perRowMaxError(b bucket, rate int64) int64 {
 	if b == bucketCentRounded {
 		return microPerCent / 2
 	}
+	// GUARD: rate==0 is unreachable through any real entry point — RunDryRun
+	// and RunApply both validate rate>0 before this is ever called — but a
+	// modulo-by-zero panic is a bad last thing for a migration tool to
+	// print. Guarded here, where it lives with the code that depends on the
+	// invariant, rather than trusted to hold from a distance.
+	if rate == 0 {
+		return 1
+	}
 	if 1_000_000%rate == 0 {
 		return 0
 	}
@@ -463,8 +471,6 @@ func perRowMaxError(b bucket, rate int64) int64 {
 // the rate divides 1_000_000 evenly, vndToMicro cannot round at all, so any
 // non-zero delta on a free-micro column is a genuine defect, not drift.
 //
-// columnDriftBound reports what the sqrt estimate WOULD be, for operator
-// eyes only — see its comment.
 // The +1 is the AGGREGATE side's own rounding, and leaving it out made this
 // not quite a bound: ExpectedSumAfter is convertValue(SumBefore), which
 // rounds once more on top of the per-row roundings Delta is measuring
@@ -502,10 +508,20 @@ func columnTolerance(b bucket, rate int64, rowCount int64) int64 {
 // reports.
 func rowRounded(vnd, rate int64, b bucket) bool {
 	if b != bucketCentRounded {
-		// bucketFreeMicro does not round to the cent at all; its only
-		// rounding is vndToMicro's own step, which perRowMaxError already
-		// reports as exact whenever the rate divides 1_000_000 evenly.
-		return false
+		// bucketFreeMicro does not round to the cent at all, but its ONE
+		// step (vndToMicro) can still round — HIGH found reviewing 89469d4:
+		// this branch used to unconditionally return false here, which made
+		// every free-micro column (balances, processed) report "exact at
+		// this rate" even when vndToMicro rounded on nearly every row. The
+		// fix: exact iff rate divides vnd*1_000_000 with no remainder.
+		// big.Int because vnd*1_000_000 overflows int64 on aggregate-sized
+		// inputs, and because big.Int's Mod is Euclidean (always
+		// non-negative for a positive modulus) — a plain int64 % is
+		// truncated, not Euclidean, so this stays correct for the negative
+		// balances baseSpecs explicitly allows (e.g. the fixture's
+		// balances[222] = -50000).
+		num := new(big.Int).Mul(big.NewInt(vnd), big.NewInt(1_000_000))
+		return new(big.Int).Mod(num, big.NewInt(rate)).Sign() != 0
 	}
 	micro, err := vndToMicro(vnd, rate)
 	if err != nil {
@@ -831,25 +847,32 @@ func checkProvenanceRoundTrip(q querier, specs []moneySpec) error {
 // evaluateColumns applies plan §6.6's pre-commit reconciliation gate to a
 // set of already-computed ColumnReports: any column whose Delta exceeds its
 // Tolerance is a hard, non-overridable abort (ErrToleranceBreach — no flag
-// lets an apply past this, ever); any column with zero-collapse rows aborts
-// too (ErrZeroCollapse) unless allowZeroCollapse is set. Kept as a small
-// pure function, separate from runApply's I/O, so it is directly testable
-// against hand-built ColumnReports rather than requiring real data crafted
-// to breach tolerance.
-func evaluateColumns(cols []ColumnReport, allowZeroCollapse bool) error {
+// lets an apply past this, ever, not even for a column named in `allowed`);
+// any column with zero-collapse rows aborts too (ErrZeroCollapse) unless
+// its own "table.column" key is present in `allowed` (nil/empty means
+// nothing is allowed, i.e. the old default-refuse behaviour). Kept
+// per-column rather than one global bool: a blanket override for one
+// legitimate tiny collapse (e.g. orders.code_discount) would otherwise also
+// blind orders.total — exactly the column requirement #6 exists to
+// protect. Kept as a small pure function, separate from runApply's I/O, so
+// it is directly testable against hand-built ColumnReports rather than
+// requiring real data crafted to breach tolerance.
+func evaluateColumns(cols []ColumnReport, allowed map[string]bool) error {
 	for _, c := range cols {
 		if c.Delta > c.Tolerance {
 			return fmt.Errorf("%w: %s.%s delta=%d tolerance=%d",
 				ErrToleranceBreach, c.Table, c.Column, c.Delta, c.Tolerance)
 		}
 	}
-	if !allowZeroCollapse {
-		for _, c := range cols {
-			if len(c.ZeroCollapses) > 0 {
-				return fmt.Errorf("%w: %s.%s has %d zero-collapse row(s)",
-					ErrZeroCollapse, c.Table, c.Column, len(c.ZeroCollapses))
-			}
+	for _, c := range cols {
+		if len(c.ZeroCollapses) == 0 {
+			continue
 		}
+		if allowed[c.Table+"."+c.Column] {
+			continue
+		}
+		return fmt.Errorf("%w: %s.%s has %d zero-collapse row(s)",
+			ErrZeroCollapse, c.Table, c.Column, len(c.ZeroCollapses))
 	}
 	return nil
 }
@@ -858,9 +881,11 @@ func evaluateColumns(cols []ColumnReport, allowZeroCollapse bool) error {
 // requirement #2. Any error at any point rolls back everything: the
 // provenance writes, the column conversions, the ALTER TABLEs that added
 // the legacy_vnd_* columns, all of it, because SQLite DDL is transactional
-// exactly like its DML. allowZeroCollapse overrides ONLY the zero-collapse
-// abort (evaluateColumns) — a tolerance breach is never overridable.
-func RunApply(dbPath string, rate int64, allowZeroCollapse bool) (*Report, error) {
+// exactly like its DML. allowZeroCollapse is a per-column "table.column"
+// allowlist (nil/empty allows nothing, the default-refuse posture) that
+// overrides ONLY the zero-collapse abort (evaluateColumns) for the columns
+// it names — a tolerance breach is never overridable, for any column.
+func RunApply(dbPath string, rate int64, allowZeroCollapse map[string]bool) (*Report, error) {
 	return runApply(dbPath, rate, allowZeroCollapse, nil, false)
 }
 
@@ -874,7 +899,7 @@ func RunApply(dbPath string, rate int64, allowZeroCollapse bool) (*Report, error
 //     guard below (used by TestMetaInsertPKConflictIsLoadBearing to reach
 //     the plain "INSERT INTO meta" on a second run and prove ITS OWN
 //     PRIMARY KEY conflict — not the guard — is what aborts the run).
-func runApply(dbPath string, rate int64, allowZeroCollapse bool, overrideSpecs []moneySpec, skipAlreadyMigratedGuard bool) (*Report, error) {
+func runApply(dbPath string, rate int64, allowZeroCollapse map[string]bool, overrideSpecs []moneySpec, skipAlreadyMigratedGuard bool) (*Report, error) {
 	if rate <= 0 {
 		return nil, fmt.Errorf("migrate-usdt: rate must be positive, got %d", rate)
 	}
@@ -943,7 +968,11 @@ func runApply(dbPath string, rate int64, allowZeroCollapse bool, overrideSpecs [
 	}
 	for table, n := range pending {
 		if n > 0 {
-			return nil, fmt.Errorf("%w: %s has %d row(s)", ErrPendingNotEmpty, table, n)
+			// D1: this is an in-tx failure exactly like the §6.6 gates below —
+			// hand back an apply-REFUSED report (with the pending snapshot
+			// that triggered the refusal) instead of a bare error line.
+			return &Report{DBPath: dbPath, Rate: rate, Mode: "apply-REFUSED", PendingCounts: pending},
+				fmt.Errorf("%w: %s has %d row(s)", ErrPendingNotEmpty, table, n)
 		}
 	}
 	// ---- end fix ------------------------------------------------------
@@ -974,7 +1003,11 @@ func runApply(dbPath string, rate int64, allowZeroCollapse bool, overrideSpecs [
 
 	cols, err := processSpecs(tx, specs, rate, true)
 	if err != nil {
-		return nil, err
+		// D1: same reasoning as the pending-gate return above — processSpecs
+		// itself failing (e.g. ErrRowUpdateMismatch) is an in-tx failure, so
+		// the operator gets an apply-REFUSED report (the pending snapshot is
+		// all that was computed at this point; cols is nil on this path).
+		return &Report{DBPath: dbPath, Rate: rate, Mode: "apply-REFUSED", PendingCounts: pending}, err
 	}
 
 	// ---- GATE: plan §6.6 pre-commit checks, inside the transaction, after
@@ -1007,7 +1040,10 @@ func runApply(dbPath string, rate int64, allowZeroCollapse bool, overrideSpecs [
 		"migration_rate", strconv.FormatInt(rate, 10),
 		"ledger_migrated_ts", strconv.FormatInt(time.Now().Unix(), 10),
 	); err != nil {
-		return nil, fmt.Errorf("write migration marker: %w", err)
+		// D1: the marker write's own PK conflict (the load-bearing safety
+		// net described above) is an in-tx failure too — reuse `refused`,
+		// which already carries this run's Columns and PendingCounts.
+		return refused, fmt.Errorf("write migration marker: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {

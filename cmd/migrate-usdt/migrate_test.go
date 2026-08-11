@@ -3,10 +3,12 @@ package main
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"math"
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -134,6 +136,20 @@ func queryInt64(t *testing.T, path, q string, args ...any) int64 {
 	return v.Int64
 }
 
+// findCol returns the ColumnReport for one table.column in a Report, or
+// fails the test — a small lookup helper so tests can assert against a
+// specific column without hand-walking report.Columns themselves.
+func findCol(t *testing.T, report *Report, table, column string) ColumnReport {
+	t.Helper()
+	for _, c := range report.Columns {
+		if c.Table == table && c.Column == column {
+			return c
+		}
+	}
+	t.Fatalf("report has no column %s.%s (columns: %+v)", table, column, report.Columns)
+	return ColumnReport{}
+}
+
 // ---- pure math ----------------------------------------------------------
 
 func TestRoundDivHalfUp(t *testing.T) {
@@ -206,7 +222,7 @@ func TestApplyConvertsFixtureToExactFigures(t *testing.T) {
 	path := newFixtureDB(t)
 	seedKnownValues(t, path)
 
-	report, err := RunApply(path, 25000, false)
+	report, err := RunApply(path, 25000, nil)
 	if err != nil {
 		t.Fatalf("RunApply: %v", err)
 	}
@@ -293,7 +309,7 @@ func TestNullStaysNull(t *testing.T) {
 	path := newFixtureDB(t)
 	seedKnownValues(t, path)
 
-	if _, err := RunApply(path, 25000, false); err != nil {
+	if _, err := RunApply(path, 25000, nil); err != nil {
 		t.Fatalf("RunApply: %v", err)
 	}
 
@@ -320,7 +336,7 @@ func TestNonMoneyColumnUntouched(t *testing.T) {
 	path := newFixtureDB(t)
 	seedKnownValues(t, path)
 
-	if _, err := RunApply(path, 25000, false); err != nil {
+	if _, err := RunApply(path, 25000, nil); err != nil {
 		t.Fatalf("RunApply: %v", err)
 	}
 	if got := queryInt64(t, path, "SELECT qty FROM orders WHERE des='ord1'"); got != 3 {
@@ -341,12 +357,12 @@ func TestIdempotenceGuardRefusesSecondRun(t *testing.T) {
 	path := newFixtureDB(t)
 	seedKnownValues(t, path)
 
-	if _, err := RunApply(path, 25000, false); err != nil {
+	if _, err := RunApply(path, 25000, nil); err != nil {
 		t.Fatalf("first RunApply: %v", err)
 	}
 	firstBal := queryInt64(t, path, "SELECT amount FROM balances WHERE chat_id='111'")
 
-	_, err := RunApply(path, 25000, false)
+	_, err := RunApply(path, 25000, nil)
 	if err == nil {
 		t.Fatal("second RunApply: got nil error, want ErrAlreadyMigrated")
 	}
@@ -381,7 +397,7 @@ func TestRollbackOnMidMigrationError(t *testing.T) {
 		baseSpecs[0], // balances.amount — would succeed if reached alone
 		{"orders", "des", "status", "legacy_vnd_test_inject_fail", bucketFreeMicro}, // status is TEXT ("paid" etc.) — fails to scan as int64
 	}
-	if _, err := runApply(path, 25000, false, broken, false); err == nil {
+	if _, err := runApply(path, 25000, nil, broken, false); err == nil {
 		t.Fatal("runApply with an injected bad spec: got nil error, want a scan failure")
 	}
 
@@ -440,7 +456,7 @@ func TestRequiredSchemaMissingColumnRefuses(t *testing.T) {
 	}
 	db.Close()
 
-	if _, err := RunApply(path, 25000, false); !errors.Is(err, ErrMissingSchema) {
+	if _, err := RunApply(path, 25000, nil); !errors.Is(err, ErrMissingSchema) {
 		t.Errorf("RunApply on a partial schema: err = %v, want errors.Is(err, ErrMissingSchema)", err)
 	}
 	if _, err := RunDryRun(path, 25000); !errors.Is(err, ErrMissingSchema) {
@@ -465,8 +481,14 @@ func TestPendingNotEmptyRefusesApply(t *testing.T) {
 	}
 	db.Close()
 
-	if _, err := RunApply(path, 25000, false); !errors.Is(err, ErrPendingNotEmpty) {
+	report, err := RunApply(path, 25000, nil)
+	if !errors.Is(err, ErrPendingNotEmpty) {
 		t.Errorf("RunApply with a non-empty bep20_pending: err = %v, want errors.Is(err, ErrPendingNotEmpty)", err)
+	}
+	// D1: the §1.G3 pending gate is an in-tx failure too — the operator
+	// must get an apply-REFUSED report here, not a bare error line.
+	if report == nil || report.Mode != "apply-REFUSED" {
+		t.Errorf("report = %+v, want non-nil with Mode=apply-REFUSED", report)
 	}
 	// Nothing should have been written.
 	bal := queryInt64(t, path, "SELECT amount FROM balances WHERE chat_id='111'")
@@ -530,7 +552,7 @@ func TestDryRunWritesNothing(t *testing.T) {
 func TestAlreadyMigratedDryRunDoesNotDoubleReport(t *testing.T) {
 	path := newFixtureDB(t)
 	seedKnownValues(t, path)
-	if _, err := RunApply(path, 25000, false); err != nil {
+	if _, err := RunApply(path, 25000, nil); err != nil {
 		t.Fatalf("RunApply: %v", err)
 	}
 	report, err := RunDryRun(path, 25000)
@@ -551,33 +573,55 @@ func TestAlreadyMigratedDryRunDoesNotDoubleReport(t *testing.T) {
 // column whose Delta exceeds its Tolerance must produce ErrToleranceBreach.
 func TestEvaluateColumnsAbortsOnToleranceBreach(t *testing.T) {
 	cols := []ColumnReport{{Table: "orders", Column: "total", Delta: 100, Tolerance: 50}}
-	if err := evaluateColumns(cols, false); !errors.Is(err, ErrToleranceBreach) {
+	if err := evaluateColumns(cols, nil); !errors.Is(err, ErrToleranceBreach) {
 		t.Errorf("evaluateColumns: err = %v, want errors.Is(err, ErrToleranceBreach)", err)
 	}
 }
 
 // TestEvaluateColumnsToleranceBreachNeverOverridable is PINNED: unlike
-// zero-collapse, a tolerance breach has no override flag at all.
+// zero-collapse, a tolerance breach has no override flag at all -- not even
+// when the offending column is explicitly named in the allowlist.
 func TestEvaluateColumnsToleranceBreachNeverOverridable(t *testing.T) {
 	cols := []ColumnReport{{Table: "orders", Column: "total", Delta: 100, Tolerance: 50}}
-	if err := evaluateColumns(cols, true); !errors.Is(err, ErrToleranceBreach) {
-		t.Errorf("evaluateColumns(allowZeroCollapse=true) with a tolerance breach: err = %v, want errors.Is(err, ErrToleranceBreach)", err)
+	if err := evaluateColumns(cols, map[string]bool{"orders.total": true}); !errors.Is(err, ErrToleranceBreach) {
+		t.Errorf("evaluateColumns(orders.total allowed) with a tolerance breach: err = %v, want errors.Is(err, ErrToleranceBreach)", err)
 	}
 }
 
 // TestEvaluateColumnsAbortsOnZeroCollapseUnlessAllowed is PINNED to Fix 1's
 // other gate: a column with zero-collapse rows must produce ErrZeroCollapse
-// unless allowZeroCollapse overrides it.
+// unless its own "table.column" key is in the allowlist.
 func TestEvaluateColumnsAbortsOnZeroCollapseUnlessAllowed(t *testing.T) {
 	cols := []ColumnReport{{
 		Table: "balances", Column: "amount", Delta: 0, Tolerance: 0,
 		ZeroCollapses: []ZeroCollapse{{Table: "balances", PK: "x", Old: 1}},
 	}}
-	if err := evaluateColumns(cols, false); !errors.Is(err, ErrZeroCollapse) {
-		t.Errorf("evaluateColumns(allowZeroCollapse=false): err = %v, want errors.Is(err, ErrZeroCollapse)", err)
+	if err := evaluateColumns(cols, nil); !errors.Is(err, ErrZeroCollapse) {
+		t.Errorf("evaluateColumns(nil allowlist): err = %v, want errors.Is(err, ErrZeroCollapse)", err)
 	}
-	if err := evaluateColumns(cols, true); err != nil {
-		t.Errorf("evaluateColumns(allowZeroCollapse=true): err = %v, want nil", err)
+	if err := evaluateColumns(cols, map[string]bool{"balances.amount": true}); err != nil {
+		t.Errorf("evaluateColumns(balances.amount allowed): err = %v, want nil", err)
+	}
+}
+
+// TestEvaluateColumnsAllowlistIsPerColumn is PINNED to the per-column
+// -allow-zero-collapse fix: naming ONE column in the allowlist must not
+// excuse a collapse in a DIFFERENT column -- a blanket override for a
+// legitimate tiny collapse (e.g. orders.code_discount) would otherwise also
+// blind orders.total, exactly the column requirement #6 exists to protect.
+func TestEvaluateColumnsAllowlistIsPerColumn(t *testing.T) {
+	cols := []ColumnReport{
+		{Table: "orders", Column: "code_discount", Delta: 0, Tolerance: 0,
+			ZeroCollapses: []ZeroCollapse{{Table: "orders", PK: "ord1", Old: 100}}},
+		{Table: "orders", Column: "total", Delta: 0, Tolerance: 0,
+			ZeroCollapses: []ZeroCollapse{{Table: "orders", PK: "ord2", Old: 200}}},
+	}
+	err := evaluateColumns(cols, map[string]bool{"orders.code_discount": true})
+	if !errors.Is(err, ErrZeroCollapse) {
+		t.Fatalf("evaluateColumns with orders.code_discount allowed but orders.total NOT allowed: err = %v, want errors.Is(err, ErrZeroCollapse)", err)
+	}
+	if got := err.Error(); !strings.Contains(got, "orders.total") {
+		t.Errorf("evaluateColumns error = %q, want it to name orders.total (the un-allowed column), not silently cover it via orders.code_discount's allowlist entry", got)
 	}
 }
 
@@ -600,9 +644,9 @@ func TestApplyRefusesZeroCollapseByDefault(t *testing.T) {
 	}
 	db.Close()
 
-	report, err := RunApply(path, 100_000_000, false)
+	report, err := RunApply(path, 100_000_000, nil)
 	if !errors.Is(err, ErrZeroCollapse) {
-		t.Errorf("RunApply with a zero-collapse row, allowZeroCollapse=false: err = %v, want errors.Is(err, ErrZeroCollapse)", err)
+		t.Errorf("RunApply with a zero-collapse row, allowZeroCollapse=nil: err = %v, want errors.Is(err, ErrZeroCollapse)", err)
 	}
 	if report == nil || report.Mode != "apply-REFUSED" {
 		t.Errorf("report = %+v, want non-nil with Mode=apply-REFUSED (a refused apply must not read as a success)", report)
@@ -612,9 +656,9 @@ func TestApplyRefusesZeroCollapseByDefault(t *testing.T) {
 		t.Errorf("balances[tiny].amount = %d after a refused apply, want unchanged 1 (transaction must roll back)", bal)
 	}
 
-	report, err = RunApply(path, 100_000_000, true)
+	report, err = RunApply(path, 100_000_000, map[string]bool{"balances.amount": true})
 	if err != nil {
-		t.Fatalf("RunApply with allowZeroCollapse=true: %v", err)
+		t.Fatalf("RunApply with balances.amount allowed: %v", err)
 	}
 	if report.Mode != "apply" {
 		t.Errorf("report.Mode = %q, want apply (the override should let it commit)", report.Mode)
@@ -638,7 +682,7 @@ func TestLegacyColumnPresentWithoutMarkerRefuses(t *testing.T) {
 	path := newFixtureDB(t)
 	seedKnownValues(t, path)
 
-	if _, err := RunApply(path, 25000, false); err != nil {
+	if _, err := RunApply(path, 25000, nil); err != nil {
 		t.Fatalf("first RunApply: %v", err)
 	}
 	firstBal := queryInt64(t, path, "SELECT amount FROM balances WHERE chat_id='111'")
@@ -654,7 +698,7 @@ func TestLegacyColumnPresentWithoutMarkerRefuses(t *testing.T) {
 	}
 	db.Close()
 
-	if _, err := RunApply(path, 25000, false); !errors.Is(err, ErrLegacyColumnPresent) {
+	if _, err := RunApply(path, 25000, nil); !errors.Is(err, ErrLegacyColumnPresent) {
 		t.Errorf("RunApply with marker gone but legacy columns present: err = %v, want errors.Is(err, ErrLegacyColumnPresent)", err)
 	}
 	if _, err := RunDryRun(path, 25000); !errors.Is(err, ErrLegacyColumnPresent) {
@@ -703,7 +747,7 @@ func TestPendingGateReadsInsideTransaction(t *testing.T) {
 	}
 	defer func() { pendingCountsTestHook = nil }()
 
-	_, err := RunApply(path, 25000, false)
+	_, err := RunApply(path, 25000, nil)
 	if err != nil {
 		t.Errorf("RunApply: %v, want success (the fixture's pending tables are empty, and the racer's write must not land)", err)
 	}
@@ -741,8 +785,14 @@ func TestUpdateRowCountMismatchAborts(t *testing.T) {
 	broken := []moneySpec{
 		{"balances", "amount", "amount", "legacy_vnd_amount", bucketFreeMicro},
 	}
-	if _, err := runApply(path, 25000, false, broken, false); !errors.Is(err, ErrRowUpdateMismatch) {
+	report, err := runApply(path, 25000, nil, broken, false)
+	if !errors.Is(err, ErrRowUpdateMismatch) {
 		t.Errorf("runApply with a non-unique pkCol spec: err = %v, want errors.Is(err, ErrRowUpdateMismatch)", err)
+	}
+	// D1: processSpecs' own failure (here, ErrRowUpdateMismatch) is an in-tx
+	// failure too — must still hand back an apply-REFUSED report.
+	if report == nil || report.Mode != "apply-REFUSED" {
+		t.Errorf("report = %+v, want non-nil with Mode=apply-REFUSED", report)
 	}
 	bal := queryInt64(t, path, "SELECT amount FROM balances WHERE chat_id='a'")
 	if bal != 100000 {
@@ -921,14 +971,36 @@ func TestMetaInsertPKConflictIsLoadBearing(t *testing.T) {
 	path := newFixtureDB(t)
 	seedKnownValues(t, path)
 
-	if _, err := RunApply(path, 25000, false); err != nil {
+	if _, err := RunApply(path, 25000, nil); err != nil {
 		t.Fatalf("first RunApply: %v", err)
 	}
 	firstBal := queryInt64(t, path, "SELECT amount FROM balances WHERE chat_id='111'")
 
-	_, err := runApply(path, 25000, false, baseSpecs, true)
+	report, err := runApply(path, 25000, nil, baseSpecs, true)
 	if err == nil {
 		t.Fatal("second runApply with the guard skipped: got nil error, want a meta PK-conflict failure")
+	}
+	// TIGHTENED: this test's whole point is to isolate the INSERT's own
+	// PRIMARY KEY conflict as the thing that aborts the run. Asserting only
+	// `err != nil` passes for ANY earlier gate error too, which is exactly
+	// the vacuous-test failure mode this test exists to close — so also
+	// assert the error is NOT one of our own typed sentinels, leaving only
+	// the driver's constraint error as the thing that could still be under
+	// test here.
+	for _, sentinel := range []error{
+		ErrAlreadyMigrated, ErrToleranceBreach, ErrZeroCollapse,
+		ErrWholeCentInvariant, ErrProvenanceMismatch, ErrRowUpdateMismatch,
+	} {
+		if errors.Is(err, sentinel) {
+			t.Fatalf("second runApply with the guard skipped: err = %v, want the driver's own PK-conflict error, not %v — an earlier gate firing first would make this test pass vacuously", err, sentinel)
+		}
+	}
+
+	// D1: an in-tx failure past processSpecs (here, the marker-write's PK
+	// conflict) must still hand back an apply-REFUSED report, not a bare nil
+	// — the exact silence the abort-before-commit fix set out to remove.
+	if report == nil || report.Mode != "apply-REFUSED" {
+		t.Errorf("report = %+v, want non-nil with Mode=apply-REFUSED", report)
 	}
 
 	// If the INSERT's PK conflict is what's actually stopping this (rather
@@ -941,5 +1013,231 @@ func TestMetaInsertPKConflictIsLoadBearing(t *testing.T) {
 	if secondBal != firstBal {
 		t.Errorf("balances[111].amount = %d after a should-be-rolled-back second run, want unchanged %d — "+
 			"the meta INSERT's PK conflict did not roll back the re-conversion", secondBal, firstBal)
+	}
+}
+
+// ---- §6.6 gate call-site pins: deleting the CALL, not just the gate itself,
+// must go red -----------------------------------------------------------
+
+// TestWholeCentGateIsWiredIntoApply pins checkWholeCentInvariant's CALL SITE
+// in runApply, not just the function itself: a fixture trigger that fires
+// AFTER processSpecs' UPDATE, inside the same transaction, nudges an
+// already-cent-rounded total off the cent boundary. processSpecs cannot
+// prevent this — only the pre-commit gate can catch it — so deleting the
+// gate's call site (while leaving checkWholeCentInvariant itself intact)
+// must turn this red.
+func TestWholeCentGateIsWiredIntoApply(t *testing.T) {
+	path := newFixtureDB(t)
+	seedKnownValues(t, path)
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// Fires after processSpecs' UPDATE, inside the same tx: nudges an
+	// already-cent-rounded total off the cent boundary. recursive_triggers
+	// is off by default, so the inner UPDATE does not re-fire this.
+	if _, err := db.Exec(`CREATE TRIGGER zz_break_cent AFTER UPDATE OF total ON orders
+		BEGIN UPDATE orders SET total = NEW.total + 1
+		      WHERE des = NEW.des AND NEW.total % 10000 = 0; END;`); err != nil {
+		t.Fatalf("trigger: %v", err)
+	}
+	db.Close()
+
+	report, err := RunApply(path, 25000, nil)
+	if !errors.Is(err, ErrWholeCentInvariant) {
+		t.Errorf("err = %v, want errors.Is(err, ErrWholeCentInvariant)", err)
+	}
+	if report == nil || report.Mode != "apply-REFUSED" {
+		t.Errorf("report mode = %v, want apply-REFUSED", report)
+	}
+	// Gate must run BEFORE the marker write, and the tx must roll back.
+	if n := queryInt64(t, path, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'"); n != 0 {
+		t.Errorf("meta table exists after a refused apply — gate ran too late, or no rollback")
+	}
+	if bal := queryInt64(t, path, "SELECT amount FROM balances WHERE chat_id='111'"); bal != 125000 {
+		t.Errorf("balances[111] = %d after a refused apply, want unchanged 125000", bal)
+	}
+}
+
+// TestProvenanceGateIsWiredIntoApply pins checkProvenanceRoundTrip's CALL
+// SITE in runApply, the same way TestWholeCentGateIsWiredIntoApply pins
+// checkWholeCentInvariant's: a fixture trigger erases balances'
+// legacy_vnd_amount immediately after processSpecs writes it, inside the
+// same transaction, leaving a converted row whose original VND survives
+// only in the backup. Only the pre-commit gate can catch this.
+func TestProvenanceGateIsWiredIntoApply(t *testing.T) {
+	path := newFixtureDB(t)
+	seedKnownValues(t, path)
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// Fires after processSpecs writes provenance, inside the same tx: erases
+	// it, leaving a converted row whose original VND survives only in the backup.
+	if _, err := db.Exec(`CREATE TRIGGER zz_break_prov AFTER UPDATE OF legacy_vnd_amount ON balances
+		BEGIN UPDATE balances SET legacy_vnd_amount = NULL
+		      WHERE chat_id = NEW.chat_id AND NEW.legacy_vnd_amount IS NOT NULL; END;`); err != nil {
+		t.Fatalf("trigger: %v", err)
+	}
+	db.Close()
+
+	report, err := RunApply(path, 25000, nil)
+	if !errors.Is(err, ErrProvenanceMismatch) {
+		t.Errorf("err = %v, want errors.Is(err, ErrProvenanceMismatch)", err)
+	}
+	if report == nil || report.Mode != "apply-REFUSED" {
+		t.Errorf("report mode = %v, want apply-REFUSED", report)
+	}
+	if n := queryInt64(t, path, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'"); n != 0 {
+		t.Errorf("meta table exists after a refused apply — the tx did not roll back")
+	}
+}
+
+// ---- structural hole: every RunApply test ran at rate=25000, the ONE rate
+// where 1_000_000 divides evenly and nothing ever rounds -----------------
+
+// TestApplyAtANonDivisorRateConverts is the regression pin for the
+// structural gap all twelve other RunApply tests share: they all pass
+// rate=25000, the one rate at which no cent-rounded column ever rounds.
+// The incident this closes was "the sqrt tolerance bound refuses a correct
+// run" — the PROPERTY that must hold is "a correct conversion at a rate
+// that rounds must not be refused." rate=26150 and price=100100 are chosen
+// so cent-rounding genuinely bites on every row.
+func TestApplyAtANonDivisorRateConverts(t *testing.T) {
+	const rate = 26150
+	const n = 60
+	const price = 100100 // not a multiple of 250: cent-rounding must bite
+
+	// GUARD 1 — the test is about a rate that rounds. If someone "fixes"
+	// this to a divisor rate, fail loudly instead of passing vacuously.
+	if 1_000_000%rate == 0 {
+		t.Fatalf("rate %d divides 1_000_000 — this test is vacuous at a divisor rate", rate)
+	}
+
+	path := newFixtureDB(t)
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		des := fmt.Sprintf("nd%d", i)
+		if _, err := db.Exec(
+			"INSERT INTO orders(des, chat_id, product, tier, qty, total, status) VALUES (?,?,?,?,?,?,?)",
+			des, "c", "p", "t", 1, price, "paid"); err != nil {
+			t.Fatalf("seed order %d: %v", i, err)
+		}
+	}
+	db.Close()
+
+	report, err := RunApply(path, rate, nil)
+	if err != nil {
+		t.Fatalf("RunApply at rate=%d: %v — a correct conversion must not be refused", rate, err)
+	}
+	oc := findCol(t, report, "orders", "total")
+
+	// GUARD 2 — prove the fixture actually exercises drift.
+	if oc.Delta == 0 {
+		t.Errorf("delta = 0 at rate=%d — fixture does not exercise cent-rounding drift", rate)
+	}
+	// GUARD 3 (ADAPTED to the RoundedRows vocabulary — columnDriftBound
+	// itself was deleted in favour of this field, see ColumnReport's doc
+	// comment) — prove the fixture rounds at all.
+	if oc.RoundedRows == 0 {
+		t.Errorf("rounded_rows = 0 at rate=%d — fixture does not exercise rounding, so it cannot detect a tolerance regression", rate)
+	}
+	if oc.Delta > oc.Tolerance {
+		t.Errorf("delta=%d > tolerance=%d — a correct conversion was refused", oc.Delta, oc.Tolerance)
+	}
+
+	// Value correctness by INDEPENDENT arithmetic, never convertValue —
+	// otherwise the assertion is tautological with the code under test.
+	micro := (int64(price)*1_000_000*2 + rate) / (2 * rate)
+	want := ((micro*2 + microPerCent) / (2 * microPerCent)) * microPerCent
+
+	gotTotal := queryInt64(t, path, "SELECT total FROM orders WHERE des=?", "nd0")
+	if gotTotal != want {
+		t.Errorf("orders[nd0].total = %d, want %d (independent arithmetic)", gotTotal, want)
+	}
+	gotLegacy := queryInt64(t, path, "SELECT legacy_vnd_total FROM orders WHERE des=?", "nd0")
+	if gotLegacy != price {
+		t.Errorf("orders[nd0].legacy_vnd_total = %d, want %d", gotLegacy, price)
+	}
+
+	db2, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db2.Close()
+	var mismatches int64
+	if err := db2.QueryRow("SELECT COUNT(*) FROM orders WHERE total % 10000 != 0").Scan(&mismatches); err != nil {
+		t.Fatalf("count non-cent-aligned: %v", err)
+	}
+	if mismatches != 0 {
+		t.Errorf("orders has %d row(s) with total not a multiple of 10000 micro", mismatches)
+	}
+}
+
+// ---- D3: perRowMaxError must not panic on rate==0 ------------------------
+
+// TestPerRowMaxErrorDoesNotPanicOnZeroRate is PINNED to the D3 hygiene fix:
+// rate==0 is unreachable through any real entry point (RunDryRun and
+// RunApply both validate rate>0 first), but a modulo-by-zero panic is a bad
+// last thing for a migration tool to print, so the invariant is guarded
+// inside perRowMaxError itself.
+func TestPerRowMaxErrorDoesNotPanicOnZeroRate(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("perRowMaxError(bucketFreeMicro, 0) panicked: %v", r)
+		}
+	}()
+	if got := perRowMaxError(bucketFreeMicro, 0); got == 0 {
+		t.Error("perRowMaxError(bucketFreeMicro, 0) = 0, want a non-zero guard value — rate=0 must not be silently treated as \"divides 1_000_000 evenly\"")
+	}
+}
+
+// ---- HIGH (review of 89469d4): rowRounded lied about free-micro columns --
+
+// TestRowRoundedFreeMicroReportsRounding is PINNED to a HIGH found reviewing
+// 89469d4: rowRounded early-returned false for EVERY non-cent-rounded
+// bucket, so balances/processed (both free-micro) printed
+// "rounded_rows=0 ... (exact at this rate)" at every rate, including rates
+// where vndToMicro rounds on nearly every row. That is not a weak
+// diagnostic, it is a FALSE AFFIRMATIVE on the operator's only decision
+// input before a one-shot, no-second-chance apply.
+func TestRowRoundedFreeMicroReportsRounding(t *testing.T) {
+	path := newFixtureDB(t)
+	seedKnownValues(t, path)
+
+	const rate = 26150 // does not divide 1_000_000 -- vndToMicro must round
+	if 1_000_000%rate == 0 {
+		t.Fatalf("rate %d divides 1_000_000 — this test is vacuous at a divisor rate", rate)
+	}
+
+	report, err := RunDryRun(path, rate)
+	if err != nil {
+		t.Fatalf("RunDryRun: %v", err)
+	}
+	bal := findCol(t, report, "balances", "amount")
+	if bal.RoundedRows == 0 {
+		t.Errorf("balances.amount rounded_rows = 0 at rate=%d, want > 0 — vndToMicro rounds on a free-micro column at a non-divisor rate, and the report must say so, not claim \"exact at this rate\"", rate)
+	}
+}
+
+// TestRowRoundedFreeMicroExactAtDivisorRate is the companion check: at a
+// rate that DOES divide 1_000_000 evenly, vndToMicro cannot round at all,
+// so a free-micro column's rounded_rows really must be 0 — the fixed
+// predicate must not become a false NEGATIVE (crying wolf) in fixing the
+// false affirmative above.
+func TestRowRoundedFreeMicroExactAtDivisorRate(t *testing.T) {
+	path := newFixtureDB(t)
+	seedKnownValues(t, path)
+
+	report, err := RunDryRun(path, 25000) // 1_000_000 / 25000 == 40, exact
+	if err != nil {
+		t.Fatalf("RunDryRun: %v", err)
+	}
+	bal := findCol(t, report, "balances", "amount")
+	if bal.RoundedRows != 0 {
+		t.Errorf("balances.amount rounded_rows = %d at rate=25000, want 0 (1_000_000/25000 is exact, so vndToMicro cannot round)", bal.RoundedRows)
 	}
 }

@@ -26,13 +26,18 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 )
 
 func main() {
 	dbPath := flag.String("db", "store.db", "path to store.db")
 	rate := flag.Int64("rate", 0, "VND-per-USD rate, FROZEN off production per plan §1.G2 (do not re-derive) — REQUIRED, no default")
 	apply := flag.Bool("apply", false, "actually write the conversion, in one transaction. Without this flag, report only — nothing is written")
-	allowZeroCollapse := flag.Bool("allow-zero-collapse", false, "override the zero-collapse abort ONLY — a tolerance breach is never overridable")
+	allowZeroCollapse := flag.String("allow-zero-collapse", "",
+		"per-column zero-collapse override ONLY — a tolerance breach is never overridable, for any column. "+
+			"Comma-separated table.column list, e.g. orders.code_discount,refund_requests.total — naming one "+
+			"column does not excuse a collapse in any other. Copy the exact \"table.column\" string straight "+
+			"out of a dry run's refusal message. Empty (default) refuses every zero-collapse.")
 	haveBackup := flag.Bool("i-have-a-backup", false, "REQUIRED with -apply: confirms a store.db backup exists before this tool writes to it")
 	yes := flag.Bool("yes", false, "REQUIRED with -apply: confirms this run is intentional (this tool has no other interactive confirmation)")
 	flag.Parse()
@@ -48,12 +53,15 @@ func main() {
 	}
 	// ---- end guard --------------------------------------------------------
 
-	var (
-		report *Report
-		err    error
-	)
+	allowed, err := parseAllowZeroCollapse(*allowZeroCollapse)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "migrate-usdt:", err)
+		os.Exit(1)
+	}
+
+	var report *Report
 	if *apply {
-		report, err = RunApply(*dbPath, *rate, *allowZeroCollapse)
+		report, err = RunApply(*dbPath, *rate, allowed)
 	} else {
 		report, err = RunDryRun(*dbPath, *rate)
 	}
@@ -79,6 +87,35 @@ func validateCLIFlags(rate int64, apply, haveBackup, yes bool) error {
 		return fmt.Errorf("-apply requires both -i-have-a-backup and -yes — this tool converts real money in place, in one transaction, with no further confirmation")
 	}
 	return nil
+}
+
+// parseAllowZeroCollapse turns the -allow-zero-collapse flag's comma-
+// separated "table.column" list into the per-column allowlist evaluateColumns
+// checks each ZeroCollapse against. Kept per-column rather than one global
+// bool: overriding it for a legitimate tiny collapse (e.g.
+// orders.code_discount) must not ALSO blind orders.total — exactly the
+// column requirement #6 exists to protect. It fails SAFE in both
+// directions: an empty flag refuses every column (unchanged from before),
+// and an entry that doesn't look like "table.column" is a hard error rather
+// than being silently ignored — a typo'd column name must not read to the
+// operator as "I allowed this collapse" when it did nothing.
+func parseAllowZeroCollapse(s string) (map[string]bool, error) {
+	if s == "" {
+		return nil, nil
+	}
+	allowed := map[string]bool{}
+	for _, entry := range strings.Split(s, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if !strings.Contains(entry, ".") {
+			return nil, fmt.Errorf(
+				"-allow-zero-collapse entry %q is not table.column — copy the exact string out of a dry run's refusal message, e.g. orders.code_discount", entry)
+		}
+		allowed[entry] = true
+	}
+	return allowed, nil
 }
 
 // printReport renders a Report as plain text: mode, rate, the §1.G3 pending
