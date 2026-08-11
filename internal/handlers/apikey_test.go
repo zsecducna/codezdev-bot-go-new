@@ -2090,12 +2090,21 @@ func TestApikeySelfServiceRefundNotifiesAdmins(t *testing.T) {
 	}
 }
 
+// TestMaskAPIKey pins maskAPIKey's two branches. The <=14-rune case used to
+// render verbatim — hardening added because keyShapeRe (internal/kirogo)
+// accepts an 11-rune key as well-formed, even though no real key has ever
+// measured that short; see maskAPIKey's own doc comment. A short key must
+// now render as same-length bullets, never the cleartext itself.
 func TestMaskAPIKey(t *testing.T) {
 	if got := maskAPIKey("sk-test-0123456789abcdef"); got != "sk-test…cdef" {
 		t.Errorf("mask = %q, want %q", got, "sk-test…cdef")
 	}
-	if got := maskAPIKey("sk-short-14ch"); got != "sk-short-14ch" {
-		t.Errorf("a <=14-char key renders verbatim, got %q", got)
+	const short = "sk-short-14ch" // 13 runes, <=14
+	if got := maskAPIKey(short); got != "•••••••••••••" {
+		t.Errorf("a <=14-char key must render as same-length bullets, not verbatim: got %q", got)
+	}
+	if got := maskAPIKey(short); strings.Contains(got, short) || got == short {
+		t.Errorf("mask = %q leaks the short key %q verbatim", got, short)
 	}
 	if got := maskAPIKey(""); got != "" {
 		t.Errorf("empty key masks to empty, got %q", got)

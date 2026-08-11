@@ -457,7 +457,9 @@ func (b *Bot) apikeyRefundPreview(ctx context.Context, chatID int64, lang i18n.L
 // atomically claims delivered/paid->refunded (so a double-tap's loser is a
 // no-op), recomputes the amount from the rows, credits the wallet, revokes the
 // key on Kiro-Go and DMs the customer. Fully automatic per policy: no admin is
-// in the approval loop; admins are notified after the fact (M3).
+// in the approval loop; admins are notified after the fact, via the
+// notifyAdmins call a few lines below — not deferred to a future milestone,
+// already landed right here.
 func (b *Bot) cbApikeyRefOK(cc *cbCtx) {
 	c := &i18n.C().APIKey
 	lang := b.langFor(cc.ChatID, "en")

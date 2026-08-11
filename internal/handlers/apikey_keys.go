@@ -25,12 +25,22 @@ import (
 // maskAPIKey is the shortened display form of an sk-… key (prefix + tail only)
 // for lists and button labels — _mask_api_key (telegram_bot.py:4220-4224). The
 // full cleartext is only ever sent via the reveal/delivery path.
+//
+// Real keys always exceed the 14-rune threshold below (the server's own
+// masking scheme is a 6-char prefix + 4-char tail + a middle worth hiding, so
+// anything real is longer), so the >14 branch is the one that actually fires
+// in production. The <=14 branch is hardening, not a fix for an observed
+// leak: keyShapeRe (internal/kirogo) accepts "sk-"/"ksk_" + 8 chars — 11
+// runes — as a well-formed key shape, so the grammar alone permits a value
+// short enough to have rendered verbatim here; nothing in this repo has ever
+// measured a real key that short. Masking unconditionally below the
+// threshold closes that gap for free rather than leaving it to inference.
 func maskAPIKey(k string) string {
 	if len([]rune(k)) > 14 {
 		r := []rune(k)
 		return string(r[:7]) + "…" + string(r[len(r)-4:])
 	}
-	return k
+	return strings.Repeat("•", len([]rune(k)))
 }
 
 // tgSendHTML builds the parse_mode=HTML, no-link-preview send params the

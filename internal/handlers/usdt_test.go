@@ -734,8 +734,14 @@ func TestUSDTDepositReplayCreditsOnce(t *testing.T) {
 	if again != first {
 		t.Errorf("a replayed hash credited again (%d -> %d)", first, again)
 	}
-	if lastSend(f) != i18n.C().Pay.TxidAlreadyUsed.T(i18n.EN) {
-		t.Errorf("last send = %q, want TXID_ALREADY_USED", lastSend(f))
+	// Scoped to the customer's own chat, not lastSend's "most recent send
+	// overall": this passes today only because a guard suppresses the owner
+	// alert on the replay path, so lastSend happens to still be the
+	// customer's TXID_ALREADY_USED reply. If that ordering ever changes,
+	// lastSend would report a confusing failure about the WRONG message.
+	got := lastSendMsgTo(f, chat)
+	if got == nil || got.Text != i18n.C().Pay.TxidAlreadyUsed.T(i18n.EN) {
+		t.Errorf("last send to chat = %v, want TXID_ALREADY_USED", got)
 	}
 }
 
@@ -984,8 +990,29 @@ func TestUSDTDepositOKRendersAmountAtWhitespacePaddedAmbientRate(t *testing.T) {
 // deposit settle (the isDeposit branch inside verifyUSDTTxid) —
 // notify_admin_deposit (telegram_bot.py:9861-9862). Also pins the CARE
 // requirement for this rail specifically: replaying the SAME tx hash is
-// rejected by the processed-ledger PK BEFORE the notify call is reached, so
-// a duplicate submit must not produce a second alert.
+// rejected by store.Credit's ledger PK BEFORE the notify call further down
+// is ever reached, so a duplicate submit must not produce a second alert.
+//
+// This is NOT a duplicate-CREDIT guard, and must never be described as one:
+// store.Credit's ledger primary key already does dedupe-and-credit
+// atomically, so the balance can never double regardless of anything below
+// it. The `if !credited` branch this test exercises (usdt.go, right after
+// the store.Credit call) only stops the SIDE EFFECTS that would otherwise
+// repeat if execution fell through past it — the customer DM, this owner
+// alert, the order close/deliver claims, and the audit row.
+//
+// The replay is driven against a FRESH deposit order (o2), not the original
+// (now-closed) one, mirroring TestUSDTDepositReplayCreditsOnce above and for
+// the same reason: capTxid's pending_txid slot is nil'd the instant the
+// first submit consumes it (usdt.go's capTxid: `cap := c.st.Txid; c.st.Txid
+// = nil`), so re-submitting the identical text WITHOUT re-arming the
+// capture never reaches verifyUSDTTxid at all — capTxid itself finds
+// nothing armed and the text falls through one layer earlier. Re-arming via
+// armTxid on o2 gives the second submit a live capture, so the same hash
+// genuinely reaches verifyUSDTTxid and is rejected there, by the ledger PK
+// — not by capTxid short-circuiting first, which would pass this test for
+// the wrong reason (proving nothing about the notify-suppression this test
+// claims to cover).
 func TestVerifyUSDTTxidDepositNotifiesAdminOwner(t *testing.T) {
 	ctx := context.Background()
 	b, f, st, _, fk := newUSDTBot(t)
@@ -1008,8 +1035,14 @@ func TestVerifyUSDTTxidDepositNotifiesAdminOwner(t *testing.T) {
 		t.Errorf("deposit alert = %q, want the BEP20 rail label", alert.Text)
 	}
 
-	// Replay the identical hash: MarkTxn's PK rejects it before the notify
-	// call is ever reached (TXID_ALREADY_USED), so the alert must not repeat.
+	// Re-arm on a fresh order (o2) so the replay's capTxid slot is live and
+	// the same hash genuinely reaches verifyUSDTTxid — see the doc comment
+	// above for why replaying against the original closed order, without
+	// re-arming, would never get there at all.
+	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
+	b.Process(ctx, textUpdate(chat, "5"))
+	o2 := reservedDeposit(t, st, chat)
+	armTxid(t, ctx, b, chat, chainBSC, o2.Des)
 	b.Process(ctx, textUpdate(chat, "0x"+h))
 	if n := countContains(f, "💰 NEW DEPOSIT"); n != 1 {
 		t.Errorf("after replaying the same tx hash: NEW DEPOSIT count = %d, want still 1", n)
