@@ -316,6 +316,23 @@ func (b *Bot) doRefund(ctx context.Context, o *store.Order, method string, force
 		if serr := b.store.SetRefundedAmount(won.Des, amount); serr != nil {
 			log.Printf("SetRefundedAmount(%s, %d) failed: %v", won.Des, amount, serr)
 		}
+	default:
+		// An unrecognised payout method has no branch above that knows how to
+		// credit it or record the amount — the claim already committed (the
+		// order IS 'refunded'), so refunded_amount is left exactly as it was,
+		// almost certainly NULL. NULL is a load-bearing state: it means
+		// "genuinely refunded, actual amount unrecoverable" (see
+		// SetRefundedAmount's doc comment). Falling through silently here
+		// would forge that state for an order that in fact HAS a computable
+		// amount — indistinguishable from a real unrecoverable historical
+		// row. This must be caught loudly, matching the CreditFailed alert
+		// above (the only "should not happen on a money path" pattern this
+		// file already has).
+		log.Printf("CRITICAL refund: unrecognised payout method %q [des=%s chat=%s amount=%d] — order IS 'refunded'; refunded_amount NOT recorded",
+			method, o.Des, won.ChatID, amount)
+		b.notifyOwners(ctx, "🚨 REFUND UNKNOWN PAYOUT METHOD — MANUAL FIX REQUIRED\n"+
+			"🧾 "+o.Des+"\n👤 "+won.ChatID+"\n💰 "+b.usdtDisp(amount)+"\nmethod="+method+"\n"+
+			"Order IS 'refunded'; refunded_amount was NOT recorded for it — investigate and record by hand.")
 	}
 
 	// Skip the customer DM entirely when the credit failed: the money never

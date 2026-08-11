@@ -412,6 +412,32 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 		// unverifiable from the wallet ledger (no balance transaction backs
 		// it).
 		b.recordGroupRefundedAmounts(won, groupPaid, amountGroup, stuckDes, extra)
+	default:
+		// An unrecognised payout method has no branch above that knows how
+		// to credit it or record amounts — every claim in this group already
+		// committed (each order IS 'refunded'), so refunded_amount is left
+		// exactly as it was for EVERY member of the group: the root order,
+		// every applied recharge, and the stuck order if any — not just the
+		// one order this call was invoked from. NULL is a load-bearing
+		// state meaning "genuinely refunded, actual amount unrecoverable"
+		// (SetRefundedAmount's doc comment); falling through silently here
+		// would forge that state for a group that in fact has a computable
+		// amount. Must be caught loudly, matching the CreditFailed alert
+		// above (the only "should not happen on a money path" pattern this
+		// file already has).
+		members := make([]string, 0, len(won)+1)
+		for _, w := range won {
+			members = append(members, w.Des)
+		}
+		if stuckDes != "" {
+			members = append(members, stuckDes)
+		}
+		log.Printf("CRITICAL apikey group refund: unrecognised payout method %q [des=%s chat=%s amount=%d members=%v] — orders ARE 'refunded'; refunded_amount NOT recorded for any of them",
+			method, des, o.ChatID, amount, members)
+		b.notifyOwners(ctx, fmt.Sprintf(
+			"🚨 REFUND UNKNOWN PAYOUT METHOD — MANUAL FIX REQUIRED\n🧾 %s\n👤 %s\n💰 %s\nmethod=%s\nmembers=%v\n"+
+				"Orders ARE 'refunded'; refunded_amount was NOT recorded for any of them — investigate and record by hand.",
+			des, o.ChatID, b.usdtDisp(amount), method, members))
 	}
 	// Notify the customer (best-effort) — the same receipt the generic refund
 	// sends, anchored on the order they acted from. Skipped entirely when the
@@ -453,10 +479,13 @@ func (b *Bot) sendOK(ctx context.Context, chatID int64, text string) bool {
 // across won's members proportional to each member's paid Total — the exact
 // per-order share of a pro-rated group refund (task #20, stage S2). Plain
 // rounding of each share independently can drift from amountGroup by a unit
-// or two, so the residual is handed to the largest member (largest-remainder
-// method): this keeps SUM(shares) == amountGroup exactly, which is the
-// property that makes refunded_amount trustworthy for a group refund — the
-// stats query will one day just SUM() this column.
+// or two, so the residual is handed entirely to the member with the largest
+// paid Total (NOT the textbook largest-remainder method, which ranks
+// candidates by the FRACTIONAL PART of their share — this dumps the whole
+// leftover on the biggest payer instead): this keeps SUM(shares) ==
+// amountGroup exactly, which is the property that makes refunded_amount
+// trustworthy for a group refund — the stats query will one day just SUM()
+// this column.
 func splitRefundedAmount(won []apikeyRefundMember, groupPaid, amountGroup int64) map[string]int64 {
 	out := make(map[string]int64, len(won))
 	if len(won) == 0 || groupPaid <= 0 {
@@ -472,6 +501,22 @@ func splitRefundedAmount(won []apikeyRefundMember, groupPaid, amountGroup int64)
 			largestTotal, largestIdx = m.Total, i
 		}
 	}
+	// An individual member's share can go NEGATIVE here. Worked example: 4
+	// members each with Total=250 (groupPaid=1000), amountGroup=2 — every
+	// member's independently-rounded share is math.Round(2*250/1000) =
+	// math.Round(0.5) = 1 (Go's math.Round rounds half away from zero), so
+	// assigned=4 and the residual folded onto the largest member is
+	// amountGroup-assigned = 2-4 = -2, landing that member's final share at
+	// 1-2 = -1. SUM(shares) stays EXACTLY amountGroup regardless — that
+	// invariant is what recordGroupRefundedAmounts/SetRefundedAmount rely
+	// on, and it still holds here. This is unreachable in the admin UI
+	// TODAY only because the revenue screen renders the group aggregate
+	// (admin.go's Refunded block sums refunded_amount, never displays one
+	// member's row) — a negative per-member share never surfaces. If
+	// per-order or per-member refunded_amount rendering is ever added, the
+	// displayed residual must be clamped (e.g. to 0) before it is shown,
+	// since a negative "amount refunded" on a single order reads as a bug
+	// even though the group total is correct.
 	out[won[largestIdx].Des] += amountGroup - assigned
 	return out
 }

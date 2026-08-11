@@ -379,6 +379,44 @@ func TestDoRefundManualRecordsRefundedAmount(t *testing.T) {
 	}
 }
 
+// TestDoRefundUnknownMethodAlertsOwner covers doRefund's switch-on-method
+// default branch (task #43, L3): a payout method that matches neither
+// "balance" nor "manual" has no branch that knows how to credit it or record
+// refunded_amount, so it must alert the owner loudly by name rather than
+// silently leaving the column NULL and untraceable. Deleting the default
+// branch's notifyOwners call turns this test red.
+func TestDoRefundUnknownMethodAlertsOwner(t *testing.T) {
+	b, f, st, _, _, _, _ := newOrdersTestBot(t, "1")
+	des := store.NewDes()
+	if err := st.CreateOrder(des, "42", "en", "prod", "BH7D", 1, 7000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOrder(des, "reserved", "delivered"); err != nil {
+		t.Fatal(err)
+	}
+	o, _ := st.GetOrder(des)
+	b.now = func() time.Time { return time.Unix(int64(o.TS), 0) }
+
+	res := b.doRefund(context.Background(), o, "carrier_pigeon", false)
+	if res == nil {
+		t.Fatal("doRefund returned nil — the claim must still win even though the method is unrecognised")
+	}
+	got, _ := st.GetOrder(des)
+	if got.Status != "refunded" {
+		t.Errorf("status=%q, want refunded (the claim commits before the payout-method switch runs)", got.Status)
+	}
+	alert := lastSendMsgTo(f, 1)
+	if alert == nil || !strings.Contains(alert.Text, "UNKNOWN PAYOUT METHOD") {
+		t.Fatalf("owner alert = %v, want an UNKNOWN PAYOUT METHOD message", alert)
+	}
+	if !strings.Contains(alert.Text, "carrier_pigeon") {
+		t.Errorf("owner alert missing the unrecognised method name, got: %q", alert.Text)
+	}
+	if !strings.Contains(alert.Text, des) {
+		t.Errorf("owner alert missing the order des: %q", alert.Text)
+	}
+}
+
 // ============================================================================
 // Refund-request state machine
 // ============================================================================

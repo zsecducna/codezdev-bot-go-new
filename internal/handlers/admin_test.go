@@ -794,6 +794,58 @@ func TestAdminDashboardRefundedRangeForLegacyUnknownRefunds(t *testing.T) {
 	}
 }
 
+// TestAdminDashboardZeroTotalUnknownRefundOmitsUncertaintyLine covers task
+// #43's nano fix: a legacy unknown refund (refund_kind set, refunded_amount
+// still NULL) whose order total is 0 contributes RefundedUnknownCount=1 but
+// RefundedUnknownUpperBound=0 — Net's own range collapses to a point for
+// exactly this row (0 possible credited amounts in [0,0]), so the "a further
+// X may have been refunded" line must NOT render either: showing it here
+// would claim uncertainty the Net figure right below already proves doesn't
+// exist. Before the fix the line branched on RefundedUnknownCount>0 alone
+// and rendered regardless of the total. Reverting the branch condition back
+// to RefundedUnknownCount>0 turns this test red on its own message (the
+// TestAdminDashboardRefundedRangeForLegacyUnknownRefunds test above already
+// pins the nonzero-total case, where the two conditions agree).
+func TestAdminDashboardZeroTotalUnknownRefundOmitsUncertaintyLine(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newDashboardTestBot(t, "1")
+
+	if err := st.CreateOrder("delivered1", "9", "en", "kiro-pro", "T1", 1, 5000); err != nil {
+		t.Fatalf("CreateOrder(delivered1): %v", err)
+	}
+	if _, err := st.ClaimOrder("delivered1", "reserved", "delivered"); err != nil {
+		t.Fatalf("claim delivered1 -> delivered: %v", err)
+	}
+
+	// Unknown, but zero-total: same pre-S2 shape (refund_kind set,
+	// refunded_amount left NULL) as the legacy-unknown test above, except
+	// this order never charged anything, so its contribution to the
+	// upper-bound ceiling is exactly 0.
+	if err := st.CreateOrder("reflegacy0", "9", "en", "kiro-pro", "T1", 1, 0); err != nil {
+		t.Fatalf("CreateOrder(reflegacy0): %v", err)
+	}
+	if _, err := st.ClaimOrder("reflegacy0", "reserved", "paid"); err != nil {
+		t.Fatalf("claim reflegacy0 -> paid: %v", err)
+	}
+	if _, err := st.ClaimOrderKind("reflegacy0", "paid", "refunded", store.RefundKindAdminCancel); err != nil {
+		t.Fatalf("claim reflegacy0 -> refunded/admin_cancel: %v", err)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "admroot"))
+	last := lastSendMsg(f)
+	if last == nil {
+		t.Fatal("admroot produced no reply")
+	}
+	if strings.Contains(last.Text, "may have been refunded, unrecorded") {
+		t.Errorf("the uncertainty line must not render when the unknown row's "+
+			"total is 0 (Net is already an exact point figure), got:\n%s", last.Text)
+	}
+	if !strings.Contains(last.Text, "Net: 0.20 USDT  (") {
+		t.Errorf("want Net as a plain point figure (no range) since the only "+
+			"unknown row contributes 0 to the upper bound, got:\n%s", last.Text)
+	}
+}
+
 // TestAdminDashboardZeroRefundsOmitsNegativeSign guards the zero-refund
 // formatting edge the A7 render must not get wrong: "-0.00 USDT" on a shop
 // with no refunds at all reads as a bug, not a healthy zero.

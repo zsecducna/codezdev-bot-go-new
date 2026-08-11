@@ -51,9 +51,9 @@ func TestDoRefundApikeyGroupCreditFailedNotifiesOwner(t *testing.T) {
 // refunded_amount — S2 bookkeeping (task #20), the group-refund split
 // ============================================================================
 
-// TestSplitRefundedAmountExactSum is a direct unit test of the largest-
-// remainder split: SUM(shares) must equal amountGroup EXACTLY even when
-// independent per-member rounding would drift from it (here, two equal
+// TestSplitRefundedAmountExactSum is a direct unit test of the
+// largest-paid-member split: SUM(shares) must equal amountGroup EXACTLY even
+// when independent per-member rounding would drift from it (here, two equal
 // 500/500 totals splitting an odd 1, where round(0.5)+round(0.5)=2 != 1).
 // This is the property that makes refunded_amount trustworthy for a group
 // refund — a stats query can SUM() this column and get the real payout back.
@@ -67,10 +67,10 @@ func TestSplitRefundedAmountExactSum(t *testing.T) {
 	if sum != 1 {
 		t.Fatalf("sum(shares) = %d, want 1 (== amountGroup)", sum)
 	}
-	// The largest-remainder residual lands on the first member when totals
-	// tie (index 0 never loses its "largest" slot to an equal, not greater,
-	// total) — pin the exact split so a future reshuffle of the algorithm is
-	// caught, not just its sum property.
+	// The residual lands on the first member when totals tie (index 0 never
+	// loses its "largest" slot to an equal, not greater, total) — pin the
+	// exact split so a future reshuffle of the algorithm is caught, not just
+	// its sum property.
 	if shares["a"] != 0 || shares["b"] != 1 {
 		t.Errorf("shares = %v, want {a:0, b:1}", shares)
 	}
@@ -183,5 +183,39 @@ func TestDoRefundApikeyGroupManualRecordsRefundedAmount(t *testing.T) {
 	got, ok := refundedAmountFor(t, st, keyDes)
 	if !ok || got != res.Amount {
 		t.Errorf("refunded_amount = (valid=%v, %d), want (true, %d)", ok, got, res.Amount)
+	}
+}
+
+// TestDoRefundApikeyGroupUnknownMethodAlertsOwner is the group-refund twin of
+// adminorders.go's TestDoRefundUnknownMethodAlertsOwner (task #43, L3): a
+// payout method matching neither "balance" nor "manual" has no branch that
+// knows how to credit the group or record refunded_amount for any of its
+// members, so it must alert the owner loudly by name. Deleting the default
+// branch's notifyOwners call in doRefundApikeyGroup turns this test red.
+func TestDoRefundApikeyGroupUnknownMethodAlertsOwner(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, fk, _ := newAPIKeyBot(t)
+	const chat = 100
+	const keyDes = "eeee5555eeee5555eeee5555eeee5555"
+	seedKey(t, st, fk, keyDes, chat, "poolkey-unknownmethod", "sk-test-unknownmethod-0123456789", "bedrock", 1000, 1000, 200)
+
+	o, _ := st.GetOrder(keyDes)
+	res := b.doRefundApikeyGroup(ctx, o, "carrier_pigeon", false)
+	if res == nil {
+		t.Fatal("doRefundApikeyGroup returned nil — the group claim must still win even though the method is unrecognised")
+	}
+	got, _ := st.GetOrder(keyDes)
+	if got.Status != "refunded" {
+		t.Errorf("order status = %q, want refunded (the claim commits before the payout-method switch runs)", got.Status)
+	}
+	alert := lastSendMsgTo(f, 999)
+	if alert == nil || !strings.Contains(alert.Text, "UNKNOWN PAYOUT METHOD") {
+		t.Fatalf("owner alert = %v, want an UNKNOWN PAYOUT METHOD message", alert)
+	}
+	if !strings.Contains(alert.Text, "carrier_pigeon") {
+		t.Errorf("owner alert missing the unrecognised method name, got: %q", alert.Text)
+	}
+	if !strings.Contains(alert.Text, keyDes) {
+		t.Errorf("owner alert missing the order des: %q", alert.Text)
 	}
 }

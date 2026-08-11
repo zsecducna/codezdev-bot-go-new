@@ -365,16 +365,35 @@ func (b *Bot) adminDashboardText(chatID int64) string {
 			// refund (misc.go's GetRevenueSummary doc comment on the refund
 			// query has the full mechanism), so it stays exact.
 			grossRevenue := r.DeliveredRevenue + r.RefundedRevenue
+			// Net is a RANGE, not a relabelled DeliveredRevenue (task #20
+			// stage S3 — this is the ONE figure that actually moves on this
+			// screen; S1/S2 were invisible by design). Cash actually retained
+			// is Gross minus what was ACTUALLY credited back, and each unknown
+			// row's actual credit is somewhere in [0, its own total], so the
+			// true figure is somewhere in
+			// [Gross-Known-UnknownUpperBound, Gross-Known]. Computed here,
+			// ahead of refundedBlock below, because the "may have been
+			// refunded" line reuses this same netLow!=netHigh test (see
+			// there) rather than a separate condition that could disagree
+			// with it.
+			netHigh := grossRevenue - r.RefundedAmountKnown
+			netLow := netHigh - r.RefundedUnknownUpperBound
+			netLine := b.usdtDisp(netHigh)
+			if netLow != netHigh {
+				netLine = b.usdtDisp(netLow) + " – " + netLine
+			}
 			// Refunded now renders as TWO populations instead of one blended
 			// figure (task #20 stage S3): the EXACT amount actually credited
 			// back on orders where SetRefundedAmount (stage S2) ran, and —
-			// only when nonzero, so a shop with no legacy refunds renders
-			// clean — a bounded ceiling for orders refunded before S2 existed,
-			// whose real credited amount is permanently unrecoverable
-			// (misc.go's doc comment: no backfill source exists). Folding the
-			// unknown bucket into the known sum via a naive
-			// SUM(refunded_amount) would silently drop it from EVERY figure on
-			// this screen — the exact defect the split exists to prevent.
+			// only when the ceiling is actually nonzero, so a shop with no
+			// legacy refunds (or one whose only legacy refunds are on
+			// zero-total orders) renders clean — a bounded ceiling for
+			// orders refunded before S2 existed, whose real credited amount
+			// is permanently unrecoverable (misc.go's doc comment: no
+			// backfill source exists). Folding the unknown bucket into the
+			// known sum via a naive SUM(refunded_amount) would silently drop
+			// it from EVERY figure on this screen — the exact defect the
+			// split exists to prevent.
 			// usdtDisp(0) never renders a negative sign (money.go), so the
 			// sign-add below only ever fires on real money.
 			knownLine := b.usdtDisp(r.RefundedAmountKnown)
@@ -383,7 +402,16 @@ func (b *Bot) adminDashboardText(chatID int64) string {
 			}
 			refundedBlock := "   Refunded: " + knownLine + " exact  (" +
 				itoa64(r.RefundedKnownCount) + " orders)"
-			if r.RefundedUnknownCount > 0 {
+			// Branches on the SAME condition as the Net range collapse
+			// (netLow != netHigh) rather than on RefundedUnknownCount>0 —
+			// those two diverge in exactly one case: every unknown row has
+			// total 0 (RefundedUnknownUpperBound==0 with
+			// RefundedUnknownCount>0), where Net is already an exact point
+			// figure and this line would otherwise be the only place on the
+			// screen claiming uncertainty that doesn't actually exist.
+			// Sharing the condition makes the two structurally unable to
+			// disagree.
+			if netLow != netHigh {
 				// Review finding (post-ship follow-up #1): a leading "+" here reads
 				// as money coming IN, sitting right under a negative (outflow)
 				// figure — this line means MORE refund, i.e. more money OUT, and
@@ -393,24 +421,6 @@ func (b *Bot) adminDashboardText(chatID int64) string {
 				refundedBlock += "\n              a further " + b.usdtDisp(r.RefundedUnknownUpperBound) +
 					" may have been refunded, unrecorded  (" + itoa64(r.RefundedUnknownCount) +
 					" legacy orders — actual refund not recorded)"
-			}
-			// Net is now a RANGE, not a relabelled DeliveredRevenue (task #20
-			// stage S3 — this is the ONE figure that actually moves on this
-			// screen; S1/S2 were invisible by design). Cash actually retained
-			// is Gross minus what was ACTUALLY credited back, and each unknown
-			// row's actual credit is somewhere in [0, its own total], so the
-			// true figure is somewhere in
-			// [Gross-Known-UnknownUpperBound, Gross-Known]. When there is no
-			// legacy unknown (RefundedUnknownUpperBound==0, which misc.go's
-			// query guarantees whenever RefundedUnknownCount==0), netLow ==
-			// netHigh and the range collapses to a single point automatically
-			// — no special-casing needed, so a fresh shop (and this shop,
-			// eventually) renders a plain number.
-			netHigh := grossRevenue - r.RefundedAmountKnown
-			netLow := netHigh - r.RefundedUnknownUpperBound
-			netLine := b.usdtDisp(netHigh)
-			if netLow != netHigh {
-				netLine = b.usdtDisp(netLow) + " – " + netLine
 			}
 			// Today is delivered-only, i.e. the same NET basis as the Net line
 			// above (it has no refund split of its own — a same-day refund is

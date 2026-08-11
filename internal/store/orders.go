@@ -168,6 +168,19 @@ func (s *Store) MarkEntraDeleted(des string, ts float64) error {
 // by the time this is called, so callers must log a returned error and
 // continue rather than propagate it into a path that could unwind a
 // completed credit.
+//
+// CONSTRAINT ON FUTURE WORK: unlike refund_kind, which ClaimOrderKind clears
+// back to NULL on every revert transition (fromStatus="refunded"), nothing
+// clears refunded_amount on a revert. That is harmless TODAY only because
+// the three existing revert sites (apikey_deliver.go's two ClaimOrder(des,
+// "refunded", "paid") calls and purchase.go's matching one) revert kinds
+// that never write this column in the first place (mint_failed /
+// out_of_stock forward transitions never call SetRefundedAmount — only the
+// customer/admin_cancel refund paths do). If a future writer ever calls
+// SetRefundedAmount on an order whose kind can later be reverted, that
+// writer must also clear refunded_amount (e.g. back to NULL) on the revert
+// path, or a reverted order — one that is no longer refunded at all — keeps
+// reporting a refund amount for a refund that no longer exists.
 func (s *Store) SetRefundedAmount(des string, amount int64) error {
 	res, err := s.db.Exec("UPDATE orders SET refunded_amount=? WHERE des=?", amount, des)
 	if err != nil {
