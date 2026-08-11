@@ -33,19 +33,26 @@
 //     id, never silently omitted); Credits must be > 0 (checked client-side,
 //     before any HTTP call); tokenLimit is hardcoded to 0 in the wire
 //     payload and is not a caller-settable field.
-//     3b. TWO MINT CLASSES through provision_customer, architecture-go.md §6:
-//     - bedrock (SaleClassBedrock, or "" legacy): accountId REQUIRED (rule 3
-//     above); gated on the sell side by Configured() (base URL + admin key
-//     + account id).
-//     - kiro (SaleClassKiro): sends saleClass:"kiro", skipUpstream:true
-//     (hardcoded — not caller-controlled, same treatment as tokenLimit),
-//     and NO accountId field on the wire at all (an explicit AccountID on
-//     a kiro request is rejected client-side — ErrAccountIDForbiddenForKiro
-//     — rather than silently dropped, since silently dropping a caller's
-//     explicit value is its own bug class). Gated on the sell side by
-//     ConfiguredBase() (base URL + admin key only) — requiring an account
-//     id here would hide a fully sellable product behind a setting its
-//     mints never read (telegram_bot.py:5829-5836).
+//
+// Invariant 3b, TWO MINT CLASSES through provision_customer
+// (architecture-go.md §6), is a named sub-rule of #3 above, deliberately
+// kept as one prose paragraph rather than its own numbered or bulleted
+// item: gofmt's doc-comment formatter only recognizes plain sequential
+// digits as list markers (not a letter suffix like "3b"), and even a
+// "-"-bulleted sub-list here got its own "+"-prefixed wrapped line read
+// back as a THIRD bullet — either shape silently re-mangles on the next
+// gofmt -w. Bedrock (SaleClassBedrock, or "" legacy) REQUIRES accountId
+// (rule 3 above) and is gated on the sell side by Configured() (base URL,
+// admin key, and account id all set). Kiro (SaleClassKiro) sends
+// saleClass:"kiro", skipUpstream:true (hardcoded — not caller-controlled,
+// same treatment as tokenLimit) and NO accountId field on the wire at all
+// — an explicit AccountID on a kiro request is rejected client-side
+// (ErrAccountIDForbiddenForKiro) rather than silently dropped, since
+// silently dropping a caller's explicit value is its own bug class. Kiro
+// is gated on the sell side by ConfiguredBase() (base URL and admin key
+// only) — requiring an account id here would hide a fully sellable
+// product behind a setting its mints never read (telegram_bot.py:5829-5836).
+//
 //  4. -1 in any *Remaining field means unlimited, with the corresponding
 //     limit at zero — modeled as the Remaining int64 type with IsUnlimited().
 //  5. DeleteAPIKey's upstreamRevoked is tri-state: absent (old server) is NOT
