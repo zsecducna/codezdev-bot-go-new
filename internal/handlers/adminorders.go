@@ -262,7 +262,8 @@ func (b *Bot) doRefund(ctx context.Context, o *store.Order, method string, force
 	res := &refundResult{Amount: amount, UnitsTotal: unitsTotal, UnitNum: unitNum, Unit: unit,
 		Method: method, PaidTotal: won.Total}
 	var balanceStr string
-	if method == "balance" {
+	switch method {
+	case "balance":
 		newBal, err := b.store.CreditBalance(won.ChatID, amount)
 		if err != nil {
 			// The claim already committed — the order IS 'refunded'. Money must
@@ -281,9 +282,31 @@ func (b *Bot) doRefund(ctx context.Context, o *store.Order, method string, force
 			b.notifyOwners(ctx, "🚨 REFUND CREDIT FAILED — MANUAL FIX REQUIRED\n"+
 				"🧾 "+o.Des+"\n👤 "+won.ChatID+"\n💰 "+b.usdtDisp(amount)+"\n"+
 				"Order IS 'refunded'; credit the wallet by hand.")
+			// The claim already committed but nothing was credited: record 0,
+			// not NULL — 0 is literally true (nothing reached the customer).
+			// This write must never fail the refund it records (see
+			// SetRefundedAmount's doc comment), so log-and-continue only.
+			// Residual: if an operator hand-credits later per the alert
+			// above, nothing updates this column — that order under-reports
+			// forever.
+			if serr := b.store.SetRefundedAmount(won.Des, 0); serr != nil {
+				log.Printf("SetRefundedAmount(%s, 0) failed: %v", won.Des, serr)
+			}
 		} else {
 			res.Balance = newBal
 			balanceStr = b.usdtDisp(newBal)
+			if serr := b.store.SetRefundedAmount(won.Des, amount); serr != nil {
+				log.Printf("SetRefundedAmount(%s, %d) failed: %v", won.Des, amount, serr)
+			}
+		}
+	case "manual":
+		// No CreditBalance call for a manual payout — the admin pays out
+		// off-platform. Cash still left the business, so for a revenue
+		// report the honest value is the computed amount, though it is
+		// unverifiable from the wallet ledger (no balance transaction backs
+		// it).
+		if serr := b.store.SetRefundedAmount(won.Des, amount); serr != nil {
+			log.Printf("SetRefundedAmount(%s, %d) failed: %v", won.Des, amount, serr)
 		}
 	}
 

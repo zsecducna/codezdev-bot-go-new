@@ -148,6 +148,46 @@ func (s *Store) MarkEntraDeleted(des string, ts float64) error {
 	return err
 }
 
+// SetRefundedAmount stamps the CREDITED-back amount on an order (task #20,
+// stage S2). It is written as a SECOND update, strictly AFTER the caller has
+// confirmed real money moved (or, for a manual payout, that it was handed
+// out off-platform) — never alongside ClaimOrderKind's status flip. Both
+// ClaimOrderKind call sites have a CreditFailed branch where the order is
+// ALREADY 'refunded' and ZERO money moved; if this column were written in
+// the same statement as the claim, it would assert a completed refund on
+// exactly the path that exists to alert a human that nothing was credited.
+// So: this column means CREDITED, not intended.
+//
+// Deliberately no `WHERE status='refunded'` guard: by the time a caller has
+// a figure to write, ClaimOrderKind has already committed the status change,
+// so there is no race left to guard here, and a status predicate would only
+// give a mismatched/retried write a way to silently no-op instead of erroring.
+//
+// This write must never be able to fail the refund it records — the money
+// has already moved (or, for CreditFailed, already definitively NOT moved)
+// by the time this is called, so callers must log a returned error and
+// continue rather than propagate it into a path that could unwind a
+// completed credit.
+func (s *Store) SetRefundedAmount(des string, amount int64) error {
+	res, err := s.db.Exec("UPDATE orders SET refunded_amount=? WHERE des=?", amount, des)
+	if err != nil {
+		return err
+	}
+	// A zero-match UPDATE would otherwise succeed silently and leave the
+	// refund recorded nowhere — nothing reads this column back to notice.
+	// `des` is the orders PRIMARY KEY, so exactly one row is the only correct
+	// outcome; anything else means the caller was handed an order id that
+	// does not exist.
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("store: SetRefundedAmount(%s) matched %d rows, want exactly 1", des, n)
+	}
+	return nil
+}
+
 // UpdateOrderCode attaches (or clears) an applied promo/referral code on a
 // RESERVED order and overwrites its total to the recomputed, code-adjusted
 // price (store.py:231-244). code=nil clears the code. Only a reserved order is

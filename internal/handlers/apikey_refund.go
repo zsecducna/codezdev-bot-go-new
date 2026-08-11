@@ -278,12 +278,14 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 	// The stuck never-applied order refunds at face value via its own atomic
 	// claim (its credits never reached the key, so it sits outside the maths).
 	var extra int64
+	var stuckDes string
 	if stuck {
 		// customer | admin_cancel (stats-fixes-spec.md §2.1): apikeyStuckRecharge
 		// only returns true when isRefundableStatus(o.Status) already holds, so
 		// the same {delivered, paid} branch applies as the group loop above.
 		if w, err := b.store.ClaimOrderKind(o.Des, o.Status, "refunded", refundKindForStatus(o.Status)); err == nil && w != nil {
 			extra = w.Total
+			stuckDes = w.Des
 			b.dropRefundAsOf(w.Des) // telegram_bot.py:4833
 		}
 	}
@@ -310,6 +312,12 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 		// already refunded earlier): pay its face value, nothing to pro-rate.
 		amount, used, bought = extra, 0, 0
 	}
+	// The portion of `amount` attributable to the pro-rated `won` members,
+	// as opposed to the stuck order's own face-value `extra`. This is also
+	// correct for forceFull (amountGroup == groupPaid, so splitRefundedAmount
+	// hands each member back its own Total) and for the stuck-only default
+	// case (amountGroup == 0, nothing to split).
+	amountGroup := amount - extra
 	// REVOKE the sold key on Kiro-Go so the refunded credits can't be spent, and
 	// stamp the row so the reveal button / My-Keys view stop re-serving it.
 	// Best-effort (the refund has already committed); on failure alert the OWNER
@@ -343,7 +351,8 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 	if extra != 0 {
 		res.GroupN++
 	}
-	if method == "balance" {
+	switch method {
+	case "balance":
 		newBal, err := b.store.CreditBalance(o.ChatID, amount)
 		if err != nil {
 			// The claims already committed. Money must never be silently dropped:
@@ -360,9 +369,32 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 			b.notifyOwners(ctx, fmt.Sprintf(
 				"🚨 REFUND CREDIT FAILED — MANUAL FIX REQUIRED\n🧾 %s\n👤 %s\n💰 %s\nOrders ARE 'refunded'; credit the wallet by hand.",
 				des, o.ChatID, b.usdtDisp(amount)))
+			// The claims already committed but nothing was credited: record 0
+			// (not NULL — 0 is literally true) for every order this call
+			// claimed, group and stuck alike. This write must never fail the
+			// refund it records (see SetRefundedAmount's doc comment), so
+			// log-and-continue only.
+			for _, w := range won {
+				if serr := b.store.SetRefundedAmount(w.Des, 0); serr != nil {
+					log.Printf("SetRefundedAmount(%s, 0) failed: %v", w.Des, serr)
+				}
+			}
+			if stuckDes != "" {
+				if serr := b.store.SetRefundedAmount(stuckDes, 0); serr != nil {
+					log.Printf("SetRefundedAmount(%s, 0) failed: %v", stuckDes, serr)
+				}
+			}
 		} else {
 			res.Balance = newBal
+			b.recordGroupRefundedAmounts(won, groupPaid, amountGroup, stuckDes, extra)
 		}
+	case "manual":
+		// No CreditBalance call for a manual payout — the admin pays out
+		// off-platform. Cash still left the business, so for a revenue
+		// report the honest value is the computed split, though it is
+		// unverifiable from the wallet ledger (no balance transaction backs
+		// it).
+		b.recordGroupRefundedAmounts(won, groupPaid, amountGroup, stuckDes, extra)
 	}
 	// Notify the customer (best-effort) — the same receipt the generic refund
 	// sends, anchored on the order they acted from. Skipped entirely when the
@@ -397,6 +429,58 @@ func (b *Bot) sendOK(ctx context.Context, chatID int64, text string) bool {
 		return false
 	}
 	return true
+}
+
+// splitRefundedAmount divides amountGroup (the slice of the group payout
+// attributable to `won`, i.e. amount minus the stuck order's own extra)
+// across won's members proportional to each member's paid Total — the exact
+// per-order share of a pro-rated group refund (task #20, stage S2). Plain
+// rounding of each share independently can drift from amountGroup by a unit
+// or two, so the residual is handed to the largest member (largest-remainder
+// method): this keeps SUM(shares) == amountGroup exactly, which is the
+// property that makes refunded_amount trustworthy for a group refund — the
+// stats query will one day just SUM() this column.
+func splitRefundedAmount(won []apikeyRefundMember, groupPaid, amountGroup int64) map[string]int64 {
+	out := make(map[string]int64, len(won))
+	if len(won) == 0 || groupPaid <= 0 {
+		return out
+	}
+	var assigned int64
+	largestIdx, largestTotal := 0, int64(-1)
+	for i, m := range won {
+		share := int64(math.Round(float64(amountGroup) * float64(m.Total) / float64(groupPaid)))
+		out[m.Des] = share
+		assigned += share
+		if m.Total > largestTotal {
+			largestTotal, largestIdx = m.Total, i
+		}
+	}
+	out[won[largestIdx].Des] += amountGroup - assigned
+	return out
+}
+
+// recordGroupRefundedAmounts writes refunded_amount for every order this
+// call paid out FOR REAL: the pro-rata split across won (via
+// splitRefundedAmount) plus the stuck order's own face value (extra).
+// Callers must only reach this after money has genuinely moved — a
+// successful CreditBalance, or a manual payout where cash left the business
+// off-platform — never on a CreditFailed path (that path writes 0 directly,
+// bypassing the split entirely). Same rule as SetRefundedAmount itself: this
+// bookkeeping write must never fail the refund it records, so every error is
+// logged and swallowed here too.
+func (b *Bot) recordGroupRefundedAmounts(won []apikeyRefundMember, groupPaid, amountGroup int64, stuckDes string, extra int64) {
+	shares := splitRefundedAmount(won, groupPaid, amountGroup)
+	for _, m := range won {
+		share := shares[m.Des]
+		if err := b.store.SetRefundedAmount(m.Des, share); err != nil {
+			log.Printf("SetRefundedAmount(%s, %d) failed: %v", m.Des, share, err)
+		}
+	}
+	if stuckDes != "" {
+		if err := b.store.SetRefundedAmount(stuckDes, extra); err != nil {
+			log.Printf("SetRefundedAmount(%s, %d) failed: %v", stuckDes, extra, err)
+		}
+	}
 }
 
 // ---- customer self-service preview / confirm --------------------------------

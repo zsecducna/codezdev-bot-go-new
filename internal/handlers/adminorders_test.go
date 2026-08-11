@@ -6,6 +6,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -23,6 +24,19 @@ import (
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// refundedAmountFor reads the raw refunded_amount column back for an order.
+// There is no Order.RefundedAmount field yet (stage S3, the stats read side,
+// hasn't landed), so tests reach for the column directly, the way the
+// eventual stats query will. ok is false when the column is still NULL.
+func refundedAmountFor(t *testing.T, st *store.Store, des string) (amount int64, ok bool) {
+	t.Helper()
+	var v sql.NullInt64
+	if err := st.DB().QueryRow("SELECT refunded_amount FROM orders WHERE des=?", des).Scan(&v); err != nil {
+		t.Fatalf("read refunded_amount(%s): %v", des, err)
+	}
+	return v.Int64, v.Valid
 }
 
 // newOrdersTestBot wires a Bot to real Store/Stock/RefundStore/Config
@@ -262,6 +276,106 @@ func TestDoRefundNormalLeavesStockInSold(t *testing.T) {
 	}
 	if bal, _ := st.GetBalance("555"); bal != res.Amount {
 		t.Errorf("balance changed on second refund attempt: %d, want unchanged %d", bal, res.Amount)
+	}
+}
+
+// ============================================================================
+// refunded_amount — S2 bookkeeping (task #20)
+// ============================================================================
+
+// TestDoRefundRecordsRefundedAmount proves the write is CREDITED, not
+// intended: a partial warranty refund (only some days remain) must record the
+// same partial figure that was actually credited to the wallet, not the
+// order's full total. Deleting the SetRefundedAmount call in doRefund's
+// balance-success branch turns this test red (refunded_amount stays NULL).
+func TestDoRefundRecordsRefundedAmount(t *testing.T) {
+	b, _, st, _, _, _, _ := newOrdersTestBot(t, "1")
+	des := store.NewDes()
+	if err := st.CreateOrder(des, "42", "en", "prod", "BH7D", 1, 7000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOrder(des, "reserved", "delivered"); err != nil {
+		t.Fatal(err)
+	}
+	o, _ := st.GetOrder(des)
+	b.now = func() time.Time { return time.Unix(int64(o.TS), 0) } // refund immediately -> 6/7 days left, NOT the full total
+
+	res := b.doRefund(context.Background(), o, "balance", false)
+	if res == nil {
+		t.Fatal("doRefund returned nil, want a result")
+	}
+	if res.Amount == o.Total {
+		t.Fatalf("res.Amount = %d equals o.Total %d — this test needs a genuinely PARTIAL refund to be meaningful", res.Amount, o.Total)
+	}
+	got, ok := refundedAmountFor(t, st, des)
+	if !ok || got != res.Amount {
+		t.Errorf("refunded_amount = (valid=%v, %d), want (true, %d) — the actual CREDITED amount, not o.Total (%d)",
+			ok, got, res.Amount, o.Total)
+	}
+}
+
+// TestDoRefundCreditFailedRecordsZeroRefundedAmount proves the CreditFailed
+// branch — where the claim committed 'refunded' but CreditBalance errored and
+// ZERO money moved — records 0, not the would-be amount and not NULL. This is
+// exactly the path a naive "write refunded_amount alongside the claim" would
+// get wrong: the claim already committed by the time CreditBalance is even
+// attempted. Deleting the SetRefundedAmount(des, 0) call turns this test red
+// (refunded_amount stays NULL, which reads as "unknown" instead of the true
+// "definitely credited zero").
+func TestDoRefundCreditFailedRecordsZeroRefundedAmount(t *testing.T) {
+	b, _, st, _, _, _, _ := newOrdersTestBot(t, "1")
+	des := store.NewDes()
+	if err := st.CreateOrder(des, "42", "en", "prod", "BH7D", 1, 7000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOrder(des, "reserved", "delivered"); err != nil {
+		t.Fatal(err)
+	}
+	o, _ := st.GetOrder(des)
+	b.now = func() time.Time { return time.Unix(int64(o.TS), 0) }
+
+	if _, err := st.DB().Exec("DROP TABLE balances"); err != nil {
+		t.Fatal(err)
+	}
+
+	res := b.doRefund(context.Background(), o, "balance", false)
+	if res == nil || !res.CreditFailed {
+		t.Fatalf("res = %+v, want a claimed refund with CreditFailed=true", res)
+	}
+	got, ok := refundedAmountFor(t, st, des)
+	if !ok || got != 0 {
+		t.Errorf("refunded_amount = (valid=%v, %d), want (true, 0) — nothing was actually credited", ok, got)
+	}
+}
+
+// TestDoRefundManualRecordsRefundedAmount proves the "manual" payout method
+// (admin pays out off-platform, no CreditBalance call at all) still records
+// refunded_amount — cash left the business, so the honest revenue figure is
+// the computed amount, even though it can't be verified against a wallet
+// transaction. Deleting the SetRefundedAmount call in doRefund's manual
+// branch turns this test red.
+func TestDoRefundManualRecordsRefundedAmount(t *testing.T) {
+	b, _, st, _, _, _, _ := newOrdersTestBot(t, "1")
+	des := store.NewDes()
+	if err := st.CreateOrder(des, "42", "en", "prod", "BH7D", 1, 7000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOrder(des, "reserved", "delivered"); err != nil {
+		t.Fatal(err)
+	}
+	o, _ := st.GetOrder(des)
+	b.now = func() time.Time { return time.Unix(int64(o.TS), 0) }
+
+	res := b.doRefund(context.Background(), o, "manual", false)
+	if res == nil {
+		t.Fatal("doRefund returned nil, want a result")
+	}
+	if bal, _ := st.GetBalance("42"); bal != 0 {
+		t.Errorf("balance = %d, want 0 — manual payout must never call CreditBalance", bal)
+	}
+	got, ok := refundedAmountFor(t, st, des)
+	if !ok || got != res.Amount {
+		t.Errorf("refunded_amount = (valid=%v, %d), want (true, %d)", ok, got, res.Amount)
 	}
 }
 
