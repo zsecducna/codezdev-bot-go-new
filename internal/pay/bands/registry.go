@@ -136,7 +136,8 @@ func (r *Registry) Params(p Provider) (Params, bool) {
 }
 
 // Reserve allocates a unique amount for (base price, provider, chat) and records
-// it. Called when a pay/deposit screen is opened.
+// it. Called when a pay/deposit screen is opened. Product orders use this: an
+// undercharge on the last-resort downward slot is an acceptable seller cost.
 //
 // TWO PASSES, exactly as in Python (_binance_unique_amount @9095,
 // _bep20_unique_amount @9397, _tron_unique_amount @9888):
@@ -153,6 +154,26 @@ func (r *Registry) Params(p Provider) (Params, bool) {
 // Re-reserving an existing Des overwrites its row and — deliberately — does not
 // let the old row block the new pick (a row can never collide with itself).
 func (r *Registry) Reserve(p Provider, base, chatID, des string, deadline time.Time) (Reservation, error) {
+	return r.reserve(p, base, chatID, des, deadline, true)
+}
+
+// ReserveUpwardOnly is Reserve's twin for a money path where quoting BELOW the
+// customer's requested base would be a straight giveaway, not a seller-absorbed
+// courtesy — currently only USDT deposits (handlers.startOnchainDeposit):
+// DepositCredit rounds an exact match up to the customer's FULL requested
+// total regardless of which band amount they were actually quoted, so the
+// last-resort downward slot below base would hand out free USDT. Everything
+// else — the two-pass eviction, cross-provider collision set, MinGap spacing,
+// ErrBandExhausted on exhaustion — is identical to Reserve; it just never
+// takes uniqueAmountUnits' downward fallback, so exhaustion happens one slot
+// sooner (Slots() upward tries only, no last resort).
+func (r *Registry) ReserveUpwardOnly(p Provider, base, chatID, des string, deadline time.Time) (Reservation, error) {
+	return r.reserve(p, base, chatID, des, deadline, false)
+}
+
+// reserve is Reserve/ReserveUpwardOnly's shared body; allowDownward gates the
+// picker's last-resort downward slot (see uniqueAmountUnits).
+func (r *Registry) reserve(p Provider, base, chatID, des string, deadline time.Time, allowDownward bool) (Reservation, error) {
 	if des == "" {
 		return Reservation{}, fmt.Errorf("bands: Reserve needs a non-empty des")
 	}
@@ -167,9 +188,9 @@ func (r *Registry) Reserve(p Provider, base, chatID, des string, deadline time.T
 		return Reservation{}, err
 	}
 	// Pass 1, then pass 2 with long-dead rows evicted under pressure.
-	cu, ok := uniqueAmountUnits(prm, baseU, r.collisionUnits(p, prm, chatID, des, false))
+	cu, ok := uniqueAmountUnits(prm, baseU, r.collisionUnits(p, prm, chatID, des, false), allowDownward)
 	if !ok {
-		cu, ok = uniqueAmountUnits(prm, baseU, r.collisionUnits(p, prm, chatID, des, true))
+		cu, ok = uniqueAmountUnits(prm, baseU, r.collisionUnits(p, prm, chatID, des, true), allowDownward)
 	}
 	if !ok {
 		return Reservation{}, ErrBandExhausted

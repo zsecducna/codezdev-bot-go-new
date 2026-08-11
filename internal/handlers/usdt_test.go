@@ -356,8 +356,10 @@ func TestUSDTSharedBandAcrossRails(t *testing.T) {
 
 // TestUSDTBandExhaustedShowsBusy: when every slot for a price is taken the rail
 // must answer USDT_BUSY and hand out NOTHING — refusing beats colliding
-// (telegram_bot.py:9092 "no clear slot: refuse rather than collide"). BEP20 has
-// 100//21 = 4 upward slots plus ONE last-resort slot below base.
+// (telegram_bot.py:9092 "no clear slot: refuse rather than collide"). This
+// drives the ORDER pay path (paybsc:), which still allows the last-resort
+// downward slot: BEP20 has 200//21 = 9 upward slots (widened
+// bands.SlotSpanWholeUnits=2) plus ONE last-resort slot below base.
 func TestUSDTBandExhaustedShowsBusy(t *testing.T) {
 	ctx := context.Background()
 	b, f, st, _, _ := newUSDTBot(t)
@@ -366,7 +368,7 @@ func TestUSDTBandExhaustedShowsBusy(t *testing.T) {
 	// Fill every slot from DISTINCT chats, so the own-dead-session rule (which
 	// only forgives a chat's OWN expired sessions) cannot free one.
 	taken := map[int64]bool{}
-	const slots = 5 // 4 upward (100/21) + 1 last-resort downward
+	const slots = 10 // 9 upward (200/21) + 1 last-resort downward
 	for i := range slots {
 		chat := int64(200 + i)
 		des := usdtOrder(t, st, chat, total)
@@ -871,6 +873,101 @@ func TestDepositAmountsAreUnique(t *testing.T) {
 	minGap := int64(2*tron.AmountMatchTol() + 1)
 	if d := uA - uB; (d < 0 && -d < minGap) || (d >= 0 && d < minGap) {
 		t.Errorf("deposit amounts %d and %d (units) are closer than the %d-unit min gap — bands overlap", uA, uB, minGap)
+	}
+}
+
+// TestDepositNeverQuotedBelowBase pins hands-free-deposits ruling (a): a
+// deposit must never fall back to the picker's last-resort DOWNWARD slot.
+// DepositCredit rounds an exact payment up to the customer's FULL requested
+// total regardless of which band amount they were actually quoted, so a
+// downward-slot deposit would be a straight giveaway (~0.21 USDT at the
+// shipped step) — adoptUSDTAmount could never produce this, and
+// reserveUSDTAmount must not either now that it picks amounts.
+//
+// Fills every widened upward TRON slot (9, bands.SlotSpanWholeUnits=2) with
+// distinct deposits at the same round base, then asserts the 10th is REFUSED
+// with USDT_BUSY rather than handed the downward amount a product order would
+// get in the same spot (see TestOrderCanTakeDownwardSlotDepositsCannot).
+func TestDepositNeverQuotedBelowBase(t *testing.T) {
+	ctx := context.Background()
+	b, f, _, _, _ := newUSDTBot(t)
+	const vnd = 3000000 // 120.00 USDT at 25,000 VND/USDT
+
+	for i := range 9 {
+		chat := int64(500 + i)
+		b.startOnchainDeposit(ctx, chat, i18n.EN, vnd, chainTRX)
+	}
+	amounts := usdtScreenAmounts(t, f)
+	if len(amounts) != 9 {
+		t.Fatalf("want 9 deposit screens (the widened upward span), got %d: %+v", len(amounts), amounts)
+	}
+	seen := map[string]bool{}
+	base, err := bands.AmountUnits(b.usdtStr(vnd), tron.AmountDecimals())
+	if err != nil {
+		t.Fatalf("AmountUnits(base): %v", err)
+	}
+	for _, a := range amounts {
+		if seen[a] {
+			t.Fatalf("amount %q handed to two deposits — bands are not unique", a)
+		}
+		seen[a] = true
+		u, err := bands.AmountUnits(a, tron.AmountDecimals())
+		if err != nil {
+			t.Fatalf("AmountUnits(%q): %v", a, err)
+		}
+		if u < base {
+			t.Errorf("deposit quoted %q, BELOW the base %q — the downward last-resort slot leaked into a deposit", a, b.usdtStr(vnd))
+		}
+	}
+
+	// The 10th deposit at the same price has no upward slot left. It must be
+	// REFUSED (USDT_BUSY), never handed the downward amount.
+	before := len(f.Sends)
+	b.startOnchainDeposit(ctx, 599, i18n.EN, vnd, chainTRX)
+	busy := i18n.C().Pay.USDTBusy.T(i18n.EN)
+	found := false
+	f.mu.Lock()
+	for _, s := range f.Sends[before:] {
+		if s.Text == busy {
+			found = true
+		}
+	}
+	f.mu.Unlock()
+	if !found {
+		t.Fatalf("10th deposit was not refused with USDT_BUSY; last send = %q", lastSend(f))
+	}
+	if got := usdtScreenAmounts(t, f); len(got) != 9 {
+		t.Fatalf("a 10th deposit screen was rendered (%+v) — the downward slot was handed to a deposit", got)
+	}
+}
+
+// TestOrderCanTakeDownwardSlotDepositsCannot pins the other half of ruling
+// (a): unlike a deposit, a PRODUCT ORDER may still be quoted the picker's
+// downward last-resort amount — a seller-absorbed <=step undercharge is an
+// acceptable cost there (Reserve, unlike ReserveUpwardOnly, must keep
+// offering it). This is also the widened-span check for ruling (b): filling
+// the 9 upward slots plus this 10th, downward one is reserving past the OLD
+// 5-slot cap and getting SUCCESS where it used to refuse.
+func TestOrderCanTakeDownwardSlotDepositsCannot(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, _ := newUSDTBot(t)
+	const total = 150000 // 6.00 USDT at 25,000 VND/USDT
+
+	for i := range 9 {
+		chat := int64(600 + i)
+		des := usdtOrder(t, st, chat, total)
+		b.Process(ctx, callbackUpdate(chat, "paybsc:"+des))
+	}
+	chat := int64(699)
+	des := usdtOrder(t, st, chat, total)
+	b.Process(ctx, callbackUpdate(chat, "paybsc:"+des))
+
+	res, ok := b.bands.Get(bands.ProviderBEP20, des)
+	if !ok {
+		t.Fatal("10th order was refused — the downward last-resort slot must still be offered to orders")
+	}
+	if res.Amount != "5.79" {
+		t.Errorf("10th order amount = %q, want %q (the downward last-resort slot)", res.Amount, "5.79")
 	}
 }
 

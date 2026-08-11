@@ -17,8 +17,9 @@ var (
 
 // TestParamsGeometry pins the invariant tests/test_usdt_verify.py:125-131
 // asserts: step >= 2*tol+1 (so +/-tol bands never overlap) and the resulting
-// per-price slot counts (100//21 = 4 upward slots for the on-chain rails — the
-// "max 4 slots per price" cap; 100//10 = 10 for Binance).
+// per-price slot counts. Widened by SlotSpanWholeUnits=2 (hands-free-deposits
+// ruling (b)): 200//21 = 9 upward slots for the on-chain rails, 200//10 = 20
+// for Binance.
 func TestParamsGeometry(t *testing.T) {
 	for name, p := range map[string]Params{"bep20": bep20Params, "tron": tronParams, "binance": binanceParams} {
 		if !p.SpacingOK() {
@@ -34,11 +35,11 @@ func TestParamsGeometry(t *testing.T) {
 	if got := bep20Params.MinGap(); got != 21 {
 		t.Errorf("bep20 MinGap() = %d, want 21", got)
 	}
-	if got := bep20Params.Slots(); got != 4 {
-		t.Errorf("bep20 Slots() = %d, want 4 (the max-4-slots-per-price cap)", got)
+	if got := bep20Params.Slots(); got != 9 {
+		t.Errorf("bep20 Slots() = %d, want 9 (the widened max-slots-per-price cap)", got)
 	}
-	if got := binanceParams.Slots(); got != 10 {
-		t.Errorf("binance Slots() = %d, want 10", got)
+	if got := binanceParams.Slots(); got != 20 {
+		t.Errorf("binance Slots() = %d, want 20", got)
 	}
 }
 
@@ -48,7 +49,7 @@ func TestParamsValidateRejectsBadGeometry(t *testing.T) {
 		"negative step": {Step: -1, Tol: 10, Decimals: 2},
 		"negative tol":  {Step: 21, Tol: -1, Decimals: 2},
 		"bad decimals":  {Step: 21, Tol: 10, Decimals: -1},
-		"step too wide": {Step: 101, Tol: 10, Decimals: 2}, // 100//101 = 0 slots
+		"step too wide": {Step: 201, Tol: 10, Decimals: 2}, // 200//201 = 0 slots
 	}
 	for name, p := range cases {
 		if err := p.Validate(); err == nil {
@@ -181,8 +182,8 @@ func TestUniqueAmountStepBands(t *testing.T) {
 		{"base taken -> +1 step", []string{"6.00"}, "6.21"},
 		{"two taken -> +2 steps", []string{"6.00", "6.21"}, "6.42"},
 		{"three taken -> +3 steps", []string{"6.00", "6.21", "6.42"}, "6.63"},
-		{"all 4 upward taken -> last-resort slot BELOW base",
-			[]string{"6.00", "6.21", "6.42", "6.63"}, "5.79"},
+		{"all 9 upward taken -> last-resort slot BELOW base",
+			[]string{"6.00", "6.21", "6.42", "6.63", "6.84", "7.05", "7.26", "7.47", "7.68"}, "5.79"},
 		// An off-grid live amount blocks EVERY slot whose +/-tol band it
 		// overlaps: 6.05's band is [5.95,6.15] and 6.21's is [6.11,6.31], so
 		// minGap (21) rejects both 6.00 and 6.21 -> the picker lands on 6.42.
@@ -204,7 +205,7 @@ func TestUniqueAmountStepBands(t *testing.T) {
 // (telegram_bot.py:9092). This is the "band exhausted" incident case; the
 // handlers must show BUSY, never fall through to a duplicate amount.
 func TestUniqueAmountExhausted(t *testing.T) {
-	used := []string{"6.00", "6.21", "6.42", "6.63", "5.79"}
+	used := []string{"6.00", "6.21", "6.42", "6.63", "6.84", "7.05", "7.26", "7.47", "7.68", "5.79"}
 	if _, err := UniqueAmount(bep20Params, "6.00", used); !errors.Is(err, ErrBandExhausted) {
 		t.Errorf("UniqueAmount with every slot taken = %v, want ErrBandExhausted", err)
 	}
@@ -214,15 +215,17 @@ func TestUniqueAmountExhausted(t *testing.T) {
 // would be <= 0, so the last-resort slot must not be offered
 // (telegram_bot.py:9089 `if cu > 0`).
 func TestUniqueAmountNoNegativeLastResort(t *testing.T) {
-	// base 0.10 = 10 units, step 21 -> down slot would be -11.
-	used := []string{"0.10", "0.31", "0.52", "0.73"}
+	// base 0.10 = 10 units, step 21 -> down slot would be -11. All 9 upward
+	// slots (widened SlotSpanWholeUnits=2) must be filled first.
+	used := []string{"0.10", "0.31", "0.52", "0.73", "0.94", "1.15", "1.36", "1.57", "1.78"}
 	if _, err := UniqueAmount(bep20Params, "0.10", used); !errors.Is(err, ErrBandExhausted) {
 		t.Errorf("UniqueAmount at a sub-step price = %v, want ErrBandExhausted (no negative slot)", err)
 	}
 }
 
 // TestUniqueAmountBinanceGeometry: the tighter Binance geometry (step 10, tol 4)
-// yields 10 upward slots and a 9-unit minGap (binance_pay.py:50-58).
+// yields 20 upward slots (widened SlotSpanWholeUnits=2) and a 9-unit minGap
+// (binance_pay.py:50-58).
 func TestUniqueAmountBinanceGeometry(t *testing.T) {
 	got, err := UniqueAmount(binanceParams, "6.00", []string{"6.00"})
 	if err != nil {
@@ -231,9 +234,9 @@ func TestUniqueAmountBinanceGeometry(t *testing.T) {
 	if got != "6.10" {
 		t.Errorf("binance second slot = %q, want %q", got, "6.10")
 	}
-	// 6.00..6.90 is 10 slots; then the 5.90 last resort; then exhausted.
+	// 6.00..7.90 is 20 slots; then the 5.90 last resort; then exhausted.
 	var used []string
-	for k := range 10 {
+	for k := range 20 {
 		used = append(used, FormatUnits(600+int64(k)*10, 2))
 	}
 	got, err = UniqueAmount(binanceParams, "6.00", used)

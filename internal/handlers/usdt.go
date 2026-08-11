@@ -323,11 +323,21 @@ func (b *Bot) dropUSDTPending(p bands.Provider, des string) {
 // Returns bands.ErrBandExhausted when every slot for this price is ambiguous —
 // the caller MUST answer USDT_BUSY and refuse, never fall back to a colliding
 // amount.
-func (b *Bot) reserveUSDTAmount(p bands.Provider, baseUSDT, chatID, des string, total, sinceMS int64, deadline time.Time) (string, error) {
+//
+// allowDownward selects Reserve (product orders: the last-resort downward
+// slot is an acceptable seller-absorbed undercharge) vs ReserveUpwardOnly
+// (deposits: DepositCredit would round an exact downward-slot payment up to
+// the customer's full requested total, so quoting below their request is a
+// straight giveaway there — see ReserveUpwardOnly's doc comment).
+func (b *Bot) reserveUSDTAmount(p bands.Provider, baseUSDT, chatID, des string, total, sinceMS int64, deadline time.Time, allowDownward bool) (string, error) {
 	if res, ok := b.bands.Get(p, des); ok {
 		return res.Amount, nil // re-tap: same amount + same window
 	}
-	res, err := b.bands.Reserve(p, baseUSDT, chatID, des, deadline)
+	reserve := b.bands.ReserveUpwardOnly
+	if allowDownward {
+		reserve = b.bands.Reserve
+	}
+	res, err := reserve(p, baseUSDT, chatID, des, deadline)
 	if err != nil {
 		return "", err
 	}
@@ -445,7 +455,9 @@ func (b *Bot) startOnchainDeposit(ctx context.Context, chatID int64, lang i18n.L
 	// startBep20Deposit/startTronDeposit for why. Mirrors cbPayOnchain's
 	// order-pay call below: no caller-side log, sendBandError already logs a
 	// non-exhaustion failure itself, so logging here too would double it up.
-	picked, err := b.reserveUSDTAmount(p, amount, fmtInt(chatID), des, vnd, now.UnixMilli(), deadline)
+	// allowDownward=false: a deposit must never be quoted below what the
+	// customer asked to send (see reserveUSDTAmount's doc comment).
+	picked, err := b.reserveUSDTAmount(p, amount, fmtInt(chatID), des, vnd, now.UnixMilli(), deadline, false)
 	if err != nil {
 		b.abandonUSDTStub(des)
 		// Band exhaustion is "busy", not "unconfigured" — sendBandError picks
@@ -676,8 +688,11 @@ func (b *Bot) cbPayOnchain(cc *cbCtx, chain string) {
 		return
 	}
 	created := b.orderTS(o)
+	// allowDownward=true: an order MAY absorb the last-resort downward slot's
+	// undercharge as a seller cost, unlike a deposit — this is Reserve's
+	// original, unchanged behavior.
 	amount, err := b.reserveUSDTAmount(p, base, o.ChatID, o.Des,
-		o.Total, created.UnixMilli(), created.Add(b.expiryTimeout))
+		o.Total, created.UnixMilli(), created.Add(b.expiryTimeout), true)
 	if err != nil {
 		b.sendBandError(cc.Ctx, cc.ChatID, lang, err, noID)
 		return

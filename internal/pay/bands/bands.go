@@ -113,13 +113,35 @@ func (p Params) MinGap() int { return 2*p.Tol + 1 }
 // it only reduces how many concurrent same-price orders fit.
 func (p Params) SpacingOK() bool { return p.Step >= p.MinGap() }
 
-// Slots is the number of UPWARD slots the picker will try: scale//step, i.e.
-// how many `base + k*step` values stay strictly below base+1.00
-// (telegram_bot.py:9085 `for k in range(scale // step)`). At the shipped
-// defaults that is 100//21 = 4 for BEP20/TRON (the "max 4 slots per price"
-// cap) and 100//10 = 10 for Binance. One extra LAST-RESORT slot at base-step
-// exists below these (telegram_bot.py:9089).
-func (p Params) Slots() int { return int(pow10Int64(p.Decimals) / int64(p.Step)) }
+// SlotSpanWholeUnits is how many WHOLE units of price the upward slot search
+// spans: the picker tries base, base+step, ... up to
+// base + SlotSpanWholeUnits (exclusive) before giving up upward and, for
+// callers that allow it, falling back to the single last-resort downward
+// slot (telegram_bot.py:9085 originally spanned exactly 1 whole unit; ported
+// as `scale // step`).
+//
+// TRADEOFF (hands-free-deposits ruling (b)): doubled from 1 to 2 whole units
+// to buy back headroom the deposit unique-amount work now spends one-way —
+// a live band is held for the full customer-facing deposit window (up to an
+// hour) and a deposit can no longer fall back to the downward slot (see
+// ReserveUpwardOnly), so more upward slots means fewer customers refused
+// USDT_BUSY under concurrent same-price traffic. The cost is a wider
+// worst-case gap between the amount a customer is quoted and the amount they
+// actually asked for — up to just under SlotSpanWholeUnits whole units (e.g.
+// up to ~1.89 USDT at the shipped 21-cent BEP20/TRON step) before the last
+// upward slot is tried.
+const SlotSpanWholeUnits = 2
+
+// Slots is the number of UPWARD slots the picker will try:
+// SlotSpanWholeUnits*scale//step, i.e. how many `base + k*step` values stay
+// strictly below base+SlotSpanWholeUnits (telegram_bot.py:9085 `for k in
+// range(scale // step)`, widened by SlotSpanWholeUnits). At the shipped
+// BEP20/TRON defaults (step 21, decimals 2) that is 200//21 = 9; Binance
+// (step 10) gets 200//10 = 20. One extra LAST-RESORT slot at base-step exists
+// below these for callers that allow it (telegram_bot.py:9089).
+func (p Params) Slots() int {
+	return int(int64(SlotSpanWholeUnits) * pow10Int64(p.Decimals) / int64(p.Step))
+}
 
 // Validate rejects geometry the picker cannot work with.
 func (p Params) Validate() error {
@@ -230,7 +252,10 @@ func UniqueAmount(p Params, base string, used []string) (string, error) {
 		}
 		usedU = append(usedU, blocker{units: u, minGap: int64(p.MinGap())})
 	}
-	cu, ok := uniqueAmountUnits(p, baseU, usedU)
+	// true: UniqueAmount is the general-purpose picker (no production caller
+	// since the deposit path moved to Registry.ReserveUpwardOnly) — it keeps
+	// the original allow-downward behavior every existing test here pins.
+	cu, ok := uniqueAmountUnits(p, baseU, usedU, true)
 	if !ok {
 		return "", ErrBandExhausted
 	}
@@ -250,14 +275,29 @@ type blocker struct {
 // uniqueAmountUnits is the picker in integer units. Callers have already
 // normalised `usedU` to p.Decimals. Pure and allocation-free so the registry
 // can call it under its mutex.
-func uniqueAmountUnits(p Params, baseU int64, usedU []blocker) (int64, bool) {
+//
+// allowDownward gates the single last-resort slot BELOW base
+// (telegram_bot.py:9089-9091, e.g. 5.79 for a 6.00 price): a product order
+// may absorb that <=step undercharge as a seller cost rather than refuse the
+// sale, but a DEPOSIT must never be quoted below what the customer asked to
+// send — DepositCredit rounds an exact match up to the customer's full
+// requested total regardless of which band amount they were actually quoted,
+// so a downward deposit slot is a straight giveaway, not a courtesy. Callers
+// that must never underquote (Registry.ReserveUpwardOnly) pass false and
+// accept ErrBandExhausted instead once the upward slots run out.
+func uniqueAmountUnits(p Params, baseU int64, usedU []blocker, allowDownward bool) (int64, bool) {
 	step := int64(p.Step)
-	// Upward slots first: base, base+step, ... strictly below base+1 whole unit.
+	// Upward slots first: base, base+step, ... strictly below
+	// base+SlotSpanWholeUnits. Upward is preferred because it never
+	// undercharges.
 	for k := int64(0); k < int64(p.Slots()); k++ {
 		cu := baseU + k*step
 		if slotClear(cu, usedU) {
 			return cu, true
 		}
+	}
+	if !allowDownward {
+		return 0, false
 	}
 	// Last resort: the single slot BELOW base (telegram_bot.py:9089-9091).
 	// `cu > 0` guards a price so small that base-step would be zero/negative.

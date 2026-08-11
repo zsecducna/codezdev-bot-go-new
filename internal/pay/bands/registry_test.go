@@ -77,14 +77,17 @@ func TestNewRejectsEmptyAndBadParams(t *testing.T) {
 	}
 }
 
-// TestReserveFillsSlotsThenExhausts is the capacity contract: 4 upward slots per
-// price (telegram_bot.py:9085, 100//21), then the single last-resort slot below
-// base (telegram_bot.py:9089), then a clear ErrBandExhausted instead of a silent
+// TestReserveFillsSlotsThenExhausts is the capacity contract: 9 upward slots
+// per price (widened SlotSpanWholeUnits=2, telegram_bot.py:9085's 100//21
+// doubled to 200//21), then the single last-resort slot below base
+// (telegram_bot.py:9089), then a clear ErrBandExhausted instead of a silent
 // collision (telegram_bot.py:9092). Every reserver is a DIFFERENT chat and every
-// session is live, so no exclusion rule applies.
+// session is live, so no exclusion rule applies. This is also the test that
+// pins ruling (b) directly: it reserves past the OLD 5-slot cap and expects
+// success, not a refusal, all the way out to slot 10.
 func TestReserveFillsSlotsThenExhausts(t *testing.T) {
 	r, _ := newTestRegistry(t)
-	want := []string{"6.00", "6.21", "6.42", "6.63", "5.79"}
+	want := []string{"6.00", "6.21", "6.42", "6.63", "6.84", "7.05", "7.26", "7.47", "7.68", "5.79"}
 	for i, w := range want {
 		res, err := r.Reserve(ProviderBEP20, "6.00", chatN(i), desN(i), tLive)
 		if err != nil {
@@ -97,7 +100,7 @@ func TestReserveFillsSlotsThenExhausts(t *testing.T) {
 			t.Errorf("Reserve #%d units = %d/%d dec, want %d/2", i, res.Units, res.Decimals, mustUnits(t, w))
 		}
 	}
-	if _, err := r.Reserve(ProviderBEP20, "6.00", chatN(9), desN(9), tLive); !errors.Is(err, ErrBandExhausted) {
+	if _, err := r.Reserve(ProviderBEP20, "6.00", chatN(len(want)), desN(len(want)), tLive); !errors.Is(err, ErrBandExhausted) {
 		t.Errorf("Reserve past capacity = %v, want ErrBandExhausted", err)
 	}
 	if got := r.Len(ProviderBEP20); got != len(want) {
@@ -267,6 +270,14 @@ func TestReserveOwnDeadSessionsDoNotBlock(t *testing.T) {
 	adopt(t, r, ProviderBEP20, "own-b", "7", "6.42", tDead) // own, dead
 	adopt(t, r, ProviderBEP20, "own-c", "7", "6.63", tDead) // own, dead
 	adopt(t, r, ProviderBEP20, "far-d", "9", "6.00", tLive) // foreign, live
+	// Foreign, live: fills the rest of the widened (SlotSpanWholeUnits=2) upward
+	// span so the chat-less call below still has to fall through to the
+	// downward last-resort slot rather than landing on 6.84.
+	adopt(t, r, ProviderBEP20, "far-g", "9", "6.84", tLive)
+	adopt(t, r, ProviderBEP20, "far-h", "9", "7.05", tLive)
+	adopt(t, r, ProviderBEP20, "far-i", "9", "7.26", tLive)
+	adopt(t, r, ProviderBEP20, "far-j", "9", "7.47", tLive)
+	adopt(t, r, ProviderBEP20, "far-k", "9", "7.68", tLive)
 
 	// Own dead rows freed -> the first slot clear of the foreign 6.00 band is 6.21.
 	res, err := r.Reserve(ProviderBEP20, "6.00", "7", "new-1", tLive)
@@ -303,8 +314,10 @@ func TestReserveOwnDeadSessionsDoNotBlock(t *testing.T) {
 // and the rows are KEPT so their late payment is still submittable.
 func TestReserveEvictsStaleRowsUnderPressure(t *testing.T) {
 	r, _ := newTestRegistry(t)
-	// All five slots held by a FOREIGN chat, every row dead for 3000s > 1800s.
-	for i, a := range []string{"6.00", "6.21", "6.42", "6.63", "5.79"} {
+	// All ten slots (9 widened upward + 1 downward last-resort) held by a
+	// FOREIGN chat, every row dead for 3000s > 1800s.
+	all := []string{"6.00", "6.21", "6.42", "6.63", "6.84", "7.05", "7.26", "7.47", "7.68", "5.79"}
+	for i, a := range all {
 		adopt(t, r, ProviderBEP20, desN(i), "9", a, tStale)
 	}
 	res, err := r.Reserve(ProviderBEP20, "6.00", "7", "fresh", tLive)
@@ -316,8 +329,8 @@ func TestReserveEvictsStaleRowsUnderPressure(t *testing.T) {
 	}
 	// Eviction is soft: the stale rows are still present (their late payment can
 	// still be submitted against their own order).
-	if got := r.Len(ProviderBEP20); got != 6 {
-		t.Errorf("Len = %d, want 6 — eviction must NOT delete rows", got)
+	if want := len(all) + 1; r.Len(ProviderBEP20) != want {
+		t.Errorf("Len = %d, want %d — eviction must NOT delete rows", r.Len(ProviderBEP20), want)
 	}
 
 	// A stale row does NOT get evicted when the first pass already has a slot:
@@ -676,9 +689,9 @@ func TestReserveSameDesDoesNotBlockItself(t *testing.T) {
 }
 
 // TestConcurrentReserveNeverDuplicates: many chats race for the same price on
-// the same rail. Exactly the 5 slots must be handed out, each exactly once, and
-// everyone else must get ErrBandExhausted — never a duplicate amount. Run with
-// -race.
+// the same rail. Exactly the 10 slots (widened SlotSpanWholeUnits=2) must be
+// handed out, each exactly once, and everyone else must get ErrBandExhausted —
+// never a duplicate amount. Run with -race.
 func TestConcurrentReserveNeverDuplicates(t *testing.T) {
 	r, _ := newTestRegistry(t)
 	const n = 64
@@ -713,19 +726,20 @@ func TestConcurrentReserveNeverDuplicates(t *testing.T) {
 	if len(otherErr) != 0 {
 		t.Fatalf("unexpected errors: %v", otherErr)
 	}
-	if len(granted) != 5 {
-		t.Errorf("granted %d amounts (%v), want exactly the 5 slots", len(granted), granted)
+	const wantSlots = 10
+	if len(granted) != wantSlots {
+		t.Errorf("granted %d amounts (%v), want exactly the %d slots", len(granted), granted, wantSlots)
 	}
-	if refused != n-5 {
-		t.Errorf("refused %d, want %d", refused, n-5)
+	if refused != n-wantSlots {
+		t.Errorf("refused %d, want %d", refused, n-wantSlots)
 	}
-	for _, want := range []string{"6.00", "6.21", "6.42", "6.63", "5.79"} {
+	for _, want := range []string{"6.00", "6.21", "6.42", "6.63", "6.84", "7.05", "7.26", "7.47", "7.68", "5.79"} {
 		if _, ok := granted[want]; !ok {
 			t.Errorf("slot %q was never handed out", want)
 		}
 	}
-	if got := r.Len(ProviderBEP20); got != 5 {
-		t.Errorf("Len = %d, want 5", got)
+	if got := r.Len(ProviderBEP20); got != wantSlots {
+		t.Errorf("Len = %d, want %d", got, wantSlots)
 	}
 }
 
