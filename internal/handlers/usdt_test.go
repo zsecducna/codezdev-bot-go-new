@@ -96,7 +96,19 @@ func (u *usdtFakes) setTRX(hash string, tx *tron.Transfer) {
 // the USD_TO_VND rate are all in place when the registry is built.
 func newUSDTBot(t *testing.T) (*Bot, *fakeTG, *store.Store, string, *usdtFakes) {
 	t.Helper()
-	t.Setenv("USD_TO_VND", "25000") // 1 USDT = 25,000 VND
+	return newUSDTBotAtRate(t, "25000") // 1 USDT = 25,000 VND
+}
+
+// newUSDTBotAtRate is newUSDTBot's twin, parameterized on the AMBIENT
+// USD_TO_VND value (task #15 — needs a bot whose env-derived rate is
+// invalid ON ITS MERITS from the moment config.Load runs, e.g. garbage
+// text or "0"; that shape can only be built pre-Load, since cfg.USDToVND()
+// snapshots the ambient env once and a settings.json write afterward
+// can't touch it — see TestUSDToVNDTrimPropagatesToOtherRateConsumers's
+// doc comment for the same snapshot fact used the other direction).
+func newUSDTBotAtRate(t *testing.T, usdToVND string) (*Bot, *fakeTG, *store.Store, string, *usdtFakes) {
+	t.Helper()
+	t.Setenv("USD_TO_VND", usdToVND)
 	t.Setenv("BEP20_ADDRESS", testSellerBSC)
 	t.Setenv("TRON_ADDRESS", testSellerTRX)
 
@@ -721,6 +733,131 @@ func TestUSDTDepositReplayCreditsOnce(t *testing.T) {
 	}
 	if lastSend(f) != i18n.C().Pay.TxidAlreadyUsed.T(i18n.EN) {
 		t.Errorf("last send = %q, want TXID_ALREADY_USED", lastSend(f))
+	}
+}
+
+// TestUSDTDepositAuditRowIsWellFormedAtHealthyRate is task #15's
+// healthy-rate control for the on-chain settle audit line (usdt.go
+// ~986, "usdt_"+chain+"_deposit"): at a healthy rate the row this line
+// writes must be the ordinary signed "+X.XX USDT" figure, not the raw-VND
+// fallback — proving TestAuditAmountFallsBackOnInvalidRate's fallback isn't
+// unconditionally taken. Reads the row back from the STORE (RecentAudit),
+// not auditAmount's return value, per this repo's own standard that an
+// audit-row assertion must pin what actually persisted, not what a
+// formatter merely returned.
+//
+// The invalid-rate counterpart of this SAME audit line is deliberately NOT
+// pinned end-to-end here: usdtToVNDFor (usdt.go ~923, backed by
+// bep20/tron.UsdtToVND) applies the identical rate<=0 predicate to the
+// identical cfg.USDToVND() value earlier in this same verifyUSDTTxid call
+// and re-arms (txidNotFound) before ever reaching this audit line, so a
+// genuinely invalid rate can never actually reach this code path through
+// the standard verify flow — traced, not assumed (see auditAmount's doc
+// comment in money.go for the full reachability discussion).
+// TestAuditAmountFallsBackOnInvalidRate pins the fallback branch itself
+// directly instead, which is the only form in which it's reachable today.
+func TestUSDTDepositAuditRowIsWellFormedAtHealthyRate(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, fk := newUSDTBot(t)
+	const chat = 4840
+
+	before, err := st.RecentAudit(50, "")
+	if err != nil {
+		t.Fatalf("RecentAudit before: %v", err)
+	}
+
+	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
+	b.Process(ctx, textUpdate(chat, "6")) // 6 USDT desired == 150,000 VND @25,000
+	o := reservedDeposit(t, st, chat)
+	armTxid(t, ctx, b, chat, chainBSC, o.Des)
+
+	// Overpay well outside tolerance so the credited VND is the CONVERTED
+	// received value (bands/credit.go), not the order total verbatim — the
+	// same reason TestUSDTDepositCreditsAtAdminSetRate overpays: an exact
+	// payment would credit o.Total regardless of what usdtStr resolves,
+	// proving nothing about this render.
+	h := hash64("f")
+	fk.setBSC(h, bscTx(h, "8.00", time.Now().Unix()))
+	b.Process(ctx, textUpdate(chat, "0x"+h))
+
+	bal, _ := st.GetBalance(fmtInt(chat))
+	if bal != 200000 {
+		t.Fatalf("fixture broken: credited %d VND, want 200000 (8 USDT at the healthy 25,000)", bal)
+	}
+
+	after, err := st.RecentAudit(50, "")
+	if err != nil {
+		t.Fatalf("RecentAudit after: %v", err)
+	}
+	if len(after) != len(before)+1 {
+		t.Fatalf("audit row count = %d, want exactly %d (before+1): %+v", len(after), len(before)+1, after)
+	}
+	row := after[0] // RecentAudit is newest-first
+	if row.Action != "usdt_bsc_deposit" {
+		t.Errorf("Action = %q, want usdt_bsc_deposit", row.Action)
+	}
+	if want := "+8.00 USDT"; row.Outcome != want {
+		t.Errorf("Outcome = %q, want %q — the healthy-rate row must be the ordinary signed figure, not the raw-VND fallback", row.Outcome, want)
+	}
+}
+
+// TestUSDTDepositQuoteAbandonsOnInvalidRate is task #15's quote-site
+// regression pin: startOnchainDeposit (usdt.go ~420) must keep calling
+// usdtStr directly and ABANDONING when it returns "" — a customer quote may
+// not be approximate, only an audit row may fall back to a marker.
+//
+// This does NOT just re-check the existing `if amount == ""` guard by
+// deleting it outright: that specific mutation changes nothing observable
+// here, because bands.Registry.Adopt parses Amount via AmountUnits, which
+// rejects "" too (empty is not a decimal), so adoptUSDTAmount still fails
+// and falls through to the same noID reply — a wrong-reason pass. The same
+// is true of literally routing this line through auditAmount: its fallback
+// ("150000 VND (usdt rate unavailable)") isn't a decimal either, so
+// AmountUnits rejects THAT too and the quote still abandons — verified,
+// not assumed. What actually endangers a customer, and what this test is
+// built to catch, is a fallback that IS a valid decimal — e.g. a future
+// "simplification" that substitutes "0.00" for an empty usdtStr instead of
+// abandoning, which Adopt accepts and ships as a real pay screen quoting
+// zero. Verified red for exactly that mutation (usdt.go's
+// `if amount == "" { b.abandonUSDTStub(...); ...; return }` swapped for
+// `if amount == "" { amount = "0.00" }`), then restored — see the executor
+// report.
+func TestUSDTDepositQuoteAbandonsOnInvalidRate(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, _ := newUSDTBotAtRate(t, "not-a-number")
+	const chat = 4850
+
+	before := len(f.Sends)
+	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
+	b.Process(ctx, textUpdate(chat, "6"))
+
+	noID := i18n.C().Pay.BEP20NoID.T(i18n.EN)
+	refused := false
+	f.mu.Lock()
+	for _, s := range f.Sends[before:] {
+		if s.Text == noID {
+			refused = true
+		}
+		if strings.Contains(s.Text, "VND (usdt rate unavailable)") {
+			t.Errorf("a fallback audit string leaked into a customer-facing send: %q", s.Text)
+		}
+		if strings.Contains(s.Text, "Send EXACTLY") {
+			t.Error("a pay screen was shown despite the invalid rate")
+		}
+	}
+	f.mu.Unlock()
+	if !refused {
+		t.Errorf("customer was not told the rail is unavailable; sends since start: %+v", f.Sends[before:])
+	}
+
+	rows, err := st.OrdersForChat(fmtInt(chat), 20, []string{"reserved"}, nil)
+	if err != nil {
+		t.Fatalf("orders_for_chat: %v", err)
+	}
+	for _, o := range rows {
+		if o.Product == depositProduct {
+			t.Errorf("a reserved deposit order survived an invalid-rate quote: %+v", o)
+		}
 	}
 }
 

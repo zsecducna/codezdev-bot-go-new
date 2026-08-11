@@ -73,6 +73,60 @@ func (b *Bot) usdtDisp(vnd int64) string {
 	return fmt.Sprintf("%.2f USDT", cents/100)
 }
 
+// auditAmount renders a SIGNED VND magnitude as a USDT audit/description
+// string that can never come back missing its number. sign is "+", "-", or
+// "" for an unsigned figure (e.g. a resulting balance).
+//
+// Built BY CONSTRUCTION, not per-site (task #15): usdtStr (usdt.go) returns
+// "" on a configured-but-INVALID exchange rate (garbage text, zero,
+// negative — see its own doc comment), and naively building
+// sign+usdtStr(vnd)+" USDT" from that "" produces "+ USDT" — a row that
+// LOOKS well-formed while silently missing the one number that matters.
+// Two call sites (the on-chain deposit-settle audit line in usdt.go and
+// execAddBal's admin credit/debit audit lines in adminusers.go) used to
+// each hand-guard this the same way; both now collapse into this one
+// helper so a THIRD audit/description site can't reintroduce the trap by
+// simply forgetting to add its own guard.
+//
+// As it happens, an audit reader on THOSE two specific call sites is
+// unreachable today: usdtToVNDFor (usdt.go, backed by bep20/tron.UsdtToVND)
+// and adminUsdtToVnd (adminpricing.go) each apply this exact same
+// ParseFloat->rate<=0 predicate to the exact same cfg.USDToVND() value
+// BEFORE either call site is reached (adminUsdtToVnd relies on
+// config.USDToVND()'s own TrimSpace at settings.go:331 rather than
+// repeating it locally, and that function's settings.json branch returns a
+// strconv.Itoa'd integer string, so the two readers cannot disagree on the
+// string they parse), so an invalid
+// rate already aborts the deposit (re-arms) or rejects the admin amount
+// (outright) upstream of the audit line. That does not make this dead
+// code: it is by-construction protection for whatever audit/description
+// site gets written next, which may have no such upstream gate — exactly
+// the failure mode task #15 flagged ("closed per site, not by
+// construction"). Do not delete the fallback branch on the theory that the
+// two current call sites can't trigger it; a future call site is the point.
+//
+// Deliberately does NOT delegate to usdtDisp above, even though usdtDisp
+// already has a non-empty fallback ("— USDT"): concatenated as
+// sign+usdtDisp(vnd) that becomes "+— USDT" on a bad rate, which is
+// non-empty but throws away the one thing an audit row can still offer
+// when the USD conversion breaks — the real VND figure. "+120000 VND (usdt
+// rate unavailable)" tells an investigator something; "+— USDT" does not.
+// So this reimplements usdtStr's own trim/parse/fallback shape but keeps
+// the VND number in the fallback branch instead of discarding it.
+//
+// NOT for customer-facing quotes. startOnchainDeposit and cbPayOnchain
+// (usdt.go) must keep calling usdtStr directly and ABANDONING the flow
+// when it returns "" — a customer quote may not be approximate, only an
+// audit row may fall back to an explicit marker instead of a number.
+// Routing a customer quote through this function would silently hand out
+// a fallback STRING as if it were a price.
+func (b *Bot) auditAmount(sign string, vnd int64) string {
+	if s := b.usdtStr(vnd); s != "" {
+		return sign + s + " USDT"
+	}
+	return fmt.Sprintf("%s%d VND (usdt rate unavailable)", sign, vnd)
+}
+
 // itoa / itoa64 are the terse int->string helpers used to fill i18n {qty}/{max}/
 // {stock} placeholders (i18n.F takes string kv pairs).
 func itoa(n int) string     { return strconv.Itoa(n) }

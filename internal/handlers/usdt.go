@@ -168,16 +168,23 @@ func ledgerPrefix(p bands.Provider) string {
 // this branch still fires for a rate that is invalid on its merits (garbage
 // text, zero, negative).
 //
-// That branch is real, not dead, but it is only CHECKED at two of its three
-// call sites: startOnchainDeposit (usdtStr at ~line 433) and cbPayOnchain
-// (~line 585) both test for "" and abandon rather than quote a broken price.
-// The third call site — the audit-log line in the on-chain settle path
-// (~line 942, "+"+b.usdtStr(creditVND)+" USDT") — does NOT check it: on an
-// invalid rate the wallet is still credited correctly (that path doesn't call
-// usdtStr for the money, only for the audit string), but the audit row would
-// read "+ USDT" with the amount silently missing. Flagged, not fixed here —
-// out of this slice's scope (a stale-comment fix, not a money-handling
-// change), but a real gap worth closing separately.
+// That branch is real, not dead. Its callers split into two kinds by what
+// "" is allowed to do:
+//   - startOnchainDeposit (~line 420) and cbPayOnchain (~line 607) are
+//     customer-facing quotes: both test usdtStr == "" and ABANDON rather
+//     than quote a broken price. Quoting wrong is worse than not quoting —
+//     deliberate, and it stays this way.
+//   - the on-chain settle audit line (~line 986) does NOT call usdtStr
+//     directly any more (task #15) — it goes through auditAmount
+//     (money.go), which can never render "+ USDT" with the amount silently
+//     missing; it falls back to the raw VND figure plus an explicit marker
+//     instead. adminusers.go's admin-credit/-debit audit lines route
+//     through the same helper. See auditAmount's doc comment for the full
+//     reasoning, including why that fallback is unreachable at BOTH of
+//     today's call sites (an identical rate check already gates each one
+//     upstream — usdtToVNDFor here, adminUsdtToVnd in adminpricing.go) and
+//     is kept anyway as by-construction protection for the next
+//     audit/description site, which may have no such upstream gate.
 func (b *Bot) usdtStr(vnd int64) string {
 	s, err := b.vndToUSD(vnd)
 	if err != nil {
@@ -974,20 +981,16 @@ func (b *Bot) verifyUSDTTxid(ctx context.Context, chatID int64, chain, des, txha
 			log.Printf("usdt deposit delivered-claim failed [des=%s]: %v", des, cerr)
 		}
 		b.dropUSDTPending(p, des)
-		// usdtStr's own doc comment flags this exact gap: it returns "" on an
-		// invalid (not merely missing) configured rate, and unlike
-		// startOnchainDeposit/cbPayOnchain this audit line never checked for
-		// that. The wallet above is already credited correctly (that math
-		// never calls usdtStr), so silence here would only cost the audit
-		// trail its number, not the customer's money — but a money record
-		// that LOOKS well-formed while missing its amount ("+ USDT") is worse
-		// than one that visibly says the rate broke. Fall back to the raw VND
-		// figure plus an explicit marker so the amount is never silently gone.
-		creditUSDT := b.usdtStr(creditVND)
-		creditDesc := "+" + creditUSDT + " USDT"
-		if creditUSDT == "" {
-			creditDesc = fmt.Sprintf("+%d VND (usdt rate unavailable)", creditVND)
-		}
+		// The wallet above is already credited correctly (that math never
+		// calls usdtStr) — this line only formats the audit-row description.
+		// auditAmount (money.go) guarantees it can never render "+ USDT"
+		// with the amount silently missing; see its doc comment for why,
+		// and for why this particular call site's invalid-rate branch is
+		// actually unreachable today (usdtToVNDFor above already gates the
+		// same rate) but kept anyway as by-construction protection rather
+		// than per-site (task #15 — this call site used to hand-guard the
+		// same gap, now collapsed into the shared helper).
+		creditDesc := b.auditAmount("+", creditVND)
 		b.audit(chatStr, "usdt_"+chain+"_deposit", ledgerID,
 			creditDesc,
 			fmt.Sprintf("from=%s recv=%s balance=%d", frm, recvStr, bal))

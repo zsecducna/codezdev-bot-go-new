@@ -409,29 +409,18 @@ func (b *Bot) capAddBalStep(c *Ctx, armed *AdminAction, step string) bool {
 // admin who manually re-arms adm:addbal and re-enters the SAME chat_id/amount
 // (a genuinely new admin action, not a double-tap of one) gets a second,
 // equally-real credit — exactly as Python would for the same manual repeat.
-// usdtAuditAmt renders a VND magnitude for execAddBal's audit row, prefixed
-// with sign ("+", "-", or "" for an unsigned figure like the resulting
-// balance). Money-safety hazard flagged just above this function: CreditBalance
-// writes no ledger/txn row, so the audit row this feeds is the ONLY place
-// "who moved how much, and to what resulting balance" can ever be
-// reconstructed from — unlike every other admin money mutation in this
-// codebase, there is no second record to fall back on if this one is wrong
-// or missing a digit. b.usdtStr can return "" on a configured-but-INVALID
-// exchange rate (its own doc comment; distinct from "unset", which usdtStr
-// already prices via the compiled default) — a bare "+ USDT" in that case
-// would look like a well-formed row while silently dropping the one number
-// that matters. Falls back to the raw VND figure plus an explicit marker
-// instead, the exact idiom usdt.go's on-chain settle audit line already
-// established (usdt.go ~986-990) for the identical gap — copied rather than
-// reinvented so the two audit surfaces can't silently diverge if the rate
-// ever breaks.
-func (b *Bot) usdtAuditAmt(sign string, vnd int64) string {
-	if s := b.usdtStr(vnd); s != "" {
-		return sign + s + " USDT"
-	}
-	return fmt.Sprintf("%s%d VND (usdt rate unavailable)", sign, vnd)
-}
-
+// Money-safety hazard flagged just above this function: CreditBalance writes
+// no ledger/txn row, so the audit rows execAddBal writes below (via
+// money.go's auditAmount) are the ONLY place "who moved how much, and to
+// what resulting balance" can ever be reconstructed from — unlike every
+// other admin money mutation in this codebase, there is no second record to
+// fall back on if this one is wrong or missing a digit. This used to build
+// its own "sign + usdtStr(vnd) + \" USDT\"" by hand (the same idiom
+// usdt.go's on-chain settle audit line separately hand-rolled for the
+// identical gap); both collapsed into auditAmount (task #15) so the two
+// audit surfaces can't silently diverge if the rate ever breaks — see that
+// function's doc comment for the full reasoning, including why it doesn't
+// just reuse usdtDisp's "— USDT" fallback.
 func (b *Bot) execAddBal(ctx context.Context, chatID int64, rawTarget, rawAmount string) {
 	target := b.resolveCustomerTarget(rawTarget)
 	if target == "" {
@@ -478,7 +467,7 @@ func (b *Bot) execAddBal(ctx context.Context, chatID int64, rawTarget, rawAmount
 		// two identical "+X USDT" rows in a row against a climbing balance is
 		// the only signal that it happened twice.
 		b.store.LogAction(fmtInt(chatID), "admin", "admin_credit_balance", target,
-			b.usdtAuditAmt("+", amount)+" → new balance "+b.usdtAuditAmt("", newBal),
+			b.auditAmount("+", amount)+" → new balance "+b.auditAmount("", newBal),
 			fmt.Sprintf("amount_vnd=%d new_balance_vnd=%d", amount, newBal))
 		b.send(ctx, chatID,
 			"✅ Credited "+b.usdtDisp(amount)+" to "+target+". New balance: "+b.usdtDisp(newBal),
@@ -507,7 +496,7 @@ func (b *Bot) execAddBal(ctx context.Context, chatID int64, rawTarget, rawAmount
 		// POSITIVE magnitude actually removed (-amount, matching what was
 		// just passed to store.Debit above), not the raw negative `amount`.
 		b.store.LogAction(fmtInt(chatID), "admin", "admin_debit_balance", target,
-			b.usdtAuditAmt("-", -amount)+" → new balance "+b.usdtAuditAmt("", newBal),
+			b.auditAmount("-", -amount)+" → new balance "+b.auditAmount("", newBal),
 			fmt.Sprintf("amount_vnd=%d new_balance_vnd=%d", amount, newBal))
 		b.send(ctx, chatID,
 			"✅ Deducted "+b.usdtDisp(-amount)+" from "+target+". New balance: "+b.usdtDisp(newBal),
