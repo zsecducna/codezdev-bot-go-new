@@ -318,21 +318,40 @@ func (b *Bot) doRefund(ctx context.Context, o *store.Order, method string, force
 		}
 	default:
 		// An unrecognised payout method has no branch above that knows how to
-		// credit it or record the amount — the claim already committed (the
-		// order IS 'refunded'), so refunded_amount is left exactly as it was,
-		// almost certainly NULL. NULL is a load-bearing state: it means
-		// "genuinely refunded, actual amount unrecoverable" (see
-		// SetRefundedAmount's doc comment). Falling through silently here
-		// would forge that state for an order that in fact HAS a computable
-		// amount — indistinguishable from a real unrecoverable historical
-		// row. This must be caught loudly, matching the CreditFailed alert
-		// above (the only "should not happen on a money path" pattern this
-		// file already has).
-		log.Printf("CRITICAL refund: unrecognised payout method %q [des=%s chat=%s amount=%d] — order IS 'refunded'; refunded_amount NOT recorded",
+		// credit it — the claim already committed (the order IS 'refunded'),
+		// and NOTHING reached the customer: no CreditBalance call ran, and no
+		// manual off-platform payout was recorded either. This is the same
+		// fact as the CreditBalance-error case above (money owed, nothing
+		// paid), so it gets the same treatment: CreditFailed=true so
+		// sendRefundReceipt renders a loud failure notice instead of a false
+		// "balance now 0" success line, and so the customer DM below is
+		// skipped entirely — telling either party this "worked" would be a
+		// lie.
+		log.Printf("CRITICAL refund: unrecognised payout method %q [des=%s chat=%s amount=%d] — order IS 'refunded'; nothing was credited",
 			method, o.Des, won.ChatID, amount)
+		res.CreditFailed = true
+		// Owner alert (#39-shaped): the order is 'refunded' with NOTHING
+		// credited because no branch above knows how to pay out `method`,
+		// and no automatic path will ever retry a 'refunded' order — the log
+		// line above was the only trace before this.
 		b.notifyOwners(ctx, "🚨 REFUND UNKNOWN PAYOUT METHOD — MANUAL FIX REQUIRED\n"+
 			"🧾 "+o.Des+"\n👤 "+won.ChatID+"\n💰 "+b.usdtDisp(amount)+"\nmethod="+method+"\n"+
-			"Order IS 'refunded'; refunded_amount was NOT recorded for it — investigate and record by hand.")
+			"Order IS 'refunded'; nothing was credited — investigate and credit the buyer by hand.")
+		// Record 0, not NULL — 0 is literally true (nothing reached the
+		// customer via any payout rail), the same rationale as the
+		// CreditBalance-error branch above. Leaving NULL here would read as
+		// "refunded before this column existed, amount unknowable", which is
+		// false: we DO know what this build did, it credited nothing. This
+		// write must never fail the refund it records (see
+		// SetRefundedAmount's doc comment), so log-and-continue only.
+		// Residual: if an operator hand-credits later per the alert above,
+		// nothing updates this column — that order will read "0, exact"
+		// forever while Net silently overstates by the hand-credited amount.
+		// That gap is task #43's already-recorded sharpest open item; this
+		// path inherits it rather than introducing a new one.
+		if serr := b.store.SetRefundedAmount(won.Des, 0); serr != nil {
+			log.Printf("SetRefundedAmount(%s, 0) failed: %v", won.Des, serr)
+		}
 	}
 
 	// Skip the customer DM entirely when the credit failed: the money never
@@ -780,6 +799,16 @@ func (b *Bot) sendRefundReceipt(ctx context.Context, chatID int64, o *store.Orde
 	}
 	var balLine string
 	switch {
+	case res.CreditFailed && res.Method != "balance" && res.Method != "manual":
+		// doRefund's default branch: `res.Method` here is not "balance" or
+		// "manual" but whatever unrecognised string was passed in — no
+		// CreditBalance call was ever attempted, so "WALLET CREDIT FAILED"
+		// below would misdirect an operator into debugging the balance rail
+		// (DB, CreditBalance) when the actual defect is a dispatch bug (an
+		// order carrying a payout method this switch doesn't know). Naming
+		// the method here points the operator at the real cause.
+		header = "❌ UNKNOWN PAYOUT METHOD " + strconv.Quote(res.Method) + " — credit " + b.usdtDisp(res.Amount) + " to " + o.ChatID + " by hand"
+		balLine = "⚠️ Payout method " + strconv.Quote(res.Method) + " not recognised — nothing was credited. Credit the buyer manually."
 	case res.CreditFailed:
 		// The claim committed but CreditBalance errored — the order IS
 		// 'refunded' and no automatic path will ever retry it, so this

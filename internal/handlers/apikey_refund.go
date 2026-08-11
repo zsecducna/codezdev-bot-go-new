@@ -414,17 +414,20 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 		b.recordGroupRefundedAmounts(won, groupPaid, amountGroup, stuckDes, extra)
 	default:
 		// An unrecognised payout method has no branch above that knows how
-		// to credit it or record amounts — every claim in this group already
-		// committed (each order IS 'refunded'), so refunded_amount is left
-		// exactly as it was for EVERY member of the group: the root order,
-		// every applied recharge, and the stuck order if any — not just the
-		// one order this call was invoked from. NULL is a load-bearing
-		// state meaning "genuinely refunded, actual amount unrecoverable"
-		// (SetRefundedAmount's doc comment); falling through silently here
-		// would forge that state for a group that in fact has a computable
-		// amount. Must be caught loudly, matching the CreditFailed alert
-		// above (the only "should not happen on a money path" pattern this
-		// file already has).
+		// to credit it — every claim in this group already committed (each
+		// order IS 'refunded'), and NOTHING reached the customer for ANY
+		// member of the group: no CreditBalance call ran, no manual
+		// off-platform payout was recorded. This is the same fact as the
+		// CreditBalance-error case above (money owed, nothing paid), so it
+		// gets the same treatment: CreditFailed=true so the customer DM
+		// below is skipped entirely (telling them "refunded" would be a
+		// lie — and when the key WAS revoked above, gated on `krow != nil
+		// && len(won) > 0`, a false success message would tell the customer
+		// they were paid while taking away what they bought; unless only a
+		// stuck recharge was claimed — that path never revokes — the key
+		// stays live regardless) and so cbApikeyRefOK's admin notification
+		// (gated on !CreditFailed, see there) doesn't also claim a wallet
+		// credit that never happened.
 		members := make([]string, 0, len(won)+1)
 		for _, w := range won {
 			members = append(members, w.Des)
@@ -432,12 +435,39 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 		if stuckDes != "" {
 			members = append(members, stuckDes)
 		}
-		log.Printf("CRITICAL apikey group refund: unrecognised payout method %q [des=%s chat=%s amount=%d members=%v] — orders ARE 'refunded'; refunded_amount NOT recorded for any of them",
+		log.Printf("CRITICAL apikey group refund: unrecognised payout method %q [des=%s chat=%s amount=%d members=%v] — orders ARE 'refunded'; nothing was credited",
 			method, des, o.ChatID, amount, members)
+		res.CreditFailed = true
+		// Owner alert (#39-shaped): every order in the group is 'refunded'
+		// with NOTHING credited because no branch above knows how to pay out
+		// `method`, and no automatic path will ever retry a 'refunded'
+		// order — the log line above was the only trace before this.
 		b.notifyOwners(ctx, fmt.Sprintf(
 			"🚨 REFUND UNKNOWN PAYOUT METHOD — MANUAL FIX REQUIRED\n🧾 %s\n👤 %s\n💰 %s\nmethod=%s\nmembers=%v\n"+
-				"Orders ARE 'refunded'; refunded_amount was NOT recorded for any of them — investigate and record by hand.",
+				"Orders ARE 'refunded'; nothing was credited — investigate and credit the buyer by hand.",
 			des, o.ChatID, b.usdtDisp(amount), method, members))
+		// Record 0, not NULL, for every order this call claimed — group and
+		// stuck alike — the same rationale as the CreditBalance-error branch
+		// above: 0 is literally true (nothing reached the customer via any
+		// payout rail), whereas NULL would falsely read as "refunded before
+		// this column existed, amount unknowable". This write must never
+		// fail the refund it records (see SetRefundedAmount's doc comment),
+		// so log-and-continue only. Residual: if an operator hand-credits
+		// later per the alert above, nothing updates this column — those
+		// orders will read "0, exact" forever while Net silently overstates
+		// by the hand-credited amount. That gap is task #43's
+		// already-recorded sharpest open item; this path inherits it rather
+		// than introducing a new one.
+		for _, w := range won {
+			if serr := b.store.SetRefundedAmount(w.Des, 0); serr != nil {
+				log.Printf("SetRefundedAmount(%s, 0) failed: %v", w.Des, serr)
+			}
+		}
+		if stuckDes != "" {
+			if serr := b.store.SetRefundedAmount(stuckDes, 0); serr != nil {
+				log.Printf("SetRefundedAmount(%s, 0) failed: %v", stuckDes, serr)
+			}
+		}
 	}
 	// Notify the customer (best-effort) — the same receipt the generic refund
 	// sends, anchored on the order they acted from. Skipped entirely when the
@@ -494,6 +524,22 @@ func splitRefundedAmount(won []apikeyRefundMember, groupPaid, amountGroup int64)
 	var assigned int64
 	largestIdx, largestTotal := 0, int64(-1)
 	for i, m := range won {
+		// A FOURTH whole-cent-rounding site (see commit 06b4177, which warned
+		// three others in this file and adminorders.go): math.Round-to-nearest-
+		// unit is correct TODAY because amountGroup/groupPaid are VND. After
+		// the ledger migration (task #11) they become micro-USDT and
+		// refunded_amount is bucketCentRounded — but this site is WORSE than
+		// the three already warned, because it is not just a re-rounding
+		// problem. Even if this rounded to the nearest 10,000 micro (a whole
+		// cent) instead of the nearest micro, a PROPORTIONAL split of a
+		// whole-cent amountGroup across members generally cannot land every
+		// share on a 10,000-micro boundary — the per-member fractions rarely
+		// divide evenly into cents. Re-rounding the existing float division
+		// is not enough to fix this site; the split itself must be
+		// redesigned to work in CENT units (i.e. divide amountGroup/10000
+		// cents proportionally, then multiply back by 10000), not merely
+		// have its rounding mode changed. Post-cutover this needs a cent-unit
+		// rewrite, not a one-line round-mode swap.
 		share := int64(math.Round(float64(amountGroup) * float64(m.Total) / float64(groupPaid)))
 		out[m.Des] = share
 		assigned += share
@@ -621,9 +667,23 @@ func (b *Bot) cbApikeyRefOK(cc *cbCtx) {
 		b.send(cc.Ctx, cc.ChatID, c.RefundRace.T(lang), nil)
 		return
 	}
-	// _notify_admins — telegram_bot.py:17068-17075.
+	// Logged unconditionally (this is the only place UnitNum/UnitsTotal get
+	// logged for a self-service refund — the CRITICAL log inside
+	// doRefundApikeyGroup's failure branches carries amount but not units),
+	// even when the credit below failed: the refund attempt happened and its
+	// units are worth recording regardless of payout outcome.
 	log.Printf("API-KEY REFUND (self-service) [des=%s chat=%d amount=%d used=%d/%d]",
 		des, cc.ChatID, res.Amount, res.UnitNum, res.UnitsTotal)
+	// _notify_admins — telegram_bot.py:17068-17075. Skipped when nothing was
+	// actually credited (res.CreditFailed, e.g. CreditBalance erroring or an
+	// unrecognised payout method): doRefundApikeyGroup already paged the
+	// owners with a loud REFUND-FAILED alert from inside that branch itself
+	// — a second admin message here claiming "refunded X to wallet" would
+	// flatly contradict that alert and could read as the failure having
+	// been resolved when it has not.
+	if res.CreditFailed {
+		return
+	}
 	b.notifyAdmins(cc.Ctx, fmt.Sprintf(
 		"↩️ API-KEY REFUND (self-service)\n🧾 %s\n👤 %d\n💰 refunded %s to wallet\n🔑 %d of %d credits used",
 		des, cc.ChatID, b.usdtDisp(res.Amount), res.UnitNum, res.UnitsTotal))

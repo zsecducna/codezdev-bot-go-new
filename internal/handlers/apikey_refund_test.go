@@ -47,6 +47,50 @@ func TestDoRefundApikeyGroupCreditFailedNotifiesOwner(t *testing.T) {
 	}
 }
 
+// TestCbApikeyRefOKSkipsAdminRefundedNoticeOnCreditFailed covers a
+// pre-existing bug found alongside task #43's HIGH fixes: cbApikeyRefOK (the
+// customer's self-service refund confirm) always hardcodes method="balance"
+// and, before this fix, sent its "refunded X to wallet" admin notice
+// UNCONDITIONALLY — even when doRefundApikeyGroup's CreditBalance call above
+// it errored and res.CreditFailed is true. That claimed a wallet credit had
+// happened directly alongside (and in flat contradiction of) the loud
+// REFUND CREDIT FAILED alert doRefundApikeyGroup itself already sent from
+// inside the failure branch. Deleting the `if res.CreditFailed { return }`
+// guard in cbApikeyRefOK turns this test red.
+func TestCbApikeyRefOKSkipsAdminRefundedNoticeOnCreditFailed(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, fk, _ := newAPIKeyBot(t)
+	const chat = 100
+	const keyDes = "ffff6666ffff6666ffff6666ffff6666"
+	seedKey(t, st, fk, keyDes, chat, "poolkey-cbcredfail", "sk-test-cbcredfail-0123456789", "bedrock", 1000, 1000, 200)
+
+	if _, err := st.DB().Exec("DROP TABLE balances"); err != nil {
+		t.Fatal(err)
+	}
+
+	b.Process(ctx, callbackUpdate(chat, "apikeyrefok:"+keyDes))
+
+	got, _ := st.GetOrder(keyDes)
+	if got.Status != "refunded" {
+		t.Errorf("order status = %q, want refunded (the claim commits before CreditBalance runs)", got.Status)
+	}
+	sawCreditFailedAlert := false
+	for _, s := range f.Sends {
+		if strings.Contains(s.Text, "to wallet") {
+			t.Errorf("a message claimed a wallet credit that never happened: %q", s.Text)
+		}
+		if s.ChatID == 999 && strings.Contains(s.Text, "REFUND CREDIT FAILED") {
+			sawCreditFailedAlert = true
+		}
+	}
+	if !sawCreditFailedAlert {
+		t.Error("owner never received the REFUND CREDIT FAILED alert from doRefundApikeyGroup")
+	}
+	if buyerMsg := lastSendMsgTo(f, chat); buyerMsg != nil {
+		t.Errorf("buyer chat %d received a message, want NONE (nothing was credited), got: %q", chat, buyerMsg.Text)
+	}
+}
+
 // ============================================================================
 // refunded_amount — S2 bookkeeping (task #20), the group-refund split
 // ============================================================================
@@ -192,21 +236,87 @@ func TestDoRefundApikeyGroupManualRecordsRefundedAmount(t *testing.T) {
 // knows how to credit the group or record refunded_amount for any of its
 // members, so it must alert the owner loudly by name. Deleting the default
 // branch's notifyOwners call in doRefundApikeyGroup turns this test red.
+//
+// Seeds all THREE refunded_amount populations the default branch must zero:
+// the root key order, an APPLIED recharge (a normal group member, paid via
+// the pro-rated split), and a STUCK never-applied recharge (paid at face
+// value outside the group maths, refunded via the same call by acting on the
+// stuck order itself — apikeyRefundGroup resolves back to the same root).
 func TestDoRefundApikeyGroupUnknownMethodAlertsOwner(t *testing.T) {
 	ctx := context.Background()
 	b, f, st, fk, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "eeee5555eeee5555eeee5555eeee5555"
+	const rcDes = "eeee5555eeee5555eeee5555eeee5551"
+	const stuckDes = "eeee5555eeee5555eeee5555eeee5552"
 	seedKey(t, st, fk, keyDes, chat, "poolkey-unknownmethod", "sk-test-unknownmethod-0123456789", "bedrock", 1000, 1000, 200)
+	// Applied recharge: a normal group member.
+	if _, err := st.AddAPIKeyRecharge(rcDes, keyDes, chat, 500); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateOrder(rcDes, itoa64(chat), "en", apikeyRechargeProduct, "API", 500, 500000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOrder(rcDes, "reserved", "delivered"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkAPIKeyRechargeApplied(rcDes); err != nil {
+		t.Fatal(err)
+	}
+	// Stuck recharge: paid but never applied (Kiro-Go down between payment
+	// and fulfillment) — refunds at face value outside the group maths.
+	if _, err := st.AddAPIKeyRecharge(stuckDes, keyDes, chat, 300); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateOrder(stuckDes, itoa64(chat), "en", apikeyRechargeProduct, "API", 300, 300000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOrder(stuckDes, "reserved", "paid"); err != nil {
+		t.Fatal(err)
+	}
 
-	o, _ := st.GetOrder(keyDes)
-	res := b.doRefundApikeyGroup(ctx, o, "carrier_pigeon", false)
+	// Act on the stuck order itself — apikeyRefundGroup resolves it back to
+	// the same root/group, so this single call refunds all three orders.
+	oStuck, _ := st.GetOrder(stuckDes)
+	res := b.doRefundApikeyGroup(ctx, oStuck, "carrier_pigeon", false)
 	if res == nil {
 		t.Fatal("doRefundApikeyGroup returned nil — the group claim must still win even though the method is unrecognised")
 	}
-	got, _ := st.GetOrder(keyDes)
-	if got.Status != "refunded" {
-		t.Errorf("order status = %q, want refunded (the claim commits before the payout-method switch runs)", got.Status)
+	// Nothing was actually credited (no CreditBalance call, no manual payout
+	// recorded), so this must read exactly like a CreditBalance failure:
+	// CreditFailed=true, and the buyer must NEVER hear "refunded" — they
+	// would be told they were paid while nothing moved (and, when the key
+	// was revoked above — gated on len(won)>0, not always true for a
+	// stuck-only claim — while their key is gone too). Review finding (task
+	// #43 HIGH): without CreditFailed set here, the customer DM guard below
+	// it (and cbApikeyRefOK's admin "refunded X to wallet" notice) would
+	// both fire as if the payout had actually succeeded. (This switch is
+	// unreachable in the current build — every caller passes "balance" or
+	// "manual" — so this has not actually happened; this pins the guarantee
+	// for whenever that stops being true.)
+	if !res.CreditFailed {
+		t.Error("res.CreditFailed = false, want true — nothing was credited for an unrecognised payout method")
+	}
+	if res.Notified {
+		t.Error("res.Notified = true — no customer DM should have been attempted")
+	}
+	for _, d := range []string{keyDes, rcDes, stuckDes} {
+		if got, _ := st.GetOrder(d); got.Status != "refunded" {
+			t.Errorf("order %s status = %q, want refunded (the claim commits before the payout-method switch runs)", d, got.Status)
+		}
+	}
+	if buyerMsg := lastSendMsgTo(f, chat); buyerMsg != nil {
+		t.Errorf("buyer chat %d received a message, want NONE (nothing was credited, so no refund DM must be sent), got: %q", chat, buyerMsg.Text)
+	}
+	// The headline decision this default branch makes: record 0, not NULL,
+	// for EVERY member of the group — root, applied recharge, and stuck
+	// order alike — not just the one order the call was invoked from.
+	// Deleting either SetRefundedAmount(_, 0) loop/call in the default
+	// branch turns one or more of these red.
+	for _, d := range []string{keyDes, rcDes, stuckDes} {
+		if got, ok := refundedAmountFor(t, st, d); !ok || got != 0 {
+			t.Errorf("refunded_amount(%s) = (valid=%v, %d), want (true, 0) — nothing was actually credited", d, ok, got)
+		}
 	}
 	alert := lastSendMsgTo(f, 999)
 	if alert == nil || !strings.Contains(alert.Text, "UNKNOWN PAYOUT METHOD") {
@@ -215,7 +325,10 @@ func TestDoRefundApikeyGroupUnknownMethodAlertsOwner(t *testing.T) {
 	if !strings.Contains(alert.Text, "carrier_pigeon") {
 		t.Errorf("owner alert missing the unrecognised method name, got: %q", alert.Text)
 	}
-	if !strings.Contains(alert.Text, keyDes) {
-		t.Errorf("owner alert missing the order des: %q", alert.Text)
+	if !strings.Contains(alert.Text, stuckDes) {
+		t.Errorf("owner alert missing the acted-on order des: %q", alert.Text)
+	}
+	if !strings.Contains(alert.Text, keyDes) || !strings.Contains(alert.Text, rcDes) {
+		t.Errorf("owner alert missing group members (root/recharge) from the members list: %q", alert.Text)
 	}
 }

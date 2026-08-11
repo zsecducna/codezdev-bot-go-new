@@ -831,6 +831,22 @@ func TestAdminDashboardZeroTotalUnknownRefundOmitsUncertaintyLine(t *testing.T) 
 		t.Fatalf("claim reflegacy0 -> refunded/admin_cancel: %v", err)
 	}
 
+	// Pin the premise directly, not just the two symptoms below: reflegacy0
+	// must actually land in the unknown bucket (RefundedUnknownCount==1)
+	// with a zero upper bound, or the assertions further down would also
+	// pass in a world where reflegacy0 stopped being classified as an
+	// unknown refund at all.
+	r, err := st.GetRevenueSummary(depositProduct)
+	if err != nil {
+		t.Fatalf("GetRevenueSummary: %v", err)
+	}
+	if r.RefundedUnknownCount != 1 {
+		t.Fatalf("RefundedUnknownCount = %d, want 1 (reflegacy0 must be the one unknown refund)", r.RefundedUnknownCount)
+	}
+	if r.RefundedUnknownUpperBound != 0 {
+		t.Fatalf("RefundedUnknownUpperBound = %d, want 0 (reflegacy0's total is 0)", r.RefundedUnknownUpperBound)
+	}
+
 	b.Process(ctx, callbackUpdate(1, "admroot"))
 	last := lastSendMsg(f)
 	if last == nil {

@@ -401,9 +401,34 @@ func TestDoRefundUnknownMethodAlertsOwner(t *testing.T) {
 	if res == nil {
 		t.Fatal("doRefund returned nil — the claim must still win even though the method is unrecognised")
 	}
+	// Nothing was actually credited on this path (no CreditBalance call, no
+	// manual payout recorded), so this must read exactly like a
+	// CreditBalance failure: CreditFailed=true, and the buyer must NEVER
+	// hear "refunded" — they would be told they were paid while nothing
+	// moved. Review finding (task #43 HIGH): without CreditFailed set here,
+	// the customer DM guard below would pass and a false success message
+	// would go out. (This switch is unreachable in the current build — every
+	// caller passes "balance" or "manual" — so no such message has actually
+	// gone out; this pins the guarantee for whenever that stops being true.)
+	if !res.CreditFailed {
+		t.Error("res.CreditFailed = false, want true — nothing was credited for an unrecognised payout method")
+	}
+	if res.Notified {
+		t.Error("res.Notified = true — no customer DM should have been attempted")
+	}
 	got, _ := st.GetOrder(des)
 	if got.Status != "refunded" {
 		t.Errorf("status=%q, want refunded (the claim commits before the payout-method switch runs)", got.Status)
+	}
+	if buyerMsg := lastSendMsgTo(f, 42); buyerMsg != nil {
+		t.Errorf("buyer chat 42 received a message, want NONE (nothing was credited, so no refund DM must be sent), got: %q", buyerMsg.Text)
+	}
+	// The headline decision this default branch makes: record 0, not NULL —
+	// 0 is literally true (nothing reached the customer), matching the
+	// CreditBalance-error branch's rationale. Deleting the
+	// SetRefundedAmount(des, 0) call turns this assertion red.
+	if got, ok := refundedAmountFor(t, st, des); !ok || got != 0 {
+		t.Errorf("refunded_amount = (valid=%v, %d), want (true, 0) — nothing was actually credited", ok, got)
 	}
 	alert := lastSendMsgTo(f, 1)
 	if alert == nil || !strings.Contains(alert.Text, "UNKNOWN PAYOUT METHOD") {
@@ -761,6 +786,42 @@ func TestSendRefundReceiptCreditFailedHeader(t *testing.T) {
 	}
 	if lastSendMsgTo(f, 42) != nil {
 		t.Error("buyer must receive NO DM when the credit failed")
+	}
+}
+
+// TestSendRefundReceiptUnknownPayoutMethodHeader proves sendRefundReceipt's
+// unrecognised-method case in isolation. doRefund's default branch that would
+// naturally produce this res is UNREACHABLE through any live entry point
+// today (cbRefundMethod/cbForceRefundExec hard-gate `method` to "balance" or
+// "manual" before ever calling doRefund; cbApikeyRefOK hardcodes "balance"),
+// so this drives sendRefundReceipt directly with a hand-built res shaped the
+// way that default branch constructs one, to pin the render itself — pure
+// defensive hardening for whenever a caller starts passing something else.
+// Deleting the new `res.CreditFailed && res.Method != "balance" && ...` case
+// (falling through to the generic CreditFailed case) turns this test red.
+func TestSendRefundReceiptUnknownPayoutMethodHeader(t *testing.T) {
+	b, f, st, _, _, _, _ := newOrdersTestBot(t, "1")
+	des := store.NewDes()
+	if err := st.CreateOrder(des, "42", "en", "prod", "BH7D", 1, 7000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOrder(des, "reserved", "delivered"); err != nil {
+		t.Fatal(err)
+	}
+	o, _ := st.GetOrder(des)
+
+	res := &refundResult{Amount: 3500, Method: "qr", CreditFailed: true, PaidTotal: o.Total}
+	b.sendRefundReceipt(context.Background(), 1, o, res, false)
+
+	admMsg := lastSendMsgTo(f, 1)
+	if admMsg == nil || !strings.Contains(admMsg.Text, "UNKNOWN PAYOUT METHOD") {
+		t.Fatalf("admin receipt must show the unknown-payout-method header; got %+v", admMsg)
+	}
+	if !strings.Contains(admMsg.Text, "qr") {
+		t.Errorf("admin receipt must name the unrecognised method, got: %q", admMsg.Text)
+	}
+	if strings.Contains(admMsg.Text, "WALLET CREDIT FAILED") {
+		t.Error("must not show the generic wallet-credit-failed header — that misdirects an operator to debug the balance rail instead of the actual dispatch bug")
 	}
 }
 
