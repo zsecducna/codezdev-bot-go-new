@@ -3,10 +3,15 @@ package bands
 // ---- deposit credit decision ------------------------------------------------
 //
 // A DEPOSIT is not a pay-for-order: it credits the SUBMITTER's own wallet, so
-// there is no unique offset and no claim-jack band gate — the customer is asked
-// to send their DESIRED amount (a round "120.00") and the window + confirmed
-// check + hash-dedupe are the deposit's defenses
-// (telegram_bot.py:9479-9488, 9748-9756).
+// there is no claim-jack band gate — a neighbour-band collision must not
+// false-reject a deposit settling against its own stored amount. As of the
+// hands-free-deposits work, a deposit DOES take a unique offset from the same
+// picker product orders use (handlers.reserveUSDTAmount): `expected` below is
+// that PICKED amount (a round "120.00" when its band is free, else the next
+// MinGap-spaced slot), not necessarily the customer's original round request —
+// the tolerance math is unchanged, it is just measured against the picked
+// amount instead of the raw request. The window + confirmed check + hash-dedupe
+// remain the deposit's other defenses (telegram_bot.py:9479-9488, 9748-9756).
 
 // DefaultDepositMatchTolCents is DEPOSIT_MATCH_TOL_CENTS
 // (telegram_bot.py:9552-9555): a received amount this close to the customer's

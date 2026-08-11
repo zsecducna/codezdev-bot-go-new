@@ -360,12 +360,14 @@ func (b *Bot) releaseUnpersisted(p bands.Provider, des string) {
 	b.usdtMu.Unlock()
 }
 
-// adoptUSDTAmount records a NON-picked amount: the customer's DESIRED top-up for
-// a BEP20/TRON deposit (start_bep20_deposit @9478 / start_tron_deposit @9935
-// deliberately bypass the unique-amount picker — "a deposit only ever credits the
-// SUBMITTER's own wallet", so a round "120.00" must stay "120.00"). The row still
-// enters the registry so it (a) blocks other orders' pickers and (b) supplies the
-// `expected` amount the verify compares against.
+// adoptUSDTAmount records a NON-picked amount: the customer's DESIRED top-up
+// amount, verbatim. As of the hands-free-deposits work it has no caller on the
+// deposit path any more — startOnchainDeposit below now calls
+// reserveUSDTAmount instead, so every deposit's amount is unique too — but the
+// function itself stays until Task 7 deletes it along with the rest of the
+// customer-pastes-a-hash flow. The row still enters the registry so it (a)
+// blocks other orders' pickers and (b) supplies the `expected` amount the
+// verify compares against.
 func (b *Bot) adoptUSDTAmount(p bands.Provider, amount, chatID, des string, total, sinceMS int64, deadline time.Time) error {
 	now := b.now()
 	if err := b.bands.Adopt(bands.Reservation{
@@ -394,10 +396,12 @@ func (b *Bot) adoptUSDTAmount(p bands.Provider, amount, chatID, des string, tota
 // PICKED amount, like an order (see reserveUSDTAmount): a hands-free watcher
 // attributes an incoming payment by amount alone, so two customers depositing
 // the same round "120" at once must be handed different amounts or their
-// payments would be indistinguishable. The customer is asked to send the band's
-// spaced amount (e.g. "120.07") rather than their round "120"; DepositCredit's
-// tolerance still governs what they are credited if the amount that lands
-// differs slightly.
+// payments would be indistinguishable. The picker tries the round base first —
+// most deposits still quote exactly "120.00" — and only offsets to the next
+// MinGap-spaced slot (e.g. "120.21" at the shipped 21-cent step) when that base
+// is already held by a live session. DepositCredit's tolerance still governs
+// what the customer is credited if the amount that lands differs slightly from
+// whichever amount they were quoted.
 func (b *Bot) startBep20Deposit(ctx context.Context, chatID int64, lang i18n.Lang, vnd int64) {
 	b.startOnchainDeposit(ctx, chatID, lang, vnd, chainBSC)
 }
@@ -437,16 +441,12 @@ func (b *Bot) startOnchainDeposit(ctx context.Context, chatID int64, lang i18n.L
 	// it gets the wide customer-facing window instead of the product-order
 	// hard limit (see depositTimeout's field comment in dispatch.go).
 	deadline := now.Add(b.depositTimeout) // wall-clock so it survives a restart
-	// Deposits now take a PICKED amount, like orders, instead of adopting the
-	// customer's round number. The watcher attributes a payment by amount
-	// alone, so two customers topping up 120.00 at once would be
-	// indistinguishable; Reserve's MinGap (2*tol+1) spacing is what makes the
-	// match unambiguous. The customer is asked for "120.07" rather than
-	// "120.00" — DepositCredit's tolerance still governs what they are
-	// credited if the amount that lands differs slightly.
+	// PICKED amount now, not adopted verbatim — see the doc comment above
+	// startBep20Deposit/startTronDeposit for why. Mirrors cbPayOnchain's
+	// order-pay call below: no caller-side log, sendBandError already logs a
+	// non-exhaustion failure itself, so logging here too would double it up.
 	picked, err := b.reserveUSDTAmount(p, amount, fmtInt(chatID), des, vnd, now.UnixMilli(), deadline)
 	if err != nil {
-		log.Printf("%s deposit band reserve failed: %v", chain, err)
 		b.abandonUSDTStub(des)
 		// Band exhaustion is "busy", not "unconfigured" — sendBandError picks
 		// the right refusal.

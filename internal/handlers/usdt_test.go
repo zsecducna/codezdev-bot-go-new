@@ -842,17 +842,35 @@ func TestUSDTDepositAuditRowIsWellFormedAtHealthyRate(t *testing.T) {
 // amounts — without this the watcher cannot tell whose payment is whose, and
 // amount-based attribution is unsound.
 func TestDepositAmountsAreUnique(t *testing.T) {
-	b, f, _, _, _ := newUSDTBot(t)
+	b, f, st, _, _ := newUSDTBot(t)
 	ctx := context.Background()
-	b.startOnchainDeposit(ctx, 111, i18n.EN, 3000000, chainTRX)
-	b.startOnchainDeposit(ctx, 222, i18n.EN, 3000000, chainTRX)
+	const total = 3000000 // 120.00 USDT at 25,000 VND/USDT
+	b.startOnchainDeposit(ctx, 111, i18n.EN, total, chainTRX)
+	b.startOnchainDeposit(ctx, 222, i18n.EN, total, chainTRX)
 
 	amounts := usdtScreenAmounts(t, f) // amounts rendered on the two deposit screens
 	if len(amounts) != 2 {
 		t.Fatalf("want 2 deposit screens, got %d: %+v", len(amounts), amounts)
 	}
+	// The FIRST (uncontended) deposit must still get the exact round base —
+	// the picker only offsets on collision, it does not spread every deposit
+	// out pre-emptively.
+	if want := b.usdtStr(total); amounts[0] != want {
+		t.Errorf("first deposit quoted %q, want the uncontended round base %q", amounts[0], want)
+	}
 	if amounts[0] == amounts[1] {
 		t.Fatalf("both deposits were quoted %q — bands are not unique", amounts[0])
+	}
+	// Plain inequality isn't the property the hands-free watcher actually
+	// needs: two amounts that differ by less than MinGap (2*tol+1) could both
+	// still match one on-chain receipt within tolerance. Compare in UNITS
+	// (the same minGap check TestUSDTSharedBandAcrossRails runs for its
+	// cross-provider twin of this invariant), not the rendered strings.
+	desA, desB := reservedDeposit(t, st, 111).Des, reservedDeposit(t, st, 222).Des
+	uA, uB := bandUnits(t, b, bands.ProviderTron, desA), bandUnits(t, b, bands.ProviderTron, desB)
+	minGap := int64(2*tron.AmountMatchTol() + 1)
+	if d := uA - uB; (d < 0 && -d < minGap) || (d >= 0 && d < minGap) {
+		t.Errorf("deposit amounts %d and %d (units) are closer than the %d-unit min gap — bands overlap", uA, uB, minGap)
 	}
 }
 
@@ -863,9 +881,11 @@ func TestDepositAmountsAreUnique(t *testing.T) {
 //
 // This does NOT just re-check the existing `if amount == ""` guard by
 // deleting it outright: that specific mutation changes nothing observable
-// here, because bands.Registry.Adopt parses Amount via AmountUnits, which
-// rejects "" too (empty is not a decimal), so adoptUSDTAmount still fails
-// and falls through to the same noID reply — a wrong-reason pass. The same
+// here, because bands.Registry.Reserve (the deposit path since
+// hands-free-deposits; formerly Adopt, same guard either way) parses the base
+// amount via AmountUnits, which rejects "" too (empty is not a decimal), so
+// reserveUSDTAmount still fails and falls through to the same noID reply — a
+// wrong-reason pass. The same
 // is true of literally routing this line through auditAmount: its fallback
 // ("150000 VND (usdt rate unavailable)") isn't a decimal either, so
 // AmountUnits rejects THAT too and the quote still abandons — verified,
