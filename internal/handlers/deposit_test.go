@@ -31,6 +31,18 @@ func waitFor(t *testing.T, cond func() bool) bool {
 	return cond()
 }
 
+// TestDepositWindowIsOneHour pins the customer-facing deposit expiry: a
+// deposit must stay claimable long enough for a customer to leave Telegram,
+// open a wallet app, and send — ten minutes was not enough (204 of 426
+// deposit orders expired). Pinned as a constant expectation so a future edit
+// to the default is a deliberate, visible change.
+func TestDepositWindowIsOneHour(t *testing.T) {
+	b, _ := newTestBot("999", nil)
+	if got, want := b.expiryTimeout, time.Hour; got != want {
+		t.Fatalf("expiryTimeout = %v, want %v", got, want)
+	}
+}
+
 // TestDepositAmountBounds pins the pending_deposit capture's peek + bounds: an
 // out-of-range amount re-prompts and keeps the slot armed; a slash/label escape
 // leaves it armed; a valid amount consumes it.

@@ -297,8 +297,14 @@ func New(d Deps) *Bot {
 	b.clickLimit = max(b.envInt("PRODUCT_CLICK_LIMIT", 10), 1)
 	b.clickWindow = time.Duration(b.envInt("PRODUCT_CLICK_WINDOW_S", 60)) * time.Second
 	b.clickCooldown = time.Duration(b.envInt("PRODUCT_CLICK_COOLDOWN_S", 60)) * time.Second
-	// DEPOSIT_TIMEOUT_S=600 hard payment limit; RESERVE_TTL_S=600+120 slack.
-	b.expiryTimeout = 600 * time.Second
+	// One hour, not the original ten minutes: a deposit has to survive the
+	// customer leaving Telegram, finding their wallet app and sending. At
+	// roughly one deposit per thirty minutes the wider window costs nothing —
+	// the only resource a live band consumes is a slot in the amount picker,
+	// and MinGap spacing keeps collisions impossible at this volume.
+	b.expiryTimeout = 3600 * time.Second
+	// RESERVE_TTL_S=600+120 slack — unrelated to the customer-facing deposit
+	// window above; this is stock-reservation TTL and stays untouched.
 	b.reserveTTL = (600 + 120) * time.Second
 	b.depositPoll = 10 * time.Second // POLL_INTERVAL @10548
 	// ---- USDT rails ---------------------------------------------------------
