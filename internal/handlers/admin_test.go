@@ -712,8 +712,9 @@ func TestAdminDashboardGrossRefundedNetRender(t *testing.T) {
 // of task #20 stage S3's core new behaviour: a refund with no recorded
 // refunded_amount (the shape every refund had before stage S2 started
 // writing the column — ClaimOrderKind alone, no SetRefundedAmount call)
-// must render as a SEPARATE "+ up to X unrecorded" line and widen Net into a
-// RANGE, never get silently folded into the exact known figure.
+// must render as a SEPARATE "a further X may have been refunded, unrecorded"
+// line and widen Net into a RANGE, never get silently folded into the exact
+// known figure.
 //
 // This is the regression pin for the trap misc.go's GetRevenueSummary doc
 // comment calls out by name: SQLite's SUM() silently skips NULL rows, so a
@@ -782,7 +783,7 @@ func TestAdminDashboardRefundedRangeForLegacyUnknownRefunds(t *testing.T) {
 	if !strings.Contains(last.Text, "Refunded: -0.05 USDT exact  (1 orders)") {
 		t.Errorf("want the exact known refund on its own line, got:\n%s", last.Text)
 	}
-	if !strings.Contains(last.Text, "+ up to 0.12 USDT unrecorded  (1 legacy orders — actual refund not recorded)") {
+	if !strings.Contains(last.Text, "a further 0.12 USDT may have been refunded, unrecorded  (1 legacy orders — actual refund not recorded)") {
 		t.Errorf("want the legacy refund's total (0.12 USDT) shown as a "+
 			"separate bounded ceiling, not folded into the exact figure, got:\n%s", last.Text)
 	}

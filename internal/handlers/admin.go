@@ -384,8 +384,14 @@ func (b *Bot) adminDashboardText(chatID int64) string {
 			refundedBlock := "   Refunded: " + knownLine + " exact  (" +
 				itoa64(r.RefundedKnownCount) + " orders)"
 			if r.RefundedUnknownCount > 0 {
-				refundedBlock += "\n              + up to " + b.usdtDisp(r.RefundedUnknownUpperBound) +
-					" unrecorded  (" + itoa64(r.RefundedUnknownCount) +
+				// Review finding (post-ship follow-up #1): a leading "+" here reads
+				// as money coming IN, sitting right under a negative (outflow)
+				// figure — this line means MORE refund, i.e. more money OUT, and
+				// "+ up to X" invited the opposite reading. "a further X may have
+				// been refunded" carries the same ceiling/uncertainty without the
+				// sign ambiguity a bare "+" creates.
+				refundedBlock += "\n              a further " + b.usdtDisp(r.RefundedUnknownUpperBound) +
+					" may have been refunded, unrecorded  (" + itoa64(r.RefundedUnknownCount) +
 					" legacy orders — actual refund not recorded)"
 			}
 			// Net is now a RANGE, not a relabelled DeliveredRevenue (task #20

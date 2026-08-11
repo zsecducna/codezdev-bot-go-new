@@ -726,6 +726,21 @@ func TestRevenueSummaryRefundedAmountSplitKnownVsUnknown(t *testing.T) {
 		t.Errorf("RefundedUnknownUpperBound = %d, want 3000 (legacy1's total, "+
 			"the only figure still knowable for it)", r.RefundedUnknownUpperBound)
 	}
+	// Partition regression guard (post-ship follow-up #2): known+unknown must
+	// always reconstitute the whole population. This is airtight TODAY only
+	// because the split lives inside ONE query as `refunded_amount IS NOT
+	// NULL` / `IS NULL` over the SAME WHERE clause — exhaustive and disjoint
+	// by construction, so it cannot drift. The risk is a future refactor into
+	// two separate queries with WHERE clauses that quietly diverge, which
+	// would break this identity silently and make "unknown" mean something
+	// other than "every genuine refund not already counted as known" — the
+	// property admin.go's Net range is built on.
+	if got, want := r.RefundedKnownCount+r.RefundedUnknownCount, r.RefundedCount; got != want {
+		t.Errorf("RefundedKnownCount(%d)+RefundedUnknownCount(%d) = %d, want %d "+
+			"(RefundedCount) — known and unknown must partition the SAME "+
+			"population with no row double-counted or dropped",
+			r.RefundedKnownCount, r.RefundedUnknownCount, got, want)
+	}
 }
 
 // TestRevenueSummaryRefundedAmountSplitCollapsesWhenAllKnown pins the other
