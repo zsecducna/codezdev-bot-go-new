@@ -173,6 +173,14 @@ func (b *Bot) apikeyRefundAmount(ctx context.Context, o *store.Order) (amount, u
 		remaining = bought
 	}
 	used := bought - remaining
+	// RoundToEven-to-nearest-unit is correct TODAY because groupPaid is VND.
+	// After the ledger migration (task #11) groupPaid becomes micro-USDT and
+	// orders.total/refunded_amount are bucketCentRounded — rounding to the
+	// nearest MICRO here would land off a whole-cent (10,000 micro) boundary,
+	// silently producing a value the migration's own whole-cent invariant
+	// (cmd/migrate-usdt/migrate.go's checkWholeCentInvariant) exists to
+	// reject. Post-cutover this must round to the nearest 10,000 micro, not
+	// the nearest micro.
 	amount = min(int64(math.RoundToEven(float64(groupPaid)*remaining/bought)), groupPaid)
 	// A stuck never-applied recharge refunds its FULL face value on top of the
 	// group proration, so the preview must quote the same figure (preview ==
@@ -305,6 +313,15 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 		}
 	case len(won) > 0:
 		// Per-credit rate from the FULL group, applied to the totals actually won.
+		//
+		// RoundToEven-to-nearest-unit is correct TODAY because groupPaid is
+		// VND. After the ledger migration (task #11) groupPaid becomes
+		// micro-USDT and orders.total/refunded_amount are bucketCentRounded —
+		// rounding to the nearest MICRO here would land off a whole-cent
+		// (10,000 micro) boundary, silently producing a value the migration's
+		// own whole-cent invariant (cmd/migrate-usdt/migrate.go's
+		// checkWholeCentInvariant) exists to reject. Post-cutover this must
+		// round to the nearest 10,000 micro, not the nearest micro.
 		amount = min(int64(math.RoundToEven(float64(groupPaid)*remaining/bought)), groupPaid) + extra
 		used = int64(math.Round(bought - remaining))
 	default:

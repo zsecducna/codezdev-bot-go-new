@@ -158,6 +158,14 @@ func (b *Bot) refundAmount(o *store.Order, asOf *float64) (amount, unitsTotal, u
 	if remaining < 0 {
 		remaining = 0
 	}
+	// RoundToEven-to-nearest-unit is correct TODAY because o.Total is VND.
+	// After the ledger migration (task #11) o.Total becomes micro-USDT and
+	// orders.total/refunded_amount are bucketCentRounded — rounding to the
+	// nearest MICRO here would land off a whole-cent (10,000 micro) boundary,
+	// silently producing a value the migration's own whole-cent invariant
+	// (cmd/migrate-usdt/migrate.go's checkWholeCentInvariant) exists to
+	// reject. Post-cutover this must round to the nearest 10,000 micro, not
+	// the nearest micro.
 	amount = int64(math.RoundToEven(float64(o.Total) * float64(remaining) / float64(unitsTotal)))
 	if amount < 0 {
 		amount = 0
