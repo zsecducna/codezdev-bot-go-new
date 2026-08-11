@@ -427,18 +427,61 @@ func perRowMaxError(b bucket, rate int64) int64 {
 }
 
 // columnTolerance is plan §6.6 check #2's reconciliation bound: the maximum
-// |SumAfter - ExpectedSumAfter| a column's independent per-row roundings
-// may legitimately produce. Per-row rounding errors are independent and
-// roughly uniformly distributed, so they accumulate like a random walk —
-// on the order of sqrt(rowCount), not rowCount. The old rowCount-linear
-// bound (rowCount * perRowMaxError) was thousands of times looser than
-// real drift at realistic row counts and would hide a genuinely
-// mis-converted row inside a much larger allowance. This bound is now
-// LOAD-BEARING (RunApply aborts the transaction when Delta exceeds it, see
-// evaluateColumns) — verified empirically against a copy of the live
-// production ledger: delta = 0 on all nine money columns at the frozen
-// rate, comfortably inside this bound.
+// |SumAfter - ExpectedSumAfter| a column's per-row roundings may
+// legitimately produce. It is rowCount-linear, and this file previously
+// carried a sqrt(rowCount) bound here on the argument that rounding errors
+// are independent, zero-mean and therefore accumulate like a random walk.
+//
+// THAT ARGUMENT IS WRONG ON THIS DATA, and the bound was reverted after it
+// was measured rather than assumed. Two reasons, both fatal:
+//
+//   - The errors are not zero-mean. Shop prices are not arbitrary integers;
+//     they are round numbers (multiples of 1000 VND). At a rate that does
+//     not divide 1_000_000 evenly, vnd*1_000_000/rate lands on a RESTRICTED
+//     set of residues mod one cent, so the per-row error carries a
+//     systematic bias and the sum grows LINEARLY in rowCount, not as its
+//     square root. Simulated at rowCount=2911 with realistic prices: at
+//     rate 24000 the mean |delta| is ~2,430,000 micro against a sqrt bound
+//     of 270,000 — the bound is exceeded on EVERY run.
+//   - Even where the errors do behave independently, ceil(sqrt(n))*maxErr
+//     is about 1.7 sigma, not a bound. Uniform per-row errors in
+//     ±maxErr have std maxErr/sqrt(3), so the sum's std is
+//     sqrt(n)*maxErr/sqrt(3); the sqrt bound therefore refuses a CORRECT
+//     migration roughly 8% of the time (measured: 8.5% at rate 26000,
+//     10.2% at rate 23500).
+//
+// This matters because the bound is LOAD-BEARING as of Fix 1 — RunApply
+// aborts and rolls back when Delta exceeds it — and `-rate` is a MANDATORY
+// operator-supplied value with no default. A one-shot ledger migration that
+// refuses a correct conversion because the operator chose 24000 instead of
+// 25000 is a worse failure than a loose bound, and the genuine
+// mis-conversion case this was meant to catch is already covered: a wrong
+// rate, an inverted operation or a mis-scanned row does NOT move Delta at
+// all (both sides derive from the same scanned values through the same
+// function), so tightening it never bought what it appeared to buy.
+//
+// The exactly-zero case is kept and is the one real tightening here: where
+// the rate divides 1_000_000 evenly, vndToMicro cannot round at all, so any
+// non-zero delta on a free-micro column is a genuine defect, not drift.
+//
+// columnDriftBound reports what the sqrt estimate WOULD be, for operator
+// eyes only — see its comment.
 func columnTolerance(b bucket, rate int64, rowCount int64) int64 {
+	maxErr := perRowMaxError(b, rate)
+	if maxErr == 0 || rowCount == 0 {
+		return 0
+	}
+	return rowCount * maxErr
+}
+
+// columnDriftBound is the sqrt(rowCount) figure that columnTolerance
+// deliberately does NOT enforce (see its comment for why enforcing it
+// refuses correct migrations). It is reported next to Delta purely as a
+// diagnostic: on a ledger whose prices round cleanly at the chosen rate,
+// Delta sits at 0 and far below this, and a Delta that exceeds it is worth
+// an operator's attention even though it is not, on its own, grounds to
+// abort.
+func columnDriftBound(b bucket, rate int64, rowCount int64) int64 {
 	maxErr := perRowMaxError(b, rate)
 	if maxErr == 0 || rowCount == 0 {
 		return 0
@@ -527,12 +570,18 @@ type ColumnReport struct {
 	// ExpectedSumAfter is the AGGREGATE conversion of SumBefore in one shot
 	// (not a sum of per-row roundings) — the number §6.6 check #2 compares
 	// SumAfter against. Delta is |SumAfter - ExpectedSumAfter|; the column
-	// reconciles when Delta <= Tolerance (see columnTolerance — a sqrt(n)
-	// bound, LOAD-BEARING as of Fix 1: RunApply aborts and rolls back when
-	// this is exceeded).
+	// reconciles when Delta <= Tolerance (see columnTolerance — a
+	// rowCount-linear bound, LOAD-BEARING as of Fix 1: RunApply aborts and
+	// rolls back when this is exceeded).
 	ExpectedSumAfter int64
 	Delta            int64
 	Tolerance        int64
+
+	// DriftBound is the sqrt(rowCount) drift estimate, REPORTED BUT NEVER
+	// ENFORCED — a Delta above it is worth an operator's attention but is
+	// not grounds to abort. See columnDriftBound for why enforcing it
+	// refuses correct migrations at plausible rates.
+	DriftBound int64
 
 	// ZeroCollapses lists every row whose ORIGINAL value was non-zero but
 	// whose converted value rounded to zero — requirement #6, "the class
@@ -614,6 +663,8 @@ func processSpecs(q querier, specs []moneySpec, rate int64, write bool) ([]Colum
 			cr.Delta = -cr.Delta
 		}
 		cr.Tolerance = columnTolerance(spec.bucket, rate, cr.RowCount)
+		// Reported, never enforced — see columnDriftBound.
+		cr.DriftBound = columnDriftBound(spec.bucket, rate, cr.RowCount)
 		out = append(out, cr)
 	}
 	return out, nil

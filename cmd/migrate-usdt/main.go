@@ -121,6 +121,13 @@ func printReport(w io.Writer, r *Report) {
 		fmt.Fprintf(w, "  %s.%s [%s]\n", c.Table, c.Column, c.Bucket)
 		fmt.Fprintf(w, "    rows=%d  sum_before(VND)=%d  sum_after(micro)=%d  expected(micro)=%d  delta=%d  tolerance=%d  %s\n",
 			c.RowCount, c.SumBefore, c.SumAfter, c.ExpectedSumAfter, c.Delta, c.Tolerance, verdict)
+		// The drift estimate is advisory only (see columnDriftBound): a delta
+		// above it deserves a look, but enforcing it would refuse correct
+		// migrations at rates that do not divide 1_000_000 evenly.
+		if c.DriftBound > 0 && c.Delta > c.DriftBound {
+			fmt.Fprintf(w, "    NOTE: delta=%d exceeds the sqrt(n) drift estimate %d — not an abort, but worth checking before you proceed\n",
+				c.Delta, c.DriftBound)
+		}
 		if len(c.ZeroCollapses) > 0 {
 			fmt.Fprintf(w, "    ZERO-COLLAPSE (non-zero VND -> zero micro), %d row(s):\n", len(c.ZeroCollapses))
 			for _, z := range c.ZeroCollapses {

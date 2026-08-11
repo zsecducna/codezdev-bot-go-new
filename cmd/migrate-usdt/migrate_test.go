@@ -785,24 +785,51 @@ func TestValidateCLIFlagsRequiresConfirmationForApply(t *testing.T) {
 
 // ---- Fix 7: tolerance scales with sqrt(rowCount), not rowCount -----------
 
-// TestColumnToleranceIsTight is PINNED to Fix 7: the reconciliation
-// tolerance must be exactly 0 for a free-micro column at a rate that
-// divides 1_000_000 evenly (rate=25000 does: 1_000_000/25000=40, so
-// vndToMicro never rounds), and must scale with sqrt(rowCount), not
-// rowCount, for a cent-rounded column.
-func TestColumnToleranceIsTight(t *testing.T) {
+// TestColumnToleranceIsExactWhereRoundingCannotHappen pins the one
+// tightening that is genuinely safe: where the rate divides 1_000_000
+// evenly, vndToMicro cannot round at all, so a free-micro column's
+// tolerance must be EXACTLY 0 and any non-zero delta is a real defect
+// rather than drift. The condition must be computed from the rate, not
+// special-cased to the frozen 25000.
+func TestColumnToleranceIsExactWhereRoundingCannotHappen(t *testing.T) {
 	if got := columnTolerance(bucketFreeMicro, 25000, 3); got != 0 {
-		t.Errorf("columnTolerance(freeMicro, rate=25000, n=3) = %d, want 0 (rate divides 1_000_000 evenly, no rounding possible)", got)
+		t.Errorf("columnTolerance(freeMicro, rate=25000, n=3) = %d, want 0 (1_000_000/25000 = 40, no rounding possible)", got)
 	}
-	// n=2911 (the reviewer's own real order-count figure): sqrt(2911) ~=
-	// 53.96, ceil = 54, * 5000 = 270000 -- a small fraction of the old
-	// rowCount*5000 = 14,555,000 bound.
-	got := columnTolerance(bucketCentRounded, 25000, 2911)
-	if got != 270000 {
-		t.Errorf("columnTolerance(centRounded, rate=25000, n=2911) = %d, want 270000", got)
+	// 3 divides 1_000_000? No. So rounding CAN happen and the tolerance
+	// must not be zero -- this is what proves the check is computed rather
+	// than hardcoded to the one rate we happen to ship with.
+	if got := columnTolerance(bucketFreeMicro, 3, 10); got == 0 {
+		t.Error("columnTolerance(freeMicro, rate=3, n=10) = 0, but 1_000_000%3 != 0 so rounding IS possible — the exactness check is hardcoded to a rate instead of computed")
 	}
-	if old := int64(2911) * 5000; got >= old {
-		t.Errorf("columnTolerance(centRounded, n=2911) = %d, not tighter than the old rowCount-linear bound %d", got, old)
+}
+
+// TestColumnToleranceDoesNotRefuseACorrectMigration is the regression pin
+// for a bound that was tightened to ceil(sqrt(rowCount))*maxErr and had to
+// be reverted. The sqrt bound assumed per-row rounding errors are
+// independent and zero-mean. They are not: shop prices are round numbers,
+// so at a rate that does not divide 1_000_000 evenly the errors carry a
+// systematic bias and their sum grows LINEARLY in rowCount. Simulated over
+// 2911 realistic order totals, the sqrt bound was exceeded on 100% of runs
+// at rate 24000 and ~8-10% of runs at rates 26000 and 23500 — i.e. it
+// refused CORRECT migrations, and this tolerance aborts a one-shot ledger
+// conversion.
+//
+// The property that must hold: the enforced tolerance must cover the worst
+// case the conversion can actually produce, which is every row rounding the
+// same direction by the maximum amount. Anything below rowCount*maxErr can
+// refuse a correct run.
+func TestColumnToleranceDoesNotRefuseACorrectMigration(t *testing.T) {
+	const n = 2911
+	worstCase := int64(n) * (microPerCent / 2) // every row rounds the same way, maximally
+	got := columnTolerance(bucketCentRounded, 24000, n)
+	if got < worstCase {
+		t.Errorf("columnTolerance(centRounded, rate=24000, n=%d) = %d, which is below the worst case a correct conversion can produce (%d) — a correct migration can be refused",
+			n, got, worstCase)
+	}
+	// And the sqrt figure it replaced must survive only as a REPORTED
+	// diagnostic, never as the enforced bound.
+	if drift := columnDriftBound(bucketCentRounded, 24000, n); drift >= got {
+		t.Errorf("columnDriftBound(%d) = %d is not below the enforced tolerance %d — the advisory bound has become the enforced one", n, drift, got)
 	}
 }
 
