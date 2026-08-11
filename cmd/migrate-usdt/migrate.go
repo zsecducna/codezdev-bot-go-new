@@ -14,6 +14,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"os"
 	"strconv"
@@ -46,6 +47,45 @@ var (
 	// what stops a typo'd path from "migrating" 0 rows and stamping the
 	// marker on a brand-new, empty database.
 	ErrDBMissing = errors.New("migrate-usdt: database file does not exist")
+	// ErrLegacyColumnPresent means a spec's legacy_vnd_* column already
+	// exists on its table even though meta.ledger_unit does not say
+	// "migrated" — the marker (dropped table, hand-edit, partial restore)
+	// is NOT the only signal a prior run touched this database. A
+	// pre-existing legacy column means a divide has already happened once;
+	// converting again would divide a second time, and the legacy column —
+	// the one place the original VND value would otherwise survive — would
+	// get silently overwritten with the now-double-converted value.
+	ErrLegacyColumnPresent = errors.New("migrate-usdt: a legacy_vnd_* column already exists — this database was touched by a prior run (marker or no marker); refusing to convert again")
+	// ErrToleranceBreach means a column's reconciliation Delta exceeded its
+	// Tolerance (plan §6.6 check #2) — a hard, non-overridable abort:
+	// unlike a zero-collapse, there is no flag that lets an apply past
+	// this.
+	ErrToleranceBreach = errors.New("migrate-usdt: a column's reconciliation delta exceeds its tolerance")
+	// ErrZeroCollapse means a column has at least one row whose non-zero
+	// VND value rounded to zero micro — requirement #6, "the class that
+	// loses a customer real money." Refused unless -allow-zero-collapse is
+	// passed.
+	ErrZeroCollapse = errors.New("migrate-usdt: a column has row(s) whose non-zero VND value collapsed to zero micro")
+	// ErrRowUpdateMismatch means a per-row UPDATE inside the conversion
+	// transaction matched a row count other than exactly 1 — see
+	// processSpecs' RowsAffected guard for why that must abort rather than
+	// pass silently.
+	ErrRowUpdateMismatch = errors.New("migrate-usdt: a conversion UPDATE matched a row count other than 1")
+	// ErrMicroOverflow means a VND->micro conversion's result does not fit
+	// in an int64 — see vndToMicro's doc comment. Not reachable with any
+	// real data this tool has ever seen; guarded anyway.
+	ErrMicroOverflow = errors.New("migrate-usdt: converted micro-USDT value overflows int64")
+	// ErrWholeCentInvariant means a cent-rounded money column has a value,
+	// post-conversion, that is not an exact multiple of one whole cent
+	// (10,000 micro) — plan §6.6 check #5, "the single most valuable
+	// design decision in the migration," verified pre-commit instead of
+	// merely asserted in a comment.
+	ErrWholeCentInvariant = errors.New("migrate-usdt: a cent-rounded column has a value that is not a whole cent after conversion")
+	// ErrProvenanceMismatch means a converted row (non-NULL money value)
+	// has a NULL legacy_vnd_* column — plan §6.6 check #7: that row's
+	// original VND amount now exists only in the backup, nowhere in the
+	// live database.
+	ErrProvenanceMismatch = errors.New("migrate-usdt: a converted row is missing its legacy_vnd_* provenance value")
 )
 
 // bucket is the rounding rule a money column follows, per plan §2.2/§2.3.
@@ -217,6 +257,7 @@ func tableColumnsQ(q querier, table string) (map[string]bool, error) {
 // that case.
 func checkRequiredSchema(q querier, specs []moneySpec) error {
 	var missing []string
+	var alreadyConverted []string
 	seen := map[string]bool{} // "table.column" already reported
 	for _, spec := range specs {
 		cols, err := tableColumnsQ(q, spec.table)
@@ -230,12 +271,34 @@ func checkRequiredSchema(q querier, specs []moneySpec) error {
 				seen[key] = true
 			}
 		}
+		// ---- GUARD: a pre-existing legacy column means a prior run
+		// already touched this table, meta.ledger_unit marker or not (see
+		// ErrLegacyColumnPresent's doc comment) — this is what makes the
+		// meta marker non-load-bearing as the SOLE idempotence signal. -----
+		legacyKey := spec.table + "." + spec.legacyCol
+		if cols[spec.legacyCol] && !seen[legacyKey] {
+			alreadyConverted = append(alreadyConverted, legacyKey)
+			seen[legacyKey] = true
+		}
+		// ---- end guard ------------------------------------------------
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("%w: %v", ErrMissingSchema, missing)
 	}
+	if len(alreadyConverted) > 0 {
+		return fmt.Errorf("%w: %v", ErrLegacyColumnPresent, alreadyConverted)
+	}
 	return nil
 }
+
+// pendingCountsTestHook, when non-nil, is invoked immediately after
+// RunApply's transaction begins (write lock acquired via _txlock=immediate)
+// and immediately before the §1.G3 pending-table gate reads its snapshot.
+// Test-only seam (TestPendingGateReadsInsideTransaction) that lets a test
+// observe the exact moment the gate runs relative to Begin(), to prove the
+// read happens after the write lock, not before it. main.go never sets
+// this.
+var pendingCountsTestHook func()
 
 // pendingCounts returns the row count of every *_pending table this tool
 // knows about (bep20/tron always, binance if present) — the data the §1.G3
@@ -305,13 +368,24 @@ func roundDivHalfUp(numerator, denominator *big.Int) *big.Int {
 
 // vndToMicro converts a VND integer amount to micro-USDT at `rate`
 // VND-per-USD: micro = round(vnd * 1_000_000 / rate), computed via big.Int
-// so the intermediate vnd*1_000_000 product can never silently overflow
-// int64 (plan §6.1). rate must be > 0 — callers validate this once, at the
-// CLI boundary.
-func vndToMicro(vnd, rate int64) int64 {
+// so the intermediate vnd*1_000_000 product itself can never silently
+// overflow (plan §6.1) — but the FINAL result still has to fit back into an
+// int64 for every caller downstream (SQL bind params, Report fields,
+// etc.), and big.Int's own .Int64() truncates to the low 64 bits SILENTLY
+// if the value doesn't fit. IsInt64() below is what turns that into a
+// typed error instead of a silently wrong number. Not reachable with
+// today's data at today's rate (would need vnd > ~2.3e17; the largest real
+// aggregate this tool has seen is ~2.55e12 VND) — guarded anyway, because
+// "not reachable today" is not the same claim as "can never happen". rate
+// must be > 0 — callers validate this once, at the CLI boundary.
+func vndToMicro(vnd, rate int64) (int64, error) {
 	num := new(big.Int).Mul(big.NewInt(vnd), big.NewInt(1_000_000))
 	den := big.NewInt(rate)
-	return roundDivHalfUp(num, den).Int64()
+	q := roundDivHalfUp(num, den)
+	if !q.IsInt64() {
+		return 0, fmt.Errorf("%w: vnd=%d rate=%d", ErrMicroOverflow, vnd, rate)
+	}
+	return q.Int64(), nil
 }
 
 // roundToNearestCent rounds a micro-USDT amount to the nearest whole cent
@@ -323,23 +397,53 @@ func roundToNearestCent(micro int64) int64 {
 }
 
 // convertValue applies a spec's bucket rule to one VND value.
-func convertValue(vnd, rate int64, b bucket) int64 {
-	micro := vndToMicro(vnd, rate)
-	if b == bucketCentRounded {
-		return roundToNearestCent(micro)
+func convertValue(vnd, rate int64, b bucket) (int64, error) {
+	micro, err := vndToMicro(vnd, rate)
+	if err != nil {
+		return 0, err
 	}
-	return micro
+	if b == bucketCentRounded {
+		return roundToNearestCent(micro), nil
+	}
+	return micro, nil
 }
 
-// perRowTolerance is the maximum reconciliation drift one row can
-// contribute, per plan §6.6 check #2 (generalised from "row_count micro,
-// one micro of rounding per row" to the cent-rounded bucket, which rounds
-// twice and so can drift up to half a cent = 5,000 micro per row).
-func perRowTolerance(b bucket) int64 {
+// perRowMaxError is the largest rounding error, in micro-USDT, a SINGLE
+// row's conversion can introduce. bucketFreeMicro rounds once
+// (vnd*1_000_000/rate) — that step is EXACT, zero error, whenever `rate`
+// evenly divides 1_000_000 (it leaves no remainder to round away); at any
+// other rate the single round-half-up step can be off by up to half a
+// micro, which as an integer bound rounds up to 1. bucketCentRounded rounds
+// TWICE (vndToMicro, then roundToNearestCent), so its worst case is half a
+// cent (microPerCent/2) regardless of rate.
+func perRowMaxError(b bucket, rate int64) int64 {
 	if b == bucketCentRounded {
 		return microPerCent / 2
 	}
+	if 1_000_000%rate == 0 {
+		return 0
+	}
 	return 1
+}
+
+// columnTolerance is plan §6.6 check #2's reconciliation bound: the maximum
+// |SumAfter - ExpectedSumAfter| a column's independent per-row roundings
+// may legitimately produce. Per-row rounding errors are independent and
+// roughly uniformly distributed, so they accumulate like a random walk —
+// on the order of sqrt(rowCount), not rowCount. The old rowCount-linear
+// bound (rowCount * perRowMaxError) was thousands of times looser than
+// real drift at realistic row counts and would hide a genuinely
+// mis-converted row inside a much larger allowance. This bound is now
+// LOAD-BEARING (RunApply aborts the transaction when Delta exceeds it, see
+// evaluateColumns) — verified empirically against a copy of the live
+// production ledger: delta = 0 on all nine money columns at the frozen
+// rate, comfortably inside this bound.
+func columnTolerance(b bucket, rate int64, rowCount int64) int64 {
+	maxErr := perRowMaxError(b, rate)
+	if maxErr == 0 || rowCount == 0 {
+		return 0
+	}
+	return int64(math.Ceil(math.Sqrt(float64(rowCount)))) * maxErr
 }
 
 // ---- per-row work -----------------------------------------------------
@@ -423,7 +527,9 @@ type ColumnReport struct {
 	// ExpectedSumAfter is the AGGREGATE conversion of SumBefore in one shot
 	// (not a sum of per-row roundings) — the number §6.6 check #2 compares
 	// SumAfter against. Delta is |SumAfter - ExpectedSumAfter|; the column
-	// reconciles when Delta <= Tolerance (RowCount * perRowTolerance(Bucket)).
+	// reconciles when Delta <= Tolerance (see columnTolerance — a sqrt(n)
+	// bound, LOAD-BEARING as of Fix 1: RunApply aborts and rolls back when
+	// this is exceeded).
 	ExpectedSumAfter int64
 	Delta            int64
 	Tolerance        int64
@@ -461,7 +567,10 @@ func processSpecs(q querier, specs []moneySpec, rate int64, write bool) ([]Colum
 		}
 		cr := ColumnReport{Table: spec.table, Column: spec.valueCol, Bucket: spec.bucket}
 		for _, r := range rows {
-			newVal := convertValue(r.old, rate, spec.bucket)
+			newVal, err := convertValue(r.old, rate, spec.bucket)
+			if err != nil {
+				return nil, fmt.Errorf("convert %s.%s pk=%v: %w", spec.table, spec.valueCol, r.pk, err)
+			}
 			cr.RowCount++
 			cr.SumBefore += r.old
 			cr.SumAfter += newVal
@@ -469,21 +578,42 @@ func processSpecs(q querier, specs []moneySpec, rate int64, write bool) ([]Colum
 				cr.ZeroCollapses = append(cr.ZeroCollapses, ZeroCollapse{spec.table, r.pk, r.old})
 			}
 			if write {
-				_, err := q.Exec(fmt.Sprintf(
+				res, err := q.Exec(fmt.Sprintf(
 					"UPDATE %s SET %s = ?, %s = ? WHERE %s = ?",
 					spec.table, spec.valueCol, spec.legacyCol, spec.pkCol),
 					newVal, r.old, r.pk)
 				if err != nil {
 					return nil, fmt.Errorf("update %s.%s pk=%v: %w", spec.table, spec.valueCol, r.pk, err)
 				}
+				// ---- GUARD: the UPDATE must touch exactly the row it
+				// targeted. sql.Result is normally discarded, which makes a
+				// zero-match (a row deleted/renumbered out from under this
+				// transaction) or a multi-match (a non-unique pkCol) UPDATE
+				// invisible: SumAfter above is accumulated in Go and never
+				// re-read from the database, so nothing else would catch a
+				// row that silently kept its old VND value (or a sibling row
+				// getting overwritten by mistake). --------------------------
+				n, err := res.RowsAffected()
+				if err != nil {
+					return nil, fmt.Errorf("rows affected %s.%s pk=%v: %w", spec.table, spec.valueCol, r.pk, err)
+				}
+				if n != 1 {
+					return nil, fmt.Errorf("%w: %s.%s pk=%v matched %d row(s), want exactly 1",
+						ErrRowUpdateMismatch, spec.table, spec.valueCol, r.pk, n)
+				}
+				// ---- end guard --------------------------------------------
 			}
 		}
-		cr.ExpectedSumAfter = convertValue(cr.SumBefore, rate, spec.bucket)
+		expected, err := convertValue(cr.SumBefore, rate, spec.bucket)
+		if err != nil {
+			return nil, fmt.Errorf("convert %s.%s aggregate: %w", spec.table, spec.valueCol, err)
+		}
+		cr.ExpectedSumAfter = expected
 		cr.Delta = cr.SumAfter - cr.ExpectedSumAfter
 		if cr.Delta < 0 {
 			cr.Delta = -cr.Delta
 		}
-		cr.Tolerance = perRowTolerance(spec.bucket) * cr.RowCount
+		cr.Tolerance = columnTolerance(spec.bucket, rate, cr.RowCount)
 		out = append(out, cr)
 	}
 	return out, nil
@@ -568,21 +698,98 @@ func RunDryRun(dbPath string, rate int64) (*Report, error) {
 	return report, nil
 }
 
+// checkWholeCentInvariant is plan §6.6 check #5, run as a pre-commit gate
+// inside RunApply's transaction (after conversion, before COMMIT): every
+// cent-rounded column must be an exact multiple of one whole cent (10,000
+// micro). processSpecs' own rounding step is SUPPOSED to guarantee this by
+// construction — this check is defense-in-depth against a future bug in
+// that step, not something normal operation is expected to ever trip.
+func checkWholeCentInvariant(q querier, specs []moneySpec) error {
+	for _, spec := range specs {
+		if spec.bucket != bucketCentRounded {
+			continue
+		}
+		var n int64
+		query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s %% %d != 0", spec.table, spec.valueCol, microPerCent)
+		if err := q.QueryRow(query).Scan(&n); err != nil {
+			return fmt.Errorf("whole-cent check %s.%s: %w", spec.table, spec.valueCol, err)
+		}
+		if n > 0 {
+			return fmt.Errorf("%w: %s.%s has %d row(s) not a multiple of %d micro",
+				ErrWholeCentInvariant, spec.table, spec.valueCol, n, microPerCent)
+		}
+	}
+	return nil
+}
+
+// checkProvenanceRoundTrip is plan §6.6 check #7, the same kind of
+// pre-commit, defense-in-depth gate as checkWholeCentInvariant: no row may
+// have a non-NULL money value with a NULL legacy_vnd_* column, for every
+// spec (not just cent-rounded ones) — a NULL legacy column on a converted
+// row means that row's original VND amount now exists only in the backup.
+func checkProvenanceRoundTrip(q querier, specs []moneySpec) error {
+	for _, spec := range specs {
+		var n int64
+		query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s IS NOT NULL AND %s IS NULL",
+			spec.table, spec.valueCol, spec.legacyCol)
+		if err := q.QueryRow(query).Scan(&n); err != nil {
+			return fmt.Errorf("provenance check %s.%s: %w", spec.table, spec.valueCol, err)
+		}
+		if n > 0 {
+			return fmt.Errorf("%w: %s.%s has %d row(s) with a NULL %s",
+				ErrProvenanceMismatch, spec.table, spec.valueCol, n, spec.legacyCol)
+		}
+	}
+	return nil
+}
+
+// evaluateColumns applies plan §6.6's pre-commit reconciliation gate to a
+// set of already-computed ColumnReports: any column whose Delta exceeds its
+// Tolerance is a hard, non-overridable abort (ErrToleranceBreach — no flag
+// lets an apply past this, ever); any column with zero-collapse rows aborts
+// too (ErrZeroCollapse) unless allowZeroCollapse is set. Kept as a small
+// pure function, separate from runApply's I/O, so it is directly testable
+// against hand-built ColumnReports rather than requiring real data crafted
+// to breach tolerance.
+func evaluateColumns(cols []ColumnReport, allowZeroCollapse bool) error {
+	for _, c := range cols {
+		if c.Delta > c.Tolerance {
+			return fmt.Errorf("%w: %s.%s delta=%d tolerance=%d",
+				ErrToleranceBreach, c.Table, c.Column, c.Delta, c.Tolerance)
+		}
+	}
+	if !allowZeroCollapse {
+		for _, c := range cols {
+			if len(c.ZeroCollapses) > 0 {
+				return fmt.Errorf("%w: %s.%s has %d zero-collapse row(s)",
+					ErrZeroCollapse, c.Table, c.Column, len(c.ZeroCollapses))
+			}
+		}
+	}
+	return nil
+}
+
 // RunApply performs the live conversion in ONE SQLite transaction —
 // requirement #2. Any error at any point rolls back everything: the
 // provenance writes, the column conversions, the ALTER TABLEs that added
 // the legacy_vnd_* columns, all of it, because SQLite DDL is transactional
-// exactly like its DML.
-func RunApply(dbPath string, rate int64) (*Report, error) {
-	return runApply(dbPath, rate, nil)
+// exactly like its DML. allowZeroCollapse overrides ONLY the zero-collapse
+// abort (evaluateColumns) — a tolerance breach is never overridable.
+func RunApply(dbPath string, rate int64, allowZeroCollapse bool) (*Report, error) {
+	return runApply(dbPath, rate, allowZeroCollapse, nil, false)
 }
 
-// runApply is RunApply's implementation. overrideSpecs, when non-nil,
-// replaces the normal buildSpecs(db) discovery — a test-only seam (used by
-// TestRollbackOnMidMigrationError to inject a spec that fails partway
-// through the transaction) that main.go never exercises: RunApply always
-// calls this with overrideSpecs nil.
-func runApply(dbPath string, rate int64, overrideSpecs []moneySpec) (*Report, error) {
+// runApply is RunApply's implementation, plus two test-only seams that
+// main.go never exercises (RunApply always calls this with overrideSpecs
+// nil and skipAlreadyMigratedGuard false):
+//   - overrideSpecs, when non-nil, replaces the normal buildSpecs(db)
+//     discovery (used by TestRollbackOnMidMigrationError to inject a spec
+//     that fails partway through the transaction).
+//   - skipAlreadyMigratedGuard, when true, skips the in-tx idempotence
+//     guard below (used by TestMetaInsertPKConflictIsLoadBearing to reach
+//     the plain "INSERT INTO meta" on a second run and prove ITS OWN
+//     PRIMARY KEY conflict — not the guard — is what aborts the run).
+func runApply(dbPath string, rate int64, allowZeroCollapse bool, overrideSpecs []moneySpec, skipAlreadyMigratedGuard bool) (*Report, error) {
 	if rate <= 0 {
 		return nil, fmt.Errorf("migrate-usdt: rate must be positive, got %d", rate)
 	}
@@ -604,6 +811,20 @@ func runApply(dbPath string, rate int64, overrideSpecs []moneySpec) (*Report, er
 	if overrideSpecs != nil {
 		specs = overrideSpecs
 	} else {
+		// ---- GUARD: fast idempotence check, before opening a write tx.
+		// This MUST run before checkRequiredSchema below: a normal,
+		// marker-present second run must report the fast, friendly
+		// ErrAlreadyMigrated, not trip checkRequiredSchema's
+		// ErrLegacyColumnPresent check — that one exists for the OTHER
+		// case, where the marker itself is missing (Fix 2). --------------
+		migratedPre, err := alreadyMigrated(db)
+		if err != nil {
+			return nil, err
+		}
+		if migratedPre {
+			return nil, ErrAlreadyMigrated
+		}
+		// ---- end guard --------------------------------------------------
 		specs, err = buildSpecs(db)
 		if err != nil {
 			return nil, err
@@ -613,12 +834,25 @@ func runApply(dbPath string, rate int64, overrideSpecs []moneySpec) (*Report, er
 		}
 	}
 
-	// Plan §1.G3 hard gate, checked BEFORE opening the transaction: if a
-	// checkout is still in flight, converting straddles the cutover and
-	// produces a credit off by ~the conversion rate in whichever direction
-	// the arithmetic falls. Refuse outright rather than convert an empty
-	// set and hope nothing lands mid-run.
-	pending, err := pendingCounts(db)
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() // no-op after a successful Commit below
+
+	// ---- FIX (G3 TOCTOU): the §1.G3 pending-table gate is evaluated from
+	// INSIDE this transaction, not from the bare db connection before
+	// Begin(). _txlock=immediate acquires SQLite's write lock at Begin, not
+	// before — reading pendingCounts on the bare connection first leaves a
+	// window between that read and the lock where another writer could
+	// insert a pending row this gate would never see. Reading via tx here
+	// guarantees the snapshot we gate on is the same one the conversion
+	// below operates on. (RunDryRun's read is deliberately still pre-Begin
+	// — it never opens a transaction at all, it's report-only.)
+	if pendingCountsTestHook != nil {
+		pendingCountsTestHook()
+	}
+	pending, err := pendingCounts(tx)
 	if err != nil {
 		return nil, err
 	}
@@ -627,39 +861,53 @@ func runApply(dbPath string, rate int64, overrideSpecs []moneySpec) (*Report, er
 			return nil, fmt.Errorf("%w: %s has %d row(s)", ErrPendingNotEmpty, table, n)
 		}
 	}
-
-	tx, err := db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback() // no-op after a successful Commit below
+	// ---- end fix ------------------------------------------------------
 
 	if _, err := tx.Exec(
 		"CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"); err != nil {
 		return nil, fmt.Errorf("create meta: %w", err)
 	}
 
-	// ---- GUARD: idempotence marker check ----------------------------------
-	// Refuses a re-run BEFORE a single money row is touched. This is what
-	// turns "ran twice" into a clean, typed ErrAlreadyMigrated instead of
-	// relying solely on the plain INSERT below — that INSERT's PK conflict
-	// is the actual, mutation-proof safety net (it rolls back the whole
-	// transaction even if this check is ever deleted), but on its own it
-	// surfaces as an opaque driver error, not something a caller can branch
-	// on.
-	migrated, err := alreadyMigrated(tx)
-	if err != nil {
-		return nil, err
+	if !skipAlreadyMigratedGuard {
+		// ---- GUARD: idempotence marker check --------------------------------
+		// Refuses a re-run BEFORE a single money row is touched. This is what
+		// turns "ran twice" into a clean, typed ErrAlreadyMigrated instead of
+		// relying solely on the plain INSERT below — that INSERT's PK conflict
+		// is the actual, mutation-proof safety net (it rolls back the whole
+		// transaction even if this check is ever deleted), but on its own it
+		// surfaces as an opaque driver error, not something a caller can branch
+		// on.
+		migrated, err := alreadyMigrated(tx)
+		if err != nil {
+			return nil, err
+		}
+		if migrated {
+			return nil, ErrAlreadyMigrated
+		}
+		// ---- end guard --------------------------------------------------------
 	}
-	if migrated {
-		return nil, ErrAlreadyMigrated
-	}
-	// ---- end guard --------------------------------------------------------
 
 	cols, err := processSpecs(tx, specs, rate, true)
 	if err != nil {
 		return nil, err
 	}
+
+	// ---- GATE: plan §6.6 pre-commit checks, inside the transaction, after
+	// conversion, before the meta write. Any failure here means the report
+	// returned alongside the error reflects a REFUSED apply (Mode
+	// "apply-REFUSED") — not a report that reads as if the run succeeded
+	// while the deferred tx.Rollback() above quietly undoes it (Fix 1).
+	refused := &Report{DBPath: dbPath, Rate: rate, Mode: "apply-REFUSED", Columns: cols, PendingCounts: pending}
+	if err := checkWholeCentInvariant(tx, specs); err != nil {
+		return refused, err
+	}
+	if err := checkProvenanceRoundTrip(tx, specs); err != nil {
+		return refused, err
+	}
+	if err := evaluateColumns(cols, allowZeroCollapse); err != nil {
+		return refused, err
+	}
+	// ---- end gate -------------------------------------------------------
 
 	// Plain INSERT — deliberately NOT "INSERT OR REPLACE". `key` is the
 	// meta table's PRIMARY KEY, so if the guard above were ever bypassed
