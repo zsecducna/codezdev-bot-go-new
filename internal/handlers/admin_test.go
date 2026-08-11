@@ -633,25 +633,28 @@ func TestAdminDashboardRefundBucketsRender(t *testing.T) {
 }
 
 // TestAdminDashboardGrossRefundedNetRender is the HANDLER half of A7
-// (stats-fixes-spec.md §5.5). The old dashboard printed a single "Total" line
-// that already excluded refunds, so a refund on an order from an
-// already-closed period silently shrank that report with nothing on screen
-// explaining why. Also pins the review-round "(at original price)" qualifier
-// on the Refunded line: of the three new lines, Gross and Net are EXACT
-// (Gross sums original charges; Net is the pre-existing figure relabelled),
-// but Refunded can overstate cash actually credited back on a partial refund
-// — the qualifier belongs on screen, not only in misc.go's comment, since an
-// admin reconciling a bank statement never opens the source. Seeds one
-// still-delivered sale (5000 VND) and one GENUINELY refunded sale (2000 VND)
-// and asserts the exact rendered Gross / Refunded / Net lines at the default
-// 25000 VND/USD test rate — Net must
-// equal exactly what the OLD "Total" line would have read (DeliveredRevenue
-// alone, 0.20 USDT / 1 order), and Gross must be the strictly larger,
-// previously-unseen number (0.28 USDT / 2 orders).
+// (stats-fixes-spec.md §5.5) AND task #20 stage S3 (misc.go's
+// GetRevenueSummary doc comment on the refund-split query). The old
+// dashboard printed a single "Total" line that already excluded refunds, so
+// a refund on an order from an already-closed period silently shrank that
+// report with nothing on screen explaining why — A7 replaced it with
+// Gross/Refunded/Net. Stage S3 then fixed WHAT those lines measure: this
+// test seeds a PARTIAL refund (1250 credited back out of a 2000 total,
+// recorded via SetRefundedAmount — the stage-S2 write path) specifically so
+// a regression back to the pre-S3 behaviour (Refunded = the 2000 order
+// total, Net = a bare relabelled DeliveredRevenue that ignores the refund
+// entirely) is caught: Refunded must read the CREDITED 1250, not the 2000
+// total, and Net must read Gross minus that credited amount (5750/0.23 USDT),
+// not the old 5000/0.20 USDT DeliveredRevenue figure. No legacy (unrecorded)
+// refund exists in this scenario, so Net renders as a single point — the
+// range-collapse case is pinned separately by
+// TestAdminDashboardRefundedRangeForLegacyUnknownRefunds.
 //
 // Falsification: reverting the REVENUE block back to the single
-// "Total: 0.20 USDT (1 orders)" line makes every assertion below fail —
-// verified by mutation (see the executor report).
+// "Total: 0.20 USDT (1 orders)" line, OR reverting Refunded/Net to read
+// RefundedRevenue/DeliveredRevenue (the pre-S3 order-total-based figures)
+// instead of the RefundedAmountKnown split, makes every assertion below
+// fail — verified by mutation (see the executor report).
 func TestAdminDashboardGrossRefundedNetRender(t *testing.T) {
 	ctx := context.Background()
 	b, f, st := newDashboardTestBot(t, "1")
@@ -672,6 +675,12 @@ func TestAdminDashboardGrossRefundedNetRender(t *testing.T) {
 	if _, err := st.ClaimOrderKind("refcust1", "delivered", "refunded", store.RefundKindCustomer); err != nil {
 		t.Fatalf("claim refcust1 -> refunded/customer: %v", err)
 	}
+	// The stage-S2 write: only 1250 of the 2000 total was actually credited
+	// back (a pro-rated warranty refund), recorded strictly after the status
+	// flip above, per SetRefundedAmount's own doc comment (orders.go).
+	if err := st.SetRefundedAmount("refcust1", 1250); err != nil {
+		t.Fatalf("SetRefundedAmount(refcust1, 1250): %v", err)
+	}
 
 	b.Process(ctx, callbackUpdate(1, "admroot"))
 	last := lastSendMsg(f)
@@ -679,18 +688,108 @@ func TestAdminDashboardGrossRefundedNetRender(t *testing.T) {
 		t.Fatal("admroot produced no reply")
 	}
 	if !strings.Contains(last.Text, "Gross: 0.28 USDT  (2 orders)") {
-		t.Errorf("want Gross = Net+Refunded = 0.28 USDT over 2 orders, got:\n%s", last.Text)
+		t.Errorf("want Gross = Σ original charges = 0.28 USDT over 2 orders "+
+			"(unaffected by the partial refund), got:\n%s", last.Text)
 	}
-	if !strings.Contains(last.Text, "Refunded: -0.08 USDT (at original price)  (1 orders)") {
-		t.Errorf("want Refunded = -0.08 USDT, qualified 'at original price' since "+
-			"it can overstate cash actually credited back on a partial refund "+
-			"(unlike Gross and Net, which are exact), got:\n%s", last.Text)
+	if !strings.Contains(last.Text, "Refunded: -0.05 USDT exact  (1 orders)") {
+		t.Errorf("want Refunded = the CREDITED 1250 (0.05 USDT), not refcust1's "+
+			"2000 total, got:\n%s", last.Text)
 	}
-	if !strings.Contains(last.Text, "Net: 0.20 USDT  (1 orders)") {
-		t.Errorf("want Net = the OLD Total unchanged (0.20 USDT / 1 order), got:\n%s", last.Text)
+	if strings.Contains(last.Text, "unrecorded") {
+		t.Errorf("no legacy/unknown refund exists in this scenario, so the "+
+			"'unrecorded' continuation line must not render, got:\n%s", last.Text)
+	}
+	if !strings.Contains(last.Text, "Net: 0.23 USDT  (1 orders)") {
+		t.Errorf("want Net = Gross(0.28) - Refunded(0.05) = 0.23 USDT as a single "+
+			"point (no legacy unknown to widen the range), got:\n%s", last.Text)
 	}
 	if strings.Contains(last.Text, "Total: ") {
 		t.Errorf("the old single Total line must be gone, replaced by Gross/Refunded/Net, got:\n%s", last.Text)
+	}
+}
+
+// TestAdminDashboardRefundedRangeForLegacyUnknownRefunds is the HANDLER half
+// of task #20 stage S3's core new behaviour: a refund with no recorded
+// refunded_amount (the shape every refund had before stage S2 started
+// writing the column — ClaimOrderKind alone, no SetRefundedAmount call)
+// must render as a SEPARATE "+ up to X unrecorded" line and widen Net into a
+// RANGE, never get silently folded into the exact known figure.
+//
+// This is the regression pin for the trap misc.go's GetRevenueSummary doc
+// comment calls out by name: SQLite's SUM() silently skips NULL rows, so a
+// naive SUM(refunded_amount) (or, equivalently at the render layer, a Net
+// computed as a single `Gross - RefundedAmountKnown` point instead of a
+// range) would treat every legacy unknown refund as if it credited back
+// $0 — UNDERSTATING refunds and OVERSTATING Net, the mirror image of the A7
+// bug this whole column exists to fix. A "fix" that reverts Net to a single
+// number cannot pass this test: the exact range string asserted below only
+// exists if RefundedUnknownUpperBound is actually subtracted at the low end.
+//
+// Seeds ONE known refund (1250 credited of a 2000 total, same as the sibling
+// test above) alongside ONE legacy/unknown refund (3000 total, refunded_amount
+// left NULL) so known and unknown are visibly distinct populations on the
+// same screen.
+//
+// Falsification: reverting Net to `b.usdtDisp(grossRevenue - r.RefundedAmountKnown)`
+// with no range logic renders "Net: 0.35 USDT  (1 orders)" instead of the
+// "0.23 USDT – 0.35 USDT" range asserted below, and dropping the
+// RefundedUnknownCount>0 branch entirely removes the "unrecorded" line —
+// both make this test fail (verified by mutation, see the executor report).
+func TestAdminDashboardRefundedRangeForLegacyUnknownRefunds(t *testing.T) {
+	ctx := context.Background()
+	b, f, st := newDashboardTestBot(t, "1")
+
+	if err := st.CreateOrder("delivered1", "9", "en", "kiro-pro", "T1", 1, 5000); err != nil {
+		t.Fatalf("CreateOrder(delivered1): %v", err)
+	}
+	if _, err := st.ClaimOrder("delivered1", "reserved", "delivered"); err != nil {
+		t.Fatalf("claim delivered1 -> delivered: %v", err)
+	}
+
+	// Known: recorded via SetRefundedAmount, the stage-S2 write path.
+	if err := st.CreateOrder("refcust1", "9", "en", "kiro-pro", "T1", 1, 2000); err != nil {
+		t.Fatalf("CreateOrder(refcust1): %v", err)
+	}
+	if _, err := st.ClaimOrder("refcust1", "reserved", "delivered"); err != nil {
+		t.Fatalf("claim refcust1 -> delivered: %v", err)
+	}
+	if _, err := st.ClaimOrderKind("refcust1", "delivered", "refunded", store.RefundKindCustomer); err != nil {
+		t.Fatalf("claim refcust1 -> refunded/customer: %v", err)
+	}
+	if err := st.SetRefundedAmount("refcust1", 1250); err != nil {
+		t.Fatalf("SetRefundedAmount(refcust1, 1250): %v", err)
+	}
+
+	// Unknown: the pre-S2 shape — status flip only, refunded_amount left NULL.
+	if err := st.CreateOrder("reflegacy1", "9", "en", "kiro-pro", "T1", 1, 3000); err != nil {
+		t.Fatalf("CreateOrder(reflegacy1): %v", err)
+	}
+	if _, err := st.ClaimOrder("reflegacy1", "reserved", "paid"); err != nil {
+		t.Fatalf("claim reflegacy1 -> paid: %v", err)
+	}
+	if _, err := st.ClaimOrderKind("reflegacy1", "paid", "refunded", store.RefundKindAdminCancel); err != nil {
+		t.Fatalf("claim reflegacy1 -> refunded/admin_cancel: %v", err)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "admroot"))
+	last := lastSendMsg(f)
+	if last == nil {
+		t.Fatal("admroot produced no reply")
+	}
+	if !strings.Contains(last.Text, "Gross: 0.40 USDT  (3 orders)") {
+		t.Errorf("want Gross = Σ original charges = 0.40 USDT over 3 orders, got:\n%s", last.Text)
+	}
+	if !strings.Contains(last.Text, "Refunded: -0.05 USDT exact  (1 orders)") {
+		t.Errorf("want the exact known refund on its own line, got:\n%s", last.Text)
+	}
+	if !strings.Contains(last.Text, "+ up to 0.12 USDT unrecorded  (1 legacy orders — actual refund not recorded)") {
+		t.Errorf("want the legacy refund's total (0.12 USDT) shown as a "+
+			"separate bounded ceiling, not folded into the exact figure, got:\n%s", last.Text)
+	}
+	if !strings.Contains(last.Text, "Net: 0.23 USDT – 0.35 USDT") {
+		t.Errorf("want Net as a RANGE — high end assumes the legacy refund "+
+			"credited $0 (0.35), low end assumes it credited its full 3000 "+
+			"total (0.23) — got:\n%s", last.Text)
 	}
 }
 
@@ -736,7 +835,7 @@ func TestAdminDashboardZeroRefundsOmitsNegativeSign(t *testing.T) {
 		t.Errorf("the source-level usdtDisp(0) fix must clear the negative sign "+
 			"EVERYWHERE it renders, not just on the Refunded line, got:\n%s", last.Text)
 	}
-	if !strings.Contains(last.Text, "Refunded: 0.00 USDT  (0 orders)") {
+	if !strings.Contains(last.Text, "Refunded: 0.00 USDT exact  (0 orders)") {
 		t.Errorf("want an unsigned zero Refunded line, got:\n%s", last.Text)
 	}
 }

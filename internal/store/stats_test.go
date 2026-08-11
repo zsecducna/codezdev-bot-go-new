@@ -645,6 +645,127 @@ func TestRevenueSummaryRefundedRevenueTracksGenuineRefundsOnly(t *testing.T) {
 	}
 }
 
+// TestRevenueSummaryRefundedAmountSplitKnownVsUnknown is the store half of
+// task #20 stage S3 (misc.go's GetRevenueSummary doc comment on the query
+// above the refund split). SQLite's SUM() silently skips NULL rows, so a
+// naive SUM(refunded_amount) over the genuine-refund population would credit
+// every legacy (pre-S2) row with $0 refunded instead of disclosing that its
+// real figure is unknown — UNDERSTATING refunds and silently claiming the
+// shop kept money it actually returned, the mirror image of the A7
+// overstatement bug this column exists to fix.
+//
+// Seeds a MIXED population: one refund with a recorded, PARTIAL
+// refunded_amount (1250 credited of a 2000 total — proving the known figure
+// is the CREDITED amount, not the order total, the original A7 bug), and one
+// refund with none (ClaimOrderKind alone, no SetRefundedAmount call — the
+// exact shape every refund had before stage S2 landed). Distinct
+// totals/amounts on purpose so a query that folds the wrong subset into the
+// wrong bucket produces a wrong NUMBER, not just a wrong count.
+//
+// Falsification: against pre-S3 code, RevenueSummary has no
+// RefundedAmountKnown/RefundedKnownCount/RefundedUnknownCount/
+// RefundedUnknownUpperBound fields at all (compile failure). Verified
+// further by mutation: replacing the CASE-WHEN split with a bare
+// `COALESCE(SUM(refunded_amount),0)` scanned into RefundedAmountKnown while
+// leaving RefundedUnknownCount/RefundedUnknownUpperBound unset (the shape a
+// naive "just sum the column" fix takes — RefundedAmountKnown itself would
+// coincidentally still read 1250, since SUM() already drops the NULL row)
+// makes the RefundedUnknownCount/RefundedUnknownUpperBound assertions below
+// fail: they would read 0 instead of 1/3000, silently erasing the legacy
+// refund from the report instead of disclosing it.
+func TestRevenueSummaryRefundedAmountSplitKnownVsUnknown(t *testing.T) {
+	s := newTestStore(t)
+
+	// Known: a genuine customer refund with its ACTUAL credited amount
+	// recorded via SetRefundedAmount (stage S2's write path) — a partial,
+	// pro-rated refund, so this also pins that the known figure tracks the
+	// CREDITED amount, not the order total.
+	if err := s.CreateOrder("known1", "7", "en", "kiro-pro", "T1", 1, 2000); err != nil {
+		t.Fatalf("CreateOrder(known1): %v", err)
+	}
+	if _, err := s.db.Exec("UPDATE orders SET status='delivered' WHERE des='known1'"); err != nil {
+		t.Fatalf("seed known1 delivered: %v", err)
+	}
+	if _, err := s.ClaimOrderKind("known1", "delivered", "refunded", RefundKindCustomer); err != nil {
+		t.Fatalf("claim known1: %v", err)
+	}
+	if err := s.SetRefundedAmount("known1", 1250); err != nil {
+		t.Fatalf("SetRefundedAmount(known1, 1250): %v", err)
+	}
+
+	// Unknown: a genuine admin-cancel refund with NO recorded amount — the
+	// pre-S2 shape (status flip only, refunded_amount left NULL).
+	if err := s.CreateOrder("legacy1", "7", "en", "kiro-pro", "T1", 1, 3000); err != nil {
+		t.Fatalf("CreateOrder(legacy1): %v", err)
+	}
+	if _, err := s.db.Exec("UPDATE orders SET status='paid' WHERE des='legacy1'"); err != nil {
+		t.Fatalf("seed legacy1 paid: %v", err)
+	}
+	if _, err := s.ClaimOrderKind("legacy1", "paid", "refunded", RefundKindAdminCancel); err != nil {
+		t.Fatalf("claim legacy1: %v", err)
+	}
+
+	r, err := s.GetRevenueSummary("")
+	if err != nil {
+		t.Fatalf("GetRevenueSummary: %v", err)
+	}
+	if r.RefundedCount != 2 {
+		t.Errorf("RefundedCount = %d, want 2 (both are genuine refunds)", r.RefundedCount)
+	}
+	if r.RefundedKnownCount != 1 {
+		t.Errorf("RefundedKnownCount = %d, want 1", r.RefundedKnownCount)
+	}
+	if r.RefundedAmountKnown != 1250 {
+		t.Errorf("RefundedAmountKnown = %d, want 1250 (the CREDITED amount, "+
+			"not known1's 2000 total)", r.RefundedAmountKnown)
+	}
+	if r.RefundedUnknownCount != 1 {
+		t.Errorf("RefundedUnknownCount = %d, want 1", r.RefundedUnknownCount)
+	}
+	if r.RefundedUnknownUpperBound != 3000 {
+		t.Errorf("RefundedUnknownUpperBound = %d, want 3000 (legacy1's total, "+
+			"the only figure still knowable for it)", r.RefundedUnknownUpperBound)
+	}
+}
+
+// TestRevenueSummaryRefundedAmountSplitCollapsesWhenAllKnown pins the other
+// end of the same split: when every genuine refund has a recorded
+// refunded_amount, RefundedUnknownCount and RefundedUnknownUpperBound must
+// both read exactly zero — the property admin.go's Net-range rendering
+// depends on to collapse a fresh shop's range down to a single point without
+// any special-casing in the renderer itself.
+func TestRevenueSummaryRefundedAmountSplitCollapsesWhenAllKnown(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateOrder("known1", "7", "en", "kiro-pro", "T1", 1, 2000); err != nil {
+		t.Fatalf("CreateOrder(known1): %v", err)
+	}
+	if _, err := s.db.Exec("UPDATE orders SET status='delivered' WHERE des='known1'"); err != nil {
+		t.Fatalf("seed known1 delivered: %v", err)
+	}
+	if _, err := s.ClaimOrderKind("known1", "delivered", "refunded", RefundKindCustomer); err != nil {
+		t.Fatalf("claim known1: %v", err)
+	}
+	if err := s.SetRefundedAmount("known1", 1250); err != nil {
+		t.Fatalf("SetRefundedAmount(known1, 1250): %v", err)
+	}
+
+	r, err := s.GetRevenueSummary("")
+	if err != nil {
+		t.Fatalf("GetRevenueSummary: %v", err)
+	}
+	if r.RefundedUnknownCount != 0 {
+		t.Errorf("RefundedUnknownCount = %d, want 0 when every refund is known", r.RefundedUnknownCount)
+	}
+	if r.RefundedUnknownUpperBound != 0 {
+		t.Errorf("RefundedUnknownUpperBound = %d, want 0 when every refund is known "+
+			"(admin.go's Net range collapses to a point on this invariant)", r.RefundedUnknownUpperBound)
+	}
+	if r.RefundedAmountKnown != 1250 {
+		t.Errorf("RefundedAmountKnown = %d, want 1250", r.RefundedAmountKnown)
+	}
+}
+
 // TestPaidUndeliveredExcludesDepositsAndReserved is the A4 store half: the
 // count of orders where MONEY IS IN AND GOODS ARE NOT OUT, plus the age of the
 // oldest so the alarm can say "oldest 3h ago" instead of a bare "2".

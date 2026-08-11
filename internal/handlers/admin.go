@@ -360,27 +360,51 @@ func (b *Bot) adminDashboardText(chatID int64) string {
 			// are expected, not a regression (spec §5.5's own note). grossCount
 			// is the SAME variable computed above for the refund-rate
 			// denominator, reused here rather than recomputed.
+			// Gross is unaffected by task #20 stage S3: it sums orders.total,
+			// the ORIGINAL charge, which never gets rewritten by a partial
+			// refund (misc.go's GetRevenueSummary doc comment on the refund
+			// query has the full mechanism), so it stays exact.
 			grossRevenue := r.DeliveredRevenue + r.RefundedRevenue
-			// usdtDisp(0) used to render "-0.00 USDT" on any healthy zero
-			// (IEEE-754 negative zero, fixed at the source in money.go — see
-			// its comment); no local sign-stripping is needed here anymore, so
-			// a genuine refund is the only thing that ever prepends "-".
-			refundedLine := b.usdtDisp(r.RefundedRevenue)
-			if r.RefundedRevenue > 0 {
-				refundedLine = "-" + refundedLine
+			// Refunded now renders as TWO populations instead of one blended
+			// figure (task #20 stage S3): the EXACT amount actually credited
+			// back on orders where SetRefundedAmount (stage S2) ran, and —
+			// only when nonzero, so a shop with no legacy refunds renders
+			// clean — a bounded ceiling for orders refunded before S2 existed,
+			// whose real credited amount is permanently unrecoverable
+			// (misc.go's doc comment: no backfill source exists). Folding the
+			// unknown bucket into the known sum via a naive
+			// SUM(refunded_amount) would silently drop it from EVERY figure on
+			// this screen — the exact defect the split exists to prevent.
+			// usdtDisp(0) never renders a negative sign (money.go), so the
+			// sign-add below only ever fires on real money.
+			knownLine := b.usdtDisp(r.RefundedAmountKnown)
+			if r.RefundedAmountKnown > 0 {
+				knownLine = "-" + knownLine
 			}
-			// Qualified ON SCREEN, not only in misc.go's comment (review
-			// finding on this slice): of the three new lines, only Refunded is
-			// approximate. Gross is exact — it sums orders.total, the ORIGINAL
-			// charge, which is precisely what "Gross" means. Net is the
-			// pre-existing figure simply relabelled (byte-identical to the old
-			// Total). Refunded alone can overstate cash actually credited back
-			// on a partial/pro-rated refund (misc.go's RefundedRevenue comment
-			// has the full mechanism) — an admin reconciling a bank statement
-			// never opens misc.go, so the qualifier belongs on the line itself.
-			refundedQualifier := ""
-			if r.RefundedRevenue > 0 {
-				refundedQualifier = " (at original price)"
+			refundedBlock := "   Refunded: " + knownLine + " exact  (" +
+				itoa64(r.RefundedKnownCount) + " orders)"
+			if r.RefundedUnknownCount > 0 {
+				refundedBlock += "\n              + up to " + b.usdtDisp(r.RefundedUnknownUpperBound) +
+					" unrecorded  (" + itoa64(r.RefundedUnknownCount) +
+					" legacy orders — actual refund not recorded)"
+			}
+			// Net is now a RANGE, not a relabelled DeliveredRevenue (task #20
+			// stage S3 — this is the ONE figure that actually moves on this
+			// screen; S1/S2 were invisible by design). Cash actually retained
+			// is Gross minus what was ACTUALLY credited back, and each unknown
+			// row's actual credit is somewhere in [0, its own total], so the
+			// true figure is somewhere in
+			// [Gross-Known-UnknownUpperBound, Gross-Known]. When there is no
+			// legacy unknown (RefundedUnknownUpperBound==0, which misc.go's
+			// query guarantees whenever RefundedUnknownCount==0), netLow ==
+			// netHigh and the range collapses to a single point automatically
+			// — no special-casing needed, so a fresh shop (and this shop,
+			// eventually) renders a plain number.
+			netHigh := grossRevenue - r.RefundedAmountKnown
+			netLow := netHigh - r.RefundedUnknownUpperBound
+			netLine := b.usdtDisp(netHigh)
+			if netLow != netHigh {
+				netLine = b.usdtDisp(netLow) + " – " + netLine
 			}
 			// Today is delivered-only, i.e. the same NET basis as the Net line
 			// above (it has no refund split of its own — a same-day refund is
@@ -389,8 +413,8 @@ func (b *Bot) adminDashboardText(chatID int64) string {
 			// that just taught the admin to distinguish gross from net.
 			parts = append(parts, "💰 REVENUE\n"+
 				"   Gross: "+b.usdtDisp(grossRevenue)+"  ("+itoa64(grossCount)+" orders)\n"+
-				"   Refunded: "+refundedLine+refundedQualifier+"  ("+itoa64(r.RefundedCount)+" orders)\n"+
-				"   Net: "+b.usdtDisp(r.DeliveredRevenue)+"  ("+itoa64(r.DeliveredCount)+" orders)\n"+
+				refundedBlock+"\n"+
+				"   Net: "+netLine+"  ("+itoa64(r.DeliveredCount)+" orders)\n"+
 				"   Today (net): "+b.usdtDisp(r.TodayRevenue)+"  ("+itoa64(r.TodayCount)+" orders)\n"+
 				"   Customers: "+itoa64(r.Customers)+"\n"+
 				ordersBlock+"\n"+
