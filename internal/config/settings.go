@@ -2,7 +2,9 @@ package config
 
 import (
 	"encoding/json"
+	"log"
 	"maps"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -72,6 +74,25 @@ func (c *Config) Settings() map[string]any {
 			// leaves the defaults in place, it never surfaces as an error.
 			if json.Unmarshal(raw, &file) == nil {
 				maps.Copy(s, file)
+			}
+		}
+		// Task #40: a hand-edited settings.json can carry a "usd_to_vnd" no
+		// admin action could ever have written (capSetRate,
+		// internal/handlers/adminsettings.go, only accepts a whole number in
+		// [RateMin, RateMax]). Applying that SAME bound here, once per actual
+		// disk read, means a bad value can never reach USDToVND() below at
+		// all — dropping the key here makes its "ok" lookup miss and fall
+		// through to the env/compiled default exactly like an absent key
+		// always has. This also closes the silent half of the bug: a value
+		// that used to fall through silently (e.g. "abc") or get truncated
+		// into a poison "0" (e.g. 0.5) now logs loudly, exactly once per
+		// load, naming the key and the offending value, so an admin relying
+		// on b.rateStr() is never left believing a rate is in effect that
+		// isn't.
+		if v, present := s["usd_to_vnd"]; present {
+			if _, valid := validAdminRate(v); !valid {
+				log.Printf("config: settings.json usd_to_vnd=%v is not a whole number in [%d, %d] (the range capSetRate enforces on admin input) — ignoring it and falling back to env/compiled default rate", v, RateMin, RateMax)
+				delete(s, "usd_to_vnd")
 			}
 		}
 		c.cache.data = s
@@ -235,6 +256,39 @@ func truthyFloat(v any) float64 {
 	}
 }
 
+// RateMin / RateMax are the VND-per-USD bounds a settings.json "usd_to_vnd"
+// must fall within to be honored at read time — DUPLICATED from rateMin/
+// rateMax (internal/handlers/adminsettings.go:444-447, RATE_MIN/RATE_MAX,
+// telegram_bot.py:5282), the bound capSetRate already enforces on every
+// admin-typed rate. Not imported from there: internal/handlers imports
+// internal/config, so the reverse import would cycle. If that range ever
+// changes, update BOTH — this comment and adminsettings.go's are
+// cross-referenced to each other for exactly that reason.
+const (
+	RateMin = 1000
+	RateMax = 200000
+)
+
+// validAdminRate reports whether v is a shape capSetRate could actually have
+// written into settings.json: a whole number of VND-per-USD in [RateMin,
+// RateMax]. Used by Settings() below to reject, at read time, any
+// "usd_to_vnd" a hand edit could produce that no admin action ever could —
+// a non-numeric string ("abc", truthyFloat 0), a fraction (0.5, truncates
+// to a poison "0" downstream), a JSON boolean (true, truthyFloat 1 — a
+// "valid" but catastrophically wrong rate), zero, or any integer outside
+// the admin-settable range.
+func validAdminRate(v any) (int, bool) {
+	f := truthyFloat(v)
+	if f != math.Trunc(f) {
+		return 0, false
+	}
+	n := int(f)
+	if n < RateMin || n > RateMax {
+		return 0, false
+	}
+	return n, true
+}
+
 // ReferralEnabled reports whether the customer REFERRAL program is on
 // (referral codes accepted + referral info in My Info). Admin PROMO codes
 // are always usable regardless of this. Falls back to the legacy combined
@@ -304,6 +358,12 @@ const DefaultUSDToVND = "25000"
 // which lets a non-numeric settings value raise inside apply_saved_rate,
 // this falls through to the env/default instead of erroring — a deliberate
 // hardening, not a behavior this package needs to reproduce.
+//
+// Task #40: that fall-through can now only happen for a "usd_to_vnd" a hand
+// edit put there — Settings() above already scrubbed anything capSetRate
+// couldn't have written (see validAdminRate), logging once per settings.json
+// load when it does. This method never sees the bad value at all; it just
+// finds the key missing, same as if it had never been set.
 //
 // TrimSpace on the returned string, structurally, not as a per-caller
 // convention: EnvOr/Env read straight from the Load-time snapshot, and that

@@ -442,6 +442,14 @@ func (b *Bot) capSetMaxQty(c *Ctx) bool {
 // ---- adm:setrate (button + "setrate" capture) ------------------------------
 
 // rateMin / rateMax mirror RATE_MIN, RATE_MAX (telegram_bot.py:5282).
+//
+// DUPLICATED, deliberately: config.RateMin / config.RateMax (internal/config/
+// settings.go) hold the same two numbers and apply the same bound when READING
+// a hand-edited settings.json, so a rate this wizard could never have written
+// can never be used either. internal/handlers imports internal/config, so the
+// reverse import would cycle — hence two copies rather than one. **If this
+// range ever changes, change it there too**; that side carries the matching
+// pointer back here.
 const (
 	rateMin = 1000
 	rateMax = 200000
