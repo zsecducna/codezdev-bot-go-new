@@ -235,6 +235,31 @@ func bandUnits(t *testing.T, b *Bot, p bands.Provider, des string) int64 {
 	return res.Units
 }
 
+// usdtScreenAmounts walks f.Sends and returns the amount rendered on every
+// BEP20/TRON pay/deposit screen, in send order. sendUSDTScreen (usdt.go) fills
+// the caption from i18n's BEP20Pay/TronPay template — "Send EXACTLY {usdt}
+// USDT ..." in EN — so the marker "EXACTLY " unambiguously identifies a
+// deposit/pay screen among the other sends a test may have triggered, and the
+// amount is the text between that marker and the following " USDT".
+func usdtScreenAmounts(t *testing.T, f *fakeTG) []string {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var amounts []string
+	for _, s := range f.Sends {
+		_, rest, ok := strings.Cut(s.Text, "EXACTLY ")
+		if !ok {
+			continue
+		}
+		amount, _, ok := strings.Cut(rest, " USDT")
+		if !ok {
+			continue
+		}
+		amounts = append(amounts, amount)
+	}
+	return amounts
+}
+
 // bscTx builds a CONFIRMED BEP20 transfer to the seller of `amount` USDT at
 // `ts` (epoch seconds) — the shape GetTransferToSellerByHash returns.
 func bscTx(id, amount string, ts int64) *bep20.TransferByHash {
@@ -807,6 +832,27 @@ func TestUSDTDepositAuditRowIsWellFormedAtHealthyRate(t *testing.T) {
 	}
 	if want := "+8.00 USDT"; row.Outcome != want {
 		t.Errorf("Outcome = %q, want %q — the healthy-rate row must be the ordinary signed figure, not the raw-VND fallback", row.Outcome, want)
+	}
+}
+
+// TestDepositAmountsAreUnique pins the hands-free-deposits behaviour swap:
+// startOnchainDeposit now hands out a PICKED band amount (reserveUSDTAmount)
+// instead of adopting the customer's round number verbatim (adoptUSDTAmount).
+// Two deposits of the SAME round amount must be handed different band
+// amounts — without this the watcher cannot tell whose payment is whose, and
+// amount-based attribution is unsound.
+func TestDepositAmountsAreUnique(t *testing.T) {
+	b, f, _, _, _ := newUSDTBot(t)
+	ctx := context.Background()
+	b.startOnchainDeposit(ctx, 111, i18n.EN, 3000000, chainTRX)
+	b.startOnchainDeposit(ctx, 222, i18n.EN, 3000000, chainTRX)
+
+	amounts := usdtScreenAmounts(t, f) // amounts rendered on the two deposit screens
+	if len(amounts) != 2 {
+		t.Fatalf("want 2 deposit screens, got %d: %+v", len(amounts), amounts)
+	}
+	if amounts[0] == amounts[1] {
+		t.Fatalf("both deposits were quoted %q — bands are not unique", amounts[0])
 	}
 }
 

@@ -391,10 +391,13 @@ func (b *Bot) adoptUSDTAmount(p bands.Provider, amount, chatID, des string, tota
 // when the customer submits a CONFIRMED tx hash — start_bep20_deposit
 // (telegram_bot.py:9478-9525) and start_tron_deposit (@9935-9962).
 //
-// NO unique offset (see adoptUSDTAmount): the customer is asked for their DESIRED
-// amount and credited exactly that within DEPOSIT_MATCH_TOL_CENTS, so a round
-// "120" tops up 120 instead of a confusing 120.21 that caused short credits and
-// amount_conflict rejects.
+// PICKED amount, like an order (see reserveUSDTAmount): a hands-free watcher
+// attributes an incoming payment by amount alone, so two customers depositing
+// the same round "120" at once must be handed different amounts or their
+// payments would be indistinguishable. The customer is asked to send the band's
+// spaced amount (e.g. "120.07") rather than their round "120"; DepositCredit's
+// tolerance still governs what they are credited if the amount that lands
+// differs slightly.
 func (b *Bot) startBep20Deposit(ctx context.Context, chatID int64, lang i18n.Lang, vnd int64) {
 	b.startOnchainDeposit(ctx, chatID, lang, vnd, chainBSC)
 }
@@ -434,13 +437,23 @@ func (b *Bot) startOnchainDeposit(ctx context.Context, chatID int64, lang i18n.L
 	// it gets the wide customer-facing window instead of the product-order
 	// hard limit (see depositTimeout's field comment in dispatch.go).
 	deadline := now.Add(b.depositTimeout) // wall-clock so it survives a restart
-	if err := b.adoptUSDTAmount(p, amount, fmtInt(chatID), des, vnd, now.UnixMilli(), deadline); err != nil {
-		log.Printf("%s deposit band adopt failed: %v", chain, err)
+	// Deposits now take a PICKED amount, like orders, instead of adopting the
+	// customer's round number. The watcher attributes a payment by amount
+	// alone, so two customers topping up 120.00 at once would be
+	// indistinguishable; Reserve's MinGap (2*tol+1) spacing is what makes the
+	// match unambiguous. The customer is asked for "120.07" rather than
+	// "120.00" — DepositCredit's tolerance still governs what they are
+	// credited if the amount that lands differs slightly.
+	picked, err := b.reserveUSDTAmount(p, amount, fmtInt(chatID), des, vnd, now.UnixMilli(), deadline)
+	if err != nil {
+		log.Printf("%s deposit band reserve failed: %v", chain, err)
 		b.abandonUSDTStub(des)
-		b.send(ctx, chatID, noID.T(lang), nil)
+		// Band exhaustion is "busy", not "unconfigured" — sendBandError picks
+		// the right refusal.
+		b.sendBandError(ctx, chatID, lang, err, noID)
 		return
 	}
-	b.sendUSDTScreen(ctx, chatID, lang, chain, des, amount)
+	b.sendUSDTScreen(ctx, chatID, lang, chain, des, picked)
 }
 
 // abandonUSDTStub releases a deposit stub order whose rail side failed —
