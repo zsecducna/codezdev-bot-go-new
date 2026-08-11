@@ -173,6 +173,72 @@ func TestMatchPayment_IsUsedSkips(t *testing.T) {
 	}
 }
 
+// TestMatchPaymentConf_HonoursInjectedMinConf pins the parameter-threading
+// added for task #42 item 2: MatchPaymentConf must consult the minConf it is
+// PASSED, not the raw-env BEP20_MIN_CONF — because in production
+// BEP20_MIN_CONF is set only via .env, which config.Load never copies back
+// into os.Environ (no systemd EnvironmentFile), so a package-level envInt
+// read is always the compiled default there. Set BEP20_MIN_CONF to a value
+// that would WRONGLY accept a shallow transfer if the raw env were still
+// consulted, then prove the injected minConf is what actually gates it.
+func TestMatchPaymentConf_HonoursInjectedMinConf(t *testing.T) {
+	t.Setenv("BEP20_AMOUNT_DECIMALS", "2")
+	t.Setenv("BEP20_MATCH_TOL", "10")
+	t.Setenv("BEP20_MIN_CONF", "1") // if this leaked through, 15 confs would pass
+
+	minBlock := int64(1000)
+	latest := int64(1015) // 15 confs deep
+	transfers := []Transfer{{ID: "shallow", Units: 10000, Block: 1000, Wei: big.NewInt(1)}}
+
+	// Injected minConf=20 is stricter than both the env value (1) and the
+	// depth (15) -> must be rejected. Old code reading raw MinConfirmations()
+	// would have accepted it (env says 1 <= 15).
+	got, err := MatchPaymentConf(transfers, "100.00", minBlock, latest, 20, nil)
+	if err != nil {
+		t.Fatalf("MatchPaymentConf error: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("MatchPaymentConf = %+v, want nil (15 confs < injected minConf=20)", got)
+	}
+
+	// Injected minConf=10 is looser than the depth (15) -> must match, even
+	// though the env value (1) is irrelevant either way here — the point is
+	// the injected value decides, not the env.
+	got, err = MatchPaymentConf(transfers, "100.00", minBlock, latest, 10, nil)
+	if err != nil {
+		t.Fatalf("MatchPaymentConf error: %v", err)
+	}
+	if got == nil || got.ID != "shallow" {
+		t.Fatalf("MatchPaymentConf = %+v, want id=shallow (15 confs >= injected minConf=10)", got)
+	}
+}
+
+// TestConfirmedAt_HonoursInjectedMinConf pins GetTransferToSellerByHashConf's
+// MinConfirmations plumbing (task #42 item 2) at the pure confirmedAt helper,
+// without a live RPC round trip. Same discriminator as MatchPaymentConf's
+// test above: the env value alone must NOT decide the outcome.
+func TestConfirmedAt_HonoursInjectedMinConf(t *testing.T) {
+	t.Setenv("BEP20_MIN_CONF", "1") // would wrongly pass 8 confs if read directly
+
+	// 8 confs deep (latest=1008, block=1000): injected minConf=12 rejects it
+	// (old code consulting raw MinConfirmations()==1 would have confirmed).
+	if confirmedAt(true, 1008, 1000, 42, 12) {
+		t.Error("confirmedAt = true, want false (8 confs < injected minConf=12)")
+	}
+	// Same depth, looser injected minConf=5 -> confirms.
+	if !confirmedAt(true, 1008, 1000, 42, 5) {
+		t.Error("confirmedAt = false, want true (8 confs >= injected minConf=5)")
+	}
+	// A reverted receipt never confirms regardless of depth.
+	if confirmedAt(false, 1008, 1000, 42, 1) {
+		t.Error("confirmedAt = true, want false (success=false must always reject)")
+	}
+	// A missing block timestamp never confirms regardless of depth.
+	if confirmedAt(true, 1008, 1000, 0, 1) {
+		t.Error("confirmedAt = true, want false (ts=0 must always reject)")
+	}
+}
+
 // TestUsdtToVNDRejectsUnusableRate pins the guard added with task #22. Deleting
 // the `rate <= 0` check in UsdtToVND must fail here, so the two cases that
 // matter most carry their own consequence in the failure message:

@@ -49,13 +49,32 @@ const httpTimeout = 20 * time.Second
 
 var httpClient = &http.Client{Timeout: httpTimeout}
 
+// DefaultAPIBase / DefaultAmountDecimals / DefaultMatchTol / DefaultOffsetStep
+// / DefaultPageLimit are the compiled-in fallbacks for the knobs below —
+// named so a caller resolving one of these through config.Config (rather
+// than through this package's own raw env read; see Address's doc comment)
+// has the same default to fall back to without hardcoding a second copy of
+// the literal.
+const (
+	DefaultAPIBase        = "https://api.trongrid.io"
+	DefaultAmountDecimals = 2
+	DefaultMatchTol       = 10
+	DefaultOffsetStep     = 21
+	DefaultPageLimit      = 200
+)
+
 // apiBase is the TronGrid REST base (override for a private node via
-// TRON_API_BASE, tron_pay.py:37).
+// TRON_API_BASE, tron_pay.py:37). Raw .env/ambient read only — same caveat
+// as Address()/PageLimit(): a production caller with a *config.Config
+// available should resolve TRON_API_BASE through it and pass the result into
+// apiGetConf/GetIncomingTransfersConf/FindConfirmedTransferByHashConf
+// instead. apiGet delegates here so it keeps working for callers with no
+// cfg to resolve from.
 func apiBase() string {
 	if v := os.Getenv("TRON_API_BASE"); v != "" {
 		return strings.TrimRight(v, "/")
 	}
-	return "https://api.trongrid.io"
+	return DefaultAPIBase
 }
 
 // AmountDecimals is the precision of the per-order UNIQUE amount. 2 = cents
@@ -63,7 +82,7 @@ func apiBase() string {
 // decimals regardless. Mirrors bep20 so the shared unique-amount picker
 // behaves identically (tron_pay.py:38-40).
 func AmountDecimals() int {
-	return envInt("TRON_AMOUNT_DECIMALS", 2)
+	return envInt("TRON_AMOUNT_DECIMALS", DefaultAmountDecimals)
 }
 
 // AmountMatchTol / AmountOffsetStep: amount matching is FUZZY so a customer
@@ -74,17 +93,27 @@ func AmountDecimals() int {
 // tol = 10 cents; step = 21 (>= 2*10+1) keeps same-price orders unambiguous
 // (tron_pay.py:41-54).
 func AmountMatchTol() int {
-	return envInt("TRON_MATCH_TOL", 10)
+	return envInt("TRON_MATCH_TOL", DefaultMatchTol)
 }
 
 func AmountOffsetStep() int {
-	return envInt("TRON_OFFSET_STEP", 21)
+	return envInt("TRON_OFFSET_STEP", DefaultOffsetStep)
 }
 
-// PageLimit is the max transfers to pull per poll cycle (TronGrid caps at
-// 200, tron_pay.py:55-57).
+// PageLimit reads the RAW .env/ambient TRON_PAGE_LIMIT — nothing more, same
+// caveat as Address()'s doc comment: it never sees a .env-only value under
+// systemd (no EnvironmentFile in production, config.Load's doc comment). A
+// production caller with a *config.Config available should resolve
+// TRON_PAGE_LIMIT through it and pass the result into
+// GetIncomingTransfersConf/FindConfirmedTransferByHashConf instead of
+// letting this package read it. GetIncomingTransfers/FindConfirmedTransferByHash
+// below delegate to the *Conf functions using this value, and survive only
+// as the low-level primitive and its default-argument callers.
+//
+// The max transfers to pull per poll cycle (TronGrid caps at 200,
+// tron_pay.py:55-57).
 func PageLimit() int {
-	return envInt("TRON_PAGE_LIMIT", 200)
+	return envInt("TRON_PAGE_LIMIT", DefaultPageLimit)
 }
 
 func envInt(key string, def int) int {
@@ -221,14 +250,24 @@ func ratToIntegral(r *big.Rat) int64 {
 	return q.Int64()
 }
 
+// apiGet is apiGetConf using the raw-env apiBase() — kept for callers with
+// no *config.Config to resolve TRON_API_BASE through (see apiBase's doc
+// comment).
+//
 // apiKey is the caller-resolved TronGrid API key (sent as the
 // TRON-PRO-API-KEY header, raising TronGrid's rate limit; "" sends no
 // header, using the free keyless tier). This package deliberately does not
 // read TRON_API_KEY itself — see Address's doc comment for why — so the
 // caller must resolve it (config.Config.TRONAPIKey()) and pass it in.
 func apiGet(path string, params url.Values, apiKey string) (map[string]any, error) {
+	return apiGetConf(path, params, apiKey, apiBase())
+}
+
+// apiGetConf is apiGet with the TronGrid REST base injected explicitly
+// rather than read from apiBase()'s raw env.
+func apiGetConf(path string, params url.Values, apiKey, base string) (map[string]any, error) {
 	key := strings.TrimSpace(apiKey)
-	reqURL := fmt.Sprintf("%s%s?%s", apiBase(), path, params.Encode())
+	reqURL := fmt.Sprintf("%s%s?%s", base, path, params.Encode())
 	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
@@ -273,20 +312,30 @@ type Transfer struct {
 	TS    int64
 }
 
-// GetIncomingTransfers returns confirmed incoming USDT (TRC20) transfers to
-// addr since minTSMS (epoch ms). Only `transfer`-type, only_to,
-// only_confirmed — so every row is a finalised credit to us
-// (tron_pay.py:128-162). apiKey is forwarded to apiGet — see its doc comment.
+// GetIncomingTransfers is GetIncomingTransfersConf using the raw-env
+// PageLimit()/apiBase() — kept for callers with no *config.Config to
+// resolve TRON_PAGE_LIMIT/TRON_API_BASE through (see their doc comments).
 func GetIncomingTransfers(addr string, minTSMS int64, apiKey string) ([]Transfer, error) {
+	return GetIncomingTransfersConf(addr, minTSMS, apiKey, PageLimit(), apiBase())
+}
+
+// GetIncomingTransfersConf returns confirmed incoming USDT (TRC20) transfers
+// to addr since minTSMS (epoch ms). Only `transfer`-type, only_to,
+// only_confirmed — so every row is a finalised credit to us
+// (tron_pay.py:128-162). apiKey is forwarded to apiGetConf — see its doc
+// comment. pageLimit/base are the caller-resolved TRON_PAGE_LIMIT/
+// TRON_API_BASE (see PageLimit's/apiBase's doc comments) rather than read
+// from raw env here.
+func GetIncomingTransfersConf(addr string, minTSMS int64, apiKey string, pageLimit int, base string) ([]Transfer, error) {
 	params := url.Values{}
 	params.Set("only_to", "true")
 	params.Set("only_confirmed", "true")
 	params.Set("contract_address", USDTContract)
 	params.Set("min_timestamp", strconv.FormatInt(minTSMS, 10))
-	params.Set("limit", strconv.Itoa(PageLimit()))
+	params.Set("limit", strconv.Itoa(pageLimit))
 	params.Set("order_by", "block_timestamp,asc")
 
-	d, err := apiGet(fmt.Sprintf("/v1/accounts/%s/transactions/trc20", addr), params, apiKey)
+	d, err := apiGetConf(fmt.Sprintf("/v1/accounts/%s/transactions/trc20", addr), params, apiKey, base)
 	if err != nil {
 		return nil, err
 	}
@@ -389,12 +438,19 @@ func absInt64(n int64) int64 {
 	return n
 }
 
-// FindConfirmedTransferByHash finds ONE CONFIRMED incoming USDT (TRC20)
+// FindConfirmedTransferByHash is FindConfirmedTransferByHashConf using the
+// raw-env PageLimit()/apiBase() — kept for callers with no *config.Config to
+// resolve TRON_PAGE_LIMIT/TRON_API_BASE through (see their doc comments).
+func FindConfirmedTransferByHash(addr, txhash string, minTSMS int64, apiKey string) (*Transfer, error) {
+	return FindConfirmedTransferByHashConf(addr, txhash, minTSMS, apiKey, PageLimit(), apiBase())
+}
+
+// FindConfirmedTransferByHashConf finds ONE CONFIRMED incoming USDT (TRC20)
 // transfer to addr by tx hash — for the customer-submitted
 // payment-verification flow (the customer pastes their tx hash; there is no
 // background poller). Returns the matching transfer row or (nil, nil).
 //
-// Reuses GetIncomingTransfers, whose TronGrid query is only_to +
+// Reuses GetIncomingTransfersConf, whose TronGrid query is only_to +
 // only_confirmed, so a returned row is GUARANTEED finalised
 // (network-confirmed) AND credited to the seller.
 //
@@ -402,9 +458,11 @@ func absInt64(n int64) int64 {
 // older than the payment window, unknown, not yet confirmed, or not to the
 // seller all return (nil, nil). Hash compare is case-insensitive and
 // tolerant of a 0x prefix (TRON ids are bare 64-hex, tron_pay.py:188-213).
-// apiKey is forwarded to GetIncomingTransfers/apiGet — see apiGet's doc
-// comment; the caller resolves it via config.Config.TRONAPIKey().
-func FindConfirmedTransferByHash(addr, txhash string, minTSMS int64, apiKey string) (*Transfer, error) {
+// apiKey is forwarded to GetIncomingTransfersConf/apiGetConf — see apiGet's
+// doc comment; the caller resolves it via config.Config.TRONAPIKey().
+// pageLimit/base are the caller-resolved TRON_PAGE_LIMIT/TRON_API_BASE (see
+// PageLimit's/apiBase's doc comments).
+func FindConfirmedTransferByHashConf(addr, txhash string, minTSMS int64, apiKey string, pageLimit int, base string) (*Transfer, error) {
 	if txhash == "" || !ValidAddress(addr) {
 		return nil, nil
 	}
@@ -416,7 +474,7 @@ func FindConfirmedTransferByHash(addr, txhash string, minTSMS int64, apiKey stri
 	if !hashRE.MatchString(want) {
 		return nil, nil
 	}
-	transfers, err := GetIncomingTransfers(addr, minTSMS, apiKey)
+	transfers, err := GetIncomingTransfersConf(addr, minTSMS, apiKey, pageLimit, base)
 	if err != nil {
 		return nil, err
 	}

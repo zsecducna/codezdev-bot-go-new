@@ -1920,6 +1920,22 @@ func (b *Bot) startPoolProvision(ctx context.Context, chatID int64, accountsText
 	})
 }
 
+// archiveRootStr resolves KIRO_ARCHIVE_DIR through cfg (.env/ambient) rather
+// than provision.ArchiveRootFromEnv's raw os.Getenv, which never sees .env in
+// production (config.Load's doc comment) — same bug class as
+// b.loginPythonStr()/b.scriptDirStr() above (task #16/#24/#42). fallback is
+// the compiled-in default passed straight through when neither cfg nor the
+// env has a value.
+func (b *Bot) archiveRootStr(fallback string) string {
+	if b.cfg == nil {
+		return provision.ArchiveRootFromEnv(fallback)
+	}
+	if v := strings.TrimSpace(b.cfg.Env("KIRO_ARCHIVE_DIR")); v != "" {
+		return v
+	}
+	return fallback
+}
+
 // runPoolProvision is _run_pool_provision (§6.3), steps 1-8.
 func (b *Bot) runPoolProvision(ctx context.Context, chatID int64, accountsText string) {
 	accounts := provision.ParseAllAccounts(accountsText)
@@ -1956,9 +1972,12 @@ func (b *Bot) runPoolProvision(ctx context.Context, chatID int64, accountsText s
 	}
 	mix := strings.Join(mixParts, ", ")
 
-	// b.loginPythonStr() resolves through cfg (.env/ambient, task #16) rather
-	// than provision.LoginPythonFromEnv's raw os.Getenv, which never sees .env.
-	runner := provision.NewScriptRunner(b.loginPythonStr(), scriptDir())
+	// b.loginPythonStr()/b.scriptDirStr() resolve through cfg (.env/ambient,
+	// task #16/#42) rather than provision.LoginPythonFromEnv/otp.go's raw
+	// scriptDir(), neither of which ever sees a .env-only value in
+	// production (config.Load's doc comment). #24 fixed only the first
+	// argument here; scriptDir() was its unfixed neighbour.
+	runner := provision.NewScriptRunner(b.loginPythonStr(), b.scriptDirStr())
 	if nIDC+nM365 > 0 {
 		if errText := runner.BrowserStackError(ctx); errText != "" {
 			b.send(ctx, chatID,
@@ -1985,7 +2004,7 @@ func (b *Bot) runPoolProvision(ctx context.Context, chatID int64, accountsText s
 	p := provision.New(provision.Options{
 		Login:       runner,
 		Pool:        pool,
-		ArchiveRoot: provision.ArchiveRootFromEnv("."),
+		ArchiveRoot: b.archiveRootStr("."),
 		Now:         time.Now,
 	})
 	progress := func(idx, total int, username string, status provision.Status, detail string) {

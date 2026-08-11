@@ -40,6 +40,17 @@ const (
 // ArchiveRootFromEnv resolves where archived key JSONs and rewrite records
 // land. Port of archive_root (kiro_provision.py:107-113).
 //
+// This reads the RAW .env/ambient KIRO_ARCHIVE_DIR only — like Address()
+// (see that function's doc comment for the full reasoning), it does NOT see
+// a value set only via .env under systemd (no EnvironmentFile in
+// production, config.Load's doc comment), even though `fallback` already
+// makes this function look parameterized. Production code with a
+// *config.Config available (internal/handlers) must resolve
+// KIRO_ARCHIVE_DIR through it instead (bridged via Bot.archiveRootStr()) and
+// pass the result here as `fallback` is passed — this function survives for
+// callers with no Config to resolve from and as the low-level primitive
+// that seam builds on.
+//
 // KIRO_ARCHIVE_DIR is read LAZILY, at call time — never captured at package
 // init — because the bot loads .env into the environment AFTER importing this
 // code, so an init-time capture would silently ignore a .env override.

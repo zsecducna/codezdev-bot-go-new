@@ -2,6 +2,8 @@ package tron
 
 import (
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -156,5 +158,42 @@ func TestUsdtToVNDRejectsUnusableRate(t *testing.T) {
 				t.Errorf("UsdtToVND(8, %q) = %d, want %d", tc.rate, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestGetIncomingTransfersConf_HonoursInjectedPageLimitAndBase pins the
+// parameter-threading added for task #42 item 5: GetIncomingTransfersConf
+// must hit the injected base URL and send the injected page limit, not the
+// raw-env TRON_API_BASE/TRON_PAGE_LIMIT — because in production those are
+// set only via .env, which config.Load never copies back into os.Environ (no
+// systemd EnvironmentFile), so a package-level envInt/os.Getenv read is
+// always the compiled default there. Env is set to values that would prove
+// the OLD (raw-env) code path was used if they leaked through.
+func TestGetIncomingTransfersConf_HonoursInjectedPageLimitAndBase(t *testing.T) {
+	t.Setenv("TRON_PAGE_LIMIT", "7")                // would leak through as limit=7 if not injected
+	t.Setenv("TRON_API_BASE", "http://127.0.0.1:1") // would leak through as an unreachable host if not injected
+
+	var gotLimit string
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotLimit = r.URL.Query().Get("limit")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"success":true,"data":[]}`))
+	}))
+	defer srv.Close()
+
+	// Injected pageLimit=99 and base=srv.URL must be what's actually used —
+	// hitting the test server at all proves apiBase() (which would dial the
+	// unreachable 127.0.0.1:1 from the env) was NOT consulted.
+	_, err := GetIncomingTransfersConf("Tseller", 0, "", 99, srv.URL)
+	if err != nil {
+		t.Fatalf("GetIncomingTransfersConf error: %v (want it to hit the injected base, not the env TRON_API_BASE)", err)
+	}
+	if gotPath == "" {
+		t.Fatal("test server never received a request — injected base was not used")
+	}
+	if gotLimit != "99" {
+		t.Errorf("limit sent = %q, want \"99\" (the injected pageLimit, not env TRON_PAGE_LIMIT=7)", gotLimit)
 	}
 }

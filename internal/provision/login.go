@@ -67,33 +67,13 @@ type LoginRunner interface {
 	RunM365Login(ctx context.Context, m365File string, index int, outDir, email string, headless bool, stepDelay float64) (subproc.Result, error)
 }
 
-// LoginPythonFromEnv resolves the Python interpreter that has Playwright +
-// CloakBrowser installed. Port of login_python (kiro_provision.py:99-105).
-//
-// This reads the RAW ambient environment only — it does NOT see a
-// KIRO_LOGIN_PYTHON set via .env, because internal/config's snapshot is
-// never copied back into os.Environ (config.Load's doc comment) and this
-// package deliberately does not import internal/config to read it directly.
-// Production code with a *config.Config available (internal/handlers) must
-// resolve the interpreter through config.Config.KiroLoginPython() instead
-// (bridged via Bot.loginPythonStr()) and pass the result to NewScriptRunner/
-// entra.SoftDeleteByUPN as a parameter, the same way tron.Address's doc
-// comment describes for that package's own raw-env primitive. This function
-// survives for callers with no Config to resolve from (e.g. tests) and as
-// the low-level primitive that seam builds on — do not call it directly
-// from a code path that has cfg.
-//
-// KIRO_LOGIN_PYTHON is read LAZILY, at call time, rather than captured once
-// at init, so a change to the ambient environment before this runs is not
-// silently missed. Python falls back to sys.executable (correct when the
-// bot itself has the browser stack); a Go binary has no such notion, so the
-// fallback is a plain "python3" resolved through PATH.
-func LoginPythonFromEnv() string {
-	if v := os.Getenv("KIRO_LOGIN_PYTHON"); v != "" {
-		return v
-	}
-	return "python3"
-}
+// Deliberately no LoginPythonFromEnv here (task #42 item 6, deleted): it had
+// zero production callers — config.Config.KiroLoginPython() (bridged via
+// Bot.loginPythonStr()) is what internal/handlers resolves KIRO_LOGIN_PYTHON
+// through instead (task #16/#24), since .env-only overrides never reach a
+// package-level os.Getenv here (config.Load's doc comment).
+// NewScriptRunner below takes the interpreter as a plain parameter for
+// exactly that reason.
 
 // ScriptRunner is the production LoginRunner: it shells out to the vendored
 // browser-login scripts through internal/subproc.

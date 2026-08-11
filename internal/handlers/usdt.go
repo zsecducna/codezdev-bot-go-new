@@ -960,8 +960,15 @@ func (b *Bot) verifyUSDTTxid(ctx context.Context, chatID int64, chain, des, txha
 			log.Printf("usdt deposit (%s) bad stored amount %q for %s: %v", chain, expected, des, aerr)
 			return b.txidNotFound(ctx, chatID, lang, quiet)
 		}
+		// DEPOSIT_MATCH_TOL_CENTS is read through b.envInt (the config.Load
+		// snapshot), NOT bands.DepositMatchTolCents() — that helper uses the
+		// pay package's raw os.Getenv, which production never populates
+		// (config.Load deliberately does not write os.Environ and systemd
+		// exports no EnvironmentFile), so the knob silently did nothing on
+		// the live deposit-credit path while working in local testing. Same
+		// class as tasks #10/#17/#22/#23.
 		creditVND, _ := bands.DepositCredit(recvUnits, desiredUnits, o.Total, recvVND,
-			bands.DepositMatchTolCents())
+			b.envInt("DEPOSIT_MATCH_TOL_CENTS", bands.DefaultDepositMatchTolCents))
 		credited, bal, cerr := b.store.Credit(chatStr, creditVND, ledgerID) // atomic dedupe + credit
 		if cerr != nil {
 			log.Printf("usdt deposit credit failed [des=%s %s]: %v", des, ledgerID, cerr)

@@ -311,10 +311,18 @@ func New(d Deps) *Bot {
 	// it never had provider-count baked into its collision logic.
 	b.bands = d.Bands
 	if b.bands == nil {
-		reg, err := bands.New(bands.Config{Providers: map[bands.Provider]bands.Params{
-			bands.ProviderBEP20: {Step: bep20.AmountOffsetStep(), Tol: bep20.AmountMatchTol(), Decimals: bep20.AmountDecimals()},
-			bands.ProviderTron:  {Step: tron.AmountOffsetStep(), Tol: tron.AmountMatchTol(), Decimals: tron.AmountDecimals()},
-		}})
+		// Every knob here goes through b.envInt (the config.Load snapshot),
+		// never the pay packages' own raw os.Getenv readers: production sets
+		// no ambient environment, so those readers always returned the
+		// compiled default and an operator tuning band geometry was tuning
+		// nothing. The Default* consts are the same values those readers fell
+		// back to, so this changes what is CONFIGURABLE, not what ships.
+		reg, err := bands.New(bands.Config{
+			EvictAfter: time.Duration(b.envInt("USDT_BAND_EVICT_S", int(bands.DefaultEvictAfter/time.Second))) * time.Second,
+			Providers: map[bands.Provider]bands.Params{
+				bands.ProviderBEP20: {Step: b.envInt("BEP20_OFFSET_STEP", bep20.DefaultAmountOffsetStep), Tol: b.envInt("BEP20_MATCH_TOL", bep20.DefaultAmountMatchTol), Decimals: b.envInt("BEP20_AMOUNT_DECIMALS", bep20.DefaultAmountDecimals)},
+				bands.ProviderTron:  {Step: b.envInt("TRON_OFFSET_STEP", tron.DefaultOffsetStep), Tol: b.envInt("TRON_MATCH_TOL", tron.DefaultMatchTol), Decimals: b.envInt("TRON_AMOUNT_DECIMALS", tron.DefaultAmountDecimals)},
+			}})
 		if err != nil {
 			// Misconfigured band geometry (e.g. a hand-set step of 0) would let two
 			// live orders share an amount — a money-safety failure, not a cosmetic
@@ -376,7 +384,13 @@ func New(d Deps) *Bot {
 	// settings.json write) instead of this getter.
 	b.bep20Configured = func() bool { return bep20.ValidAddress(b.bep20AddrStr()) }
 	b.bep20ByHash = func(txhash string) (*bep20.TransferByHash, error) {
-		return bep20.GetTransferToSellerByHash(b.bep20AddrStr(), txhash)
+		// BEP20_MIN_CONF is REORG SAFETY — the confirmation depth at which a
+		// transfer is deep enough to settle. Read through b.envInt for the
+		// same reason as the address beside it: the pay package's raw reader
+		// never sees .env in production, so the operator's chosen depth was
+		// silently ignored and every settle used the compiled default.
+		return bep20.GetTransferToSellerByHashConf(b.bep20AddrStr(), txhash,
+			b.envInt("BEP20_MIN_CONF", bep20.DefaultMinConfirmations))
 	}
 	b.tronConfigured = func() bool { return tron.ValidAddress(b.tronAddrStr()) }
 	// b.tronAPIKeyStr() is read per call, same as the address above — task
@@ -386,7 +400,13 @@ func New(d Deps) *Bot {
 	// TRONAPIKey() is the bridge; internal/pay/tron stays free of an
 	// internal/config import (see apiGet's doc comment).
 	b.tronByHash = func(txhash string, minTSMS int64) (*tron.Transfer, error) {
-		return tron.FindConfirmedTransferByHash(b.tronAddrStr(), txhash, minTSMS, b.tronAPIKeyStr())
+		// TRON_PAGE_LIMIT and TRON_API_BASE join the API key on the config
+		// chain for the same reason it is already there. TrimRight mirrors
+		// what the package's own raw apiBase() does, so a hand-edited .env
+		// with a trailing slash does not produce a doubled separator.
+		return tron.FindConfirmedTransferByHashConf(b.tronAddrStr(), txhash, minTSMS, b.tronAPIKeyStr(),
+			b.envInt("TRON_PAGE_LIMIT", tron.DefaultPageLimit),
+			strings.TrimRight(b.cfg.EnvOr("TRON_API_BASE", tron.DefaultAPIBase), "/"))
 	}
 	// The USD->VND rate is bridged the same way, and for the same reason —
 	// task #22, another instance of this port keeping a config reader while

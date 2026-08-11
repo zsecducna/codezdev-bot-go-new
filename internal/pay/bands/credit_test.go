@@ -85,14 +85,14 @@ func TestDepositMatchTolCents(t *testing.T) {
 	// t.Setenv restores the previous value on cleanup, so no manual unset here.
 }
 
-// TestEvictAndGraceFromEnv pins USDT_BAND_EVICT_S / USDT_PENDING_GRACE_S
-// (telegram_bot.py:9428, 9548).
-func TestEvictAndGraceFromEnv(t *testing.T) {
+// TestEvictFromEnv pins USDT_BAND_EVICT_S (telegram_bot.py:9428).
+//
+// No PendingGraceFromEnv counterpart here (task #42 item 6, deleted): it had
+// zero production callers, unlike EvictAfterFromEnv which registry.go:125
+// still falls back to whenever bands.Config.EvictAfter is left unset.
+func TestEvictFromEnv(t *testing.T) {
 	if got := EvictAfterFromEnv(); got != DefaultEvictAfter {
 		t.Errorf("EvictAfterFromEnv() = %v, want %v (1800s)", got, DefaultEvictAfter)
-	}
-	if got := PendingGraceFromEnv(); got != DefaultPendingGrace {
-		t.Errorf("PendingGraceFromEnv() = %v, want %v (2h)", got, DefaultPendingGrace)
 	}
 	t.Setenv("USDT_BAND_EVICT_S", "60")
 	if got := EvictAfterFromEnv(); got.Seconds() != 60 {

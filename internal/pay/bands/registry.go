@@ -39,11 +39,11 @@ func EvictAfterFromEnv() time.Duration {
 	return time.Duration(envInt("USDT_BAND_EVICT_S", int(DefaultEvictAfter/time.Second))) * time.Second
 }
 
-// PendingGraceFromEnv reads USDT_PENDING_GRACE_S (seconds,
-// telegram_bot.py:9548).
-func PendingGraceFromEnv() time.Duration {
-	return time.Duration(envInt("USDT_PENDING_GRACE_S", int(DefaultPendingGrace/time.Second))) * time.Second
-}
+// Deliberately no PendingGraceFromEnv here (task #42 item 6, deleted): it had
+// zero production callers. internal/handlers/dispatch.go's b.usdtPendingGrace
+// is the one live reader of USDT_PENDING_GRACE_S, resolved through
+// b.envInt/config.Config (the .env-visible chain) rather than this package's
+// raw env primitives — see the Sweep doc comment below for the real rule.
 
 // Reservation is one live band: the unique amount held for order `Des` on
 // `Provider`. Mirrors the value side of Python's pending dicts, minus the
@@ -471,8 +471,14 @@ func (r *Registry) ResolveRedirect(p Provider, chatID, des string, recvUnits int
 //	    o := store.GetOrder(res.Des)
 //	    if o == nil { return false }                    // order VANISHED -> free the band now
 //	    if o.Status == "reserved" { return true }       // still live -> keep
-//	    return now.Sub(res.CreatedAt) < bands.PendingGraceFromEnv()  // finished but within grace
+//	    return now.Sub(res.CreatedAt) < b.usdtPendingGrace  // finished but within grace
 //	}
+//
+// b.usdtPendingGrace (not a bands.PendingGraceFromEnv-style package read) is
+// USDT_PENDING_GRACE_S resolved through b.envInt/config.Config, the chain
+// that actually sees a .env-only value in production (config.Load's doc
+// comment) — internal/handlers/usdt.go's sweepUSDTBands is the real `keep`
+// this package doc is illustrating.
 //
 // Note the grace is measured from res.CreatedAt (Python's row `ts`), NOT from
 // the deadline — a row's band is held for USDT_PENDING_GRACE_S from when the

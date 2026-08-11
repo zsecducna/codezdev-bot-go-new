@@ -590,9 +590,9 @@ func (b *Bot) otpReleaseSlot() { <-b.otpSem }
 // reported as one — matching Python, where subprocess.run ignores returncode but
 // a TimeoutExpired falls through to CODE_FAIL.
 func (b *Bot) otpFetchNode(ctx context.Context, username string) (code, reset string, err error) {
-	dir := scriptDir()
+	dir := b.scriptDirStr()
 	res, err := subproc.Run(ctx, subproc.Request{
-		Path:    otpNodeBin(),
+		Path:    b.otpNodeBinStr(),
 		Args:    []string{filepath.Join(dir, otpScriptName), username},
 		Dir:     dir,
 		Timeout: b.otpFetchTimeout,
@@ -621,8 +621,14 @@ func parseOTPOutput(blob string) (code, reset string) {
 	return code, reset
 }
 
-// otpNodeBin resolves the Node binary. Python hardcodes "node" (@8287); the env
-// override exists because a Go deployment may not have node on the service PATH.
+// otpNodeBin reads the RAW .env/ambient KIRO_NODE — nothing more. Like
+// bep20.Address() (see that function's doc comment for the full reasoning),
+// it does NOT see a value set only via .env under systemd (no
+// EnvironmentFile in production, config.Load's doc comment). Production
+// callers must resolve it through b.otpNodeBinStr() instead, which layers
+// config.Config.Env("KIRO_NODE") over this fallback. Python hardcodes "node"
+// (@8287); the env override exists because a Go deployment may not have
+// node on the service PATH.
 func otpNodeBin() string {
 	if v := strings.TrimSpace(os.Getenv("KIRO_NODE")); v != "" {
 		return v
@@ -630,18 +636,48 @@ func otpNodeBin() string {
 	return "node"
 }
 
-// scriptDir resolves the directory holding the bot's sibling helper scripts —
-// fetch_login_code.mjs (@8280, @8289), aws_idc_provision_cli.py, and
-// aws_idc_login.mjs (idc_brief.md item D: promoted from the OTP-only
-// otpScriptDir so the AWS-IDC feature can resolve the same scripts without a
-// second copy of this logic). Python uses
-// `os.path.dirname(os.path.abspath(__file__))` — the bot's own directory — and
-// also runs the child with cwd=there (@8280, @8289). The Go twin of "my own
-// directory" is the executable's directory; KIRO_SCRIPT_DIR overrides it (read
-// lazily, at call time, because .env is loaded into the environment after link
-// time — same reasoning as provision.LoginPythonFromEnv).
+// otpNodeBinStr resolves KIRO_NODE through cfg (.env/ambient) rather than
+// otpNodeBin's raw os.Getenv, which never sees .env in production — mirrors
+// b.loginPythonStr()'s bridge over provision.LoginPythonFromEnv (task #16).
+func (b *Bot) otpNodeBinStr() string {
+	if b.cfg == nil {
+		return otpNodeBin()
+	}
+	if v := strings.TrimSpace(b.cfg.Env("KIRO_NODE")); v != "" {
+		return v
+	}
+	return "node"
+}
+
+// scriptDir reads the RAW .env/ambient KIRO_SCRIPT_DIR — nothing more, same
+// caveat as otpNodeBin's doc comment above. Production callers must resolve
+// it through b.scriptDirStr() instead. It resolves the directory holding the
+// bot's sibling helper scripts — fetch_login_code.mjs (@8280, @8289),
+// aws_idc_provision_cli.py, and aws_idc_login.mjs (idc_brief.md item D:
+// promoted from the OTP-only otpScriptDir so the AWS-IDC feature can resolve
+// the same scripts without a second copy of this logic). Python uses
+// `os.path.dirname(os.path.abspath(__file__))` — the bot's own directory —
+// and also runs the child with cwd=there (@8280, @8289). The Go twin of "my
+// own directory" is the executable's directory.
 func scriptDir() string {
 	if v := strings.TrimSpace(os.Getenv("KIRO_SCRIPT_DIR")); v != "" {
+		return v
+	}
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Dir(exe)
+	}
+	return "."
+}
+
+// scriptDirStr resolves KIRO_SCRIPT_DIR through cfg (.env/ambient) rather
+// than scriptDir's raw os.Getenv, which never sees .env in production —
+// the neighbour argument #24 left unfixed alongside b.loginPythonStr() at
+// this same call site (adminstock.go's runPoolProvision).
+func (b *Bot) scriptDirStr() string {
+	if b.cfg == nil {
+		return scriptDir()
+	}
+	if v := strings.TrimSpace(b.cfg.Env("KIRO_SCRIPT_DIR")); v != "" {
 		return v
 	}
 	if exe, err := os.Executable(); err == nil {

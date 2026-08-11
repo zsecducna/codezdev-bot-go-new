@@ -1292,7 +1292,7 @@ func (b *Bot) entraRunRefundDelete(ctx context.Context, chatID int64, orders, em
 	}
 	// b.loginPythonStr() resolves through cfg (.env/ambient, task #16) rather
 	// than provision.LoginPythonFromEnv's raw os.Getenv, which never sees .env.
-	res, err := entra.SoftDeleteByUPN(ctx, scriptDir(), b.loginPythonStr(), emails, 0)
+	res, err := entra.SoftDeleteByUPN(ctx, b.scriptDirStr(), b.loginPythonStr(), emails, 0)
 	if err != nil {
 		b.send(ctx, chatID, "⛔ Entra delete failed: "+err.Error(), admNav("admcat:orders"))
 		return

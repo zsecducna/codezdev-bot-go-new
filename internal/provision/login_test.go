@@ -397,15 +397,6 @@ func TestBrowserStackErrorProbesTheInterpreter(t *testing.T) {
 	}
 }
 
-func TestLoginPythonFromEnv(t *testing.T) {
-	// Read LAZILY: the bot loads .env into the environment AFTER this code is
-	// linked in, so an init-time capture would silently ignore a .env override.
-	t.Setenv("KIRO_LOGIN_PYTHON", "/venv/bin/python3")
-	if got := LoginPythonFromEnv(); got != "/venv/bin/python3" {
-		t.Errorf("got %q, want the env value", got)
-	}
-	t.Setenv("KIRO_LOGIN_PYTHON", "")
-	if got := LoginPythonFromEnv(); got != "python3" {
-		t.Errorf("got %q, want the python3 fallback", got)
-	}
-}
+// Deliberately no TestLoginPythonFromEnv here (task #42 item 6, deleted
+// alongside LoginPythonFromEnv — see login.go's doc comment): the function
+// had zero production callers.

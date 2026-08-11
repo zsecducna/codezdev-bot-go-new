@@ -56,18 +56,43 @@ const httpTimeout = 20 * time.Second
 
 var httpClient = &http.Client{Timeout: httpTimeout}
 
+// DefaultAmountDecimals / DefaultMinConfirmations / DefaultAmountMatchTol /
+// DefaultAmountOffsetStep are the compiled-in fallbacks for the four knobs
+// below — named so a caller resolving one of these through config.Config
+// (rather than through this package's own raw env read; see
+// MinConfirmations's doc comment) has the same default to fall back to
+// without hardcoding a second copy of the literal.
+const (
+	DefaultAmountDecimals   = 2
+	DefaultMinConfirmations = 12
+	DefaultAmountMatchTol   = 10
+	DefaultAmountOffsetStep = 21
+)
+
 // AmountDecimals is the precision of the per-order UNIQUE amount. 2 = cents
 // (universally sendable from any wallet/CEX, clean UX); bump only if
 // high-volume same-price bursts ever make the 1/step concurrency cap real.
 // On-chain supports 18 decimals regardless (bep20_pay.py:37-40).
 func AmountDecimals() int {
-	return envInt("BEP20_AMOUNT_DECIMALS", 2)
+	return envInt("BEP20_AMOUNT_DECIMALS", DefaultAmountDecimals)
 }
 
-// MinConfirmations: reorg safety, don't settle until the transfer is this
-// many blocks deep (BSC ~3s/block, so 12 ~ ~36s, bep20_pay.py:41-43).
+// MinConfirmations reads the RAW .env/ambient BEP20_MIN_CONF — nothing more.
+// Like Address() (see that function's doc comment for the full reasoning),
+// it does NOT see a value set only via .env under systemd (no
+// EnvironmentFile in production, config.Load's doc comment): a production
+// caller with a *config.Config available must resolve BEP20_MIN_CONF through
+// it and pass the result into MatchPaymentConf/GetTransferToSellerByHashConf
+// instead of letting this package read it. This function — and the
+// unparameterized MatchPayment/GetTransferToSellerByHash below, which
+// delegate to the *Conf functions using this value — survive only as the
+// low-level env primitive and its default-argument callers; do not call
+// them directly for anything customer-facing.
+//
+// reorg safety: don't settle until the transfer is this many blocks deep
+// (BSC ~3s/block, so 12 ~ ~36s, bep20_pay.py:41-43).
 func MinConfirmations() int {
-	return envInt("BEP20_MIN_CONF", 12)
+	return envInt("BEP20_MIN_CONF", DefaultMinConfirmations)
 }
 
 // AmountMatchTol / AmountOffsetStep: amount matching is FUZZY so a customer
@@ -78,11 +103,11 @@ func MinConfirmations() int {
 // at AmountDecimals precision. Default tol = 10 cents; step = 21
 // (bep20_pay.py:44-58).
 func AmountMatchTol() int {
-	return envInt("BEP20_MATCH_TOL", 10)
+	return envInt("BEP20_MATCH_TOL", DefaultAmountMatchTol)
 }
 
 func AmountOffsetStep() int {
-	return envInt("BEP20_OFFSET_STEP", 21)
+	return envInt("BEP20_OFFSET_STEP", DefaultAmountOffsetStep)
 }
 
 func envInt(key string, def int) int {
@@ -420,23 +445,34 @@ type MatchedTransfer struct {
 	Amount *big.Rat
 }
 
-// MatchPayment returns the first incoming transfer matching expectedAmount
-// (a string like "5.23"), else (nil, nil).
+// MatchPayment is MatchPaymentConf using the raw-env MinConfirmations() —
+// kept for callers with no *config.Config to resolve BEP20_MIN_CONF through
+// (see MinConfirmations's doc comment). Has no production caller today; the
+// live poller path does not exist for BEP20 (customer-submitted hash only,
+// via GetTransferToSellerByHash/Conf).
+func MatchPayment(transfers []Transfer, expectedAmount string, minBlock, latest int64, isUsed func(txnID string) bool) (*MatchedTransfer, error) {
+	return MatchPaymentConf(transfers, expectedAmount, minBlock, latest, MinConfirmations(), isUsed)
+}
+
+// MatchPaymentConf returns the first incoming transfer matching
+// expectedAmount (a string like "5.23"), else (nil, nil).
 //
 // Matches when: amount (floored to AmountDecimals) is within AmountMatchTol
 // of expected (so a customer who drops a cent or two still confirms), the
 // tx is at or after minBlock (the order's own creation block — so a
 // recycled amount's older payment can't settle a newer order), it has >=
-// MinConfirmations (latest - block), and the tx isn't already consumed. The
+// minConf confirmations (latest - block), and the tx isn't already
+// consumed. minConf is the caller's resolved BEP20_MIN_CONF (see
+// MinConfirmations's doc comment) rather than read from raw env here. The
 // picker keeps live amounts >= 2*tol+1 apart, so a payment is within tol of
 // at most ONE order (bep20_pay.py:163-186).
-func MatchPayment(transfers []Transfer, expectedAmount string, minBlock, latest int64, isUsed func(txnID string) bool) (*MatchedTransfer, error) {
+func MatchPaymentConf(transfers []Transfer, expectedAmount string, minBlock, latest int64, minConf int, isUsed func(txnID string) bool) (*MatchedTransfer, error) {
 	want, err := AmountUnits(expectedAmount)
 	if err != nil {
 		return nil, err
 	}
 	tol := int64(AmountMatchTol())
-	minConf := int64(MinConfirmations())
+	minConf64 := int64(minConf)
 	for _, t := range transfers {
 		if absInt64(t.Units-want) > tol { // fuzzy: forgot-a-cent still matches
 			continue
@@ -444,7 +480,7 @@ func MatchPayment(transfers []Transfer, expectedAmount string, minBlock, latest 
 		if t.Block < minBlock {
 			continue
 		}
-		if (latest - t.Block) < minConf {
+		if (latest - t.Block) < minConf64 {
 			continue // not deep enough yet -> next cycle
 		}
 		if isUsed != nil && isUsed(fmt.Sprintf("bsc:%s", t.ID)) {
@@ -494,12 +530,28 @@ type receiptFull struct {
 	Logs        []logEntryWithAddr `json:"logs"`
 }
 
-// GetTransferToSellerByHash looks up ONE BSC transaction by hash and returns
-// the USDT (BEP20) transfer it makes TO seller, with confirmation status —
-// for the customer-submitted payment-verification flow (the customer pastes
-// their tx hash; there is no background poller). Returns (nil, nil) when the
-// hash is malformed, unknown, not yet mined, or carries no USDT transfer to
-// seller.
+// confirmedAt reports whether a looked-up transfer is settled: the receipt
+// succeeded, it is at least minConf blocks deep (latest-block), and a block
+// timestamp was actually found. Pulled out of GetTransferToSellerByHashConf
+// as a pure function so the MinConfirmations plumbing is pinnable by a test
+// without a live RPC round trip.
+func confirmedAt(success bool, latest, block int64, ts int64, minConf int) bool {
+	return success && (latest-block) >= int64(minConf) && ts > 0
+}
+
+// GetTransferToSellerByHash is GetTransferToSellerByHashConf using the
+// raw-env MinConfirmations() — kept for callers with no *config.Config to
+// resolve BEP20_MIN_CONF through (see MinConfirmations's doc comment).
+func GetTransferToSellerByHash(seller, txhash string) (*TransferByHash, error) {
+	return GetTransferToSellerByHashConf(seller, txhash, MinConfirmations())
+}
+
+// GetTransferToSellerByHashConf looks up ONE BSC transaction by hash and
+// returns the USDT (BEP20) transfer it makes TO seller, with confirmation
+// status — for the customer-submitted payment-verification flow (the
+// customer pastes their tx hash; there is no background poller). Returns
+// (nil, nil) when the hash is malformed, unknown, not yet mined, or carries
+// no USDT transfer to seller.
 //
 // seller is passed in by the caller rather than read from this package's own
 // Address() (task #17): the live receiving address is admin-settable via
@@ -509,15 +561,17 @@ type receiptFull struct {
 // package depend on the bot's config layer for no reason beyond reading one
 // string. The caller (internal/handlers) already holds the resolved *Config
 // and is the right place to resolve "which address is live right now".
+// minConf is the same kind of caller-resolved value, for BEP20_MIN_CONF
+// (see MinConfirmations's doc comment).
 //
 // Confirmed is true only when the receipt SUCCEEDED and the tx is at least
-// MinConfirmations deep AND the block timestamp is known — so the caller
-// never credits an unconfirmed/reverted tx and always has a real on-chain
+// minConf deep AND the block timestamp is known — so the caller never
+// credits an unconfirmed/reverted tx and always has a real on-chain
 // timestamp for the [start, click] freshness window. Multiple USDT
 // transfers to the seller inside one tx are summed (defensive; normally
 // one). Stdlib-only JSON-RPC over the same endpoint pool as the poller path
 // (bep20_pay.py:189-259).
-func GetTransferToSellerByHash(seller, txhash string) (*TransferByHash, error) {
+func GetTransferToSellerByHashConf(seller, txhash string, minConf int) (*TransferByHash, error) {
 	if txhash == "" || !ValidAddress(seller) {
 		return nil, nil
 	}
@@ -593,7 +647,7 @@ func GetTransferToSellerByHash(seller, txhash string) (*TransferByHash, error) {
 					ts = tsVal
 				}
 			}
-			confirmed = success && (latest-block) >= int64(MinConfirmations()) && ts > 0
+			confirmed = confirmedAt(success, latest, block, ts, minConf)
 		}
 	}
 
