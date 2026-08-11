@@ -815,21 +815,46 @@ func TestColumnToleranceIsExactWhereRoundingCannotHappen(t *testing.T) {
 // conversion.
 //
 // The property that must hold: the enforced tolerance must cover the worst
-// case the conversion can actually produce, which is every row rounding the
-// same direction by the maximum amount. Anything below rowCount*maxErr can
-// refuse a correct run.
+// case the conversion can actually produce. That is every ROW rounding the
+// same direction by the maximum amount, PLUS the aggregate side's own
+// rounding — ExpectedSumAfter is convertValue(SumBefore), which rounds once
+// more on top. An earlier version of this test omitted that last term and so
+// asserted a property that was false: at rowCount*maxErr, rate=23001 with
+// value=115 and n=3 yields delta=20000 against tolerance=15000, refusing a
+// correct conversion.
 func TestColumnToleranceDoesNotRefuseACorrectMigration(t *testing.T) {
 	const n = 2911
-	worstCase := int64(n) * (microPerCent / 2) // every row rounds the same way, maximally
+	// (n+1): n per-row roundings plus the one on the aggregate.
+	worstCase := int64(n+1) * (microPerCent / 2)
 	got := columnTolerance(bucketCentRounded, 24000, n)
 	if got < worstCase {
 		t.Errorf("columnTolerance(centRounded, rate=24000, n=%d) = %d, which is below the worst case a correct conversion can produce (%d) — a correct migration can be refused",
 			n, got, worstCase)
 	}
-	// And the sqrt figure it replaced must survive only as a REPORTED
-	// diagnostic, never as the enforced bound.
-	if drift := columnDriftBound(bucketCentRounded, 24000, n); drift >= got {
-		t.Errorf("columnDriftBound(%d) = %d is not below the enforced tolerance %d — the advisory bound has become the enforced one", n, drift, got)
+	// The specific counterexample that the old rowCount*maxErr bound refused.
+	// Driven through the REAL conversion, not a restated formula: three rows
+	// of 115 VND at rate 23001, whose per-row and aggregate roundings
+	// genuinely disagree by more than the old bound allowed.
+	const cRate, cVal, cN = 23001, 115, 3
+	var sumAfter int64
+	for i := 0; i < cN; i++ {
+		v, err := convertValue(cVal, cRate, bucketCentRounded)
+		if err != nil {
+			t.Fatalf("convertValue: %v", err)
+		}
+		sumAfter += v
+	}
+	expected, err := convertValue(int64(cVal*cN), cRate, bucketCentRounded)
+	if err != nil {
+		t.Fatalf("convertValue aggregate: %v", err)
+	}
+	delta := sumAfter - expected
+	if delta < 0 {
+		delta = -delta
+	}
+	if tol := columnTolerance(bucketCentRounded, cRate, cN); delta > tol {
+		t.Errorf("a CORRECT conversion of %d rows of %d VND at rate %d produces delta=%d, which exceeds tolerance=%d — this exact case was refused by the old rowCount*maxErr bound",
+			cN, cVal, cRate, delta, tol)
 	}
 }
 

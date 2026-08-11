@@ -14,7 +14,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"math"
 	"math/big"
 	"os"
 	"strconv"
@@ -466,27 +465,57 @@ func perRowMaxError(b bucket, rate int64) int64 {
 //
 // columnDriftBound reports what the sqrt estimate WOULD be, for operator
 // eyes only — see its comment.
+// The +1 is the AGGREGATE side's own rounding, and leaving it out made this
+// not quite a bound: ExpectedSumAfter is convertValue(SumBefore), which
+// rounds once more on top of the per-row roundings Delta is measuring
+// against. Counterexample from the real code at rowCount*maxErr:
+// rate=23001, value=115, n=3 gives delta=20000 against tolerance=15000 —
+// a correct conversion, refused. The maximum excess is exactly one maxErr,
+// never more, so one extra covers it. Not reachable with this ledger's data
+// (no counterexample exists across seven plausible rates and every multiple
+// of 1000 VND up to 500,000), but a bound that is only almost a bound is
+// the kind of thing that comes back at the worst moment.
 func columnTolerance(b bucket, rate int64, rowCount int64) int64 {
 	maxErr := perRowMaxError(b, rate)
 	if maxErr == 0 || rowCount == 0 {
 		return 0
 	}
-	return rowCount * maxErr
+	return (rowCount + 1) * maxErr
 }
 
-// columnDriftBound is the sqrt(rowCount) figure that columnTolerance
-// deliberately does NOT enforce (see its comment for why enforcing it
-// refuses correct migrations). It is reported next to Delta purely as a
-// diagnostic: on a ledger whose prices round cleanly at the chosen rate,
-// Delta sits at 0 and far below this, and a Delta that exceeds it is worth
-// an operator's attention even though it is not, on its own, grounds to
-// abort.
-func columnDriftBound(b bucket, rate int64, rowCount int64) int64 {
-	maxErr := perRowMaxError(b, rate)
-	if maxErr == 0 || rowCount == 0 {
-		return 0
+// roundedRows counts how many of a column's rows the conversion actually
+// had to round. This replaced a reported sqrt(rowCount) "drift estimate":
+// that figure came from the same broken model columnTolerance had to stop
+// enforcing, and although making it advisory stopped it ABORTING correct
+// migrations, it did not stop it CRYING WOLF on them — measured, Delta
+// exceeded it on 90.8% of rates in 23000..28000, i.e. on nearly every
+// cent-rounded column of a perfectly correct run. A diagnostic that fires
+// nine times out of ten on healthy data teaches an operator to scroll past
+// the one line that might have meant something, and it would do so inside a
+// one-shot migration window with no second chance.
+//
+// A count of rows that rounded is the honest version of what that estimate
+// was reaching for. "0 of 2911 rows rounded" is strong, checkable evidence
+// that the chosen rate converts this ledger exactly; "2740 of 2911 rounded"
+// says the opposite plainly, without pretending to know how much drift is
+// acceptable. It cannot false-alarm, because it asserts nothing — it
+// reports.
+func rowRounded(vnd, rate int64, b bucket) bool {
+	if b != bucketCentRounded {
+		// bucketFreeMicro does not round to the cent at all; its only
+		// rounding is vndToMicro's own step, which perRowMaxError already
+		// reports as exact whenever the rate divides 1_000_000 evenly.
+		return false
 	}
-	return int64(math.Ceil(math.Sqrt(float64(rowCount)))) * maxErr
+	micro, err := vndToMicro(vnd, rate)
+	if err != nil {
+		// An overflow here is reported by the conversion itself, which runs
+		// on the same value moments later and aborts the run; this counter
+		// must not be the thing that decides anything, so it declines to
+		// guess rather than inflating the count on an error path.
+		return false
+	}
+	return roundToNearestCent(micro) != micro
 }
 
 // ---- per-row work -----------------------------------------------------
@@ -577,11 +606,12 @@ type ColumnReport struct {
 	Delta            int64
 	Tolerance        int64
 
-	// DriftBound is the sqrt(rowCount) drift estimate, REPORTED BUT NEVER
-	// ENFORCED — a Delta above it is worth an operator's attention but is
-	// not grounds to abort. See columnDriftBound for why enforcing it
-	// refuses correct migrations at plausible rates.
-	DriftBound int64
+	// RoundedRows counts the rows whose conversion actually had to round,
+	// REPORTED BUT NEVER ENFORCED. "0 of 2911 rounded" is checkable evidence
+	// that the chosen rate converts this ledger exactly; it replaced a
+	// sqrt(rowCount) drift estimate that fired on 90.8% of plausible rates
+	// and so trained the reader to ignore it. See rowRounded.
+	RoundedRows int64
 
 	// ZeroCollapses lists every row whose ORIGINAL value was non-zero but
 	// whose converted value rounded to zero — requirement #6, "the class
@@ -626,6 +656,12 @@ func processSpecs(q querier, specs []moneySpec, rate int64, write bool) ([]Colum
 			if r.old != 0 && newVal == 0 {
 				cr.ZeroCollapses = append(cr.ZeroCollapses, ZeroCollapse{spec.table, r.pk, r.old})
 			}
+			// Reported, never enforced — see rowRounded. A column that
+			// converts with zero rounded rows is exactly convertible at this
+			// rate, which is the strongest thing the report can honestly say.
+			if rowRounded(r.old, rate, spec.bucket) {
+				cr.RoundedRows++
+			}
 			if write {
 				res, err := q.Exec(fmt.Sprintf(
 					"UPDATE %s SET %s = ?, %s = ? WHERE %s = ?",
@@ -663,8 +699,6 @@ func processSpecs(q querier, specs []moneySpec, rate int64, write bool) ([]Colum
 			cr.Delta = -cr.Delta
 		}
 		cr.Tolerance = columnTolerance(spec.bucket, rate, cr.RowCount)
-		// Reported, never enforced — see columnDriftBound.
-		cr.DriftBound = columnDriftBound(spec.bucket, rate, cr.RowCount)
 		out = append(out, cr)
 	}
 	return out, nil
