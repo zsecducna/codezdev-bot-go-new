@@ -159,6 +159,23 @@ var baseSpecs = []moneySpec{
 	// no-writer-yet caveat and same §3.1 instruction as list_total
 	// (store.go:215-221).
 	{"orders", "des", "code_discount", "legacy_vnd_code_discount", bucketCentRounded},
+	// orders.refunded_amount: how much was actually CREDITED BACK for a
+	// refunded order (task #20 stage S1 — the column exists and is entirely
+	// NULL until S2 starts populating it). Cent-rounded, not free-micro,
+	// because a refund credits back exactly the original charge: it must
+	// round identically to orders.total above, which a different bucket
+	// would not guarantee.
+	//
+	// This entry MUST stay in the same commit as the ALTER that adds the
+	// column (internal/store/store.go). The migration is one-shot and
+	// marker-guarded, so a money column that first appears on a database
+	// AFTER this tool has run there is permanently unconverted: the app
+	// keeps writing VND until stages S5-S8, meta.ledger_unit blocks a second
+	// run, and nothing in the data flags the mixed unit. An all-NULL column
+	// is safe here — fetchRows' `WHERE valueCol IS NOT NULL` never reads a
+	// NULL row, and the provenance gate is phrased as an implication
+	// (non-NULL value implies non-NULL legacy), so it does not fire on one.
+	{"orders", "des", "refunded_amount", "legacy_vnd_refunded_amount", bucketCentRounded},
 	// bep20_pending.total / tron_pending.total: the VND total an in-flight
 	// on-chain order will credit on settlement — same shape as orders.total,
 	// so cent-rounded. In practice these tables must be EMPTY before a live

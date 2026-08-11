@@ -143,6 +143,87 @@ func TestMigrationAddsStatsColumnsToOldSchema(t *testing.T) {
 	defer s2.Close()
 }
 
+// TestRefundedAmountColumnNullStaysNull is task #20 stage S1. It asserts the
+// three things S1 promises and nothing more (S1 is deliberately inert — it
+// changes no displayed number): the column exists after migrating an old
+// schema, a pre-existing refunded row reads NULL (not 0 — a default would
+// claim the shop kept money it in fact refunded, which is worse than the bug
+// being fixed), and NULL survives a close/reopen round-trip rather than being
+// coerced to some other value along the way.
+//
+// Falsification: against pre-change code this fails at "orders missing
+// migrated column \"refunded_amount\"" — initSchema never added the column.
+func TestRefundedAmountColumnNullStaysNull(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	// The OLD orders shape: no refunded_amount (predates this migration).
+	if _, err := raw.Exec("CREATE TABLE orders (" +
+		"des TEXT PRIMARY KEY, chat_id TEXT, lang TEXT, product TEXT, " +
+		"tier TEXT, qty INTEGER, total INTEGER, status TEXT, " +
+		"paypal_order_id TEXT, ts REAL)"); err != nil {
+		t.Fatalf("create old orders: %v", err)
+	}
+	// A legacy refunded row — exactly the case the NULLABLE decision is
+	// about. Its true credited amount was never recorded and cannot be
+	// invented after the fact.
+	if _, err := raw.Exec("INSERT INTO orders(des, chat_id, status, qty, total, ts) " +
+		"VALUES ('legacy-refund','9','refunded',1,7000,3.0)"); err != nil {
+		t.Fatalf("seed legacy refund: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on old schema: %v", err)
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	have, err := tableColumns(tx, "orders")
+	tx.Rollback()
+	if err != nil {
+		t.Fatalf("tableColumns(orders): %v", err)
+	}
+	if !have["refunded_amount"] {
+		t.Fatalf("orders missing migrated column %q", "refunded_amount")
+	}
+
+	readRefundedAmount := func() sql.NullInt64 {
+		t.Helper()
+		var ra sql.NullInt64
+		if err := s.db.QueryRow(
+			"SELECT refunded_amount FROM orders WHERE des=?", "legacy-refund").Scan(&ra); err != nil {
+			t.Fatalf("read refunded_amount: %v", err)
+		}
+		return ra
+	}
+	if ra := readRefundedAmount(); ra.Valid {
+		t.Errorf("legacy-refund: refunded_amount backfilled to %d — want NULL, the credited amount is unrecoverable", ra.Int64)
+	}
+
+	// Round-trip: close and reopen the store (same technique as the
+	// idempotence check above) and confirm the NULL is still NULL, not
+	// coerced to 0 or dropped by a second migration pass over an
+	// already-migrated column.
+	s.Close()
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("second Open (round-trip): %v", err)
+	}
+	defer s2.Close()
+	s = s2
+	if ra := readRefundedAmount(); ra.Valid {
+		t.Errorf("legacy-refund: refunded_amount = %d after reopen — want NULL to survive the round-trip", ra.Int64)
+	}
+}
+
 // TestRefundKindClearedOnRevert is spec T2 — THE revert trap. Three handler
 // sites do ClaimOrder(des, "refunded", "paid") (apikey_deliver.go:250,411 and
 // purchase.go:343). If refund_kind survived that revert, a status='paid' row

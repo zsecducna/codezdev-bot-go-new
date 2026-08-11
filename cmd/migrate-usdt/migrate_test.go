@@ -45,8 +45,14 @@ func newFixtureDB(t *testing.T) string {
 	stmts := []string{
 		"CREATE TABLE balances (chat_id TEXT PRIMARY KEY, amount INTEGER NOT NULL DEFAULT 0)",
 		"CREATE TABLE processed (txn_id TEXT PRIMARY KEY, chat_id TEXT, amount INTEGER, ts REAL)",
+		// refunded_amount mirrors the real schema's task #20 S1 column. It is
+		// nullable and left entirely NULL here, which is the state every real
+		// database is in until S2 starts populating it — and is itself worth
+		// exercising: fetchRows' `WHERE valueCol IS NOT NULL` must never read
+		// such a row, and the provenance gate must not fire on one.
 		"CREATE TABLE orders (des TEXT PRIMARY KEY, chat_id TEXT, product TEXT, tier TEXT, " +
-			"qty INTEGER, total INTEGER, status TEXT, list_total INTEGER, code_discount INTEGER, ts REAL)",
+			"qty INTEGER, total INTEGER, status TEXT, list_total INTEGER, code_discount INTEGER, " +
+			"refunded_amount INTEGER, ts REAL)",
 		"CREATE TABLE bep20_pending (des TEXT PRIMARY KEY, chat_id TEXT, amount TEXT, total INTEGER, ts REAL)",
 		"CREATE TABLE tron_pending (des TEXT PRIMARY KEY, chat_id TEXT, amount TEXT, total INTEGER, ts REAL)",
 		"CREATE TABLE refund_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, des TEXT, chat_id TEXT, total INTEGER, ts REAL)",

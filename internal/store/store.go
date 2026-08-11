@@ -219,6 +219,53 @@ func (s *Store) initSchema() error {
 			}
 		}
 	}
+	// Migration: refunded_amount (task #20, stage S1 — misc.go's
+	// RefundedRevenue caveat). Stats today sum orders.total for every refunded
+	// row, but warranty refunds are frequently PARTIAL (adminorders.go
+	// pro-rates day/hour tiers down from o.Total unless forceFull is set), so
+	// the refunded figure is overstated and net revenue is understated by the
+	// same residue. This column will hold what was actually credited back, so
+	// a later slice (S3) can report the real number instead of the order
+	// total. THIS commit only adds the column — no displayed figure changes
+	// (S1 is deliberately inert); S2 wires the two refund call sites to
+	// populate it, S3 rewires the stats query.
+	//
+	// NULLABLE, not DEFAULT 0 — and this is the load-bearing decision, not a
+	// stylistic one. SQLite ADD COLUMN with a constant default would stamp
+	// every pre-existing refunded row with 0, which reads as "nothing was
+	// credited back" — i.e. the shop KEPT the money. That is a strictly worse
+	// lie than the bug this column fixes: today's stats overstate the refund
+	// (bad), but a defaulted 0 would claim the refund never happened (worse —
+	// it inverts who has the money). The amount actually credited on every
+	// refund before this column existed was never persisted anywhere
+	// queryable (misc.go:520-532), so it is permanently unknowable — do NOT
+	// attempt to backfill it, and specifically do not reach for the `audit`
+	// table: those rows are free-text and denominated in VND forever, so a
+	// reconstruction from them would silently reintroduce a unit bug on top
+	// of an already-approximate number. NULL is the honest state — "not
+	// recorded" — for every row that predates this column, exactly like
+	// list_total/code_discount above.
+	//
+	// NOTE for S2 (do not get this wrong when wiring the writer): this column
+	// means CREDITED, not INTENDED. ClaimOrderKind commits the order's
+	// status='refunded' BEFORE CreditBalance runs, and both refund call sites
+	// have a CreditFailed branch where the order already reads 'refunded' but
+	// ZERO money moved (that branch is exactly what fires the stuck-refund
+	// owner alert). Writing this column alongside the ClaimOrderKind call —
+	// the naturally-reached-for implementation — would make it LIE on
+	// precisely the path that already needs an operator's attention. Set it
+	// only once CreditBalance has actually succeeded.
+	//
+	// Coupling: this column is money-shaped, so it must migrate in the same
+	// commit as its cmd/migrate-usdt/migrate.go baseSpecs entry — a money
+	// column that appears on a DB after the one-shot VND->micro-USDT ledger
+	// migration has run there would stay permanently unconverted with nothing
+	// in the data flagging the mixed unit.
+	if !have["refunded_amount"] {
+		if _, err := tx.Exec("ALTER TABLE orders ADD COLUMN refunded_amount INTEGER"); err != nil {
+			return fmt.Errorf("migrate orders.refunded_amount: %w", err)
+		}
+	}
 
 	creates2 := []string{
 		// Secondary indexes for the hot non-PK lookups (store.py:118-125).
