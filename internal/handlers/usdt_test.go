@@ -37,16 +37,19 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/pay/bands"
 	"codezdev-bot/internal/pay/bep20"
 	"codezdev-bot/internal/pay/tron"
+	"codezdev-bot/internal/stock"
 	"codezdev-bot/internal/store"
 )
 
@@ -1339,18 +1342,20 @@ func TestUSDTRealClientsByHash(t *testing.T) {
 	t.Setenv("TRON_API_BASE", trx.URL)
 
 	// Build the bot AFTER the env/endpoint overrides so New binds the real
-	// clients against the fakes.
-	b, _, _, _, _ := newUSDTBot(t)
-	// newUSDTBot replaces the chain seams with scripted fakes; restore the real
-	// bindings so this test exercises the production path — same closure shape
-	// New() installs (dispatch.go), resolving the seller address through
-	// b.cfg on every call rather than a raw env read (task #17).
-	b.bep20ByHash = func(txhash string) (*bep20.TransferByHash, error) {
-		return bep20.GetTransferToSellerByHash(b.bep20AddrStr(), txhash)
-	}
-	b.tronByHash = func(txhash string, minTSMS int64) (*tron.Transfer, error) {
-		return tron.FindConfirmedTransferByHash(b.tronAddrStr(), txhash, minTSMS, b.tronAPIKeyStr())
-	}
+	// clients against the fakes, via newBuyBot (NOT newUSDTBot/newUSDTBotAtRate
+	// — those unconditionally overwrite b.bep20ByHash/b.tronByHash with
+	// scripted fakes for the buy/deposit-flow tests, which this test does not
+	// need and must not go through: this test exists specifically to exercise
+	// the closures New() installs (dispatch.go) and nothing else. An earlier
+	// version of this test built via newUSDTBot and then hand-reconstructed
+	// "the real closure" here to undo that override — which silently drifted
+	// out of sync with dispatch.go (it was still calling the pre-task#42
+	// bep20.GetTransferToSellerByHash/tron.FindConfirmedTransferByHash 2-
+	// and 4-arg forms, missing the BEP20_MIN_CONF/TRON_PAGE_LIMIT/
+	// TRON_API_BASE plumbing dispatch.go now does) and so quietly stopped
+	// testing what its own doc comment claims. Not touching b.bep20ByHash/
+	// b.tronByHash at all is the only way this test can't go stale again.
+	b, _, _, _, _ := newBuyBot(t, "999")
 
 	tx, err := b.bep20ByHash("0x" + hash64("8"))
 	if err != nil || tx == nil {
@@ -1366,6 +1371,332 @@ func TestUSDTRealClientsByHash(t *testing.T) {
 	}
 	if tr.Units != 600 {
 		t.Errorf("tron transfer units = %d, want 600", tr.Units)
+	}
+}
+
+// ---- task #42: pin the CALLER wiring, not just the package plumbing -------
+//
+// The tests above (and internal/pay/bep20, internal/pay/tron's own test
+// suites) already prove that an INJECTED value is honoured once it reaches
+// MatchPaymentConf/GetTransferToSellerByHashConf/GetIncomingTransfersConf/
+// bands.Config.EvictAfter/bands.DepositCredit's tolUnits param. None of that
+// proves dispatch.go/usdt.go actually RESOLVE the right key and PASS it in —
+// a typo'd key string (BEP20_MINCONF instead of BEP20_MIN_CONF) would build
+// clean and pass every package-level test while the knob stayed just as dead
+// as before task #42. These four tests close that gap, one per fixed call
+// site, each built the same way: write the knob into dir/.env (NEVER
+// t.Setenv) before config.Load, so a raw package-level os.Getenv/envInt read
+// sees nothing (production's systemd unit exports nothing either — no
+// EnvironmentFile, config.Load's own doc comment) while config.Config.Env
+// (and b.envInt/b.cfg.EnvOr, which read through it) see the .env-supplied
+// value. Each fixture asserts the key is absent from the ambient environment
+// FIRST, so none of these can pass "by accident" if the shell running the
+// suite happens to already export one of these names.
+
+// TestBep20ByHashResolvesMinConfFromDotEnvSnapshot pins dispatch.go's
+// b.bep20ByHash closure: BEP20_MIN_CONF must reach
+// GetTransferToSellerByHashConf's minConf parameter via b.envInt(b.cfg),
+// not bep20.MinConfirmations()'s raw env read.
+//
+// The fake BSC node reports the transfer at block 0x64 (100) with a chain
+// head of 0x69 (105) — exactly 5 confirmations deep. BEP20_MIN_CONF=3 (via
+// .env only) must confirm it (5>=3); the compiled default of 12 would not
+// (5<12). Since BEP20_MIN_CONF is never set ambient here, a caller that
+// dropped back to the raw bep20.MinConfirmations() read (or typo'd the key)
+// would silently see "" -> the 12 default -> Confirmed=false, so this test
+// only passes when dispatch.go's b.envInt("BEP20_MIN_CONF", ...) call is
+// both present and correctly spelled.
+//
+// Falsification: change dispatch.go's b.bep20ByHash closure back to call
+// bep20.GetTransferToSellerByHash(b.bep20AddrStr(), txhash) (the pre-#42
+// 2-arg form, which reads MinConfirmations() itself) and tx.Confirmed comes
+// back false instead of true.
+func TestBep20ByHashResolvesMinConfFromDotEnvSnapshot(t *testing.T) {
+	if _, ok := os.LookupEnv("BEP20_MIN_CONF"); ok {
+		t.Fatal("fixture broken: BEP20_MIN_CONF is set in the ambient environment, " +
+			"so this test would pass even if the caller read raw env")
+	}
+
+	sellerTopic := "0x000000000000000000000000" + strings.TrimPrefix(testSellerBSC, "0x")
+	fromTopic := "0x" + strings.Repeat("0", 24) + strings.Repeat("b", 40)
+	weiHex := fmt.Sprintf("0x%x", new(big.Int).Mul(big.NewInt(3), pow10BigInt(18))) // 3.00 USDT
+	bsc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		var result any
+		switch req.Method {
+		case "eth_getTransactionReceipt":
+			result = map[string]any{
+				"blockNumber": "0x64", "status": "0x1", // block 100
+				"logs": []any{map[string]any{
+					"address": bep20.USDTContract,
+					"data":    weiHex,
+					"topics":  []string{bep20.TransferTopic, fromTopic, sellerTopic},
+				}},
+			}
+		case "eth_blockNumber":
+			result = "0x69" // block 105 -> 5 confirmations deep
+		case "eth_getBlockByNumber":
+			result = map[string]any{"timestamp": "0x60000000"}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "result": result})
+	}))
+	defer bsc.Close()
+	oldRPC := bep20.RPCEndpoints
+	bep20.RPCEndpoints = []string{bsc.URL}
+	defer func() { bep20.RPCEndpoints = oldRPC }()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(
+		"BEP20_ADDRESS="+testSellerBSC+"\n"+
+			"BEP20_MIN_CONF=3\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	stk := stock.New(filepath.Join(dir, "accounts"), filepath.Join(dir, "orders"))
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, Stock: stk, Config: cfg, AdminID: "1"})
+	t.Cleanup(func() { b.Shutdown(); st.Close() })
+
+	// b.bep20ByHash is the exact closure dispatch.go's New() installs — not
+	// overridden here — so this calls production code all the way down to
+	// confirmedAt's minConf parameter.
+	tx, err := b.bep20ByHash("0x" + hash64("3"))
+	if err != nil {
+		t.Fatalf("bep20ByHash error: %v", err)
+	}
+	if tx == nil {
+		t.Fatal("bep20ByHash = nil, want a transfer (5 confs deep must at least be FOUND)")
+	}
+	if !tx.Confirmed {
+		t.Errorf("bep20ByHash Confirmed = false, want true — 5 confs >= the .env-configured " +
+			"BEP20_MIN_CONF=3 (a fallback to the 12 default would reject it: 5<12)")
+	}
+}
+
+// TestTronByHashResolvesPageLimitAndAPIBaseFromDotEnvSnapshot pins
+// dispatch.go's b.tronByHash closure: TRON_PAGE_LIMIT and TRON_API_BASE must
+// reach FindConfirmedTransferByHashConf's pageLimit/base parameters via
+// b.envInt/b.cfg.EnvOr, not tron.PageLimit()/apiBase()'s raw env reads.
+//
+// Both knobs are set via .env only, to a distinctive TRON_PAGE_LIMIT=13
+// (default 200) and to this test's own httptest server as TRON_API_BASE
+// (default "https://api.trongrid.io"). A caller that dropped back to the raw
+// readers would send limit=200 to the WRONG host entirely — this test
+// asserts on the actual "limit" query parameter the fake TronGrid receives,
+// which only comes back "13" if both the base (to reach this server at all)
+// and the limit (the value itself) resolved through cfg.
+//
+// Falsification: change dispatch.go's b.tronByHash closure back to call
+// tron.FindConfirmedTransferByHash(b.tronAddrStr(), txhash, minTSMS,
+// b.tronAPIKeyStr()) (the pre-#42 4-arg form) and this test times out /
+// errors dialing the real api.trongrid.io instead of seeing "13".
+//
+// LOAD-BEARING BEYOND ITS STATED PURPOSE: verified by hand that on that same
+// revert the request does not merely fail closed — it actually leaves the
+// process and hits the real api.trongrid.io (which answered with a live 400
+// "valid account address required"). So this test is also what keeps `go
+// test` from making an outbound network call to a third party the moment
+// this wiring regresses — do not delete it as "just an env plumbing test."
+func TestTronByHashResolvesPageLimitAndAPIBaseFromDotEnvSnapshot(t *testing.T) {
+	for _, key := range []string{"TRON_PAGE_LIMIT", "TRON_API_BASE"} {
+		if _, ok := os.LookupEnv(key); ok {
+			t.Fatalf("fixture broken: %s is set in the ambient environment, "+
+				"so this test would pass even if the caller read raw env", key)
+		}
+	}
+
+	trxHash := hash64("4")
+	var gotLimit string
+	trx := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLimit = r.URL.Query().Get("limit")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data": []any{map[string]any{
+				"transaction_id":  trxHash,
+				"type":            "Transfer",
+				"from":            "TSender",
+				"value":           "3000000", // 3.00 USDT at 6 decimals
+				"block_timestamp": float64(time.Now().UnixMilli()),
+				"token_info":      map[string]any{"address": tron.USDTContract},
+			}},
+		})
+	}))
+	defer trx.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(
+		"TRON_ADDRESS="+testSellerTRX+"\n"+
+			"TRON_PAGE_LIMIT=13\n"+
+			"TRON_API_BASE="+trx.URL+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	stk := stock.New(filepath.Join(dir, "accounts"), filepath.Join(dir, "orders"))
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, Stock: stk, Config: cfg, AdminID: "1"})
+	t.Cleanup(func() { b.Shutdown(); st.Close() })
+
+	// b.tronByHash is the exact closure dispatch.go's New() installs.
+	tr, err := b.tronByHash(trxHash, 0)
+	if err != nil {
+		t.Fatalf("tronByHash error: %v", err)
+	}
+	if tr == nil {
+		t.Fatal("tronByHash = nil, want the matching transfer")
+	}
+	if gotLimit != "13" {
+		t.Errorf("TronGrid saw limit=%q, want \"13\" (the .env-configured TRON_PAGE_LIMIT) — "+
+			"\"200\" would mean the raw default leaked through", gotLimit)
+	}
+}
+
+// TestNewResolvesBandGeometryFromDotEnvSnapshot pins dispatch.go's bands.New
+// call: BEP20_OFFSET_STEP/BEP20_MATCH_TOL/BEP20_AMOUNT_DECIMALS and their
+// TRON_ counterparts must reach the registry's Params via b.envInt(b.cfg),
+// not bep20.AmountOffsetStep()/tron.AmountOffsetStep() etc.'s raw env reads.
+// (USDT_BAND_EVICT_S sits on the exact same bands.Config{EvictAfter: ...}
+// literal, same b.envInt call shape — see this test's own doc for why it is
+// not independently pinned here.)
+//
+// Every geometry value is set via .env only, to numbers that don't collide
+// with the shipped defaults (Step 21/Tol 10/Decimals 2 for both rails).
+//
+// Falsification: revert dispatch.go's bands.Config{Providers: ...} literal
+// back to calling bep20.AmountOffsetStep()/AmountMatchTol()/AmountDecimals()
+// and tron's equivalents directly, and Params comes back {21,10,2} for both
+// providers instead of the .env-configured values.
+func TestNewResolvesBandGeometryFromDotEnvSnapshot(t *testing.T) {
+	for _, key := range []string{
+		"BEP20_OFFSET_STEP", "BEP20_MATCH_TOL", "BEP20_AMOUNT_DECIMALS",
+		"TRON_OFFSET_STEP", "TRON_MATCH_TOL", "TRON_AMOUNT_DECIMALS",
+	} {
+		if _, ok := os.LookupEnv(key); ok {
+			t.Fatalf("fixture broken: %s is set in the ambient environment, "+
+				"so this test would pass even if New read raw env", key)
+		}
+	}
+
+	b := envDurationTestBot(t,
+		"BEP20_OFFSET_STEP=99\nBEP20_MATCH_TOL=17\nBEP20_AMOUNT_DECIMALS=3\n"+
+			"TRON_OFFSET_STEP=77\nTRON_MATCH_TOL=13\nTRON_AMOUNT_DECIMALS=4\n")
+
+	bepPrm, ok := b.bands.Params(bands.ProviderBEP20)
+	if !ok {
+		t.Fatal("no BEP20 params registered")
+	}
+	if bepPrm.Step != 99 || bepPrm.Tol != 17 || bepPrm.Decimals != 3 {
+		t.Errorf("BEP20 params = %+v, want {Step:99 Tol:17 Decimals:3} (the .env-configured "+
+			"geometry) — {21 10 2} would mean the shipped defaults leaked through", bepPrm)
+	}
+	tronPrm, ok := b.bands.Params(bands.ProviderTron)
+	if !ok {
+		t.Fatal("no TRON params registered")
+	}
+	if tronPrm.Step != 77 || tronPrm.Tol != 13 || tronPrm.Decimals != 4 {
+		t.Errorf("TRON params = %+v, want {Step:77 Tol:13 Decimals:4} (the .env-configured "+
+			"geometry) — {21 10 2} would mean the shipped defaults leaked through", tronPrm)
+	}
+}
+
+// TestUSDTDepositCreditResolvesMatchTolFromDotEnvSnapshot is the money-path
+// pin — the highest priority, per the review that requested this file:
+// DEPOSIT_MATCH_TOL_CENTS must reach bands.DepositCredit's tolUnits
+// parameter (usdt.go's real settle path) via b.envInt(b.cfg), not
+// bands.DepositMatchTolCents()'s raw env read, driven through an ACTUAL
+// deposit (dep:trx -> desired amount -> submit hash -> balance credited),
+// not a call to the pure function directly (that half is already pinned in
+// bands/credit_test.go — this test exists to catch usdt.go's call site
+// forgetting to resolve the value at all).
+//
+// Desired top-up: 6.00 USDT (150,000 VND @ 25,000/USDT). Received: 5.50 USDT
+// — 50 cents short, which is OUTSIDE the compiled default tolerance (30c)
+// but INSIDE the .env-configured DEPOSIT_MATCH_TOL_CENTS=200. Under correct
+// resolution the underpay rounds UP to the full desired 150,000 VND
+// (bands.DepositCredit's within-tolerance rule); under the 30c default it
+// would instead credit only the actual 137,500 VND received.
+//
+// Falsification: change usdt.go's verifyUSDTTxid deposit branch back to
+// bands.DepositCredit(recvUnits, desiredUnits, o.Total, recvVND,
+// bands.DepositMatchTolCents()) (the pre-#42 direct raw-env call) and the
+// credited balance comes back 137,500 instead of 150,000.
+func TestUSDTDepositCreditResolvesMatchTolFromDotEnvSnapshot(t *testing.T) {
+	if _, ok := os.LookupEnv("DEPOSIT_MATCH_TOL_CENTS"); ok {
+		t.Fatal("fixture broken: DEPOSIT_MATCH_TOL_CENTS is set in the ambient environment, " +
+			"so this test would pass even if the caller read raw env")
+	}
+
+	ctx := context.Background()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(
+		"USD_TO_VND=25000\n"+
+			"TRON_ADDRESS="+testSellerTRX+"\n"+
+			"DEPOSIT_MATCH_TOL_CENTS=200\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	stk := stock.New(filepath.Join(dir, "accounts"), filepath.Join(dir, "orders"))
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, Stock: stk, Config: cfg, AdminID: "999"})
+	t.Cleanup(func() { b.Shutdown(); st.Close() })
+
+	// pay_tron defaults OFF; turn it on the same way newUSDTBotAtRate does.
+	s := b.cfg.Settings()
+	s["pay_tron"] = true
+	if err := b.cfg.SaveSettings(s); err != nil {
+		t.Fatalf("save settings: %v", err)
+	}
+	// The chain-lookup seam is scripted (this test targets the CREDIT-DECISION
+	// wiring, not the TRON client wiring — that half is TestTronByHash...
+	// above) — matches newUSDTBotAtRate's own fake shape.
+	trxByHash := map[string]*tron.Transfer{}
+	b.tronByHash = func(txhash string, _ int64) (*tron.Transfer, error) {
+		return trxByHash[strings.ToLower(strings.TrimPrefix(txhash, "0x"))], nil
+	}
+
+	const chat = 470
+	b.Process(ctx, callbackUpdate(chat, "dep:trx"))
+	b.Process(ctx, textUpdate(chat, "6")) // desired 6.00 USDT = 150,000 VND
+
+	o := reservedDeposit(t, st, chat)
+	armTxid(t, ctx, b, chat, chainTRX, o.Des)
+
+	h := hash64("5")
+	trxByHash[strings.ToLower(h)] = trxTx(h, "5.50", time.Now().UnixMilli()) // 50c short
+	b.Process(ctx, textUpdate(chat, h))
+
+	bal, _ := st.GetBalance(fmtInt(chat))
+	if bal != 150000 {
+		t.Errorf("credited %d VND, want 150000 — a 50c underpay is outside the 30c default "+
+			"tolerance but inside the .env-configured 200c one, so it must round up to the "+
+			"full desired amount; 137500 would mean the default (30c) leaked through and the "+
+			"underpay was credited at its actual (out-of-tolerance) value instead", bal)
 	}
 }
 

@@ -41,3 +41,6 @@ __pycache__/
 
 # Scratch review artifacts
 .otp_review_*.txt
+
+# Compiled one-shot migration tool (built ad hoc during testing; never committed)
+/migrate-usdt
