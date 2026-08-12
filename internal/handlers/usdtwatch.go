@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"log"
 	"math/big"
 	"strconv"
@@ -76,7 +77,12 @@ func (b *Bot) tickOnchain(ctx context.Context, p bands.Provider) {
 		return
 	}
 	transfers, err := b.tronTransfersSince(b.watchSinceMS(p, live))
-	if err != nil {
+	// A TRUNCATED window is partial, not failed: the rows that did come back are
+	// real payments and settling them is strictly better than dropping the whole
+	// tick, and the tail is re-read next tick anyway since the window is
+	// anchored on the oldest open deposit rather than a cursor. The rail already
+	// logged the truncation; do not log it twice.
+	if err != nil && !errors.Is(err, tron.ErrWindowTruncated) {
 		// Transient by assumption: TronGrid rate limits, a network blip, a bad
 		// gateway. Retry next tick, hold every band.
 		log.Printf("usdt watch [%s]: fetch failed: %v", p, err)
@@ -161,7 +167,7 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 			// silent wrong-customer credit waiting to happen and the retry is
 			// simply the next tick.
 			log.Printf("usdt watch [%s]: QUARANTINE WRITE FAILED for %s: %v — this transfer is NOT protected and may be auto-credited later",
-				p, ledgerID, merr)
+				p, ledgerID, qwerr)
 		}
 		log.Printf("usdt watch [%s]: AMBIGUOUS %s from=%s recv=%s (%d units) — two or more live deposits match, credited nothing, quarantined for manual attribution",
 			p, ledgerID, tx.Frm, recvStr, tx.Units)

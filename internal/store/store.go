@@ -299,10 +299,13 @@ func (s *Store) initSchema() error {
 		// Python ancestor — the watcher is new in the Go port.
 		//
 		// WHY THIS IS A SEPARATE TABLE AND NOT A FLAG ON `processed`: a row in
-		// `processed` means CREDITED, and TxnExists is read as exactly that by
-		// the settle paths. A quarantined transfer is the opposite — money that
-		// arrived and was deliberately NOT credited — so recording it there
-		// would corrupt a meaning other code already depends on.
+		// `processed` means CONSUMED — this transfer has been settled and must
+		// never be acted on again (by Credit for a wallet top-up, or by MarkTxn
+		// for a purchase that paid for goods directly), which is exactly how
+		// every settle path reads TxnExists. A quarantined transfer is the
+		// opposite: it has NOT been acted on and deliberately remains available
+		// for a human to settle by hand. Filing it under `processed` would
+		// consume it and close the only route left for resolving it.
 		//
 		// WHY DURABLE rather than an in-memory set: without it the refusal only
 		// holds until the competing band settles or sweeps, at which point the

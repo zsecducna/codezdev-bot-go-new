@@ -25,6 +25,7 @@ package tron
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -386,18 +387,35 @@ func GetIncomingTransfersConf(addr string, minTSMS int64, apiKey string, pageLim
 		}
 		if page >= maxTransferPages {
 			// One tick must not turn into unbounded HTTP against TronGrid. Keep
-			// what was read — those transfers are real and settleable — and say
-			// loudly that the tail was dropped, because the dropped tail is the
-			// NEWEST end of an ascending window, i.e. exactly the payments a
-			// customer is waiting on.
-			log.Printf("tron: transfer window TRUNCATED after %d pages of %d (%d transfers) — "+
+			// what was read — those transfers are real and settleable — but hand
+			// back ErrWindowTruncated ALONGSIDE them, because the dropped tail is
+			// the NEWEST end of an ascending window and a caller that cannot tell
+			// truncated from complete would read "absent" as "never arrived".
+			log.Printf("tron: transfer window TRUNCATED after %d pages (%d rows/page, %d transfers read) — "+
 				"the newest transfers in this window were not read; raise TRON_PAGE_LIMIT or "+
 				"shorten the deposit window", page, pageLimit, len(out))
-			return out, nil
+			return out, ErrWindowTruncated
 		}
 		params.Set("fingerprint", fp)
 	}
 }
+
+// ErrWindowTruncated accompanies a PARTIAL transfer window: the page guard
+// fired before the window was exhausted, so the rows returned are real but the
+// newest ones are missing.
+//
+// It is a sentinel rather than a plain error because the two callers must react
+// differently, and both reactions are correct:
+//
+//   - the watcher settles what it CAN see and tries again next tick, so losing
+//     the tail costs a delay, not a deposit;
+//   - the by-hash lookup must NOT conclude "no such payment" from a window it
+//     knows is incomplete — that is a terminal answer shown to a customer who
+//     really did pay. It propagates instead, and the verify path re-arms.
+//
+// Returned WITH the partial slice, so a caller that wants the rows can take
+// them (errors.Is) and one that needs certainty cannot miss the caveat.
+var ErrWindowTruncated = errors.New("tron: transfer window truncated at the page guard")
 
 // maxTransferPages bounds one GetIncomingTransfersConf call. At the shipped
 // TRON_PAGE_LIMIT of 200 that is 2,000 transfers in a single window — orders of
@@ -531,6 +549,18 @@ func FindConfirmedTransferByHash(addr, txhash string, minTSMS int64, apiKey stri
 // doc comment; the caller resolves it via config.Config.TRONAPIKey().
 // pageLimit/base are the caller-resolved TRON_PAGE_LIMIT/TRON_API_BASE (see
 // PageLimit's/apiBase's doc comments).
+//
+// A TRUNCATED window is propagated as an error rather than searched: "(nil,
+// nil)" from here is a TERMINAL "no such payment" shown to a customer, and
+// concluding that from a window known to be incomplete would tell someone who
+// really did pay that they did not. The verify path turns the error into a
+// retry instead.
+//
+// Cost note: minTSMS bounds this to one order's payment window — minutes — so
+// in practice the first page ends it (TronGrid omits its continuation when the
+// window fits). The paging ceiling only matters on an address busy enough to
+// overflow a page inside that window, which is also the only case where the old
+// single-page read was silently wrong.
 func FindConfirmedTransferByHashConf(addr, txhash string, minTSMS int64, apiKey string, pageLimit int, base string) (*Transfer, error) {
 	if txhash == "" || !ValidAddress(addr) {
 		return nil, nil

@@ -90,8 +90,9 @@ func (s *Store) TxnExists(txnID string) (bool, error) {
 //
 // Read-only, and keyed on the PK, so the watcher can ask it about every
 // transfer on every tick. Deliberately separate from TxnExists: that one means
-// "already credited", this one means "arrived, and must never be credited
-// automatically".
+// "consumed — already settled, never act on it again", while this one means
+// "arrived, deliberately NOT settled, and must never be settled automatically".
+// A transfer here is still waiting for a human.
 func (s *Store) AmbiguousTxnExists(txnID string) (bool, error) {
 	var one int
 	err := s.db.QueryRow("SELECT 1 FROM ambiguous_txns WHERE txn_id=?", txnID).Scan(&one)

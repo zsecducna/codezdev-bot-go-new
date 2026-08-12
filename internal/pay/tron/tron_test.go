@@ -1,6 +1,7 @@
 package tron
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -307,13 +308,35 @@ func TestGetIncomingTransfersConfStopsAtThePageGuard(t *testing.T) {
 	defer srv.Close()
 
 	got, err := GetIncomingTransfersConf("Tseller", 0, "", 1, srv.URL)
-	if err != nil {
-		t.Fatalf("GetIncomingTransfersConf: %v", err)
+	if !errors.Is(err, ErrWindowTruncated) {
+		t.Errorf("error = %v, want ErrWindowTruncated — a caller that cannot tell a truncated window "+
+			"from a complete one reads a missing transfer as one that never arrived", err)
 	}
 	if calls != maxTransferPages {
 		t.Errorf("made %d requests, want %d (the guard) — an unbounded pager inside a periodic tick", calls, maxTransferPages)
 	}
 	if len(got) != maxTransferPages {
-		t.Errorf("got %d transfers, want %d — what WAS read is real and must still be returned", len(got), maxTransferPages)
+		t.Errorf("got %d transfers, want %d — what WAS read is real and must still be returned alongside the error", len(got), maxTransferPages)
+	}
+}
+
+// TestFindConfirmedTransferByHashRefusesToAnswerFromATruncatedWindow: the
+// by-hash lookup's (nil, nil) is a TERMINAL "you did not pay" shown to a
+// customer. It must never be concluded from a window known to be incomplete.
+func TestFindConfirmedTransferByHashRefusesToAnswerFromATruncatedWindow(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(trc20Page("more", "deadbeef"))) // never the last page
+	}))
+	defer srv.Close()
+
+	tx, err := FindConfirmedTransferByHashConf("T"+strings.Repeat("A", 33), strings.Repeat("a", 64),
+		0, "", 1, srv.URL)
+	if tx != nil {
+		t.Errorf("found a transfer = %v, want none", tx)
+	}
+	if !errors.Is(err, ErrWindowTruncated) {
+		t.Errorf("error = %v, want ErrWindowTruncated — answering \"not found\" here tells a customer "+
+			"who really paid that they did not", err)
 	}
 }
