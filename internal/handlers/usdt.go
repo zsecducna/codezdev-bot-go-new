@@ -1353,6 +1353,27 @@ func (b *Bot) StartupRecovery(ctx context.Context) {
 		// crash loop, not a one-off.
 		safeStep("startup recovery (bep20)", func() { b.rehydrateOnchainPending(bands.ProviderBEP20) })
 		safeStep("startup recovery (tron)", func() { b.rehydrateOnchainPending(bands.ProviderTron) })
+		// The hands-free deposit watcher (usdtwatch.go), started AFTER the two
+		// rehydrate steps and from INSIDE this goroutine so that ordering is
+		// structural rather than a race: a first tick that ran before
+		// rehydration would see no live bands, skip its fetch, and quietly not
+		// credit a deposit that was mid-flight across the restart — the exact
+		// window this whole feature exists to close.
+		b.workers.Go(func(watchStop <-chan struct{}) {
+			for {
+				// Guarded like every other USDT money loop: a fault in one tick
+				// logs and the watcher keeps running, because the alternative is
+				// deposits silently going uncredited until someone notices.
+				safeStep("usdt watch (tron)", func() { b.tickOnchain(ctx, bands.ProviderTron) })
+				select {
+				case <-watchStop:
+					return
+				case <-ctx.Done():
+					return
+				case <-time.After(b.usdtWatchInterval):
+				}
+			}
+		})
 		for {
 			// Python guards the sweep body too (@10021-10024) so one bad row can
 			// never stop the backstop that frees bands and expires stale orders.

@@ -141,6 +141,12 @@ type Bot struct {
 	usdtVerifyGrace     time.Duration // USDT_VERIFY_GRACE_S 120s
 	usdtConfirmWait     time.Duration // USDT_CONFIRM_WAIT_S 300s
 	usdtConfirmPoll     time.Duration // USDT_CONFIRM_POLL_S 20s
+	// usdtWatchInterval is the hands-free deposit watcher's cadence
+	// (USDT_WATCH_INTERVAL_S 20s, usdtwatch.go). It is how long a customer
+	// waits between their transfer confirming and their balance moving, so
+	// it is tuned against TronGrid's rate limits rather than made as small
+	// as possible.
+	usdtWatchInterval time.Duration
 
 	// Periodic janitor intervals — wired to the worker registry's tickers in
 	// reconcile.go / stocksweep.go. Fields (not constants) so tests can shrink
@@ -181,6 +187,12 @@ type Bot struct {
 	tronConfigured func() bool
 	tronByHash     func(txhash string, minTSMS int64) (*tron.Transfer, error)
 	tronUsdtToVND  func(usdt *big.Rat) (int64, error)
+	// tronTransfersSince lists confirmed incoming USDT transfers to the seller
+	// address since an epoch-ms bound — the hands-free watcher's one chain read
+	// (usdtwatch.go). A seam like its siblings above, and for one extra reason:
+	// it is the only way to assert that a bot with no open deposits makes ZERO
+	// RPC calls, which is a property of the watcher, not of the network.
+	tronTransfersSince func(minTSMS int64) ([]tron.Transfer, error)
 
 	// ---- login-code (OTP) suite (M2.6, otp.go) ------------------------------
 	//
@@ -407,6 +419,13 @@ func New(d Deps) *Bot {
 	b.usdtVerifyGrace = time.Duration(b.envInt("USDT_VERIFY_GRACE_S", 120)) * time.Second
 	b.usdtConfirmWait = time.Duration(b.envInt("USDT_CONFIRM_WAIT_S", 300)) * time.Second
 	b.usdtConfirmPoll = b.envDuration("USDT_CONFIRM_POLL_S", 20*time.Second, usdtConfirmPollMinInterval)
+	// USDT_WATCH_INTERVAL_S default 20s: the watcher makes ONE TronGrid call
+	// per tick no matter how many deposits are open (and none at all when
+	// none are), so 20s keeps the customer's wait short while staying far
+	// inside the free tier's budget. envDuration, not a bare
+	// envInt*time.Second, for the reason above it — a configured 0 would
+	// turn this into an unthrottled loop against a third-party API.
+	b.usdtWatchInterval = b.envDuration("USDT_WATCH_INTERVAL_S", 20*time.Second, usdtWatchMinInterval)
 	b.maxUSDTPolls = max(b.envInt("USDT_MAX_POLLS", 200), 1)
 	// Chain/exchange clients. The receiving address is resolved LIVE on every
 	// call through b.bep20AddrStr()/b.tronAddrStr() (settings.json's admin-set
@@ -445,6 +464,16 @@ func New(d Deps) *Bot {
 		// what the package's own raw apiBase() does, so a hand-edited .env
 		// with a trailing slash does not produce a doubled separator.
 		return tron.FindConfirmedTransferByHashConf(b.tronAddrStr(), txhash, minTSMS, b.tronAPIKeyStr(),
+			b.envInt("TRON_PAGE_LIMIT", tron.DefaultPageLimit),
+			strings.TrimRight(b.cfg.EnvOr("TRON_API_BASE", tron.DefaultAPIBase), "/"))
+	}
+	// The watcher's fetch resolves address, API key, page limit and base
+	// through exactly the same config chain as the by-hash lookup above —
+	// deliberately identical, because the two read the SAME address and a
+	// divergence would mean the watcher polling one address while the
+	// customer's hash is verified against another.
+	b.tronTransfersSince = func(minTSMS int64) ([]tron.Transfer, error) {
+		return tron.GetIncomingTransfersConf(b.tronAddrStr(), minTSMS, b.tronAPIKeyStr(),
 			b.envInt("TRON_PAGE_LIMIT", tron.DefaultPageLimit),
 			strings.TrimRight(b.cfg.EnvOr("TRON_API_BASE", tron.DefaultAPIBase), "/"))
 	}
@@ -605,6 +634,15 @@ const (
 	// risking a rate-limit ban on the very address the shop verifies
 	// deposits against.
 	usdtConfirmPollMinInterval = 2 * time.Second
+	// usdtWatchMinInterval is USDT_WATCH_INTERVAL_S's floor (usdtwatch.go).
+	// Each tick with any deposit open is an outbound TronGrid call, like the
+	// confirm poll above — but UNLIKE it, this loop runs for the whole life
+	// of every open deposit rather than for one customer's few-minute
+	// confirm wait, so a misconfigured value here sustains the rate-limit
+	// pressure instead of spiking it. Hence a higher floor than the confirm
+	// poll's: getting the shop's own address rate-limited would break the
+	// verification path for every rail at once.
+	usdtWatchMinInterval = 5 * time.Second
 )
 
 // envDuration resolves a seconds-valued env var into a time.Duration through
