@@ -1448,9 +1448,10 @@ const broadcastOutcomeExcerptRunes = 200
 // cheapest, always-useful signal, even for a caption-less photo broadcast —
 // followed by a short excerpt so an investigator can identify which
 // broadcast a complaint concerns without opening the DB directly. detail is
-// NOT display-exempt, though: RecentAudit's WHERE clause matches
-// actor_chat, target, action, detail, actor_kind, and outcome alike
-// (misc.go:51-53), so it is searched even though it is never shown. The
+// NOT display-exempt, though: auditFilterClause (misc.go), the WHERE
+// clause RecentAudit and RecentAuditCollapsed share, matches actor_chat,
+// target, action, detail, actor_kind, and outcome alike, so it is searched
+// even though it is never shown. The
 // practical cost of that: an /audit <query> for a term with no relation to
 // broadcasts can still match text buried inside a stored broadcast body and
 // surface the broadcast row as a false positive in an investigator's

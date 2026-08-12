@@ -315,6 +315,49 @@ func TestRecentAuditCollapsedKeepsDistinctGroupsSeparate(t *testing.T) {
 	}
 }
 
+// TestRecentAuditCollapsedDistinguishesDifferentOutcomes pins the group-key
+// choice against a real usdtwatch.go scenario (see the RecentAuditCollapsed
+// doc comment): the SAME (action, target) — e.g. action="ambiguous",
+// target=some ledger id — can legitimately carry two different outcomes
+// across ticks: "credited nothing, quarantined" on a normal tick vs.
+// "credited nothing, QUARANTINE WRITE FAILED" on a tick where the
+// protective quarantine write itself failed (the exact case commit
+// 139b3b0 exists to surface). Grouping on (action, target) alone would let
+// the later routine-outcome row win MAX(id) and silently fold the
+// write-failure row's occurrence into a happy-looking Count — hiding a
+// live "this transfer is not protected" signal.
+//
+// Falsification: if the group key were narrowed back to just
+// (action, target), this test would see 1 collapsed row instead of 2, and
+// the write-failure outcome would be gone from the result entirely.
+func TestRecentAuditCollapsedDistinguishesDifferentOutcomes(t *testing.T) {
+	s := newTestStore(t)
+	seedAuditRowFull(t, s, 1_000_000_000.0, "ambiguous", "ledger-1", "credited nothing, QUARANTINE WRITE FAILED")
+	seedAuditRowFull(t, s, 1_000_000_100.0, "ambiguous", "ledger-1", "credited nothing, quarantined")
+
+	rows, err := s.RecentAuditCollapsed(25, "")
+	if err != nil {
+		t.Fatalf("RecentAuditCollapsed: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2 — same (action, target) but different "+
+			"outcome must NOT collapse into one entry", len(rows))
+	}
+	byOutcome := map[string]int{}
+	for _, r := range rows {
+		if r.Action != "ambiguous" || r.Target != "ledger-1" {
+			t.Errorf("unexpected row %+v", r)
+		}
+		byOutcome[r.Outcome] = r.Count
+	}
+	if byOutcome["credited nothing, QUARANTINE WRITE FAILED"] != 1 {
+		t.Errorf("write-failure outcome missing or wrong count: %+v", byOutcome)
+	}
+	if byOutcome["credited nothing, quarantined"] != 1 {
+		t.Errorf("routine outcome missing or wrong count: %+v", byOutcome)
+	}
+}
+
 // TestRecentAuditCollapsedFilterAppliesBeforeGrouping pins the ordering the
 // task requires: the free-text filter must narrow the ROW set first, and
 // grouping/picking-the-latest must run on what's left — not the reverse

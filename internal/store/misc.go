@@ -95,42 +95,62 @@ func (s *Store) RecentAudit(limit int, query string) ([]AuditRow, error) {
 }
 
 // RecentAuditCollapsed returns recent audit rows collapsed to the latest row
-// per distinct (action, target) pair, with Count set to the TRUE number of
-// matching rows in that group. store.py has no equivalent — this exists
-// only because of a Go-port-era failure mode: the hands-free deposit
-// watcher (usdtwatch.go) writes ONE audit row per tick for every payment
-// still stuck ambiguous/quarantined/stale, so a single stubborn transfer
-// can leave a thousand+ identical rows in the trail and bury every other
-// admin action behind them in RecentAudit's un-deduplicated top-N. This
-// collapses the DISPLAY only — the audit table itself, and RecentAudit's
-// raw fidelity, are untouched — so a stuck payment shows up as ONE entry
-// with an occurrence count instead of drowning everything else.
+// per distinct (actor_kind, actor_chat, action, target, outcome) tuple, with
+// Count set to the TRUE number of matching rows in that group. store.py has
+// no equivalent — this exists only because of a Go-port-era failure mode:
+// the hands-free deposit watcher (usdtwatch.go) writes ONE audit row per
+// tick for every payment still stuck ambiguous/quarantined/stale, so a
+// single stubborn transfer can leave a thousand+ identical rows in the
+// trail and bury every other admin action behind them in RecentAudit's
+// un-deduplicated top-N. This collapses the DISPLAY only — the audit table
+// itself, and RecentAudit's raw fidelity, are untouched — so a stuck
+// payment shows up as ONE entry with an occurrence count instead of
+// drowning everything else.
+//
+// The group key is every column sendAuditLog actually renders, NOT just
+// (action, target) — deliberately, because outcome can legitimately differ
+// for the same (action, target) and that difference is exactly what an
+// admin needs to see. usdtwatch.go's ambiguous-transfer path logs action
+// "ambiguous" for the same ledger id with outcome "credited nothing,
+// quarantined" on a normal tick but "credited nothing, QUARANTINE WRITE
+// FAILED" on a tick where the protective quarantine write itself failed
+// (commit 139b3b0 exists specifically so that distinction is never lost).
+// Grouping on (action, target) alone would let a later, routine-outcome row
+// win MAX(id) and silently swallow an earlier write-failure row into its
+// Count — hiding a live "this transfer is not protected" signal behind a
+// happy-looking entry. Widening the key to include outcome (and actor_kind/
+// actor_chat, so two different actors never collapse into one either) means
+// only truly-identical repeated rows — the actual flood this exists to fix
+// — ever fold together.
 //
 // query: same optional free-text filter as RecentAudit, and it is applied
 // BEFORE grouping (via the shared auditFilterClause) — a filtered view must
 // narrow the candidate rows first and group what's left, not group
 // everything and then filter the groups.
 //
-// limit caps the number of DISTINCT (action, target) GROUPS returned, not
-// raw rows — a single group can represent far more than `limit` rows.
+// limit caps the number of DISTINCT groups returned, not raw rows — a
+// single group can represent far more than `limit` rows.
 //
 // Implementation: modernc.org/sqlite (this repo's driver) is targeted with
 // plain ANSI SQL rather than window functions, in three simple steps
 // merged in Go instead of one dense query, on the theory that three
 // queries that are each easy to eyeball beat one clever one that isn't:
-//  1. find the max `id` (= latest row) per (action, target) group within
-//     the filtered set, capped at `limit` groups, newest group first;
+//  1. find the max `id` (= latest row) per group within the filtered set,
+//     capped at `limit` groups, newest group first;
 //  2. join those ids back to their full rows;
-//  3. separately COUNT(*) GROUP BY action, target over the same filtered
+//  3. separately COUNT(*) GROUP BY the same columns over the same filtered
 //     set, then merge each row's true count onto it in Go.
 func (s *Store) RecentAuditCollapsed(limit int, query string) ([]AuditRow, error) {
 	where, args := auditFilterClause(query)
 
-	// Steps 1+2: latest row per group, capped at `limit` groups.
+	// Steps 1+2: latest row per group, capped at `limit` groups. Group key
+	// mirrors every rendered column (see doc comment above) — action/target
+	// alone is NOT enough, outcome can legitimately differ within it.
+	const groupCols = "actor_kind, actor_chat, action, target, outcome"
 	q := "SELECT a.ts, a.actor_chat, a.actor_kind, a.action, a.target, a.outcome, a.detail " +
 		"FROM audit a JOIN (" +
-		"SELECT action, target, MAX(id) AS max_id FROM audit" + where +
-		" GROUP BY action, target ORDER BY max_id DESC LIMIT ?" +
+		"SELECT " + groupCols + ", MAX(id) AS max_id FROM audit" + where +
+		" GROUP BY " + groupCols + " ORDER BY max_id DESC LIMIT ?" +
 		") g ON a.id = g.max_id ORDER BY a.id DESC"
 	rowArgs := append(append([]any{}, args...), limit)
 	rows, err := s.db.Query(q, rowArgs...)
@@ -163,29 +183,29 @@ func (s *Store) RecentAuditCollapsed(limit int, query string) ([]AuditRow, error
 	}
 
 	// Step 3: true total per group over the SAME filtered set.
-	cq := "SELECT action, target, COUNT(*) FROM audit" + where + " GROUP BY action, target"
+	cq := "SELECT " + groupCols + ", COUNT(*) FROM audit" + where + " GROUP BY " + groupCols
 	crows, err := s.db.Query(cq, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer crows.Close()
-	counts := make(map[[2]string]int)
+	counts := make(map[[5]string]int)
 	for crows.Next() {
 		// NullString, not string: mirrors the Step 1/2 scan above so a
-		// legacy row with a NULL action/target (RecentAudit tolerates this
-		// today) can't make this whole collapsed view error out.
-		var action, target sql.NullString
+		// legacy row with a NULL column (RecentAudit tolerates this today)
+		// can't make this whole collapsed view error out.
+		var kind, chat, action, target, outcome sql.NullString
 		var c int
-		if err := crows.Scan(&action, &target, &c); err != nil {
+		if err := crows.Scan(&kind, &chat, &action, &target, &outcome, &c); err != nil {
 			return nil, err
 		}
-		counts[[2]string{action.String, target.String}] = c
+		counts[[5]string{kind.String, chat.String, action.String, target.String, outcome.String}] = c
 	}
 	if err := crows.Err(); err != nil {
 		return nil, err
 	}
 	for i := range out {
-		out[i].Count = counts[[2]string{out[i].Action, out[i].Target}]
+		out[i].Count = counts[[5]string{out[i].ActorKind, out[i].ActorChat, out[i].Action, out[i].Target, out[i].Outcome}]
 	}
 	return out, nil
 }
