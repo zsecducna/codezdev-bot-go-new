@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"math/big"
 	"strconv"
@@ -115,6 +116,14 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 	if used {
 		return
 	}
+	// Rendered here, above the refusals, because every one of them records the
+	// amount in its audit row — an operator asking "what did the bot decide
+	// about this transaction" needs the figure on the row itself, not a second
+	// lookup. Same rendering as the hash-paste path: the RAIL's precision, so
+	// two bands 0.00101 apart do not collapse onto one string.
+	recv := new(big.Rat).SetFrac(tx.Value, pow10BigInt(tron.TokenDecimals))
+	recvStr := recv.FloatString(prm.Decimals)
+
 	// QUARANTINE, checked BEFORE the matcher so a transfer a human already owns
 	// can never be re-attributed by a later tick's changed band set. This is the
 	// durable half of the ambiguity refusal — see the ambiguous_txns table.
@@ -125,6 +134,13 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 		return
 	}
 	if held {
+		// Audited as its OWN verdict, distinct from the sighting that created
+		// the quarantine: an operator reading the trail has to be able to tell
+		// "just became ambiguous" from "already known, skipped again". No chat
+		// id — an ambiguous transfer has no single owner, which is the whole
+		// reason it is here.
+		b.auditWatch("", p, "quarantined", ledgerID, "skipped, already quarantined",
+			"recv="+recvStr+" from="+tx.Frm)
 		return
 	}
 	res, kind, merr := b.bands.MatchIncoming(p, tx.Units)
@@ -132,8 +148,6 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 		log.Printf("usdt watch [%s]: match failed for %s: %v", p, ledgerID, merr)
 		return
 	}
-	recv := new(big.Rat).SetFrac(tx.Value, pow10BigInt(tron.TokenDecimals))
-	recvStr := recv.FloatString(prm.Decimals)
 	switch kind {
 	case bands.MatchExact, bands.MatchShortfall:
 		// named below
@@ -171,6 +185,12 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 		}
 		log.Printf("usdt watch [%s]: AMBIGUOUS %s from=%s recv=%s (%d units) — two or more live deposits match, credited nothing, quarantined for manual attribution",
 			p, ledgerID, tx.Frm, recvStr, tx.Units)
+		// The quarantine row and this audit row are different things and both
+		// are needed: the quarantine is the durable GATE that changes what
+		// later ticks do, this is the durable RECORD of what happened and when.
+		// No chat id — no single customer owns an ambiguous payment.
+		b.auditWatch("", p, "ambiguous", ledgerID, "credited nothing, quarantined",
+			"recv="+recvStr+" from="+tx.Frm+" units="+fmtInt(tx.Units))
 		return
 	default: // bands.MatchNone
 		// Routine and not an error: not every transfer to the shop's address is
@@ -205,16 +225,23 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 		// it — but this is a money gate, so an unanchorable band refuses rather
 		// than accepts. The hash-paste path can still settle it.
 		log.Printf("usdt watch [%s]: deposit %s has no usable start time, refusing to attribute %s", p, res.Des, ledgerID)
+		b.auditWatch(res.ChatID, p, "no_start", ledgerID, "refused, band has no start time",
+			"recv="+recvStr+" from="+tx.Frm+" des="+res.Des)
 		return
 	}
 	if tx.TS < lo-b.usdtVerifyGrace.Milliseconds() {
 		log.Printf("usdt watch [%s]: %s predates deposit %s (tx_ts=%d lo=%d) — not attributing",
 			p, ledgerID, res.Des, tx.TS, lo)
+		b.auditWatch(res.ChatID, p, "stale", ledgerID, "refused, predates the deposit it matched",
+			fmt.Sprintf("recv=%s from=%s des=%s tx_ts=%d lo=%d", recvStr, tx.Frm, res.Des, tx.TS, lo))
 		return
 	}
 
 	o, gerr := b.store.GetOrder(res.Des)
 	if gerr != nil {
+		// A DB blip, not a decision — the next tick asks again. Deliberately NOT
+		// audited: the audit row would itself need the DB that just failed, and
+		// "we could not look" is not a verdict about the transfer.
 		log.Printf("usdt watch [%s]: get_order failed for %s: %v", p, res.Des, gerr)
 		return
 	}
@@ -222,6 +249,8 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 		// The band outlived its order (vanished row). Sweep will clear it; there
 		// is nothing to credit against in the meantime.
 		log.Printf("usdt watch [%s]: order %s gone, leaving %s unattributed", p, res.Des, ledgerID)
+		b.auditWatch(res.ChatID, p, "order_gone", ledgerID, "refused, matched order no longer exists",
+			"recv="+recvStr+" from="+tx.Frm+" des="+res.Des)
 		return
 	}
 	// Second lock on the deposit-only door. MatchIncoming already filtered to
@@ -231,6 +260,8 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 	if o.Product != depositProduct {
 		log.Printf("usdt watch [%s]: BUG — matched deposit band %s is a %q order, refusing to credit %s",
 			p, res.Des, o.Product, ledgerID)
+		b.auditWatch(o.ChatID, p, "not_deposit", ledgerID, "refused, matched band is a product order",
+			"recv="+recvStr+" from="+tx.Frm+" des="+res.Des+" product="+o.Product)
 		return
 	}
 	// settleUSDTMatch keys the wallet credit on fmtInt(chatID), so an
@@ -239,6 +270,11 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 	chatID, cerr := strconv.ParseInt(o.ChatID, 10, 64)
 	if cerr != nil {
 		log.Printf("usdt watch [%s]: order %s has unparseable chat id %q: %v", p, res.Des, o.ChatID, cerr)
+		// The order's own chat id is the thing that is broken, so it is not used
+		// as the audit row's actor — the row would then be filed under the same
+		// unusable value it is reporting.
+		b.auditWatch("", p, "bad_chat", ledgerID, "refused, order owner is unparseable",
+			"recv="+recvStr+" from="+tx.Frm+" des="+res.Des+" chat_id="+o.ChatID)
 		return
 	}
 	// Deliberately NO status check. A payment that lands just after its session
@@ -251,6 +287,8 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 		// lose the customer's money outright, so hold and retry once the rate
 		// is fixed (same call the hash-paste path makes, same reasoning).
 		log.Printf("usdt watch [%s]: rate error for %s: %v", p, res.Des, verr)
+		b.auditWatch(o.ChatID, p, "no_rate", ledgerID, "held, cannot value the payment",
+			"recv="+recvStr+" from="+tx.Frm+" des="+res.Des)
 		return
 	}
 	// res.Amount IS the atomic snapshot MatchIncoming took — a second locked
@@ -260,7 +298,49 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 		// Nothing moved (bad stored amount, or the credit call errored). The
 		// band and the persisted row are untouched, so the next tick retries.
 		log.Printf("usdt watch [%s]: settle did not credit %s for %s — retrying next tick", p, ledgerID, res.Des)
+		b.auditWatch(o.ChatID, p, "uncredited", ledgerID, "attributed but not credited, retrying",
+			"recv="+recvStr+" from="+tx.Frm+" des="+res.Des)
 	}
+	// The SUCCESS row is not written here: settleUSDTMatch already writes
+	// "usdt_<chain>_deposit" against this same ledger id, so a query by ledger
+	// id shows the whole history of the transaction — every refusal above and
+	// the credit — without this function double-recording the one outcome that
+	// was already covered.
+}
+
+// auditWatch records ONE watcher decision about ONE transfer in the queryable
+// audit table.
+//
+// WHY EVERY REFUSAL AND NOT JUST THE CREDITS. settleUSDTMatch already audits a
+// successful credit against the ledger id, so "which transactions were
+// credited" was answerable. "Which transactions did the bot see and decide NOT
+// to credit, and why" was not — it lived only in log lines, which is the wrong
+// place for the history of a money path. `target` is the ledger id here for
+// exactly the same reason the settle path uses it: one query by transaction now
+// returns the FULL sequence of decisions made about it, refusals and credit
+// alike, in order.
+//
+// NOT audited, deliberately:
+//
+//   - MatchNone. Most transfers to a shop address are not deposits anyone is
+//     waiting on, and a row per non-match would bury the decisions that matter
+//     under noise. Only transfers that are ABOUT a live deposit band earn a row.
+//   - Read failures (the ledger, the quarantine, GetOrder). "We could not look"
+//     is not a verdict about the transfer, and the row would need the very
+//     database that just failed.
+//
+// REPEATS ARE BOUNDED, which is what makes per-tick refusals affordable to
+// record: the chain query starts at the OLDEST live deposit's own start, so once
+// the bands older than a refused transfer are swept, that transfer falls out of
+// the window and is never fetched again. A refusal repeats for hours at worst,
+// not forever, and the audit-retention janitor prunes what is left.
+//
+// chatID is the actor: the matched band's owner when the decision is about a
+// known deposit, and empty when nobody owns the transfer yet — an ambiguous
+// payment has no single owner by definition, which is the whole reason it was
+// refused.
+func (b *Bot) auditWatch(chatID string, p bands.Provider, verdict, ledgerID, outcome, detail string) {
+	b.audit(chatID, "usdt_"+ledgerPrefix(p)+"_watch_"+verdict, ledgerID, outcome, detail)
 }
 
 // watchSinceMS is the lower bound of the chain query: the start of the OLDEST

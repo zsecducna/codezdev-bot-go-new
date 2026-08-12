@@ -418,6 +418,86 @@ func TestWatcherQuarantineSurvivesTheCompetitionAndARestart(t *testing.T) {
 	}
 }
 
+// TestWatcherAuditsTheDecisionsItRefuses pins the durable trail. The audit
+// table could already answer "which transactions were credited"; the question
+// that had no answer outside a log file was "which transactions did the bot SEE
+// and decide NOT to credit, and why". On a money path that has to be queryable.
+//
+// Every row is asserted from the STORE, not from the helper's return value —
+// this repo's standard for audit assertions, because a formatter that returns
+// the right string and persists nothing is exactly the regression worth
+// catching. Both rows are keyed on the LEDGER ID, the same target the settle
+// path uses, so one query by transaction returns its whole decision history.
+func TestWatcherAuditsTheDecisionsItRefuses(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, _ := newUSDTBot(t)
+	w := installWatchFake(b)
+	const chat = 4714
+
+	b.Process(ctx, callbackUpdate(chat, "dep:trx"))
+	b.Process(ctx, textUpdate(chat, "6"))
+	o := reservedDeposit(t, st, chat)
+	res, _ := b.bands.Get(bands.ProviderTron, o.Des)
+	row, _ := b.getUSDTRow(bands.ProviderTron, o.Des)
+
+	// A stale transfer: matches the band's amount exactly, but predates it.
+	staleHash := hash64("3")
+	w.set(*trxTx(staleHash, res.Amount, row.SinceMS-b.usdtVerifyGrace.Milliseconds()-1000))
+	b.tickOnchain(ctx, bands.ProviderTron)
+
+	got := latestAuditRow(t, st, "usdt_trx_watch_stale")
+	if got == nil {
+		t.Fatal("no usdt_trx_watch_stale audit row — the refusal exists only in a log line")
+	}
+	if got.Target != "trx:"+staleHash {
+		t.Errorf("audit target = %q, want %q — a refusal not keyed on the ledger id cannot be found "+
+			"by the same query that finds the credit", got.Target, "trx:"+staleHash)
+	}
+	if got.ActorChat != fmtInt(chat) {
+		t.Errorf("audit chat = %q, want %q — the matched band names an owner, so the row should", got.ActorChat, fmtInt(chat))
+	}
+
+	// An ambiguous transfer: a second deposit at the same price makes a short
+	// receipt claimable by either, and the refusal is recorded with NO owner.
+	b.Process(ctx, callbackUpdate(4715, "dep:trx"))
+	b.Process(ctx, textUpdate(4715, "6"))
+	lowUnits, err := bands.AmountUnits(res.Amount, tron.AmountDecimals())
+	if err != nil {
+		t.Fatalf("amount units: %v", err)
+	}
+	shortUnits := lowUnits - 10_000
+	if _, kind, merr := b.bands.MatchIncoming(bands.ProviderTron, shortUnits); merr != nil || kind != bands.MatchAmbiguous {
+		t.Fatalf("MatchIncoming(%d) = (%s, %v), want ambiguous", shortUnits, kind, merr)
+	}
+	ambiguousHash := hash64("4")
+	w.set(*trxTx(ambiguousHash, bands.FormatUnits(shortUnits, tron.AmountDecimals()), b.now().UnixMilli()))
+	b.tickOnchain(ctx, bands.ProviderTron)
+
+	got = latestAuditRow(t, st, "usdt_trx_watch_ambiguous")
+	if got == nil {
+		t.Fatal("no usdt_trx_watch_ambiguous audit row — the one refusal a human has to act on is unqueryable")
+	}
+	if got.Target != "trx:"+ambiguousHash {
+		t.Errorf("audit target = %q, want %q", got.Target, "trx:"+ambiguousHash)
+	}
+	if got.ActorChat != "" {
+		t.Errorf("audit chat = %q, want empty — an ambiguous payment has no single owner, which is "+
+			"precisely why it was refused; naming one would assert the thing the bot declined to decide", got.ActorChat)
+	}
+
+	// The NEXT tick over the same transfer is a distinct verdict: an operator
+	// must be able to tell "just became ambiguous" from "already known, skipped
+	// again", or a re-read looks like a fresh incident.
+	b.tickOnchain(ctx, bands.ProviderTron)
+	got = latestAuditRow(t, st, "usdt_trx_watch_quarantined")
+	if got == nil {
+		t.Fatal("no usdt_trx_watch_quarantined audit row — a repeat skip is indistinguishable from a new detection")
+	}
+	if got.Target != "trx:"+ambiguousHash {
+		t.Errorf("audit target = %q, want %q", got.Target, "trx:"+ambiguousHash)
+	}
+}
+
 // TestWatcherIgnoresATransferOlderThanItsBand is the per-band freshness gate.
 //
 // The chain query's lower bound is the OLDEST live deposit's start, which is
