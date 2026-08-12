@@ -61,9 +61,25 @@
 //     AMOUNT_DECIMALS precision, so the rounding step is a no-op on every real
 //     input and the two modes can only differ on a malformed extra digit.
 //
-// Stdlib only. All money math is integer "amount units" (cents at 2 decimals)
-// or big.Rat for decimal-string parsing — never float, per the port's
-// money-safety rule.
+// PRECISION (hands-free-deposits ruling, 2026-08-11). Amount units are
+// 1e-5 USDT (Decimals=5), not cents. The picker adds a jitter of 0.01000 to
+// 0.01999 USDT to the price so the amount identifies ONE order, and a match is
+// essentially exact (+/-0.00050). See JitterLoHundredths for the ruling and
+// Params.Slots for the resulting geometry.
+//
+// COHERENCE WITH THE MICRO-USDT LEDGER (.omc/plans/usdt-migration.md task #44,
+// which flips every money column to 1e-6 USDT): 5 decimals divides 6 exactly —
+// one amount unit is 10 micro, so amount-units <-> micro is an exact integer
+// *10 / /10 with no remainder in either direction, and an order total that is
+// a whole cent (the plan's §2.2 invariant, 10_000 micro) is exactly 1000 units.
+// 5 rather than 6 is deliberate: the plan's §4 caveat — do not let the ledger's
+// precision propagate into Params.Decimals — still holds, because a 6-decimal
+// amount string would ask customers to send digits below the 10-micro grid that
+// some wallets round away, for no gain in band capacity.
+//
+// Stdlib only. All money math is integer "amount units" (1e-5 USDT at the
+// shipped Decimals=5) or big.Rat for decimal-string parsing — never float, per
+// the port's money-safety rule.
 package bands
 
 import (
@@ -86,11 +102,16 @@ var ErrBandExhausted = errors.New("bands: band exhausted (no unambiguous amount 
 // getters, e.g. bands.Params{Step: bep20.AmountOffsetStep(), Tol:
 // bep20.AmountMatchTol(), Decimals: bep20.AmountDecimals()}.
 //
-// Defaults in the Python original:
+// Defaults in the Python original (all at 2 decimals, i.e. cents):
 //
 //	BEP20   step 21, tol 10, dec 2 (bep20_pay.py:40,54-55)
 //	TRON    step 21, tol 10, dec 2 (tron_pay.py:41,50-51)
 //	Binance step 10, tol  4, dec 2 (binance_pay.py:54-55; cents, no dec knob)
+//
+// SHIPPED HERE, after the hands-free-deposits ruling: BEP20 and TRON both run
+// step 101, tol 50, dec 5 — 0.00101 USDT apart with a +/-0.00050 band, so
+// MinGap (2*50+1 = 101) is met exactly by Step and 10 slots fit the
+// 0.01000-0.01999 jitter window.
 type Params struct {
 	// Step is AMOUNT_OFFSET_STEP: spacing between consecutive slots, in
 	// amount units.
@@ -99,7 +120,7 @@ type Params struct {
 	// receipt within +/-Tol of an amount matches it.
 	Tol int
 	// Decimals is AMOUNT_DECIMALS: the precision of the amount strings this
-	// rail hands out (2 = cents).
+	// rail hands out (5 = hundred-thousandths of a USDT).
 	Decimals int
 }
 
@@ -113,36 +134,68 @@ func (p Params) MinGap() int { return 2*p.Tol + 1 }
 // it only reduces how many concurrent same-price orders fit.
 func (p Params) SpacingOK() bool { return p.Step >= p.MinGap() }
 
-// SlotSpanWholeUnits is how many WHOLE units of price the upward slot search
-// spans: the picker tries base, base+step, ... up to
-// base + SlotSpanWholeUnits (exclusive) before giving up upward and, for
-// callers that allow it, falling back to the single last-resort downward
-// slot (telegram_bot.py:9085 originally spanned exactly 1 whole unit; ported
-// as `scale // step`).
+// JitterLoHundredths / JitterHiHundredths bound the UPWARD JITTER WINDOW in
+// HUNDREDTHS of a whole USDT unit: every picked amount is base + an offset in
+// [0.01000, 0.02000) USDT, i.e. the customer is asked for between one and two
+// hundredths MORE than the price they were quoted, never less and never more.
 //
-// TRADEOFF (hands-free-deposits ruling (b)): doubled from 1 to 2 whole units
-// to buy back headroom the deposit unique-amount work now spends one-way —
-// a live band is held for the full customer-facing deposit window (up to an
-// hour) and a deposit can no longer fall back to the downward slot (see
-// ReserveUpwardOnly), so more upward slots means fewer customers refused
-// USDT_BUSY under concurrent same-price traffic. The cost is a wider
-// worst-case gap between the amount a customer is quoted and the amount they
-// actually asked for. The picker tries k < Slots() (9 at the shipped 21-cent
-// BEP20/TRON step, since Slots() = 200//21 = 9), so the worst case is the
-// LAST tried slot, k=8: 8*21 = 168 cents = ~1.68 USDT, not the full 2 whole
-// units — k=9 (189 cents, still under the 200-cent span) is never tried
-// because the loop stops at Slots()=9 (see Slots()/uniqueAmountUnits).
-const SlotSpanWholeUnits = 2
+// USER RULING (hands-free-deposits, 2026-08-11) — this SUPERSEDES the previous
+// `SlotSpanWholeUnits = 2` geometry. That one spanned two WHOLE units at a
+// 21-cent step, so the last tried slot asked for 1.68 USDT over the price —
+// +28% on a 6.00 order, and uncredited on the order path. The ruling was
+// "28% is not acceptable, the range should be 0.01000 to 0.01999 USDT".
+//
+// The window is expressed as a fraction of a whole unit rather than as a raw
+// unit count so it stays the SAME amount of money at any Decimals: at 5
+// decimals it is offsets [1000, 2000) units, at 6 it would be [10000, 20000).
+// Decimals < 2 has no representable window at all and Validate rejects it.
+//
+// CONSEQUENCE worth stating plainly: no slot sits AT base any more. A round
+// "120.00" deposit is always quoted "120.01xxx", which is precisely what makes
+// the amount an order identifier instead of a number two customers can both
+// pick. The customer keeps every cent of the difference — a deposit credits
+// what actually arrived (see DepositCredit).
+const (
+	JitterLoHundredths = 1 // inclusive lower edge: base + 0.01000
+	JitterHiHundredths = 2 // EXCLUSIVE upper edge: base + 0.02000
+)
 
-// Slots is the number of UPWARD slots the picker will try:
-// SlotSpanWholeUnits*scale//step, i.e. how many `base + k*step` values stay
-// strictly below base+SlotSpanWholeUnits (telegram_bot.py:9085 `for k in
-// range(scale // step)`, widened by SlotSpanWholeUnits). At the shipped
-// BEP20/TRON defaults (step 21, decimals 2) that is 200//21 = 9; Binance
-// (step 10) gets 200//10 = 20. One extra LAST-RESORT slot at base-step exists
-// below these for callers that allow it (telegram_bot.py:9089).
+// JitterLo is the smallest upward offset the picker may quote, in amount units
+// (1000 at 5 decimals = 0.01000 USDT).
+func (p Params) JitterLo() int64 {
+	return pow10Int64(p.Decimals) / 100 * JitterLoHundredths
+}
+
+// JitterHiExcl is the first offset the picker may NOT quote, in amount units
+// (2000 at 5 decimals = 0.02000 USDT). Exclusive, so the largest representable
+// offset is 1999 = 0.01999 USDT — the top of the user's stated range.
+func (p Params) JitterHiExcl() int64 {
+	return pow10Int64(p.Decimals) / 100 * JitterHiHundredths
+}
+
+// JitterSpan is the width of the window the upward slots have to fit inside
+// (1000 units = 0.01 USDT at 5 decimals).
+func (p Params) JitterSpan() int64 { return p.JitterHiExcl() - p.JitterLo() }
+
+// Slots is the number of UPWARD slots the picker will try: how many
+// `base + JitterLo() + k*Step` values keep their offset strictly below
+// JitterHiExcl(). Descends from telegram_bot.py:9085 `for k in range(scale //
+// step)`, re-anchored on the jitter window instead of on whole units of price.
+//
+// At the shipped BEP20/TRON defaults (Step 101, Decimals 5) that is
+// (1000-1)/101 + 1 = 10 slots, at offsets 0.01000, 0.01101, ... 0.01909 — one
+// MORE than the 9 the superseded geometry produced, so per-price capacity does
+// not regress even though the worst-case overquote falls from 1.68 USDT to
+// 0.01909 USDT (a 98.9% reduction, and 0.32% of a 6.00 order instead of 28%).
+// One extra LAST-RESORT slot at base-Step exists below these for callers that
+// allow it (telegram_bot.py:9089).
 func (p Params) Slots() int {
-	return int(int64(SlotSpanWholeUnits) * pow10Int64(p.Decimals) / int64(p.Step))
+	span := p.JitterSpan()
+	if span <= 0 || p.Step <= 0 {
+		return 0
+	}
+	// Count of k >= 0 with k*Step <= span-1, i.e. floor((span-1)/Step) + 1.
+	return int((span-1)/int64(p.Step)) + 1
 }
 
 // Validate rejects geometry the picker cannot work with.
@@ -153,22 +206,32 @@ func (p Params) Validate() error {
 	if p.Tol < 0 {
 		return fmt.Errorf("bands: Tol must be >= 0, got %d", p.Tol)
 	}
-	if p.Decimals < 0 || p.Decimals > 9 {
-		return fmt.Errorf("bands: Decimals must be in [0,9], got %d", p.Decimals)
+	// Decimals < 2 cannot represent the jitter window at all (a hundredth of a
+	// whole unit rounds to 0 units), so JitterLo()==JitterHiExcl()==0 and every
+	// picked amount would collapse onto base. Reject before the span checks so
+	// the operator gets the real reason instead of "Step exceeds the span".
+	if p.Decimals < 2 || p.Decimals > 9 {
+		return fmt.Errorf("bands: Decimals must be in [2,9], got %d (below 2 the %d/100..%d/100 jitter window is not representable)", p.Decimals, JitterLoHundredths, JitterHiHundredths)
 	}
-	// A Step wider than one whole unit is rejected outright, independent of
-	// SlotSpanWholeUnits: it means the FIRST upward slot (base+step) already
-	// quotes the customer more than 1 unit above their ask, which reads as a
-	// misconfiguration rather than a legitimate wide-step tradeoff. This is
-	// stricter than "does at least one slot exist" — with SlotSpanWholeUnits=2
-	// a Step in (one whole unit, two whole units] would still produce exactly
-	// one slot and pass that weaker check, but that slot still overshoots by
-	// more than a unit, so it is rejected here too.
-	if scale := pow10Int64(p.Decimals); int64(p.Step) > scale {
-		return fmt.Errorf("bands: Step %d exceeds one whole unit (%d) at %d decimals: first upward slot would overshoot the ask by more than 1 unit", p.Step, scale, p.Decimals)
+	// RESTATED (was: "Step must not exceed one whole unit"). That bound existed
+	// to stop the FIRST upward slot overshooting the customer's ask by more than
+	// a whole unit. The jitter window now caps EVERY slot's overshoot below
+	// 0.02 USDT by construction, so the whole-unit bound has become vacuous —
+	// at 5 decimals one whole unit is 100000 units, a hundred times wider than
+	// the entire window, and no Step that large could ever be reached. The
+	// bound that carries the intent now is against the WINDOW: a Step wider
+	// than the span can never place a second slot inside it, so band allocation
+	// silently degenerates to one concurrent order per price and every further
+	// customer is refused USDT_BUSY. That is a misconfiguration, and it is one
+	// the Slots() >= 1 check below cannot see (it yields exactly 1, not 0).
+	if span := p.JitterSpan(); int64(p.Step) > span {
+		return fmt.Errorf("bands: Step %d exceeds the jitter span %d at %d decimals: only one slot would ever fit, so a second concurrent order at the same price is impossible", p.Step, span, p.Decimals)
 	}
+	// Backstop. Unreachable given the two checks above (Decimals >= 2 makes the
+	// span positive, Step <= span makes k=0 fit), and kept so that a future edit
+	// to JitterLoHundredths/JitterHiHundredths cannot ship a window with no slots.
 	if p.Slots() < 1 {
-		return fmt.Errorf("bands: Step %d exceeds the %d-whole-unit slot span at %d decimals (no slots)", p.Step, SlotSpanWholeUnits, p.Decimals)
+		return fmt.Errorf("bands: Step %d leaves no slot inside the jitter span %d at %d decimals", p.Step, p.JitterSpan(), p.Decimals)
 	}
 	return nil
 }
@@ -183,8 +246,9 @@ func (p Params) Validate() error {
 // It also makes every downstream multiplication provably overflow-free:
 // rescaleUnits' up-scale is bounded by the same whole-unit cap at the target
 // precision, i.e. 10^7 * 10^9 = 10^16 at the Decimals<=9 ceiling, well under
-// int64's 9.22e18; the picker's baseU + k*step stays within SlotSpanWholeUnits
-// (2) units of that.
+// int64's 9.22e18; the picker's baseU + JitterLo() + k*step stays within one
+// hundredth of a whole unit above that, since every slot's offset is bounded by
+// JitterHiExcl().
 const maxWholeUnits = 10_000_000
 
 // amountRE is an ALLOWLIST of the only syntax a stored amount may have: an
@@ -237,17 +301,19 @@ func FormatUnits(units int64, dec int) string {
 }
 
 // UniqueAmount is the Python-shaped entry point to the picker: pick the
-// smallest amount = base + k*step whose +/-tol band is clear of EVERY live
-// amount in `used`, so an incoming payment within tol of it maps to exactly
-// one order even across products (telegram_bot.py:9070-9092).
+// smallest amount = base + JitterLo() + k*step whose +/-tol band is clear of
+// EVERY live amount in `used`, so an incoming payment within tol of it maps to
+// exactly one order even across products (telegram_bot.py:9070-9092).
 //
-// Slot order, exactly as in Python:
-//  1. UPWARD slots base, base+step, ... for k < Slots(). Upward is preferred
-//     because it never undercharges.
-//  2. ONE downward slot base-step (e.g. 5.79 for a 6.00 price) as a LAST
-//     RESORT when every upward slot is taken. The seller absorbs that <=step
-//     undercharge, which beats refusing the sale outright
-//     (telegram_bot.py:9077-9080, 9089-9091).
+// Slot order:
+//  1. UPWARD slots base+0.01000, +step, ... for k < Slots(), i.e. every offset
+//     inside the jitter window. Upward is preferred because it never
+//     undercharges, and the window bounds the overquote below 0.02 USDT.
+//  2. ONE downward slot base-step (5.99899 for a 6.00 price at the shipped
+//     101-unit step) as a LAST RESORT when every upward slot is taken. The
+//     seller absorbs that <=step undercharge — now under a tenth of a cent,
+//     where the superseded 21-cent geometry made it 0.21 USDT — which beats
+//     refusing the sale outright (telegram_bot.py:9077-9080, 9089-9091).
 //
 // Returns ErrBandExhausted when every slot is ambiguous.
 func UniqueAmount(p Params, base string, used []string) (string, error) {
@@ -301,11 +367,12 @@ type blocker struct {
 // accept ErrBandExhausted instead once the upward slots run out.
 func uniqueAmountUnits(p Params, baseU int64, usedU []blocker, allowDownward bool) (int64, bool) {
 	step := int64(p.Step)
-	// Upward slots first: base, base+step, ... strictly below
-	// base+SlotSpanWholeUnits. Upward is preferred because it never
-	// undercharges.
+	// Upward slots first: base+JitterLo(), +step, ... while the offset stays
+	// strictly below JitterHiExcl(). Upward is preferred because it never
+	// undercharges, and the window keeps the overquote under 0.02 USDT.
+	lo := p.JitterLo()
 	for k := int64(0); k < int64(p.Slots()); k++ {
-		cu := baseU + k*step
+		cu := baseU + lo + k*step
 		if slotClear(cu, usedU) {
 			return cu, true
 		}
@@ -384,7 +451,7 @@ func RecvMatchesAnyBand(p Params, amounts []string, recvUnits int64) bool {
 // receipt-flooring semantics give a COARSER rail's band one extra coarse unit
 // of reach past its top edge, so Registry.collisionUnits widens the gap against
 // a coarser foreign row by 10^(reqDec-rowDec)-1 (see the COARSE-NEIGHBOUR SLACK
-// comment there). With every shipped rail at Decimals=2 the rescale here is
+// comment there). With every shipped rail at Decimals=5 the rescale here is
 // identity and the slack is zero.
 func rescaleUnits(units int64, from, to int) int64 {
 	switch {

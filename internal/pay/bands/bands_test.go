@@ -5,23 +5,27 @@ import (
 	"testing"
 )
 
-// Shipped geometry of the three rails, used across the suite.
+// Shipped geometry of the two surviving rails, used across the suite. The
+// Python original ran step 21, tol 10 at 2 decimals (bep20_pay.py:40,54-55 /
+// tron_pay.py:41,50-51); the hands-free-deposits ruling replaced that with a
+// 0.01000-0.01999 USDT jitter window at 5 decimals, which needs slots 0.00101
+// apart with a ±0.00050 band.
 //
-//	bep20_pay.py:40,54-55 / tron_pay.py:41,50-51  -> step 21, tol 10, dec 2
-//	binance_pay.py:54-55                          -> step 10, tol  4, cents
+// wideParams is a DIFFERENT valid geometry (fewer, wider slots) kept so the
+// picker's tests exercise something other than the shipped numbers — otherwise
+// a hardcoded 101 anywhere in the picker would pass every test.
 var (
-	bep20Params   = Params{Step: 21, Tol: 10, Decimals: 2}
-	tronParams    = Params{Step: 21, Tol: 10, Decimals: 2}
-	binanceParams = Params{Step: 10, Tol: 4, Decimals: 2}
+	bep20Params   = Params{Step: 101, Tol: 50, Decimals: 5}
+	tronParams    = Params{Step: 101, Tol: 50, Decimals: 5}
+	shippedParams = bep20Params
+	wideParams    = Params{Step: 250, Tol: 100, Decimals: 5}
 )
 
 // TestParamsGeometry pins the invariant tests/test_usdt_verify.py:125-131
 // asserts: step >= 2*tol+1 (so +/-tol bands never overlap) and the resulting
-// per-price slot counts. Widened by SlotSpanWholeUnits=2 (hands-free-deposits
-// ruling (b)): 200//21 = 9 upward slots for the on-chain rails, 200//10 = 20
-// for Binance.
+// per-price slot counts.
 func TestParamsGeometry(t *testing.T) {
-	for name, p := range map[string]Params{"bep20": bep20Params, "tron": tronParams, "binance": binanceParams} {
+	for name, p := range map[string]Params{"bep20": bep20Params, "tron": tronParams, "wide": wideParams} {
 		if !p.SpacingOK() {
 			t.Errorf("%s: step %d < minGap %d — concurrent same-price bands would overlap", name, p.Step, p.MinGap())
 		}
@@ -32,32 +36,45 @@ func TestParamsGeometry(t *testing.T) {
 			t.Errorf("%s: Validate() = %v", name, err)
 		}
 	}
-	if got := bep20Params.MinGap(); got != 21 {
-		t.Errorf("bep20 MinGap() = %d, want 21", got)
+	if got := bep20Params.MinGap(); got != 101 {
+		t.Errorf("bep20 MinGap() = %d, want 101", got)
 	}
-	if got := bep20Params.Slots(); got != 9 {
-		t.Errorf("bep20 Slots() = %d, want 9 (the widened max-slots-per-price cap)", got)
+	// Step == MinGap exactly: the tightest legal spacing, which is what lets ten
+	// slots fit a window only 0.01 USDT wide.
+	if bep20Params.Step != bep20Params.MinGap() {
+		t.Errorf("bep20 Step %d != MinGap %d — the shipped geometry is meant to sit exactly on the disjointness boundary", bep20Params.Step, bep20Params.MinGap())
 	}
-	if got := binanceParams.Slots(); got != 20 {
-		t.Errorf("binance Slots() = %d, want 20", got)
+	if got := bep20Params.Slots(); got != 10 {
+		t.Errorf("bep20 Slots() = %d, want 10 (offsets 0.01000..0.01909 inside the jitter window)", got)
+	}
+	if got := wideParams.Slots(); got != 4 {
+		t.Errorf("wide Slots() = %d, want 4", got)
+	}
+	// The window itself, in units, at the shipped precision.
+	if lo, hi := bep20Params.JitterLo(), bep20Params.JitterHiExcl(); lo != 1000 || hi != 2000 {
+		t.Errorf("jitter window = [%d,%d), want [1000,2000) — i.e. 0.01000 to 0.01999 USDT", lo, hi)
 	}
 }
 
 func TestParamsValidateRejectsBadGeometry(t *testing.T) {
 	cases := map[string]Params{
-		"zero step":     {Step: 0, Tol: 10, Decimals: 2},
-		"negative step": {Step: -1, Tol: 10, Decimals: 2},
-		"negative tol":  {Step: 21, Tol: -1, Decimals: 2},
-		"bad decimals":  {Step: 21, Tol: 10, Decimals: -1},
-		"step too wide": {Step: 201, Tol: 10, Decimals: 2}, // 200//201 = 0 slots
-		// Pins hands-free-deposits fix-round-2 finding 2: with
-		// SlotSpanWholeUnits=2, a Step in (one whole unit, two whole units]
-		// still produces 1 slot (200//150 = 1) and would pass the older
-		// "at least one slot" check, but its first upward slot already
-		// overshoots the customer's ask by more than one whole unit — that
-		// is a misconfiguration, not a legitimate wide-step tradeoff, so
-		// Validate must reject it explicitly.
-		"step exceeds one whole unit": {Step: 150, Tol: 10, Decimals: 2},
+		"zero step":     {Step: 0, Tol: 50, Decimals: 5},
+		"negative step": {Step: -1, Tol: 50, Decimals: 5},
+		"negative tol":  {Step: 101, Tol: -1, Decimals: 5},
+		"negative dec":  {Step: 101, Tol: 50, Decimals: -1},
+		"dec too high":  {Step: 101, Tol: 50, Decimals: 10},
+		// Below 2 decimals a hundredth of a whole unit is not representable, so
+		// the jitter window collapses to width 0 and every order would be quoted
+		// the bare base — the exact collision the picker exists to prevent.
+		"one decimal":  {Step: 1, Tol: 0, Decimals: 1},
+		"zero decimal": {Step: 1, Tol: 0, Decimals: 0},
+		// RESTATED BOUND (was "Step wider than one whole unit"). A Step past the
+		// jitter span can only ever place the k=0 slot inside the window, so the
+		// price supports exactly one concurrent order and every other customer is
+		// refused USDT_BUSY. Slots() returns 1 there, not 0, so the
+		// at-least-one-slot check below cannot catch it — this is a real check,
+		// not a restatement of that one.
+		"step past the jitter span": {Step: 1001, Tol: 50, Decimals: 5},
 	}
 	for name, p := range cases {
 		if err := p.Validate(); err == nil {
@@ -66,13 +83,102 @@ func TestParamsValidateRejectsBadGeometry(t *testing.T) {
 	}
 }
 
-// TestParamsValidateAllowsStepAtExactlyOneWholeUnit pins the boundary: a Step
-// equal to (not exceeding) one whole unit is fine — only strictly wider than
-// one unit is rejected (hands-free-deposits fix-round-2 finding 2).
-func TestParamsValidateAllowsStepAtExactlyOneWholeUnit(t *testing.T) {
-	p := Params{Step: 100, Tol: 10, Decimals: 2}
+// TestParamsValidateAllowsStepAtExactlyTheSpan pins the boundary of the
+// restated bound: a Step equal to (not exceeding) the jitter span is legal, and
+// yields exactly the one slot at the window's low edge.
+func TestParamsValidateAllowsStepAtExactlyTheSpan(t *testing.T) {
+	p := Params{Step: 1000, Tol: 50, Decimals: 5}
 	if err := p.Validate(); err != nil {
-		t.Errorf("Validate() = %v, want nil for Step == one whole unit", err)
+		t.Errorf("Validate() = %v, want nil for Step == the jitter span", err)
+	}
+	if got := p.Slots(); got != 1 {
+		t.Errorf("Slots() at Step == span = %d, want 1", got)
+	}
+}
+
+// TestPickedAmountStaysInsideTheJitterWindow is the user's ruling stated as a
+// property: whatever the picker hands an UPWARD-ONLY caller, it is between
+// 0.01000 and 0.01999 USDT above the base — never the bare base, never more.
+//
+// Scoped to the upward-only path on purpose. Product orders keep the single
+// last-resort slot BELOW base (see TestUniqueAmountStepBands), so the same
+// assertion against Reserve/UniqueAmount would be asserting the opposite of the
+// documented behaviour.
+func TestPickedAmountStaysInsideTheJitterWindow(t *testing.T) {
+	p := shippedParams
+	baseU, err := AmountUnits("6.00", p.Decimals)
+	if err != nil {
+		t.Fatalf("AmountUnits: %v", err)
+	}
+	var used []blocker
+	for k := 0; k < p.Slots(); k++ {
+		cu, ok := uniqueAmountUnits(p, baseU, used, false)
+		if !ok {
+			t.Fatalf("slot %d: picker exhausted early, want %d slots", k, p.Slots())
+		}
+		off := cu - baseU
+		if off < p.JitterLo() || off >= p.JitterHiExcl() {
+			t.Errorf("slot %d: offset %d units (%s USDT) is outside the jitter window [%d,%d)",
+				k, off, FormatUnits(off, p.Decimals), p.JitterLo(), p.JitterHiExcl())
+		}
+		used = append(used, blocker{units: cu, minGap: int64(p.MinGap())})
+	}
+	// Every slot consumed -> upward-only must REFUSE, never reach for the
+	// downward last resort.
+	if cu, ok := uniqueAmountUnits(p, baseU, used, false); ok {
+		t.Errorf("upward-only picker returned %s after the window was full, want refusal", FormatUnits(cu, p.Decimals))
+	}
+	// The worst case a customer can be quoted, stated in money so a future
+	// geometry change that regresses it is loud.
+	worst := p.JitterLo() + int64(p.Slots()-1)*int64(p.Step)
+	if got := FormatUnits(worst, p.Decimals); got != "0.01909" {
+		t.Errorf("worst-case overquote = %s USDT, want 0.01909", got)
+	}
+}
+
+// TestLiveAmountsStayDisjoint is the MinGap guarantee itself: no two amounts the
+// picker hands out for the same price are within 2*Tol of each other, so no
+// single receipt can fall inside two bands.
+//
+// MUTATION CHECK, run and documented so the next person can repeat it. Note
+// what it takes to break this, because that is itself the design's strength:
+// widening Tol alone does NOT break it (slotClear simply skips the newly
+// overlapping slots and the picker hands out fewer, still-disjoint amounts), and
+// shrinking Step alone does not either (slotClear rejects the too-close
+// candidates). Only weakening slotClear ITSELF can produce a colliding set.
+// Verified by mutating slotClear's `abs64(cu-b.units) < b.minGap` to
+// `< b.minGap/2` and setting bep20Params' Step to 51: the picker then hands out
+// amounts 51 units apart and this test fails on its own
+// "51 units apart, within 2*Tol (100) — one receipt could match both" message,
+// not on a panic or a downstream error. Both edits restored.
+func TestLiveAmountsStayDisjoint(t *testing.T) {
+	p := shippedParams
+	baseU, err := AmountUnits("6.00", p.Decimals)
+	if err != nil {
+		t.Fatalf("AmountUnits: %v", err)
+	}
+	var picked []int64
+	var used []blocker
+	// Every upward slot plus the downward last resort — the full set of amounts
+	// that can be live for one price at once.
+	for {
+		cu, ok := uniqueAmountUnits(p, baseU, used, true)
+		if !ok {
+			break
+		}
+		picked = append(picked, cu)
+		used = append(used, blocker{units: cu, minGap: int64(p.MinGap())})
+	}
+	if len(picked) != p.Slots()+1 {
+		t.Fatalf("picker produced %d amounts, want %d upward slots + 1 last resort", len(picked), p.Slots())
+	}
+	for i := range picked {
+		for j := i + 1; j < len(picked); j++ {
+			if d := abs64(picked[i] - picked[j]); d < int64(2*p.Tol+1) {
+				t.Errorf("%s and %s are %d units apart, within 2*Tol (%d) — one receipt could match both",
+					FormatUnits(picked[i], p.Decimals), FormatUnits(picked[j], p.Decimals), d, 2*p.Tol)
+			}
+		}
 	}
 }
 
@@ -90,6 +196,14 @@ func TestAmountUnitsAndFormat(t *testing.T) {
 		{"0.01", 2, 1},
 		{"5.79", 2, 579},
 		{"5.2345", 4, 52345},
+		// The shipped precision. A 2-dp base string (usdtStr still emits whole
+		// cents) must parse at 5 decimals without loss — that is what lets the
+		// picker add its jitter to a price it was handed as "6.00".
+		{"6.00", 5, 600_000},
+		{"120.00", 5, 12_000_000},
+		{"6.01000", 5, 601_000},
+		{"6.01909", 5, 601_909},
+		{"5.99899", 5, 599_899},
 		// Rounding only fires on a string carrying MORE digits than the rail's
 		// precision, which never happens for a real amount (they are all emitted
 		// at exactly Decimals). Go rounds half-away-from-zero here; Python's
@@ -196,16 +310,20 @@ func TestUniqueAmountStepBands(t *testing.T) {
 		used []string
 		want string
 	}{
-		{"nothing live -> base itself", nil, "6.00"},
-		{"base taken -> +1 step", []string{"6.00"}, "6.21"},
-		{"two taken -> +2 steps", []string{"6.00", "6.21"}, "6.42"},
-		{"three taken -> +3 steps", []string{"6.00", "6.21", "6.42"}, "6.63"},
-		{"all 9 upward taken -> last-resort slot BELOW base",
-			[]string{"6.00", "6.21", "6.42", "6.63", "6.84", "7.05", "7.26", "7.47", "7.68"}, "5.79"},
+		// Note the FIRST slot is the base plus the jitter floor, never the round
+		// base: a bare "6.00" is exactly the amount two customers would collide on.
+		{"nothing live -> base + the jitter floor", nil, "6.01000"},
+		{"first slot taken -> +1 step", []string{"6.01000"}, "6.01101"},
+		{"two taken -> +2 steps", []string{"6.01000", "6.01101"}, "6.01202"},
+		{"three taken -> +3 steps", []string{"6.01000", "6.01101", "6.01202"}, "6.01303"},
+		{"all 10 upward taken -> last-resort slot BELOW base",
+			[]string{"6.01000", "6.01101", "6.01202", "6.01303", "6.01404",
+				"6.01505", "6.01606", "6.01707", "6.01808", "6.01909"}, "5.99899"},
 		// An off-grid live amount blocks EVERY slot whose +/-tol band it
-		// overlaps: 6.05's band is [5.95,6.15] and 6.21's is [6.11,6.31], so
-		// minGap (21) rejects both 6.00 and 6.21 -> the picker lands on 6.42.
-		{"off-grid live amount blocks both overlapping slots", []string{"6.05"}, "6.42"},
+		// overlaps: 6.01050's band is [6.01000,6.01100] and it sits within
+		// minGap (101) of both the 6.01000 and the 6.01101 slots, so the picker
+		// lands on 6.01202.
+		{"off-grid live amount blocks both overlapping slots", []string{"6.01050"}, "6.01202"},
 	}
 	for _, tc := range cases {
 		got, err := UniqueAmount(bep20Params, "6.00", tc.used)
@@ -223,7 +341,8 @@ func TestUniqueAmountStepBands(t *testing.T) {
 // (telegram_bot.py:9092). This is the "band exhausted" incident case; the
 // handlers must show BUSY, never fall through to a duplicate amount.
 func TestUniqueAmountExhausted(t *testing.T) {
-	used := []string{"6.00", "6.21", "6.42", "6.63", "6.84", "7.05", "7.26", "7.47", "7.68", "5.79"}
+	used := []string{"6.01000", "6.01101", "6.01202", "6.01303", "6.01404",
+		"6.01505", "6.01606", "6.01707", "6.01808", "6.01909", "5.99899"}
 	if _, err := UniqueAmount(bep20Params, "6.00", used); !errors.Is(err, ErrBandExhausted) {
 		t.Errorf("UniqueAmount with every slot taken = %v, want ErrBandExhausted", err)
 	}
@@ -233,69 +352,85 @@ func TestUniqueAmountExhausted(t *testing.T) {
 // would be <= 0, so the last-resort slot must not be offered
 // (telegram_bot.py:9089 `if cu > 0`).
 func TestUniqueAmountNoNegativeLastResort(t *testing.T) {
-	// base 0.10 = 10 units, step 21 -> down slot would be -11. All 9 upward
-	// slots (widened SlotSpanWholeUnits=2) must be filled first.
-	used := []string{"0.10", "0.31", "0.52", "0.73", "0.94", "1.15", "1.36", "1.57", "1.78"}
-	if _, err := UniqueAmount(bep20Params, "0.10", used); !errors.Is(err, ErrBandExhausted) {
+	// base 0.001 = 100 units, step 101 -> down slot would be -1. All 10 upward
+	// slots must be filled first, and then the picker must refuse rather than
+	// quote a negative amount.
+	p := bep20Params
+	base := "0.00100"
+	baseU, err := AmountUnits(base, p.Decimals)
+	if err != nil {
+		t.Fatalf("AmountUnits: %v", err)
+	}
+	var used []string
+	for k := range p.Slots() {
+		used = append(used, FormatUnits(baseU+p.JitterLo()+int64(k)*int64(p.Step), p.Decimals))
+	}
+	if _, err := UniqueAmount(p, base, used); !errors.Is(err, ErrBandExhausted) {
 		t.Errorf("UniqueAmount at a sub-step price = %v, want ErrBandExhausted (no negative slot)", err)
 	}
 }
 
-// TestUniqueAmountBinanceGeometry: the tighter Binance geometry (step 10, tol 4)
-// yields 20 upward slots (widened SlotSpanWholeUnits=2) and a 9-unit minGap
-// (binance_pay.py:50-58).
-func TestUniqueAmountBinanceGeometry(t *testing.T) {
-	got, err := UniqueAmount(binanceParams, "6.00", []string{"6.00"})
+// TestUniqueAmountWideGeometry: a geometry other than the shipped one — fewer,
+// wider slots (step 250, tol 100 -> minGap 201) — must walk the same way, so the
+// picker is provably driven by Params rather than by the shipped constants.
+func TestUniqueAmountWideGeometry(t *testing.T) {
+	got, err := UniqueAmount(wideParams, "6.00", []string{"6.01000"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got != "6.10" {
-		t.Errorf("binance second slot = %q, want %q", got, "6.10")
+	if got != "6.01250" {
+		t.Errorf("wide second slot = %q, want %q", got, "6.01250")
 	}
-	// 6.00..7.90 is 20 slots; then the 5.90 last resort; then exhausted.
+	// 4 upward slots at offsets 1000/1250/1500/1750; then the 5.99750 last
+	// resort; then exhausted.
 	var used []string
-	for k := range 20 {
-		used = append(used, FormatUnits(600+int64(k)*10, 2))
+	for k := range wideParams.Slots() {
+		used = append(used, FormatUnits(600_000+wideParams.JitterLo()+int64(k)*int64(wideParams.Step), wideParams.Decimals))
 	}
-	got, err = UniqueAmount(binanceParams, "6.00", used)
+	got, err = UniqueAmount(wideParams, "6.00", used)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got != "5.90" {
-		t.Errorf("binance last-resort slot = %q, want %q", got, "5.90")
+	if got != "5.99750" {
+		t.Errorf("wide last-resort slot = %q, want %q", got, "5.99750")
 	}
-	used = append(used, "5.90")
-	if _, err := UniqueAmount(binanceParams, "6.00", used); !errors.Is(err, ErrBandExhausted) {
-		t.Errorf("binance all slots taken = %v, want ErrBandExhausted", err)
+	used = append(used, "5.99750")
+	if _, err := UniqueAmount(wideParams, "6.00", used); !errors.Is(err, ErrBandExhausted) {
+		t.Errorf("wide all slots taken = %v, want ErrBandExhausted", err)
 	}
 }
 
 // TestRecvMatchesBandTolerance pins the fuzzy-match boundary at
 // telegram_bot.py:9745 (`abs(recv_units - want_units) <= AMOUNT_MATCH_TOL`):
 // exactly tol matches, one unit past it does not.
+//
+// Matching is now essentially EXACT: a payment right to the last decimal
+// settles, and one further off than 0.00050 does not.
 func TestRecvMatchesBandTolerance(t *testing.T) {
+	const expected = "6.01000" // a real picked amount: base 6.00 + the jitter floor
 	cases := []struct {
 		recv int64
 		want bool
 		why  string
 	}{
-		{600, true, "exact"},
-		{610, true, "10c over = exactly tol"},
-		{611, false, "11c over = one unit past tol"},
-		{590, true, "10c under = exactly tol (goodwill underpay)"},
-		{589, false, "11c under = one unit past tol"},
-		{621, false, "the NEXT slot's amount must never match this band"},
+		{601_000, true, "exact to all five decimals"},
+		{601_050, true, "0.00050 over = exactly tol"},
+		{601_051, false, "one unit past tol"},
+		{600_950, true, "0.00050 under = exactly tol"},
+		{600_949, false, "one unit under past tol"},
+		{601_101, false, "the NEXT slot's amount must never match this band"},
+		{600_000, false, "the bare base is a full jitter away and must not match"},
 	}
 	for _, tc := range cases {
-		got, err := RecvMatchesBand(bep20Params, "6.00", tc.recv)
+		got, err := RecvMatchesBand(bep20Params, expected, tc.recv)
 		if err != nil {
 			t.Fatalf("RecvMatchesBand error: %v", err)
 		}
 		if got != tc.want {
-			t.Errorf("RecvMatchesBand(6.00, %d) = %v, want %v (%s)", tc.recv, got, tc.want, tc.why)
+			t.Errorf("RecvMatchesBand(%s, %d) = %v, want %v (%s)", expected, tc.recv, got, tc.want, tc.why)
 		}
 	}
-	if _, err := RecvMatchesBand(bep20Params, "junk", 600); err == nil {
+	if _, err := RecvMatchesBand(bep20Params, "junk", 601_000); err == nil {
 		t.Error("RecvMatchesBand with a bad expected amount = nil error, want error")
 	}
 }
@@ -304,23 +439,24 @@ func TestRecvMatchesBandTolerance(t *testing.T) {
 // a mismatched payment that lands in ANOTHER live order's band is refused, not
 // credited to the wrong session.
 func TestRecvMatchesAnyBand(t *testing.T) {
-	others := []string{"6.21", "6.42"}
-	if !RecvMatchesAnyBand(bep20Params, others, 621) {
+	others := []string{"6.01101", "6.01202"}
+	if !RecvMatchesAnyBand(bep20Params, others, 601_101) {
 		t.Error("exact neighbour amount must be reported as a band hit")
 	}
-	if !RecvMatchesAnyBand(bep20Params, others, 631) { // 6.21 + tol
+	if !RecvMatchesAnyBand(bep20Params, others, 601_151) { // 6.01101 + tol
 		t.Error("neighbour band edge must be reported as a band hit")
 	}
-	// 6.21's band is [6.11,6.31] and 6.42's is [6.32,6.52] — they are adjacent,
-	// so the only clear side is below: 6.10 is one unit under 6.21's low edge.
-	if RecvMatchesAnyBand(bep20Params, others, 610) {
+	// 6.01101's band is [6.01051,6.01151] and 6.01202's is [6.01152,6.01252] —
+	// they are adjacent, so the only clear side is below: 6.01050 is one unit
+	// under 6.01101's low edge.
+	if RecvMatchesAnyBand(bep20Params, others, 601_050) {
 		t.Error("one unit outside every neighbour band must NOT be a band hit")
 	}
-	if RecvMatchesAnyBand(bep20Params, nil, 600) {
+	if RecvMatchesAnyBand(bep20Params, nil, 601_000) {
 		t.Error("no neighbours must never be a band hit")
 	}
 	// An unparseable neighbour is skipped, never treated as a match.
-	if RecvMatchesAnyBand(bep20Params, []string{"junk"}, 600) {
+	if RecvMatchesAnyBand(bep20Params, []string{"junk"}, 601_000) {
 		t.Error("unparseable neighbour must not produce a band hit")
 	}
 }

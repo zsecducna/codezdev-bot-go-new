@@ -247,11 +247,14 @@ func usdtScreenAmounts(t *testing.T, f *fakeTG) []string {
 	defer f.mu.Unlock()
 	var amounts []string
 	for _, s := range f.Sends {
-		_, rest, ok := strings.Cut(s.Text, "EXACTLY ")
+		// The backticks are part of the assertion, not noise to strip loosely:
+		// the pay screen must render the amount in the same copyable code span
+		// the address uses, so a customer never retypes five decimals by hand.
+		_, rest, ok := strings.Cut(s.Text, "EXACTLY `")
 		if !ok {
 			continue
 		}
-		amount, _, ok := strings.Cut(rest, " USDT")
+		amount, _, ok := strings.Cut(rest, "` USDT")
 		if !ok {
 			continue
 		}
@@ -358,8 +361,8 @@ func TestUSDTSharedBandAcrossRails(t *testing.T) {
 // must answer USDT_BUSY and hand out NOTHING — refusing beats colliding
 // (telegram_bot.py:9092 "no clear slot: refuse rather than collide"). This
 // drives the ORDER pay path (paybsc:), which still allows the last-resort
-// downward slot: BEP20 has 200//21 = 9 upward slots (widened
-// bands.SlotSpanWholeUnits=2) plus ONE last-resort slot below base.
+// downward slot: BEP20 has 10 upward slots inside the 0.01000-0.01999 jitter
+// window plus ONE last-resort slot below base.
 func TestUSDTBandExhaustedShowsBusy(t *testing.T) {
 	ctx := context.Background()
 	b, f, st, _, _ := newUSDTBot(t)
@@ -368,7 +371,7 @@ func TestUSDTBandExhaustedShowsBusy(t *testing.T) {
 	// Fill every slot from DISTINCT chats, so the own-dead-session rule (which
 	// only forgives a chat's OWN expired sessions) cannot free one.
 	taken := map[int64]bool{}
-	const slots = 10 // 9 upward (200/21) + 1 last-resort downward
+	const slots = 11 // 10 upward jitter slots + 1 last-resort downward
 	for i := range slots {
 		chat := int64(200 + i)
 		des := usdtOrder(t, st, chat, total)
@@ -417,7 +420,7 @@ func TestUSDTPickerExcludesOwnDeadSessions(t *testing.T) {
 		des := store.NewDes()
 		if err := b.bands.Adopt(bands.Reservation{
 			Provider: bands.ProviderBEP20, Des: des, ChatID: fmtInt(chat),
-			Amount:    bands.FormatUnits(int64(600+21*i), 2),
+			Amount:    bands.FormatUnits(int64(601_000+101*i), bep20.AmountDecimals()),
 			CreatedAt: time.Now().Add(-time.Hour), Deadline: time.Now().Add(-time.Minute),
 		}); err != nil {
 			t.Fatalf("adopt: %v", err)
@@ -427,8 +430,8 @@ func TestUSDTPickerExcludesOwnDeadSessions(t *testing.T) {
 	// never block it), and the FIRST slot at that — the base price.
 	des := usdtOrder(t, st, chat, total)
 	b.Process(ctx, callbackUpdate(chat, "paybsc:"+des))
-	if got := bandUnits(t, b, bands.ProviderBEP20, des); got != 600 {
-		t.Errorf("own-dead-session retry got %d, want the base slot 600", got)
+	if got := bandUnits(t, b, bands.ProviderBEP20, des); got != 601_000 {
+		t.Errorf("own-dead-session retry got %d, want the first slot 601000 (6.00 + the jitter floor)", got)
 	}
 }
 
@@ -611,7 +614,7 @@ func TestUSDTSiblingRedirect(t *testing.T) {
 	// They paste, from the NEWEST screen, the hash of the payment they made for
 	// the SIBLING's amount.
 	h := hash64("c")
-	fk.setBSC(h, bscTx(h, bands.FormatUnits(sibAmount, 2), time.Now().Unix()))
+	fk.setBSC(h, bscTx(h, bands.FormatUnits(sibAmount, bep20.AmountDecimals()), time.Now().Unix()))
 	b.Process(ctx, textUpdate(chat, "0x"+h))
 
 	sibOrder, _ := st.GetOrder(sibling)
@@ -629,7 +632,7 @@ func TestUSDTSiblingRedirect(t *testing.T) {
 	b.Process(ctx, callbackUpdate(chat, "paybsc:"+sib2))
 	u2 := bandUnits(t, b, bands.ProviderBEP20, sib2)
 	h2 := hash64("d")
-	fk.setBSC(h2, bscTx(h2, bands.FormatUnits(u2, 2), time.Now().Unix()))
+	fk.setBSC(h2, bscTx(h2, bands.FormatUnits(u2, bep20.AmountDecimals()), time.Now().Unix()))
 	before, _ := st.GetOrder(sib2)
 	b.verifyUSDTTxid(ctx, chat, chainBSC, current, h2, false, true) // already redirected
 	after, _ := st.GetOrder(sib2)
@@ -660,7 +663,7 @@ func TestUSDTCrossChatStillConflicts(t *testing.T) {
 	armTxid(t, ctx, b, mine, chainBSC, myDes)
 
 	h := hash64("e")
-	fk.setBSC(h, bscTx(h, bands.FormatUnits(otherUnits, 2), time.Now().Unix()))
+	fk.setBSC(h, bscTx(h, bands.FormatUnits(otherUnits, bep20.AmountDecimals()), time.Now().Unix()))
 	b.Process(ctx, textUpdate(mine, "0x"+h))
 
 	if lastSend(f) != i18n.C().Pay.TxidAmountConflict.T(i18n.EN) {
@@ -676,23 +679,27 @@ func TestUSDTCrossChatStillConflicts(t *testing.T) {
 
 // ---- 4. deposits -----------------------------------------------------------
 
-// TestUSDTDepositCreditBoundaries pins the ±30c decision END-TO-END through a
-// TRON deposit (Python tests/test_deposit_credit.py): a small UNDERpay credits
-// the DESIRED top-up (the seller absorbs <=30c), an OVERpay within tolerance
-// credits the ACTUAL amount (the customer is never shorted), and a way-off
-// amount credits what actually arrived (money is never lost, a deposit never
-// rejects).
+// TestUSDTDepositCreditBoundaries pins the credit decision END-TO-END through a
+// TRON deposit (Python tests/test_deposit_credit.py) at the 5-decimal geometry.
+//
+// The customer asks for 6 USDT and is QUOTED 6.01000 (the request plus the
+// jitter floor). Every row below therefore credits what actually ARRIVED, on
+// both sides of the ±0.00050 tolerance — the customer keeps the jitter, and the
+// round-a-small-underpay-up-to-the-request rule is unreachable here because any
+// receipt within tolerance of the quote is already worth more than the request.
+// That branch stays pinned as a pure function in bands/credit_test.go.
 func TestUSDTDepositCreditBoundaries(t *testing.T) {
 	cases := []struct {
 		name       string
 		recv       string // USDT actually received
 		wantCredit int64  // VND credited
 	}{
-		{"short by one cent credits desired", "5.99", 150000},
-		{"exact credits desired", "6.00", 150000},
-		{"underpay within 30c credits desired", "5.71", 150000},
-		{"overpay within tol credits actual", "6.30", 157500},
-		{"way off credits actual", "8.00", 200000},
+		{"exact to the last decimal credits actual", "6.01000", 150250},
+		{"inside tolerance under credits actual", "6.00960", 150240},
+		{"outside tolerance under credits actual", "6.00940", 150235},
+		{"inside tolerance over credits actual", "6.01040", 150260},
+		{"way off credits actual", "8.00000", 200000},
+		{"way under credits actual", "5.00000", 125000},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -705,10 +712,11 @@ func TestUSDTDepositCreditBoundaries(t *testing.T) {
 			b.Process(ctx, textUpdate(chat, "6"))
 
 			o := reservedDeposit(t, st, chat)
-			// A deposit uses NO unique offset: the DESIRED amount, verbatim.
+			// A deposit takes the SAME picked amount an order does: the request
+			// plus the smallest jitter, never the round number.
 			res, ok := b.bands.Get(bands.ProviderTron, o.Des)
-			if !ok || res.Amount != "6.00" {
-				t.Fatalf("deposit amount = %q (found=%t), want the desired 6.00", res.Amount, ok)
+			if !ok || res.Amount != "6.01000" {
+				t.Fatalf("deposit amount = %q (found=%t), want the picked 6.01000", res.Amount, ok)
 			}
 			armTxid(t, ctx, b, chat, chainTRX, o.Des)
 
@@ -837,6 +845,92 @@ func TestUSDTDepositAuditRowIsWellFormedAtHealthyRate(t *testing.T) {
 	}
 }
 
+// providerFor is the test-side twin of providerForChain, failing loudly rather
+// than returning a zero Provider.
+func providerFor(t *testing.T, chain string) bands.Provider {
+	t.Helper()
+	p, ok := providerForChain(chain)
+	if !ok {
+		t.Fatalf("no provider for chain %q", chain)
+	}
+	return p
+}
+
+// TestPayScreenWarnsAboutFeesInEveryLanguage pins the copy requirement that
+// makes exact matching safe for the customer. Now that a payment is matched to
+// an order within +/-0.00050 USDT, a platform that skims its network fee OUT of
+// the transfer makes the payment unmatchable — so the screen has to say, in
+// every language the catalog supports:
+//
+//  1. the network fee is theirs, paid ON TOP of the amount;
+//  2. the figure that must ARRIVE is exact to all five decimals.
+//
+// It also pins the emphasis: the amount is rendered in the same Markdown code
+// span the address uses, so it is tap-to-copy rather than retyped by hand.
+//
+// Rendering through startOnchainDeposit rather than reading the catalog
+// directly is deliberate — an English-only string added straight to the screen,
+// or a token that stops substituting in one language, both fail here.
+func TestPayScreenWarnsAboutFeesInEveryLanguage(t *testing.T) {
+	ctx := context.Background()
+	const vnd = 3000000 // 120.00 USDT at 25,000 VND/USDT
+
+	// Per-language markers for the two required statements, plus the
+	// five-decimal claim. Chosen from the catalog copy itself so a translation
+	// that silently drops one of the three warnings fails this test.
+	cases := []struct {
+		lang    i18n.Lang
+		markers []string
+	}{
+		{i18n.EN, []string{"must ARRIVE exact to every digit", "all 5 decimals", "network fee is yours to pay, ON TOP"}},
+		{i18n.VI, []string{"VỀ TỚI NƠI đúng từng chữ số", "5 chữ số thập phân", "Phí mạng do bạn trả, CỘNG THÊM"}},
+		{i18n.ZH, []string{"到账金额必须每一位都完全一致", "5 位小数", "网络费由您另行承担"}},
+	}
+	for _, chain := range []string{chainTRX, chainBSC} {
+		for i, tc := range cases {
+			t.Run(chain+"/"+string(tc.lang), func(t *testing.T) {
+				b, f, _, _, _ := newUSDTBot(t)
+				b.startOnchainDeposit(ctx, int64(700+i), tc.lang, vnd, chain)
+
+				f.mu.Lock()
+				n := len(f.Sends)
+				var text string
+				if n == 1 {
+					text = f.Sends[0].Text
+				}
+				f.mu.Unlock()
+				if n != 1 {
+					t.Fatalf("want exactly one screen, got %d", n)
+				}
+				for _, m := range tc.markers {
+					if !strings.Contains(text, m) {
+						t.Errorf("screen is missing %q:\n%s", m, text)
+					}
+				}
+				// The amount, at full precision, inside a Markdown code span.
+				// Matched by value rather than by an English marker word, so the
+				// VI/ZH screens are held to the same standard as the EN one:
+				// this is the FIRST deposit on a fresh bot, so it takes the
+				// uncontended slot at base + the jitter floor.
+				prm, _ := b.bands.Params(providerFor(t, chain))
+				baseU, err := bands.AmountUnits(b.usdtStr(vnd), prm.Decimals)
+				if err != nil {
+					t.Fatalf("AmountUnits(base): %v", err)
+				}
+				want := bands.FormatUnits(baseU+prm.JitterLo(), prm.Decimals)
+				if want != "120.01000" {
+					t.Fatalf("fixture drifted: picked amount = %q, want 120.01000", want)
+				}
+				// At least three code spans: the headline figure, the
+				// exact-to-five-decimals line, and the fee restatement.
+				if n := strings.Count(text, "`"+want+"`"); n < 3 {
+					t.Errorf("the amount appears in a code span %d times, want at least 3 (headline, exactness, fee restatement):\n%s", n, text)
+				}
+			})
+		}
+	}
+}
+
 // TestDepositAmountsAreUnique pins the hands-free-deposits behaviour swap:
 // startOnchainDeposit now hands out a PICKED band amount (reserveUSDTAmount)
 // instead of adopting the customer's round number verbatim (adoptUSDTAmount).
@@ -854,11 +948,20 @@ func TestDepositAmountsAreUnique(t *testing.T) {
 	if len(amounts) != 2 {
 		t.Fatalf("want 2 deposit screens, got %d: %+v", len(amounts), amounts)
 	}
-	// The FIRST (uncontended) deposit must still get the exact round base —
-	// the picker only offsets on collision, it does not spread every deposit
-	// out pre-emptively.
-	if want := b.usdtStr(total); amounts[0] != want {
-		t.Errorf("first deposit quoted %q, want the uncontended round base %q", amounts[0], want)
+	// Even the FIRST, uncontended deposit is offset: the jitter is what makes
+	// the amount an order identifier, so a round number is never quoted. The
+	// quote is the base plus exactly the jitter floor.
+	baseU, err := bands.AmountUnits(b.usdtStr(total), tron.AmountDecimals())
+	if err != nil {
+		t.Fatalf("AmountUnits(base): %v", err)
+	}
+	prm, _ := b.bands.Params(bands.ProviderTron)
+	want := bands.FormatUnits(baseU+prm.JitterLo(), prm.Decimals)
+	if amounts[0] != want {
+		t.Errorf("first deposit quoted %q, want the base plus the jitter floor %q", amounts[0], want)
+	}
+	if amounts[0] == b.usdtStr(total) {
+		t.Error("first deposit was quoted the round base — two customers depositing the same amount would collide")
 	}
 	if amounts[0] == amounts[1] {
 		t.Fatalf("both deposits were quoted %q — bands are not unique", amounts[0])
@@ -880,26 +983,33 @@ func TestDepositAmountsAreUnique(t *testing.T) {
 // deposit must never fall back to the picker's last-resort DOWNWARD slot.
 // DepositCredit rounds an exact payment up to the customer's FULL requested
 // total regardless of which band amount they were actually quoted, so a
-// downward-slot deposit would be a straight giveaway (~0.21 USDT at the
-// shipped step) — adoptUSDTAmount could never produce this, and
-// reserveUSDTAmount must not either now that it picks amounts.
+// downward-slot deposit would be a straight giveaway — adoptUSDTAmount could
+// never produce this, and reserveUSDTAmount must not either now that it picks
+// amounts.
 //
-// Fills every widened upward TRON slot (9, bands.SlotSpanWholeUnits=2) with
-// distinct deposits at the same round base, then asserts the 10th is REFUSED
-// with USDT_BUSY rather than handed the downward amount a product order would
-// get in the same spot (see TestOrderCanTakeDownwardSlotDepositsCannot).
+// Fills every upward TRON jitter slot (10) with distinct deposits at the same
+// round base, then asserts the 11th is REFUSED with USDT_BUSY rather than
+// handed the downward amount a product order would get in the same spot (see
+// TestOrderCanTakeDownwardSlotDepositsCannot).
+//
+// Also pins the user's stated range end-to-end: every quote sits between
+// 0.01000 and 0.01999 USDT above the base, so the worst case a real customer
+// can be asked for is 0.01909 over — not the 1.68 the superseded geometry
+// could produce.
 func TestDepositNeverQuotedBelowBase(t *testing.T) {
 	ctx := context.Background()
 	b, f, _, _, _ := newUSDTBot(t)
 	const vnd = 3000000 // 120.00 USDT at 25,000 VND/USDT
 
-	for i := range 9 {
+	prm, _ := b.bands.Params(bands.ProviderTron)
+	slots := prm.Slots()
+	for i := range slots {
 		chat := int64(500 + i)
 		b.startOnchainDeposit(ctx, chat, i18n.EN, vnd, chainTRX)
 	}
 	amounts := usdtScreenAmounts(t, f)
-	if len(amounts) != 9 {
-		t.Fatalf("want 9 deposit screens (the widened upward span), got %d: %+v", len(amounts), amounts)
+	if len(amounts) != slots {
+		t.Fatalf("want %d deposit screens (the upward jitter window), got %d: %+v", slots, len(amounts), amounts)
 	}
 	seen := map[string]bool{}
 	base, err := bands.AmountUnits(b.usdtStr(vnd), tron.AmountDecimals())
@@ -918,9 +1028,13 @@ func TestDepositNeverQuotedBelowBase(t *testing.T) {
 		if u < base {
 			t.Errorf("deposit quoted %q, BELOW the base %q — the downward last-resort slot leaked into a deposit", a, b.usdtStr(vnd))
 		}
+		if off := u - base; off < prm.JitterLo() || off >= prm.JitterHiExcl() {
+			t.Errorf("deposit quoted %q — %s USDT over the base, outside the 0.01000-0.01999 range the user ruled",
+				a, bands.FormatUnits(off, prm.Decimals))
+		}
 	}
 
-	// The 10th deposit at the same price has no upward slot left. It must be
+	// The next deposit at the same price has no upward slot left. It must be
 	// REFUSED (USDT_BUSY), never handed the downward amount.
 	before := len(f.Sends)
 	b.startOnchainDeposit(ctx, 599, i18n.EN, vnd, chainTRX)
@@ -934,10 +1048,10 @@ func TestDepositNeverQuotedBelowBase(t *testing.T) {
 	}
 	f.mu.Unlock()
 	if !found {
-		t.Fatalf("10th deposit was not refused with USDT_BUSY; last send = %q", lastSend(f))
+		t.Fatalf("the overflow deposit was not refused with USDT_BUSY; last send = %q", lastSend(f))
 	}
-	if got := usdtScreenAmounts(t, f); len(got) != 9 {
-		t.Fatalf("a 10th deposit screen was rendered (%+v) — the downward slot was handed to a deposit", got)
+	if got := usdtScreenAmounts(t, f); len(got) != slots {
+		t.Fatalf("an extra deposit screen was rendered (%+v) — the downward slot was handed to a deposit", got)
 	}
 }
 
@@ -945,15 +1059,15 @@ func TestDepositNeverQuotedBelowBase(t *testing.T) {
 // (a): unlike a deposit, a PRODUCT ORDER may still be quoted the picker's
 // downward last-resort amount — a seller-absorbed <=step undercharge is an
 // acceptable cost there (Reserve, unlike ReserveUpwardOnly, must keep
-// offering it). This is also the widened-span check for ruling (b): filling
-// the 9 upward slots plus this 10th, downward one is reserving past the OLD
-// 5-slot cap and getting SUCCESS where it used to refuse.
+// offering it). At the 5-decimal geometry that undercharge is 0.00101 USDT,
+// where the superseded 21-cent step made it 0.21.
 func TestOrderCanTakeDownwardSlotDepositsCannot(t *testing.T) {
 	ctx := context.Background()
 	b, _, st, _, _ := newUSDTBot(t)
 	const total = 150000 // 6.00 USDT at 25,000 VND/USDT
 
-	for i := range 9 {
+	prm, _ := b.bands.Params(bands.ProviderBEP20)
+	for i := range prm.Slots() {
 		chat := int64(600 + i)
 		des := usdtOrder(t, st, chat, total)
 		b.Process(ctx, callbackUpdate(chat, "paybsc:"+des))
@@ -964,10 +1078,10 @@ func TestOrderCanTakeDownwardSlotDepositsCannot(t *testing.T) {
 
 	res, ok := b.bands.Get(bands.ProviderBEP20, des)
 	if !ok {
-		t.Fatal("10th order was refused — the downward last-resort slot must still be offered to orders")
+		t.Fatal("the overflow order was refused — the downward last-resort slot must still be offered to orders")
 	}
-	if res.Amount != "5.79" {
-		t.Errorf("10th order amount = %q, want %q (the downward last-resort slot)", res.Amount, "5.79")
+	if res.Amount != "5.99899" {
+		t.Errorf("overflow order amount = %q, want %q (the downward last-resort slot)", res.Amount, "5.99899")
 	}
 }
 
@@ -1557,16 +1671,16 @@ func TestUSDTRealClientsByHash(t *testing.T) {
 	if err != nil || tx == nil {
 		t.Fatalf("bep20 by-hash = (%v, %v), want a transfer", tx, err)
 	}
-	if !tx.Confirmed || tx.Units != 600 {
-		t.Errorf("bep20 transfer confirmed=%t units=%d, want true/600", tx.Confirmed, tx.Units)
+	if !tx.Confirmed || tx.Units != 600_000 {
+		t.Errorf("bep20 transfer confirmed=%t units=%d, want true/600000 (6.00 at 5 decimals)", tx.Confirmed, tx.Units)
 	}
 
 	tr, err := b.tronByHash(trxHash, 0)
 	if err != nil || tr == nil {
 		t.Fatalf("tron by-hash = (%v, %v), want a transfer", tr, err)
 	}
-	if tr.Units != 600 {
-		t.Errorf("tron transfer units = %d, want 600", tr.Units)
+	if tr.Units != 600_000 {
+		t.Errorf("tron transfer units = %d, want 600000 (6.00 at 5 decimals)", tr.Units)
 	}
 }
 
@@ -1774,11 +1888,14 @@ func TestTronByHashResolvesPageLimitAndAPIBaseFromDotEnvSnapshot(t *testing.T) {
 // not independently pinned here.)
 //
 // Every geometry value is set via .env only, to numbers that don't collide
-// with the shipped defaults (Step 21/Tol 10/Decimals 2 for both rails).
+// with the shipped defaults (Step 101/Tol 50/Decimals 5 for both rails) and
+// that still satisfy Validate at their own precision: BEP20 at 4 decimals has
+// a 100-unit jitter span, so Step 99 fits; TRON at 6 decimals has a 10000-unit
+// span, so Step 77 fits easily.
 //
 // Falsification: revert dispatch.go's bands.Config{Providers: ...} literal
 // back to calling bep20.AmountOffsetStep()/AmountMatchTol()/AmountDecimals()
-// and tron's equivalents directly, and Params comes back {21,10,2} for both
+// and tron's equivalents directly, and Params comes back {101,50,5} for both
 // providers instead of the .env-configured values.
 func TestNewResolvesBandGeometryFromDotEnvSnapshot(t *testing.T) {
 	for _, key := range []string{
@@ -1792,51 +1909,57 @@ func TestNewResolvesBandGeometryFromDotEnvSnapshot(t *testing.T) {
 	}
 
 	b := envDurationTestBot(t,
-		"BEP20_OFFSET_STEP=99\nBEP20_MATCH_TOL=17\nBEP20_AMOUNT_DECIMALS=3\n"+
-			"TRON_OFFSET_STEP=77\nTRON_MATCH_TOL=13\nTRON_AMOUNT_DECIMALS=4\n")
+		"BEP20_OFFSET_STEP=99\nBEP20_MATCH_TOL=17\nBEP20_AMOUNT_DECIMALS=4\n"+
+			"TRON_OFFSET_STEP=77\nTRON_MATCH_TOL=13\nTRON_AMOUNT_DECIMALS=6\n")
 
 	bepPrm, ok := b.bands.Params(bands.ProviderBEP20)
 	if !ok {
 		t.Fatal("no BEP20 params registered")
 	}
-	if bepPrm.Step != 99 || bepPrm.Tol != 17 || bepPrm.Decimals != 3 {
-		t.Errorf("BEP20 params = %+v, want {Step:99 Tol:17 Decimals:3} (the .env-configured "+
-			"geometry) — {21 10 2} would mean the shipped defaults leaked through", bepPrm)
+	if bepPrm.Step != 99 || bepPrm.Tol != 17 || bepPrm.Decimals != 4 {
+		t.Errorf("BEP20 params = %+v, want {Step:99 Tol:17 Decimals:4} (the .env-configured "+
+			"geometry) — {101 50 5} would mean the shipped defaults leaked through", bepPrm)
 	}
 	tronPrm, ok := b.bands.Params(bands.ProviderTron)
 	if !ok {
 		t.Fatal("no TRON params registered")
 	}
-	if tronPrm.Step != 77 || tronPrm.Tol != 13 || tronPrm.Decimals != 4 {
-		t.Errorf("TRON params = %+v, want {Step:77 Tol:13 Decimals:4} (the .env-configured "+
-			"geometry) — {21 10 2} would mean the shipped defaults leaked through", tronPrm)
+	if tronPrm.Step != 77 || tronPrm.Tol != 13 || tronPrm.Decimals != 6 {
+		t.Errorf("TRON params = %+v, want {Step:77 Tol:13 Decimals:6} (the .env-configured "+
+			"geometry) — {101 50 5} would mean the shipped defaults leaked through", tronPrm)
 	}
 }
 
-// TestUSDTDepositCreditResolvesMatchTolFromDotEnvSnapshot is the money-path
-// pin — the highest priority, per the review that requested this file:
-// DEPOSIT_MATCH_TOL_CENTS must reach bands.DepositCredit's tolUnits
-// parameter (usdt.go's real settle path) via b.envInt(b.cfg), not
-// bands.DepositMatchTolCents()'s raw env read, driven through an ACTUAL
-// deposit (dep:trx -> desired amount -> submit hash -> balance credited),
-// not a call to the pure function directly (that half is already pinned in
-// bands/credit_test.go — this test exists to catch usdt.go's call site
-// forgetting to resolve the value at all).
+// TestUSDTDepositMatchTolIsResolvedAndClamped is the money-path pin for the
+// deposit tolerance, driven through an ACTUAL deposit (dep:trx -> desired
+// amount -> submit hash -> balance credited) rather than a call to the pure
+// function.
 //
-// Desired top-up: 6.00 USDT (150,000 VND @ 25,000/USDT). Received: 5.50 USDT
-// — 50 cents short, which is OUTSIDE the compiled default tolerance (30c)
-// but INSIDE the .env-configured DEPOSIT_MATCH_TOL_CENTS=200. Under correct
-// resolution the underpay rounds UP to the full desired 150,000 VND
-// (bands.DepositCredit's within-tolerance rule); under the 30c default it
-// would instead credit only the actual 137,500 VND received.
+// WHAT CHANGED, and why the old assertion could not survive the 5-decimal
+// geometry. This test used to set DEPOSIT_MATCH_TOL_CENTS=200 and prove that a
+// 50-cent underpay rounded UP to the full requested top-up, where the 30-cent
+// default would have credited the smaller actual amount. That observable no
+// longer exists: the picker quotes the request PLUS a jitter of at least
+// 0.01 USDT, and the largest tolerance the geometry permits (half the 0.00101
+// band spacing) is twenty times smaller than that jitter — so any receipt
+// within tolerance of the quote is already worth MORE than the request, the
+// max() always picks the actual, and no legal tolerance can change a credit.
+// Asserting a balance difference would have meant inventing an unreachable
+// state.
 //
-// Falsification: change usdt.go's verifyUSDTTxid deposit branch back to
-// bands.DepositCredit(recvUnits, desiredUnits, o.Total, recvVND,
-// bands.DepositMatchTolCents()) (the pre-#42 direct raw-env call) and the
-// credited balance comes back 137,500 instead of 150,000.
-func TestUSDTDepositCreditResolvesMatchTolFromDotEnvSnapshot(t *testing.T) {
-	if _, ok := os.LookupEnv("DEPOSIT_MATCH_TOL_CENTS"); ok {
-		t.Fatal("fixture broken: DEPOSIT_MATCH_TOL_CENTS is set in the ambient environment, " +
+// What IS observable, and is the property that actually protects money, is the
+// CLAMP: an operator who reads "tolerance" and types a cents-era 200000 must
+// not thereby widen the deposit's match window to 2 USDT, which WOULD change
+// credits (a 4.50 receipt against a 6.01000 quote would round up to the full
+// 6.00 request, handing the customer 1.50 USDT they never sent) and would let
+// one receipt sit inside a thousand live bands at once.
+//
+// Falsification: drop bands.ClampDepositTol from usdt.go's DepositCredit call
+// and the credited balance comes back 150000 instead of the 112500 actually
+// received.
+func TestUSDTDepositMatchTolIsResolvedAndClamped(t *testing.T) {
+	if _, ok := os.LookupEnv("DEPOSIT_MATCH_TOL_UNITS"); ok {
+		t.Fatal("fixture broken: DEPOSIT_MATCH_TOL_UNITS is set in the ambient environment, " +
 			"so this test would pass even if the caller read raw env")
 	}
 
@@ -1845,7 +1968,7 @@ func TestUSDTDepositCreditResolvesMatchTolFromDotEnvSnapshot(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(
 		"USD_TO_VND=25000\n"+
 			"TRON_ADDRESS="+testSellerTRX+"\n"+
-			"DEPOSIT_MATCH_TOL_CENTS=200\n",
+			"DEPOSIT_MATCH_TOL_UNITS=200000\n",
 	), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1863,9 +1986,9 @@ func TestUSDTDepositCreditResolvesMatchTolFromDotEnvSnapshot(t *testing.T) {
 	t.Cleanup(func() { b.Shutdown(); st.Close() })
 
 	// pay_tron defaults OFF; turn it on the same way newUSDTBotAtRate does.
-	s := b.cfg.Settings()
-	s["pay_tron"] = true
-	if err := b.cfg.SaveSettings(s); err != nil {
+	sett := b.cfg.Settings()
+	sett["pay_tron"] = true
+	if err := b.cfg.SaveSettings(sett); err != nil {
 		t.Fatalf("save settings: %v", err)
 	}
 	// The chain-lookup seam is scripted (this test targets the CREDIT-DECISION
@@ -1876,6 +1999,15 @@ func TestUSDTDepositCreditResolvesMatchTolFromDotEnvSnapshot(t *testing.T) {
 		return trxByHash[strings.ToLower(strings.TrimPrefix(txhash, "0x"))], nil
 	}
 
+	// HALF ONE: the .env value really is resolved through the config snapshot
+	// and not through the pay package's raw os.Getenv (task #42's bug class).
+	// Asserted here rather than through a balance, because the clamp below
+	// deliberately erases its effect on the credit.
+	if got := b.envInt("DEPOSIT_MATCH_TOL_UNITS", bands.DefaultDepositMatchTolUnits); got != 200000 {
+		t.Errorf("resolved DEPOSIT_MATCH_TOL_UNITS = %d, want 200000 (the .env value) — "+
+			"%d would mean the compiled default leaked through", got, bands.DefaultDepositMatchTolUnits)
+	}
+
 	const chat = 470
 	b.Process(ctx, callbackUpdate(chat, "dep:trx"))
 	b.Process(ctx, textUpdate(chat, "6")) // desired 6.00 USDT = 150,000 VND
@@ -1883,16 +2015,18 @@ func TestUSDTDepositCreditResolvesMatchTolFromDotEnvSnapshot(t *testing.T) {
 	o := reservedDeposit(t, st, chat)
 	armTxid(t, ctx, b, chat, chainTRX, o.Des)
 
+	// HALF TWO: 4.50 arrives against a 6.01000 quote — 1.51 USDT off. The
+	// configured 200000-unit tolerance would swallow that and credit the full
+	// requested 6.00; the clamp to the rail's 50-unit band half-width means it
+	// is far outside tolerance and the customer is credited what they sent.
 	h := hash64("5")
-	trxByHash[strings.ToLower(h)] = trxTx(h, "5.50", time.Now().UnixMilli()) // 50c short
+	trxByHash[strings.ToLower(h)] = trxTx(h, "4.50000", time.Now().UnixMilli())
 	b.Process(ctx, textUpdate(chat, h))
 
 	bal, _ := st.GetBalance(fmtInt(chat))
-	if bal != 150000 {
-		t.Errorf("credited %d VND, want 150000 — a 50c underpay is outside the 30c default "+
-			"tolerance but inside the .env-configured 200c one, so it must round up to the "+
-			"full desired amount; 137500 would mean the default (30c) leaked through and the "+
-			"underpay was credited at its actual (out-of-tolerance) value instead", bal)
+	if bal != 112500 {
+		t.Errorf("credited %d VND, want 112500 (the 4.50 USDT actually received); 150000 would mean "+
+			"an unclamped 2-USDT tolerance rounded a 1.51-USDT shortfall up to the full request", bal)
 	}
 }
 

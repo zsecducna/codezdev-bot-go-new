@@ -63,16 +63,19 @@ var httpClient = &http.Client{Timeout: httpTimeout}
 // MinConfirmations's doc comment) has the same default to fall back to
 // without hardcoding a second copy of the literal.
 const (
-	DefaultAmountDecimals   = 2
+	DefaultAmountDecimals   = 5
 	DefaultMinConfirmations = 12
-	DefaultAmountMatchTol   = 10
-	DefaultAmountOffsetStep = 21
+	DefaultAmountMatchTol   = 50
+	DefaultAmountOffsetStep = 101
 )
 
-// AmountDecimals is the precision of the per-order UNIQUE amount. 2 = cents
-// (universally sendable from any wallet/CEX, clean UX); bump only if
-// high-volume same-price bursts ever make the 1/step concurrency cap real.
-// On-chain supports 18 decimals regardless (bep20_pay.py:37-40).
+// AmountDecimals is the precision of the per-order UNIQUE amount. 5 = 1e-5
+// USDT, raised from the Python original's 2 (cents) by the hands-free-deposits
+// ruling: the picker's identifying jitter is only 0.01000-0.01999 USDT wide, so
+// the slots inside it are 0.00101 apart and cents cannot express them. BSC
+// Binance-Peg USDT carries 18 decimals on-chain, so 5 is exactly representable
+// and weiToUnits' 18->5 floor discards at most 0.00001 USDT — a fiftieth of the
+// match tolerance (bep20_pay.py:37-40).
 func AmountDecimals() int {
 	return envInt("BEP20_AMOUNT_DECIMALS", DefaultAmountDecimals)
 }
@@ -95,13 +98,21 @@ func MinConfirmations() int {
 	return envInt("BEP20_MIN_CONF", DefaultMinConfirmations)
 }
 
-// AmountMatchTol / AmountOffsetStep: amount matching is FUZZY so a customer
-// who drops a cent or two still confirms. A payment within AmountMatchTol
-// units of the expected amount matches; the unique-amount picker spaces
-// concurrent same-price orders by AmountOffsetStep units (>= 2*tol+1) so the
-// ±tol bands never overlap -> a payment maps to exactly one order. Units are
-// at AmountDecimals precision. Default tol = 10 cents; step = 21
-// (bep20_pay.py:44-58).
+// AmountMatchTol / AmountOffsetStep: a payment within AmountMatchTol units of
+// the expected amount matches; the unique-amount picker spaces concurrent
+// same-price orders by AmountOffsetStep units (>= 2*tol+1) so the ±tol bands
+// never overlap -> a payment maps to exactly one order. Units are at
+// AmountDecimals precision.
+//
+// Default tol = 50 (0.00050 USDT), step = 101 (0.00101 USDT) — exactly
+// 2*50+1, the tightest step the disjointness rule permits, chosen so ten slots
+// fit the 0.01000-0.01999 jitter window. Matching is therefore ESSENTIALLY
+// EXACT rather than the Python original's forgiving 10-cent fuzz: customers pay
+// from personal wallets, the exact amount arrives, and the TRC20/BEP20 network
+// fee is charged separately instead of being skimmed off the transfer. The pay
+// screen says so in every language (i18n catalog_pay.go), because a sender
+// whose platform DOES skim must add the fee on top for the arriving figure to
+// match (bep20_pay.py:44-58).
 func AmountMatchTol() int {
 	return envInt("BEP20_MATCH_TOL", DefaultAmountMatchTol)
 }

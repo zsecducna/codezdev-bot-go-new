@@ -56,9 +56,9 @@ type Reservation struct {
 	// ChatID owns the session. Same-chat rules (own-dead-sessions-never-block,
 	// sibling redirect) key off this.
 	ChatID string
-	// Amount is the customer-facing unique amount string, e.g. "6.21".
+	// Amount is the customer-facing unique amount string, e.g. "6.01101".
 	Amount string
-	// Units is Amount at Decimals precision (621 at 2 decimals).
+	// Units is Amount at Decimals precision (601101 at 5 decimals).
 	Units int64
 	// Decimals is the precision Units is expressed in.
 	Decimals int
@@ -429,7 +429,7 @@ func (r *Registry) RecvMatchesAnyOtherBand(p Provider, des string, recvUnits int
 //
 // The case it fixes (prod audit 2026-07-02): the customer's first order expired
 // but its row keeps the band for the 2h grace; they re-order and get a NEW
-// offset amount (6.21) — yet they had already sent the OLD amount (6.00). When
+// offset amount (6.01101) — yet they had already sent the OLD one (6.01000). When
 // they paste the hash on the newest screen it mismatches, and without this
 // redirect they dead-end on "amount conflict, contact support". Rerouting the
 // verify to their OWN sibling order is safe: ownership is identical, the

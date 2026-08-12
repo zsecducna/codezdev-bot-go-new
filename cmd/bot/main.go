@@ -165,11 +165,19 @@ func main() {
 	// migration (S3) — the registry itself needed no change; it was always
 	// provider-agnostic.
 	//
-	// Geometry comes from each rail's own env-backed getters (BEP20/TRON step 21
-	// tol 10 at 2 decimals), so an operator tuning *_OFFSET_STEP / *_MATCH_TOL
-	// is honoured. Invalid geometry (a step that cannot keep bands disjoint) is
-	// a money-safety failure: refuse to boot rather than hand two live orders
-	// the same amount.
+	// Geometry comes from each rail's own env-backed getters (BEP20/TRON step
+	// 101, tol 50, at 5 decimals — 0.00101 USDT apart with a ±0.00050 band), so
+	// an operator tuning *_OFFSET_STEP / *_MATCH_TOL is honoured. Invalid
+	// geometry (a step that cannot keep bands disjoint) is a money-safety
+	// failure: refuse to boot rather than hand two live orders the same amount.
+	//
+	// DEPLOY NOTE for the 5-decimal cutover: an existing .env that still pins
+	// the superseded *_AMOUNT_DECIMALS=2 / *_OFFSET_STEP=21 / *_MATCH_TOL=10
+	// now fails Validate (at 2 decimals the 0.01-0.02 jitter window is one unit
+	// wide and a 21-unit step cannot fit in it), so this Fatalf fires and the
+	// bot will not start until those lines are removed or updated. That is the
+	// money-safe direction — booting on a geometry whose slots fall outside the
+	// window would quote amounts the watcher's matcher was not built for.
 	bandReg, err := bands.New(bands.Config{Providers: map[bands.Provider]bands.Params{
 		bands.ProviderBEP20: {Step: bep20.AmountOffsetStep(), Tol: bep20.AmountMatchTol(), Decimals: bep20.AmountDecimals()},
 		bands.ProviderTron:  {Step: tron.AmountOffsetStep(), Tol: tron.AmountMatchTol(), Decimals: tron.AmountDecimals()},

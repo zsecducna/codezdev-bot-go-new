@@ -18,6 +18,23 @@ type PayCatalog struct {
 	// BEP20Pay / TronPay — BEP20_PAY / TRON_PAY (telegram_bot.py:1352/1371): the
 	// on-chain pay+deposit screens; {usdt} {address}. Markdown so the address
 	// renders as a copyable code block.
+	//
+	// DELIBERATE DEVIATION from the byte-verbatim rule this file otherwise
+	// follows, required by the hands-free-deposits ruling. The quoted amount is
+	// now the price plus a 0.01000-0.01999 USDT jitter carried to five decimals,
+	// and a payment is matched to an order within ±0.00050 — essentially
+	// exactly. The Python copy was written for a ±0.10 tolerance, where "be
+	// aware of your own network fee" was advice; at this precision a platform
+	// that skims its fee out of the transfer makes the payment unmatchable, so
+	// the screen has to say two things plainly and in every language:
+	//
+	//  1. the network fee is the customer's, paid ON TOP of the amount;
+	//  2. the figure that must ARRIVE is exact to all five decimals, so a
+	//     sender whose platform deducts from the transfer must add it back.
+	//
+	// {usdt} is wrapped in Markdown backticks — the same emphasis the address
+	// already uses on this screen — so the amount is visually prominent and
+	// tap-to-copy, rather than a long decimal a customer retypes by hand.
 	BEP20Pay Str
 	TronPay  Str
 	// USDTPaidBtn — USDT_PAID_BTN (telegram_bot.py:1391): the inline button under
@@ -64,40 +81,59 @@ type PayCatalog struct {
 // cited Python constants.
 func buildPayCatalog() PayCatalog {
 	return PayCatalog{
-		// BEP20_PAY (telegram_bot.py:1352).
+		// BEP20_PAY (telegram_bot.py:1352), REWRITTEN — see the BEP20Pay/TronPay
+		// field doc for why these two strings are no longer byte-verbatim.
 		BEP20Pay: Str{
-			VI: "🟡 Gửi CHÍNH XÁC {usdt} USDT tới địa chỉ BEP20 (BNB Smart Chain) sau:\n" +
+			VI: "🟡 Gửi CHÍNH XÁC `{usdt}` USDT tới địa chỉ BEP20 (BNB Smart Chain) sau:\n" +
 				"`{address}`\n" +
-				"⚠️ ĐÚNG mạng BEP20 và ĐÚNG số tiền {usdt} USDT (số tiền này gắn với đơn của bạn) — " +
-				"lưu ý phí mạng của bạn (tùy nền tảng), gửi sao cho đủ {usdt} USDT về tới nơi.\n" +
+				"⚠️ CHỈ dùng mạng BEP20.\n" +
+				"⚠️ Số tiền phải VỀ TỚI NƠI đúng từng chữ số — đủ cả 5 chữ số thập phân của `{usdt}` USDT. " +
+				"Chính con số này nhận diện đơn của bạn.\n" +
+				"⚠️ Phí mạng do bạn trả, CỘNG THÊM. Nếu ví hoặc sàn của bạn trừ phí VÀO chính giao dịch, " +
+				"hãy tăng số tiền gửi để đúng `{usdt}` USDT vẫn về tới nơi.\n" +
 				"👉 Sau khi chuyển và giao dịch được xác nhận trên chuỗi, bấm nút bên dưới và dán mã giao dịch (tx ID).",
-			EN: "🟡 Send EXACTLY {usdt} USDT to this BEP20 (BNB Smart Chain) address:\n" +
+			EN: "🟡 Send EXACTLY `{usdt}` USDT to this BEP20 (BNB Smart Chain) address:\n" +
 				"`{address}`\n" +
-				"⚠️ BEP20 network only, and the EXACT {usdt} USDT (this amount is tied to your order) — " +
-				"be aware of your own network fee (varies by platform), so the full {usdt} USDT actually arrives.\n" +
+				"⚠️ BEP20 network ONLY.\n" +
+				"⚠️ The amount must ARRIVE exact to every digit — all 5 decimals of `{usdt}` USDT. " +
+				"That exact figure is what identifies your order.\n" +
+				"⚠️ The network fee is yours to pay, ON TOP. If your wallet or exchange takes its fee OUT of " +
+				"the transfer, raise what you send so exactly `{usdt}` USDT still arrives.\n" +
 				"👉 After you transfer and the tx is confirmed on-chain, tap the button below and paste your transaction ID (hash).",
-			ZH: "🟡 请准确发送 {usdt} USDT 到以下 BEP20（BNB 智能链）地址：\n" +
+			ZH: "🟡 请准确发送 `{usdt}` USDT 到以下 BEP20（BNB 智能链）地址：\n" +
 				"`{address}`\n" +
-				"⚠️ 仅限 BEP20 网络，且准确的 {usdt} USDT（该金额与您的订单绑定）——" +
-				"请注意您自己的网络费（因平台而异），确保完整的 {usdt} USDT 实际到账。\n" +
+				"⚠️ 仅限 BEP20 网络。\n" +
+				"⚠️ 到账金额必须每一位都完全一致——`{usdt}` USDT 的全部 5 位小数都要对上。" +
+				"正是这个数字用来识别您的订单。\n" +
+				"⚠️ 网络费由您另行承担。如果您的钱包或交易所从转账金额中扣除手续费，" +
+				"请相应提高发送金额，确保准确的 `{usdt}` USDT 到账。\n" +
 				"👉 转账并在链上确认后，点击下方按钮并粘贴您的交易 ID（哈希）。",
 		},
-		// TRON_PAY (telegram_bot.py:1371).
+		// TRON_PAY (telegram_bot.py:1371), REWRITTEN — same reasoning as BEP20Pay.
 		TronPay: Str{
-			VI: "🔴 Gửi CHÍNH XÁC {usdt} USDT tới địa chỉ TRC20 (TRON) sau:\n" +
+			VI: "🔴 Gửi CHÍNH XÁC `{usdt}` USDT tới địa chỉ TRC20 (TRON) sau:\n" +
 				"`{address}`\n" +
-				"⚠️ ĐÚNG mạng TRC20 và ĐÚNG số tiền {usdt} USDT (số tiền này gắn với đơn của bạn) — " +
-				"lưu ý phí mạng của bạn (tùy nền tảng), gửi sao cho đủ {usdt} USDT về tới nơi.\n" +
+				"⚠️ CHỈ dùng mạng TRC20.\n" +
+				"⚠️ Số tiền phải VỀ TỚI NƠI đúng từng chữ số — đủ cả 5 chữ số thập phân của `{usdt}` USDT. " +
+				"Chính con số này nhận diện đơn của bạn.\n" +
+				"⚠️ Phí mạng do bạn trả, CỘNG THÊM. Nếu ví hoặc sàn của bạn trừ phí VÀO chính giao dịch, " +
+				"hãy tăng số tiền gửi để đúng `{usdt}` USDT vẫn về tới nơi.\n" +
 				"👉 Sau khi chuyển và giao dịch được xác nhận trên chuỗi, bấm nút bên dưới và dán mã giao dịch (tx ID).",
-			EN: "🔴 Send EXACTLY {usdt} USDT to this TRC20 (TRON) address:\n" +
+			EN: "🔴 Send EXACTLY `{usdt}` USDT to this TRC20 (TRON) address:\n" +
 				"`{address}`\n" +
-				"⚠️ TRC20 network only, and the EXACT {usdt} USDT (this amount is tied to your order) — " +
-				"be aware of your own network fee (varies by platform), so the full {usdt} USDT actually arrives.\n" +
+				"⚠️ TRC20 network ONLY.\n" +
+				"⚠️ The amount must ARRIVE exact to every digit — all 5 decimals of `{usdt}` USDT. " +
+				"That exact figure is what identifies your order.\n" +
+				"⚠️ The network fee is yours to pay, ON TOP. If your wallet or exchange takes its fee OUT of " +
+				"the transfer, raise what you send so exactly `{usdt}` USDT still arrives.\n" +
 				"👉 After you transfer and the tx is confirmed on-chain, tap the button below and paste your transaction ID (hash).",
-			ZH: "🔴 请准确发送 {usdt} USDT 到以下 TRC20（TRON）地址：\n" +
+			ZH: "🔴 请准确发送 `{usdt}` USDT 到以下 TRC20（TRON）地址：\n" +
 				"`{address}`\n" +
-				"⚠️ 仅限 TRC20 网络，且准确的 {usdt} USDT（该金额与您的订单绑定）——" +
-				"请注意您自己的网络费（因平台而异），确保完整的 {usdt} USDT 实际到账。\n" +
+				"⚠️ 仅限 TRC20 网络。\n" +
+				"⚠️ 到账金额必须每一位都完全一致——`{usdt}` USDT 的全部 5 位小数都要对上。" +
+				"正是这个数字用来识别您的订单。\n" +
+				"⚠️ 网络费由您另行承担。如果您的钱包或交易所从转账金额中扣除手续费，" +
+				"请相应提高发送金额，确保准确的 `{usdt}` USDT 到账。\n" +
 				"👉 转账并在链上确认后，点击下方按钮并粘贴您的交易 ID（哈希）。",
 		},
 		// USDT_PAID_BTN (telegram_bot.py:1391).

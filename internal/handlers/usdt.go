@@ -406,12 +406,12 @@ func (b *Bot) adoptUSDTAmount(p bands.Provider, amount, chatID, des string, tota
 // PICKED amount, like an order (see reserveUSDTAmount): a hands-free watcher
 // attributes an incoming payment by amount alone, so two customers depositing
 // the same round "120" at once must be handed different amounts or their
-// payments would be indistinguishable. The picker tries the round base first —
-// most deposits still quote exactly "120.00" — and only offsets to the next
-// MinGap-spaced slot (e.g. "120.21" at the shipped 21-cent step) when that base
-// is already held by a live session. DepositCredit's tolerance still governs
-// what the customer is credited if the amount that lands differs slightly from
-// whichever amount they were quoted.
+// payments would be indistinguishable. Every deposit is quoted the round base
+// PLUS a 0.01000-0.01999 USDT jitter — "120.01000" for a free first slot, then
+// "120.01101", "120.01202" and so on for concurrent same-price sessions — so a
+// round number is never quoted and the amount alone names one order. The
+// customer keeps the difference: an on-chain deposit credits what actually
+// ARRIVED, which is always at least the jitter above what they asked for.
 func (b *Bot) startBep20Deposit(ctx context.Context, chatID int64, lang i18n.Lang, vnd int64) {
 	b.startOnchainDeposit(ctx, chatID, lang, vnd, chainBSC)
 }
@@ -882,10 +882,12 @@ func (b *Bot) pollUSDTConfirm(st *ChatState, chatID int64, chain, des, txhash st
 // PAY-for-order: the UNIQUE per-order amount binds a payment to exactly one
 // order; the [start, click] window + the processed-ledger PK + confirmed-only
 // complete the proof.
-// DEPOSIT: no offset — the customer sends their DESIRED amount and is credited
-// exactly that within DEPOSIT_MATCH_TOL_CENTS (bands.DepositCredit), else the
-// actual received amount; the window + confirmed + hash-dedupe are the deposit's
-// defenses. tx.from is logged for forensics, NEVER used as an auth gate.
+// DEPOSIT: also a picked amount (the request plus the 0.01000-0.01999 jitter),
+// but no claim-jack band gate — a deposit credits the SUBMITTER's own wallet, so
+// it is credited the actual received amount, or the requested total when that is
+// larger and the receipt is within DEPOSIT_MATCH_TOL_UNITS (bands.DepositCredit);
+// the window + confirmed + hash-dedupe are the deposit's defenses. tx.from is
+// logged for forensics, NEVER used as an auth gate.
 //
 // `quiet` (confirmation-poll retries) suppresses the "not found / not confirmed
 // yet" messages so the background poll can keep re-checking silently; terminal
@@ -972,7 +974,12 @@ func (b *Bot) verifyUSDTTxid(ctx context.Context, chatID int64, chain, des, txha
 		txID, txTS, recvUnits, frm = tx.ID, float64(tx.TS)/1000.0, tx.Units, tx.Frm
 		recv = new(big.Rat).SetFrac(tx.Value, pow10BigInt(tron.TokenDecimals))
 	}
-	recvStr := recv.FloatString(2)
+	// Rendered at the RAIL's precision, not a hardcoded 2 dp. Bands are now
+	// 0.00101 USDT apart, so a 2-dp render collapses ten distinct slots onto one
+	// string — it would show "120.01" for every one of them, in the customer's
+	// amount-mismatch message and in every audit line an operator would use to
+	// reconstruct which order a payment was meant for.
+	recvStr := recv.FloatString(prm.Decimals)
 	chatStr := fmtInt(chatID)
 	ledgerID := ledgerPrefix(p) + ":" + txID
 
@@ -1034,15 +1041,22 @@ func (b *Bot) verifyUSDTTxid(ctx context.Context, chatID int64, chain, des, txha
 			log.Printf("usdt deposit (%s) bad stored amount %q for %s: %v", chain, expected, des, aerr)
 			return b.txidNotFound(ctx, chatID, lang, quiet)
 		}
-		// DEPOSIT_MATCH_TOL_CENTS is read through b.envInt (the config.Load
-		// snapshot), NOT bands.DepositMatchTolCents() — that helper uses the
+		// DEPOSIT_MATCH_TOL_UNITS is read through b.envInt (the config.Load
+		// snapshot), NOT bands.DepositMatchTolUnits() — that helper uses the
 		// pay package's raw os.Getenv, which production never populates
 		// (config.Load deliberately does not write os.Environ and systemd
 		// exports no EnvironmentFile), so the knob silently did nothing on
 		// the live deposit-credit path while working in local testing. Same
 		// class as tasks #10/#17/#22/#23.
+		//
+		// ClampDepositTol caps whatever that resolves to at this rail's own
+		// band half-width. The two knobs live in different .env sections and
+		// are tuned independently, so a deposit tolerance wider than the band
+		// spacing is a reachable operator mistake — and it would make one
+		// receipt equidistant-and-matching for two live orders' amounts.
 		creditVND, _ := bands.DepositCredit(recvUnits, desiredUnits, o.Total, recvVND,
-			b.envInt("DEPOSIT_MATCH_TOL_CENTS", bands.DefaultDepositMatchTolCents))
+			bands.ClampDepositTol(prm,
+				b.envInt("DEPOSIT_MATCH_TOL_UNITS", bands.DefaultDepositMatchTolUnits)))
 		credited, bal, cerr := b.store.Credit(chatStr, creditVND, ledgerID) // atomic dedupe + credit
 		if cerr != nil {
 			log.Printf("usdt deposit credit failed [des=%s %s]: %v", des, ledgerID, cerr)

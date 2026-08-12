@@ -352,10 +352,18 @@ func New(d Deps) *Bot {
 			// one. Fall back to the SHIPPED defaults rather than run without a
 			// registry: the rails then price with known-good geometry and the
 			// operator sees the log line.
+			//
+			// The fallback reads the SAME Default* consts as the env lookups
+			// above rather than repeating their values as literals. It used to
+			// carry a hand-copied {21, 10, 2} pair, which the 5-decimal
+			// geometry change turned into a geometry that fails Validate — so
+			// the "unreachable" panic below was one env typo away from being
+			// the crash every misconfigured operator got. A copied constant is
+			// a constant that eventually disagrees.
 			log.Printf("bands: invalid env geometry (%v) — falling back to shipped defaults", err)
 			reg, err = bands.New(bands.Config{Providers: map[bands.Provider]bands.Params{
-				bands.ProviderBEP20: {Step: 21, Tol: 10, Decimals: 2},
-				bands.ProviderTron:  {Step: 21, Tol: 10, Decimals: 2},
+				bands.ProviderBEP20: {Step: bep20.DefaultAmountOffsetStep, Tol: bep20.DefaultAmountMatchTol, Decimals: bep20.DefaultAmountDecimals},
+				bands.ProviderTron:  {Step: tron.DefaultOffsetStep, Tol: tron.DefaultMatchTol, Decimals: tron.DefaultAmountDecimals},
 			}})
 			if err != nil { // unreachable: the shipped defaults validate
 				panic("handlers: shipped band defaults are invalid: " + err.Error())

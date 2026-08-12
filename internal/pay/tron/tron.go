@@ -57,9 +57,9 @@ var httpClient = &http.Client{Timeout: httpTimeout}
 // the literal.
 const (
 	DefaultAPIBase        = "https://api.trongrid.io"
-	DefaultAmountDecimals = 2
-	DefaultMatchTol       = 10
-	DefaultOffsetStep     = 21
+	DefaultAmountDecimals = 5
+	DefaultMatchTol       = 50
+	DefaultOffsetStep     = 101
 	DefaultPageLimit      = 200
 )
 
@@ -77,21 +77,26 @@ func apiBase() string {
 	return DefaultAPIBase
 }
 
-// AmountDecimals is the precision of the per-order UNIQUE amount. 2 = cents
-// (universally sendable from any wallet/CEX, clean UX). On-chain supports 6
-// decimals regardless. Mirrors bep20 so the shared unique-amount picker
-// behaves identically (tron_pay.py:38-40).
+// AmountDecimals is the precision of the per-order UNIQUE amount. 5 = 1e-5
+// USDT, raised from the Python original's 2 (cents) by the hands-free-deposits
+// ruling — see bep20.AmountDecimals for the reasoning; this mirrors it so the
+// SHARED unique-amount picker sees one precision across both rails and its
+// cross-provider collision set needs no rescaling. TRC20 USDT carries exactly 6
+// decimals on-chain, so 5 is representable and valToUnits' 6->5 floor discards
+// at most 0.000009 USDT — under a fifth of one amount unit, and a fiftieth of
+// the match tolerance (tron_pay.py:38-40).
 func AmountDecimals() int {
 	return envInt("TRON_AMOUNT_DECIMALS", DefaultAmountDecimals)
 }
 
-// AmountMatchTol / AmountOffsetStep: amount matching is FUZZY so a customer
-// who drops a cent or two still confirms. A payment within AmountMatchTol
-// units of the expected amount matches; the unique-amount picker spaces
-// concurrent same-price orders by AmountOffsetStep units (>= 2*tol+1) so the
-// ±tol bands never overlap. Units are at AmountDecimals precision. Default
-// tol = 10 cents; step = 21 (>= 2*10+1) keeps same-price orders unambiguous
-// (tron_pay.py:41-54).
+// AmountMatchTol / AmountOffsetStep: a payment within AmountMatchTol units of
+// the expected amount matches; the unique-amount picker spaces concurrent
+// same-price orders by AmountOffsetStep units (>= 2*tol+1) so the ±tol bands
+// never overlap. Units are at AmountDecimals precision. Default tol = 50
+// (0.00050 USDT); step = 101 (0.00101 USDT) = exactly 2*50+1, which keeps
+// same-price orders unambiguous while fitting ten slots in the
+// 0.01000-0.01999 jitter window. Matching is essentially exact — see
+// bep20.AmountMatchTol for why that is safe (tron_pay.py:41-54).
 func AmountMatchTol() int {
 	return envInt("TRON_MATCH_TOL", DefaultMatchTol)
 }
