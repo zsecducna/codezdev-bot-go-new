@@ -63,9 +63,17 @@
 //
 // PRECISION (hands-free-deposits ruling, 2026-08-11). Amount units are
 // 1e-5 USDT (Decimals=5), not cents. The picker adds a jitter of 0.01000 to
-// 0.01999 USDT to the price so the amount identifies ONE order, and a match is
-// essentially exact (+/-0.00050). See JitterLoHundredths for the ruling and
-// Params.Slots for the resulting geometry.
+// 0.01999 USDT to the price so the amount identifies ONE order, and an EXACT
+// match is +/-0.00050. See JitterLoHundredths for the ruling and Params.Slots
+// for the resulting geometry.
+//
+// The exact path is not the whole matching story any more. A later user
+// amendment added FEE FORGIVENESS: a payment short by up to
+// min(0.5 USDT, 5% of the quote) is also attributable, because some senders
+// deduct the network fee out of the transfer. That window is far too wide for
+// MinGap to disambiguate, so it is a SEPARATE, explicitly ambiguity-checked
+// path — see match.go, which owns the whole rule. Everything in THIS file
+// governs the exact path only: MinGap, Tol, Slots, the picker.
 //
 // COHERENCE WITH THE MICRO-USDT LEDGER (.omc/plans/usdt-migration.md task #44,
 // which flips every money column to 1e-6 USDT): 5 decimals divides 6 exactly —

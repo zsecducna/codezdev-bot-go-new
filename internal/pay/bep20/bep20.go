@@ -106,13 +106,17 @@ func MinConfirmations() int {
 //
 // Default tol = 50 (0.00050 USDT), step = 101 (0.00101 USDT) — exactly
 // 2*50+1, the tightest step the disjointness rule permits, chosen so ten slots
-// fit the 0.01000-0.01999 jitter window. Matching is therefore ESSENTIALLY
-// EXACT rather than the Python original's forgiving 10-cent fuzz: customers pay
-// from personal wallets, the exact amount arrives, and the TRC20/BEP20 network
-// fee is charged separately instead of being skimmed off the transfer. The pay
-// screen says so in every language (i18n catalog_pay.go), because a sender
-// whose platform DOES skim must add the fee on top for the arriving figure to
-// match (bep20_pay.py:44-58).
+// fit the 0.01000-0.01999 jitter window. EXACT matching is therefore far
+// tighter than the Python original's forgiving 10-cent fuzz: customers pay from
+// personal wallets, so the exact amount normally arrives and the network fee is
+// charged separately rather than skimmed off the transfer. The pay screen tells
+// them so in every language (i18n catalog_pay.go).
+//
+// A sender whose platform DOES skim is handled by a second, wider rule that
+// does not live here — bands/match.go's fee-shortfall path, which forgives up
+// to min(0.5 USDT, 5% of the quote) but only when exactly one live band could
+// claim the payment. Tol below governs the EXACT path; do not widen it in the
+// belief that it is what forgives a fee (bep20_pay.py:44-58).
 func AmountMatchTol() int {
 	return envInt("BEP20_MATCH_TOL", DefaultAmountMatchTol)
 }

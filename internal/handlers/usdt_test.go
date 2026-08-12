@@ -2040,8 +2040,17 @@ func TestUSDTDepositMatchTolIsResolvedAndClamped(t *testing.T) {
 // VND than the total they asked to top up — at which point the tolerance decides
 // whether they get what they asked for or the smaller new-rate value.
 //
-// Falsification: set DEPOSIT_MATCH_TOL_UNITS to 0 (or drop the max() from
-// DepositCredit) and the credit comes back 149649 instead of 150000.
+// The receipt is deliberately 30 units UNDER the quote rather than exactly on
+// it. An exact receipt would make |recv - desired| zero, which is inside ANY
+// tolerance including zero, so the tolerance would not be under test at all —
+// only the max() would be. 30 units is inside the shipped 50 and outside 0, so
+// both halves of the rule below actually bite. (Caught by the review pass: the
+// first version of this test asserted a tolerance regression it could not have
+// detected.)
+//
+// Falsification, both halves verified: set DEPOSIT_MATCH_TOL_UNITS to 0, or drop
+// the max() from DepositCredit, and the credit comes back as the smaller
+// new-rate value instead of 150000.
 func TestUSDTDepositRoundsUpWhenTheRateMovedDown(t *testing.T) {
 	ctx := context.Background()
 	b, _, st, _, fk := newUSDTBot(t) // USD_TO_VND=25000
@@ -2069,10 +2078,11 @@ func TestUSDTDepositRoundsUpWhenTheRateMovedDown(t *testing.T) {
 		t.Fatalf("save settings: %v", err)
 	}
 
-	// They send EXACTLY what they were quoted. At the new rate that is
-	// 6.01 * 24900 = 149,649 VND — 351 VND less than the 150,000 they asked for.
+	// They send 6.00970 — 30 units under the quote, well inside the 50-unit
+	// tolerance. At the new rate that is worth ~149,642 VND, under the 150,000
+	// they asked to top up, so the round-up rule is what decides the credit.
 	h := hash64("6")
-	fk.setTRX(h, trxTx(h, "6.01000", time.Now().UnixMilli()))
+	fk.setTRX(h, trxTx(h, "6.00970", time.Now().UnixMilli()))
 	b.Process(ctx, textUpdate(chat, h))
 
 	bal, _ := st.GetBalance(fmtInt(chat))

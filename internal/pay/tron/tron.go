@@ -95,8 +95,9 @@ func AmountDecimals() int {
 // never overlap. Units are at AmountDecimals precision. Default tol = 50
 // (0.00050 USDT); step = 101 (0.00101 USDT) = exactly 2*50+1, which keeps
 // same-price orders unambiguous while fitting ten slots in the
-// 0.01000-0.01999 jitter window. Matching is essentially exact — see
-// bep20.AmountMatchTol for why that is safe (tron_pay.py:41-54).
+// 0.01000-0.01999 jitter window. This is the EXACT path only — fee forgiveness
+// is a separate, ambiguity-checked rule in bands/match.go; see
+// bep20.AmountMatchTol for the full picture (tron_pay.py:41-54).
 func AmountMatchTol() int {
 	return envInt("TRON_MATCH_TOL", DefaultMatchTol)
 }

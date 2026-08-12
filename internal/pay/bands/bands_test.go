@@ -433,8 +433,11 @@ func TestUniqueAmountWideGeometry(t *testing.T) {
 // telegram_bot.py:9745 (`abs(recv_units - want_units) <= AMOUNT_MATCH_TOL`):
 // exactly tol matches, one unit past it does not.
 //
-// Matching is now essentially EXACT: a payment right to the last decimal
-// settles, and one further off than 0.00050 does not.
+// The EXACT path is now essentially exact: a payment right to the last decimal
+// settles, and one further off than 0.00050 does not match THIS band. "Does not
+// match" is not "is rejected" — a short receipt may still be attributable by the
+// separate fee-shortfall rule in match.go, which is deliberately much wider and
+// carries its own ambiguity check. This test owns the exact path only.
 func TestRecvMatchesBandTolerance(t *testing.T) {
 	const expected = "6.01000" // a real picked amount: base 6.00 + the jitter floor
 	cases := []struct {
