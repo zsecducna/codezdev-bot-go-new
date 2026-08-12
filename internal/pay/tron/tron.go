@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"math/big"
 	"net/http"
@@ -332,6 +333,14 @@ func GetIncomingTransfers(addr string, minTSMS int64, apiKey string) ([]Transfer
 // comment. pageLimit/base are the caller-resolved TRON_PAGE_LIMIT/
 // TRON_API_BASE (see PageLimit's/apiBase's doc comments) rather than read
 // from raw env here.
+//
+// THE WHOLE WINDOW, not one page. pageLimit sizes a page; this follows
+// TronGrid's fingerprint continuation until the window is exhausted (or the
+// maxTransferPages guard fires, which is logged). That matters because the sort
+// is ASCENDING: with a single fixed page the transfers dropped are the newest
+// ones, which are precisely the payments a customer is waiting to be credited
+// for. Flipping the sort would not have fixed it — it would only have moved the
+// loss to the oldest end of the window.
 func GetIncomingTransfersConf(addr string, minTSMS int64, apiKey string, pageLimit int, base string) ([]Transfer, error) {
 	params := url.Values{}
 	params.Set("only_to", "true")
@@ -341,16 +350,67 @@ func GetIncomingTransfersConf(addr string, minTSMS int64, apiKey string, pageLim
 	params.Set("limit", strconv.Itoa(pageLimit))
 	params.Set("order_by", "block_timestamp,asc")
 
-	d, err := apiGetConf(fmt.Sprintf("/v1/accounts/%s/transactions/trc20", addr), params, apiKey, base)
-	if err != nil {
-		return nil, err
-	}
-	success, _ := d["success"].(bool)
-	if !success {
-		return nil, nil
-	}
-	data, _ := d["data"].([]any)
+	path := fmt.Sprintf("/v1/accounts/%s/transactions/trc20", addr)
 	var out []Transfer
+	for page := 1; ; page++ {
+		d, err := apiGetConf(path, params, apiKey, base)
+		if err != nil {
+			return nil, err
+		}
+		success, _ := d["success"].(bool)
+		if !success {
+			if page > 1 {
+				// A window half-read must NEVER be handed back as if it were
+				// complete: the caller would treat the missing tail as "no such
+				// payment arrived". Fail the whole fetch and let the next tick
+				// start over.
+				return nil, fmt.Errorf("tron: page %d of the transfer window failed (success=false)", page)
+			}
+			return nil, nil // page 1: pre-existing "nothing to report" behaviour
+		}
+		data, _ := d["data"].([]any)
+		out = appendTransfers(out, data)
+		// PAGINATION. TronGrid returns meta.fingerprint ONLY while more pages
+		// exist and omits it on the last one — verified against the live API on
+		// 2026-08-12, both directions. So its absence is the terminator; an
+		// empty page is the belt-and-braces one.
+		//
+		// The continuation is passed back as the `fingerprint` query param, and
+		// the API's own contract is that every OTHER parameter must stay
+		// identical between pages — which is why params is built once, above,
+		// and only this key is rewritten.
+		meta, _ := d["meta"].(map[string]any)
+		fp, _ := meta["fingerprint"].(string)
+		if fp == "" || len(data) == 0 {
+			return out, nil
+		}
+		if page >= maxTransferPages {
+			// One tick must not turn into unbounded HTTP against TronGrid. Keep
+			// what was read — those transfers are real and settleable — and say
+			// loudly that the tail was dropped, because the dropped tail is the
+			// NEWEST end of an ascending window, i.e. exactly the payments a
+			// customer is waiting on.
+			log.Printf("tron: transfer window TRUNCATED after %d pages of %d (%d transfers) — "+
+				"the newest transfers in this window were not read; raise TRON_PAGE_LIMIT or "+
+				"shorten the deposit window", page, pageLimit, len(out))
+			return out, nil
+		}
+		params.Set("fingerprint", fp)
+	}
+}
+
+// maxTransferPages bounds one GetIncomingTransfersConf call. At the shipped
+// TRON_PAGE_LIMIT of 200 that is 2,000 transfers in a single window — orders of
+// magnitude past this shop's real traffic, so it is a runaway guard rather than
+// a tuning knob: the watcher runs this inside a periodic tick, and a paging
+// loop with no ceiling could spend an unbounded number of HTTP calls there if
+// the API ever kept handing back a continuation.
+const maxTransferPages = 10
+
+// appendTransfers parses one page of the TRC20 response into Transfers. Split
+// out of GetIncomingTransfersConf only so the paging loop above stays readable;
+// the filtering rules are unchanged and are documented inline.
+func appendTransfers(out []Transfer, data []any) []Transfer {
 	for _, item := range data {
 		tx, ok := item.(map[string]any)
 		if !ok {
@@ -395,7 +455,7 @@ func GetIncomingTransfersConf(addr string, minTSMS int64, apiKey string, pageLim
 			TS:    int64(tsF),
 		})
 	}
-	return out, nil
+	return out
 }
 
 // MatchedTransfer is the result of a successful match (tron_pay.py:184):

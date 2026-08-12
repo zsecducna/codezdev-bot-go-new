@@ -1,9 +1,12 @@
 package tron
 
 import (
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -195,5 +198,122 @@ func TestGetIncomingTransfersConf_HonoursInjectedPageLimitAndBase(t *testing.T) 
 	}
 	if gotLimit != "99" {
 		t.Errorf("limit sent = %q, want \"99\" (the injected pageLimit, not env TRON_PAGE_LIMIT=7)", gotLimit)
+	}
+}
+
+// trc20Page renders one API page. `fingerprint` empty means LAST page — that is
+// TronGrid's real contract, verified against the live endpoint on 2026-08-12:
+// meta.fingerprint is present only while more pages exist and is omitted from
+// the final response.
+func trc20Page(fingerprint string, ids ...string) string {
+	rows := make([]string, 0, len(ids))
+	for i, id := range ids {
+		rows = append(rows, fmt.Sprintf(
+			`{"transaction_id":%q,"type":"Transfer","from":"TFrom","value":"1000000","block_timestamp":%d,`+
+				`"token_info":{"address":%q,"decimals":6}}`, id, 1700000000000+int64(i)*1000, USDTContract))
+	}
+	meta := `"meta":{"at":1,"page_size":` + strconv.Itoa(len(ids))
+	if fingerprint != "" {
+		meta += `,"fingerprint":"` + fingerprint + `"`
+	}
+	meta += `}`
+	return `{"success":true,"data":[` + strings.Join(rows, ",") + `],` + meta + `}`
+}
+
+// TestGetIncomingTransfersConfFollowsTheFingerprint pins the pagination
+// contract. A single fixed page silently drops the NEWEST transfers in an
+// ascending window — exactly the deposits a customer is waiting on — so
+// "returned a full page" is not the same as "read the window".
+func TestGetIncomingTransfersConfFollowsTheFingerprint(t *testing.T) {
+	var fingerprints []string
+	var otherParamsPerCall []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		fp := q.Get("fingerprint")
+		fingerprints = append(fingerprints, fp)
+		// The API's contract: every parameter EXCEPT fingerprint must be
+		// identical between pages. Record them so the test can prove it.
+		q.Del("fingerprint")
+		otherParamsPerCall = append(otherParamsPerCall, q.Encode())
+		w.Header().Set("Content-Type", "application/json")
+		switch fp {
+		case "":
+			w.Write([]byte(trc20Page("fp-1", "a1", "a2")))
+		case "fp-1":
+			w.Write([]byte(trc20Page("fp-2", "b1")))
+		default:
+			w.Write([]byte(trc20Page("", "c1"))) // no fingerprint -> last page
+		}
+	}))
+	defer srv.Close()
+
+	got, err := GetIncomingTransfersConf("Tseller", 0, "", 2, srv.URL)
+	if err != nil {
+		t.Fatalf("GetIncomingTransfersConf: %v", err)
+	}
+	if len(got) != 4 {
+		t.Errorf("got %d transfers, want 4 — the tail of the window was dropped", len(got))
+	}
+	if len(fingerprints) != 3 {
+		t.Fatalf("made %d requests (%v), want 3 — pagination stopped early or did not stop", len(fingerprints), fingerprints)
+	}
+	if fingerprints[1] != "fp-1" || fingerprints[2] != "fp-2" {
+		t.Errorf("fingerprints sent = %v, want [\"\", \"fp-1\", \"fp-2\"]", fingerprints)
+	}
+	for i, p := range otherParamsPerCall {
+		if p != otherParamsPerCall[0] {
+			t.Errorf("request %d changed a non-fingerprint parameter (%q vs %q) — the API requires "+
+				"every other parameter to stay identical across pages", i, p, otherParamsPerCall[0])
+		}
+	}
+}
+
+// TestGetIncomingTransfersConfFailsRatherThanReturnHalfAWindow: a page-2 error
+// must not come back as a short-but-successful read. The caller would treat the
+// missing tail as "that payment never arrived" and leave a real deposit
+// uncredited; failing means the next tick simply tries again.
+func TestGetIncomingTransfersConfFailsRatherThanReturnHalfAWindow(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			w.Write([]byte(trc20Page("fp-1", "a1")))
+			return
+		}
+		w.Write([]byte(`{"success":false}`))
+	}))
+	defer srv.Close()
+
+	got, err := GetIncomingTransfersConf("Tseller", 0, "", 1, srv.URL)
+	if err == nil {
+		t.Errorf("got (%d transfers, nil error), want an error — a half-read window must never look complete", len(got))
+	}
+	if got != nil {
+		t.Errorf("got %d transfers alongside the failure, want none", len(got))
+	}
+}
+
+// TestGetIncomingTransfersConfStopsAtThePageGuard: the runaway guard must bound
+// one call, keep what it read, and not loop forever against a server that hands
+// back a continuation indefinitely.
+func TestGetIncomingTransfersConfStopsAtThePageGuard(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(trc20Page("more", "id"+strconv.Itoa(calls)))) // never the last page
+	}))
+	defer srv.Close()
+
+	got, err := GetIncomingTransfersConf("Tseller", 0, "", 1, srv.URL)
+	if err != nil {
+		t.Fatalf("GetIncomingTransfersConf: %v", err)
+	}
+	if calls != maxTransferPages {
+		t.Errorf("made %d requests, want %d (the guard) — an unbounded pager inside a periodic tick", calls, maxTransferPages)
+	}
+	if len(got) != maxTransferPages {
+		t.Errorf("got %d transfers, want %d — what WAS read is real and must still be returned", len(got), maxTransferPages)
 	}
 }
