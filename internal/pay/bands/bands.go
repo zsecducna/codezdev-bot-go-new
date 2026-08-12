@@ -208,10 +208,32 @@ func (p Params) Validate() error {
 	}
 	// Decimals < 2 cannot represent the jitter window at all (a hundredth of a
 	// whole unit rounds to 0 units), so JitterLo()==JitterHiExcl()==0 and every
-	// picked amount would collapse onto base. Reject before the span checks so
-	// the operator gets the real reason instead of "Step exceeds the span".
+	// picked amount would collapse onto base. Checked before the Tol bound below
+	// because that bound is stated against the window, which needs a precision to
+	// be measured at.
 	if p.Decimals < 2 || p.Decimals > 9 {
 		return fmt.Errorf("bands: Decimals must be in [2,9], got %d (below 2 the %d/100..%d/100 jitter window is not representable)", p.Decimals, JitterLoHundredths, JitterHiHundredths)
+	}
+	// Tol has an UPPER bound, and it is not cosmetic — this is the check whose
+	// absence let a configuration break the package's one absolute invariant.
+	// Tol is operator-tunable through *_MATCH_TOL, MinGap() computes 2*Tol+1 in
+	// int, and at Tol >= 2^62 that OVERFLOWS to a negative gap. slotClear's
+	// `abs64(...) < b.minGap` is then never true, every live row stops blocking,
+	// and two concurrent same-price orders are handed the SAME amount — one
+	// receipt settling the wrong order, which is the exact failure this package
+	// exists to prevent. Nothing downstream would have noticed: Validate passed,
+	// bands.New succeeded, the bot booted. The same missing bound also overflows
+	// registry.collisionUnits' gap and rescaleTolCeil's up-scale (which
+	// multiplies Tol by up to 10^7 across a 2-to-9-decimal rail spread) at Tol
+	// values far smaller than 2^62.
+	//
+	// The bound is the jitter span rather than some arbitrary large number
+	// because it also means something: a Tol wider than the whole window makes
+	// every slot in the window overlap every other, so the price collapses to a
+	// single usable slot — the same misconfiguration the Step bound below
+	// rejects, arrived at from the tolerance side.
+	if span := p.JitterSpan(); int64(p.Tol) > span {
+		return fmt.Errorf("bands: Tol %d exceeds the jitter span %d at %d decimals: every slot in the window would overlap every other", p.Tol, span, p.Decimals)
 	}
 	// RESTATED (was: "Step must not exceed one whole unit"). That bound existed
 	// to stop the FIRST upward slot overshooting the customer's ask by more than
@@ -371,7 +393,10 @@ func uniqueAmountUnits(p Params, baseU int64, usedU []blocker, allowDownward boo
 	// strictly below JitterHiExcl(). Upward is preferred because it never
 	// undercharges, and the window keeps the overquote under 0.02 USDT.
 	lo := p.JitterLo()
-	for k := int64(0); k < int64(p.Slots()); k++ {
+	// Slots() is hoisted, not called per iteration: it is constant for the whole
+	// walk, and this loop runs under Registry.mu on the money path.
+	slots := int64(p.Slots())
+	for k := int64(0); k < slots; k++ {
 		cu := baseU + lo + k*step
 		if slotClear(cu, usedU) {
 			return cu, true
@@ -380,7 +405,8 @@ func uniqueAmountUnits(p Params, baseU int64, usedU []blocker, allowDownward boo
 	if !allowDownward {
 		return 0, false
 	}
-	// Last resort: the single slot BELOW base (telegram_bot.py:9089-9091).
+	// Last resort: the single slot BELOW base (telegram_bot.py:9089-9091,
+	// 5.99899 for a 6.00 price at the shipped 101-unit step).
 	// `cu > 0` guards a price so small that base-step would be zero/negative.
 	if cu := baseU - step; cu > 0 && slotClear(cu, usedU) {
 		return cu, true

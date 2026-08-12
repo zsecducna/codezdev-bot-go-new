@@ -2,6 +2,7 @@ package bands
 
 import (
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -75,6 +76,16 @@ func TestParamsValidateRejectsBadGeometry(t *testing.T) {
 		// at-least-one-slot check below cannot catch it — this is a real check,
 		// not a restatement of that one.
 		"step past the jitter span": {Step: 1001, Tol: 50, Decimals: 5},
+		// Tol needs an upper bound for the same window reason — and, far more
+		// urgently, because MinGap() computes 2*Tol+1 in int. Without this bound
+		// a Tol at or above 2^62 overflows to a NEGATIVE gap, slotClear's
+		// `abs64(...) < b.minGap` never fires, every live row stops blocking, and
+		// two concurrent same-price orders are handed the SAME amount. Verified:
+		// before the bound, Params{Step: 101, Tol: 4611686018427387904,
+		// Decimals: 5} passed Validate and Reserve returned "6.01000" twice.
+		"tol past the jitter span": {Step: 101, Tol: 1001, Decimals: 5},
+		"tol overflows MinGap":     {Step: 101, Tol: 1 << 62, Decimals: 5},
+		"tol at int64 max":         {Step: 101, Tol: math.MaxInt64, Decimals: 5},
 	}
 	for name, p := range cases {
 		if err := p.Validate(); err == nil {
@@ -93,6 +104,24 @@ func TestParamsValidateAllowsStepAtExactlyTheSpan(t *testing.T) {
 	}
 	if got := p.Slots(); got != 1 {
 		t.Errorf("Slots() at Step == span = %d, want 1", got)
+	}
+}
+
+// TestParamsValidateAllowsTolAtExactlyTheSpan is the matching boundary for the
+// Tol bound, and the direct regression pin for the overflow above: a Tol equal
+// to the span is legal (useless in practice — MinGap 2001 leaves one usable slot
+// — but not a misconfiguration the picker can be harmed by), one unit past it is
+// not, and MinGap must stay positive for every accepted Params.
+func TestParamsValidateAllowsTolAtExactlyTheSpan(t *testing.T) {
+	p := Params{Step: 1000, Tol: 1000, Decimals: 5}
+	if err := p.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil for Tol == the jitter span", err)
+	}
+	if p.MinGap() <= 0 {
+		t.Errorf("MinGap() = %d for accepted params — a non-positive gap disables slotClear entirely", p.MinGap())
+	}
+	if err := (Params{Step: 1000, Tol: 1001, Decimals: 5}).Validate(); err == nil {
+		t.Error("Validate() = nil for Tol one past the span, want error")
 	}
 }
 

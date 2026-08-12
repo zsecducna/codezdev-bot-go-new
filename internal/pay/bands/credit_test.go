@@ -64,11 +64,13 @@ func TestDepositCredit(t *testing.T) {
 				recv, got, vndOf(recv), desiredVND)
 		}
 	}
-	// :60-63 — the round-a-small-underpay-UP rule itself. Reached here with a
-	// synthetic recvVND below desiredVND, because on the real deposit path it
-	// CANNOT fire: the picker's jitter is >= 0.01 USDT, so anything within 0.0005
-	// of the picked amount is worth more than the requested total and the
-	// credit-the-actual rule above wins every time.
+	// :60-63 — the round-a-small-underpay-UP rule itself. recvVND is below
+	// desiredVND here, which on the deposit path happens when the USD_TO_VND rate
+	// moves DOWN between the quote and the verify: the quote was priced at the
+	// old rate, the receipt is valued at the new one, and the customer's exact
+	// payment is suddenly worth less than the total they asked to top up. At a
+	// stable rate the jitter keeps every in-tolerance receipt above the request
+	// and the credit-the-actual rule above wins instead.
 	if got, _ := DepositCredit(pickedUnits, pickedUnits, desiredVND, desiredVND-1, tol); got != desiredVND {
 		t.Errorf("underpay within tolerance credited %d, want the desired %d rounded up", got, desiredVND)
 	}

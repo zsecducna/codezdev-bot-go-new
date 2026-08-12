@@ -35,6 +35,13 @@ type PayCatalog struct {
 	// {usdt} is wrapped in Markdown backticks — the same emphasis the address
 	// already uses on this screen — so the amount is visually prominent and
 	// tap-to-copy, rather than a long decimal a customer retypes by hand.
+	//
+	// The "five decimals" figure is HARDCODED in all three languages while the
+	// precision itself is operator-tunable (*_AMOUNT_DECIMALS). That is a
+	// deliberate simplification, not an oversight — the ruling fixed the shipped
+	// precision at 5 — but an operator who changes AMOUNT_DECIMALS must update
+	// these strings too, or the screen will claim a digit count the amount does
+	// not have.
 	BEP20Pay Str
 	TronPay  Str
 	// USDTPaidBtn — USDT_PAID_BTN (telegram_bot.py:1391): the inline button under

@@ -167,9 +167,18 @@ func main() {
 	//
 	// Geometry comes from each rail's own env-backed getters (BEP20/TRON step
 	// 101, tol 50, at 5 decimals — 0.00101 USDT apart with a ±0.00050 band), so
-	// an operator tuning *_OFFSET_STEP / *_MATCH_TOL is honoured. Invalid
-	// geometry (a step that cannot keep bands disjoint) is a money-safety
-	// failure: refuse to boot rather than hand two live orders the same amount.
+	// an operator tuning *_OFFSET_STEP / *_MATCH_TOL is honoured. Geometry
+	// Validate REJECTS is one the picker cannot work with at all — no slot fits
+	// the jitter window, or a tolerance so wide it would overflow the gap
+	// arithmetic — and that refuses to boot rather than risk handing two live
+	// orders the same amount.
+	//
+	// A Step below MinGap is NOT such a case and deliberately does not stop the
+	// boot: the picker enforces MinGap per slot at pick time, so a short step
+	// can never produce a colliding amount, it only shrinks how many concurrent
+	// same-price orders fit (Python warns here too — bep20_pay.py:56-58). Left
+	// silent it is invisible, though: customers just start seeing USDT_BUSY. So
+	// it is logged, loudly, right after the registry is built.
 	//
 	// DEPLOY NOTE for the 5-decimal cutover: an existing .env that still pins
 	// the superseded *_AMOUNT_DECIMALS=2 / *_OFFSET_STEP=21 / *_MATCH_TOL=10
@@ -184,6 +193,16 @@ func main() {
 	}})
 	if err != nil {
 		log.Fatalf("USDT band geometry invalid: %v", err)
+	}
+	// The warn-don't-refuse case above. SpacingOK had no production caller until
+	// now, which is exactly why a Step-below-MinGap misconfiguration produced no
+	// diagnostic anywhere.
+	for _, prov := range []bands.Provider{bands.ProviderBEP20, bands.ProviderTron} {
+		if prm, ok := bandReg.Params(prov); ok && !prm.SpacingOK() {
+			log.Printf("WARNING: %s band step %d is below MinGap %d (2*tol+1) — amounts stay disjoint, "+
+				"but concurrent same-price orders will be refused USDT_BUSY far sooner than the %d slots the window holds",
+				prov, prm.Step, prm.MinGap(), prm.Slots())
+		}
 	}
 
 	bot := handlers.New(handlers.Deps{

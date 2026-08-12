@@ -264,7 +264,7 @@ func (r *Registry) collisionUnits(reqP Provider, prm Params, chatID, des string,
 		// (inside 5.80's band) — one payment, two orders. Widening by
 		// 10^(a-b)-1 restores gap >= tolReq + tolRow' + 10^(a-b) (since
 		// 2*max >= tolReq + tolRow'). Same-precision rails (all shipped ones,
-		// AMOUNT_DECIMALS=2 everywhere) take slack 0 and keep Python's exact
+		// AMOUNT_DECIMALS=5 everywhere) take slack 0 and keep Python's exact
 		// 2*tol+1; a FINER foreign row needs no slack (its floor into requester
 		// units only ever overstates its distance on the unsafe side by <1
 		// requester unit, and tolReq + tolRow' + 1 <= 2*max+1 already covers it).

@@ -37,11 +37,19 @@ package bands
 //     forgives it" and "the rail calls it this band" mean the same thing.
 //
 // Worth recording, because it is why shrinking from "30 cents" costs the
-// customer nothing: the picker's jitter is at least 0.01000 USDT, so any
-// receipt within tolerance of the picked amount is strictly ABOVE the
-// customer's requested total, recvVND > desiredVND, and DepositCredit's
-// round-a-small-underpay-up branch cannot fire on a deposit at all. The
-// tolerance now only labels the audit line's withinTol flag.
+// customer nothing: AT A STABLE EXCHANGE RATE the picker's jitter is at least
+// 0.01000 USDT, so any receipt within tolerance of the picked amount is worth
+// strictly MORE than the customer's requested total, recvVND > desiredVND, and
+// DepositCredit's round-a-small-underpay-up branch does not fire.
+//
+// It is NOT unreachable, though, and the difference matters. The quote is
+// priced at the rate in force when the screen was drawn; the receipt is valued
+// at the rate in force when the hash is verified, which can be up to an hour
+// later (the deposit window). A downward rate move of even ~0.02% between the
+// two makes recvVND fall below the requested total, and then this tolerance is
+// what decides whether the customer is credited what they asked for or the
+// slightly smaller amount the new rate says they sent. Rare, real, and
+// customer-favourable when it fires.
 const DefaultDepositMatchTolUnits = 50
 
 // DepositMatchTolUnits reads DEPOSIT_MATCH_TOL_UNITS (in amount units, i.e.
@@ -84,12 +92,13 @@ func ClampDepositTol(p Params, tolUnits int) int {
 // tests/test_deposit_credit.py acceptance suite:
 //
 //   - UNDERPAY within tolerance is rounded UP to the desired top-up rather than
-//     short-crediting a confusing amount. NOTE this branch is unreachable on
-//     today's deposit path — see DefaultDepositMatchTolUnits: the picker's
-//     jitter puts the quoted amount at least 0.01 USDT ABOVE the requested
-//     total, so a receipt within 0.00050 of it is still above the request and
-//     the overpay rule below wins. It is kept because the rule is the Python
-//     contract and a future geometry (or a product-order caller) can re-reach it.
+//     short-crediting a confusing amount. At a STABLE exchange rate this branch
+//     does not fire on the deposit path — see DefaultDepositMatchTolUnits: the
+//     picker's jitter puts the quoted amount at least 0.01 USDT above the
+//     requested total, so a receipt within 0.00050 of it is still worth more
+//     than the request and the overpay rule below wins. It fires when the rate
+//     moves DOWN between the quote and the verify, which the hour-long deposit
+//     window makes a real occurrence, not a theoretical one.
 //   - OVERPAY within tolerance credits the ACTUAL received amount: a customer
 //     quoted 120.01000 and credited for a 120 request gets 120.01000's value,
 //     never the smaller desired 120. The customer is never shorted — which is

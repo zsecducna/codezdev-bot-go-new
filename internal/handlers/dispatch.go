@@ -353,6 +353,15 @@ func New(d Deps) *Bot {
 			// registry: the rails then price with known-good geometry and the
 			// operator sees the log line.
 			//
+			// TEST-ONLY IN PRACTICE: cmd/bot/main.go validates the same geometry
+			// and Fatalf's on failure before ever constructing a Bot, and always
+			// passes Deps.Bands, so d.Bands == nil (the branch this fallback sits
+			// in) is reachable only from tests that build a Bot directly. Worth
+			// knowing, because the fallback deliberately takes the SHIPPED
+			// precision while the rails' chain readers would still floor at the
+			// operator's own AMOUNT_DECIMALS — a mismatch that would make every
+			// verify miss. In production that state cannot exist.
+			//
 			// The fallback reads the SAME Default* consts as the env lookups
 			// above rather than repeating their values as literals. It used to
 			// carry a hand-copied {21, 10, 2} pair, which the 5-decimal

@@ -1935,24 +1935,22 @@ func TestNewResolvesBandGeometryFromDotEnvSnapshot(t *testing.T) {
 // amount -> submit hash -> balance credited) rather than a call to the pure
 // function.
 //
-// WHAT CHANGED, and why the old assertion could not survive the 5-decimal
-// geometry. This test used to set DEPOSIT_MATCH_TOL_CENTS=200 and prove that a
-// 50-cent underpay rounded UP to the full requested top-up, where the 30-cent
-// default would have credited the smaller actual amount. That observable no
-// longer exists: the picker quotes the request PLUS a jitter of at least
-// 0.01 USDT, and the largest tolerance the geometry permits (half the 0.00101
-// band spacing) is twenty times smaller than that jitter — so any receipt
-// within tolerance of the quote is already worth MORE than the request, the
-// max() always picks the actual, and no legal tolerance can change a credit.
-// Asserting a balance difference would have meant inventing an unreachable
-// state.
+// WHAT CHANGED. This test used to set DEPOSIT_MATCH_TOL_CENTS=200 and prove
+// that a 50-cent underpay rounded UP to the full requested top-up. At the
+// 5-decimal geometry the picker quotes the request PLUS a jitter of at least
+// 0.01 USDT while the largest tolerance the geometry permits is twenty times
+// smaller than that jitter, so AT A FIXED RATE every in-tolerance receipt is
+// already worth more than the request and no legal tolerance can change the
+// credit. The tolerance is not inert, though — see
+// TestUSDTDepositRoundsUpWhenTheRateMovedDown, which reaches the same branch
+// through the rate move that a deposit window an hour wide makes real.
 //
-// What IS observable, and is the property that actually protects money, is the
-// CLAMP: an operator who reads "tolerance" and types a cents-era 200000 must
-// not thereby widen the deposit's match window to 2 USDT, which WOULD change
-// credits (a 4.50 receipt against a 6.01000 quote would round up to the full
-// 6.00 request, handing the customer 1.50 USDT they never sent) and would let
-// one receipt sit inside a thousand live bands at once.
+// What this test now pins is the CLAMP, which is the property that protects
+// money regardless of rate: an operator who reads "tolerance" and types a
+// cents-era 200000 must not thereby widen the deposit's match window to 2 USDT,
+// which WOULD change credits (a 4.50 receipt against a 6.01000 quote would
+// round up to the full 6.00 request, handing the customer 1.50 USDT they never
+// sent) and would let one receipt sit inside a thousand live bands at once.
 //
 // Falsification: drop bands.ClampDepositTol from usdt.go's DepositCredit call
 // and the credited balance comes back 150000 instead of the 112500 actually
@@ -2027,6 +2025,61 @@ func TestUSDTDepositMatchTolIsResolvedAndClamped(t *testing.T) {
 	if bal != 112500 {
 		t.Errorf("credited %d VND, want 112500 (the 4.50 USDT actually received); 150000 would mean "+
 			"an unclamped 2-USDT tolerance rounded a 1.51-USDT shortfall up to the full request", bal)
+	}
+}
+
+// TestUSDTDepositRoundsUpWhenTheRateMovedDown restores, in the form the new
+// geometry actually permits, the end-to-end coverage the test above used to
+// carry: DepositCredit's round-a-small-underpay-UP rule reached through a real
+// deposit rather than through the pure function.
+//
+// The reachable path is a rate move, not a short payment. The screen quotes at
+// the USD_TO_VND in force when it is drawn; the receipt is valued at the rate in
+// force when the hash is verified, and the deposit window is an hour wide. Drop
+// the rate in between and the customer's EXACT payment is suddenly worth less
+// VND than the total they asked to top up — at which point the tolerance decides
+// whether they get what they asked for or the smaller new-rate value.
+//
+// Falsification: set DEPOSIT_MATCH_TOL_UNITS to 0 (or drop the max() from
+// DepositCredit) and the credit comes back 149649 instead of 150000.
+func TestUSDTDepositRoundsUpWhenTheRateMovedDown(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, fk := newUSDTBot(t) // USD_TO_VND=25000
+	const chat = 471
+
+	b.Process(ctx, callbackUpdate(chat, "dep:trx"))
+	b.Process(ctx, textUpdate(chat, "6")) // 6.00 USDT = 150,000 VND at the quote rate
+
+	o := reservedDeposit(t, st, chat)
+	res, ok := b.bands.Get(bands.ProviderTron, o.Des)
+	if !ok || res.Amount != "6.01000" {
+		t.Fatalf("deposit amount = %q (found=%t), want the picked 6.01000", res.Amount, ok)
+	}
+	if o.Total != 150000 {
+		t.Fatalf("order total = %d, want 150000 (the requested top-up at the quote rate)", o.Total)
+	}
+	armTxid(t, ctx, b, chat, chainTRX, o.Des)
+
+	// The rate moves DOWN by 0.4% while the customer is paying. settings.json
+	// wins over the environment, so this is the same override an admin
+	// /setrate would apply mid-window.
+	sett := b.cfg.Settings()
+	sett["usd_to_vnd"] = "24900"
+	if err := b.cfg.SaveSettings(sett); err != nil {
+		t.Fatalf("save settings: %v", err)
+	}
+
+	// They send EXACTLY what they were quoted. At the new rate that is
+	// 6.01 * 24900 = 149,649 VND — 351 VND less than the 150,000 they asked for.
+	h := hash64("6")
+	fk.setTRX(h, trxTx(h, "6.01000", time.Now().UnixMilli()))
+	b.Process(ctx, textUpdate(chat, h))
+
+	bal, _ := st.GetBalance(fmtInt(chat))
+	if bal != 150000 {
+		t.Errorf("credited %d VND, want 150000 — an exact payment inside the tolerance must be "+
+			"rounded up to the top-up the customer asked for, not shaved by a rate move they "+
+			"had no part in; 149649 means the round-up branch did not fire", bal)
 	}
 }
 
