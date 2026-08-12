@@ -1136,9 +1136,11 @@ func (b *Bot) verifyUSDTTxid(ctx context.Context, chatID int64, chain, des, txha
 // come from the specific on-chain transfer the caller looked up (recvVND via
 // the rail's own USD_TO_VND conversion of the tx's exact `big.Rat` amount,
 // frm/recvStr straight off the tx), and re-deriving them from recvUnits alone
-// would lose precision the caller already has in hand (see the recvStr/
-// recvUnits rounding-vs-floor note at this file's call site). o/lang/prm/
-// expected are likewise the caller's already-validated order/snapshot data —
+// would lose precision the caller already has in hand — recvStr is rendered
+// via FloatString (rounds) while recvUnits comes straight off the tx lookup
+// (floored), a known deferred mismatch this extraction must not compound by
+// trying to reconstruct one from the other. o/lang/prm/expected are likewise
+// the caller's already-validated order/snapshot data —
 // re-fetching them here could race a sweep/expiry between the caller's checks
 // and this call, which the caller's single read cannot.
 //
