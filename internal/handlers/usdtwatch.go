@@ -124,12 +124,59 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 		// who sent it, how much — and leave the payment alone. Nothing alerts
 		// on this line yet; raising it to the owners is a later task, and this
 		// log is the record that task will read.
+		//
+		// SCOPE, stated because the obvious reading is wrong: this refusal is
+		// per tick, not permanent. The transfer is left UNCONSUMED (no ledger
+		// row), deliberately, so a human can still settle it — but that also
+		// means a later tick re-examines it, and once the competing band
+		// settles or is swept the same transfer becomes unambiguous and is
+		// credited to whichever deposit survived. That is attribution by
+		// attrition rather than by evidence. Making the refusal stick needs
+		// somewhere durable to record "a human owns this one", which is the
+		// same storage the owner-alert task is designing; it is deliberately
+		// not invented here. Until then this line also repeats every tick for
+		// as long as both bands are live.
 		log.Printf("usdt watch [%s]: AMBIGUOUS %s from=%s recv=%s (%d units) — two or more live deposits match, credited nothing, needs manual attribution",
 			p, ledgerID, tx.Frm, recvStr, tx.Units)
 		return
 	default: // bands.MatchNone
 		// Routine and not an error: not every transfer to the shop's address is
 		// a deposit someone is waiting on.
+		return
+	}
+
+	// FRESHNESS, per matched band — not just per rail.
+	//
+	// The fetch bound above is the OLDEST live deposit's start, which is far too
+	// loose to attribute by on its own: band amounts are recycled as sessions
+	// finish, so a transfer that was never credited (it arrived when nothing
+	// matched, or while its amount was ambiguous) can sit in that window and
+	// then land exactly on a NEW deposit quoted the same amount. Crediting it
+	// would pay one customer with another customer's money.
+	//
+	// The hash-paste path has always applied this check per order
+	// (verifyUSDTTxid's "outside_window" reject); the watcher must agree with it
+	// or the two flows disagree about the same transfer. There is deliberately
+	// no UPPER bound here — the watcher has no "I have paid" tap to bound
+	// against, and a payment arriving after its session started is exactly what
+	// is expected.
+	lo := int64(0)
+	if row, ok := b.getUSDTRow(p, res.Des); ok {
+		lo = row.SinceMS
+	}
+	if lo <= 0 && !res.CreatedAt.IsZero() {
+		lo = res.CreatedAt.UnixMilli()
+	}
+	if lo <= 0 {
+		// Unreachable in practice — Reserve stamps CreatedAt and Adopt backfills
+		// it — but this is a money gate, so an unanchorable band refuses rather
+		// than accepts. The hash-paste path can still settle it.
+		log.Printf("usdt watch [%s]: deposit %s has no usable start time, refusing to attribute %s", p, res.Des, ledgerID)
+		return
+	}
+	if tx.TS < lo-b.usdtVerifyGrace.Milliseconds() {
+		log.Printf("usdt watch [%s]: %s predates deposit %s (tx_ts=%d lo=%d) — not attributing",
+			p, ledgerID, res.Des, tx.TS, lo)
 		return
 	}
 
@@ -215,6 +262,14 @@ func (b *Bot) watchSinceMS(p bands.Provider, live []bands.Reservation) int64 {
 			oldest = ms
 		}
 	}
-	// max(…, 0): an unbounded query is still correct, just wasteful.
+	if oldest == 0 {
+		// Unreachable while Reserve stamps CreatedAt and Adopt backfills it, but
+		// NOT harmlessly so: the chain query is oldest-first with a page limit,
+		// so a zero bound would return the address's oldest transfers ever and
+		// push everything recent off the end. Fall back to the furthest back a
+		// live row can legitimately be — Sweep measures its grace from
+		// CreatedAt, so nothing survives past that.
+		oldest = b.now().Add(-b.usdtPendingGrace).UnixMilli()
+	}
 	return max(oldest-b.usdtVerifyGrace.Milliseconds(), 0)
 }

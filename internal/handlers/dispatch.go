@@ -473,9 +473,20 @@ func New(d Deps) *Bot {
 	// divergence would mean the watcher polling one address while the
 	// customer's hash is verified against another.
 	b.tronTransfersSince = func(minTSMS int64) ([]tron.Transfer, error) {
-		return tron.GetIncomingTransfersConf(b.tronAddrStr(), minTSMS, b.tronAPIKeyStr(),
-			b.envInt("TRON_PAGE_LIMIT", tron.DefaultPageLimit),
+		limit := b.envInt("TRON_PAGE_LIMIT", tron.DefaultPageLimit)
+		out, err := tron.GetIncomingTransfersConf(b.tronAddrStr(), minTSMS, b.tronAPIKeyStr(), limit,
 			strings.TrimRight(b.cfg.EnvOr("TRON_API_BASE", tron.DefaultAPIBase), "/"))
+		// The query is OLDEST-first, so a full page means the newest transfers
+		// fell off the end — and the newest are exactly the ones a customer is
+		// waiting on. There is no pagination here (the by-hash lookup this
+		// shares never needed it), so say so loudly rather than degrade into
+		// silently missing recent deposits. The page limit is resolved here,
+		// which is why the check lives here and not in the watcher.
+		if err == nil && limit > 0 && len(out) >= limit {
+			log.Printf("tron: incoming-transfer page is FULL (%d of %d) — newer transfers are being "+
+				"truncated; raise TRON_PAGE_LIMIT or shorten the deposit window", len(out), limit)
+		}
+		return out, err
 	}
 	// The USD->VND rate is bridged the same way, and for the same reason —
 	// task #22, another instance of this port keeping a config reader while

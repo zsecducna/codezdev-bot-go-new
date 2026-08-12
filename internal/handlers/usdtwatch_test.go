@@ -102,8 +102,13 @@ func TestWatcherCreditsMatchingTransfer(t *testing.T) {
 }
 
 // TestWatcherDoesNotDoubleCredit re-presents the SAME transfer on a second tick.
-// The processed.txn_id primary key inside store.Credit is what makes this safe;
-// TxnExists is only the pre-filter that saves the work of getting there.
+//
+// WHAT THIS PROVES, precisely: the TxnExists PRE-FILTER stops the second
+// attempt before it reaches storage. It does NOT prove the processed.txn_id
+// primary key inside store.Credit — the second tick never gets that far.
+// TestUSDTDepositReplayCreditsOnce is what pins the PK as the real gate (it
+// replays a hash through the verify path, which does not consult TxnExists at
+// all). Both matter: the PK is the guarantee, this is the shortcut.
 //
 // A second live deposit (a different customer) is deliberately left open, so the
 // second tick genuinely performs the fetch and genuinely re-examines the already
@@ -262,6 +267,109 @@ func TestWatcherNeverSettlesAProductOrder(t *testing.T) {
 	}
 	if _, still := b.bands.Get(bands.ProviderTron, des); !still {
 		t.Error("the product order's band was released by the watcher — its unique amount is no longer bound to the order the customer is paying")
+	}
+}
+
+// TestWatcherCreditsNothingWhenAmbiguous: two customers depositing the same
+// amount are quoted 0.00101 apart, which is far inside any fee-shaped window —
+// so a payment that arrives SHORT (the sender's platform skimmed the network
+// fee) sits inside both of their allowances and names neither. Crediting either
+// one is a coin flip with the other's money.
+//
+// The transfer must also be left UNCONSUMED — no ledger row — because a human
+// still has to be able to attribute it by hand afterwards. A watcher that
+// "resolved" the ambiguity by marking the transfer used would take that away.
+func TestWatcherCreditsNothingWhenAmbiguous(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, _ := newUSDTBot(t)
+	w := installWatchFake(b)
+	const first, second = 4709, 4710
+
+	b.Process(ctx, callbackUpdate(first, "dep:trx"))
+	b.Process(ctx, textUpdate(first, "6"))
+	o1 := reservedDeposit(t, st, first)
+	r1, _ := b.bands.Get(bands.ProviderTron, o1.Des)
+
+	b.Process(ctx, callbackUpdate(second, "dep:trx"))
+	b.Process(ctx, textUpdate(second, "6"))
+	o2 := reservedDeposit(t, st, second)
+	r2, _ := b.bands.Get(bands.ProviderTron, o2.Des)
+	if r1.Amount == r2.Amount {
+		t.Fatalf("both deposits were quoted %s — the band picker did not separate them", r1.Amount)
+	}
+
+	// Short by 0.10 USDT against the LOWER of the two quotes: beyond Tol (so it
+	// is not an exact match for either) and inside both 5%/0.5-capped fee
+	// allowances (so both are shortfall candidates).
+	lowUnits, err := bands.AmountUnits(min(r1.Amount, r2.Amount), tron.AmountDecimals())
+	if err != nil {
+		t.Fatalf("amount units: %v", err)
+	}
+	shortUnits := lowUnits - 10_000 // -0.10 USDT
+	// Pin that the receipt really IS ambiguous. Without this the test would pass
+	// just as happily on a receipt nothing matches, and "credited nobody" would
+	// mean nothing.
+	if _, kind, merr := b.bands.MatchIncoming(bands.ProviderTron, shortUnits); merr != nil || kind != bands.MatchAmbiguous {
+		t.Fatalf("MatchIncoming(%d) = (%s, %v), want ambiguous — the test is not exercising the branch it claims", shortUnits, kind, merr)
+	}
+	short := bands.FormatUnits(shortUnits, tron.AmountDecimals())
+	h := hash64("f")
+	w.set(*trxTx(h, short, b.now().UnixMilli()))
+
+	b.tickOnchain(ctx, bands.ProviderTron)
+
+	if bal, _ := st.GetBalance(fmtInt(first)); bal != 0 {
+		t.Errorf("first depositor credited %d VND on an ambiguous payment", bal)
+	}
+	if bal, _ := st.GetBalance(fmtInt(second)); bal != 0 {
+		t.Errorf("second depositor credited %d VND on an ambiguous payment", bal)
+	}
+	// Unconsumed: the operator must still be able to settle it by hand.
+	if used, terr := b.store.TxnExists("trx:" + h); terr != nil || used {
+		t.Errorf("TxnExists(trx:%s) = (%t, %v), want (false, nil) — an ambiguous transfer must stay "+
+			"available for manual attribution", h, used, terr)
+	}
+}
+
+// TestWatcherIgnoresATransferOlderThanItsBand is the per-band freshness gate.
+//
+// The chain query's lower bound is the OLDEST live deposit's start, which is
+// deliberately loose — but band amounts are RECYCLED as sessions finish, so a
+// transfer that was never credited can still be sitting in that window when a
+// NEW deposit is quoted the same amount. Attributing it would pay one customer
+// with another customer's money, and the hash-paste path has always refused it
+// (verifyUSDTTxid's "outside_window"). The two flows must agree.
+func TestWatcherIgnoresATransferOlderThanItsBand(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, _ := newUSDTBot(t)
+	w := installWatchFake(b)
+	const chat = 4711
+
+	b.Process(ctx, callbackUpdate(chat, "dep:trx"))
+	b.Process(ctx, textUpdate(chat, "6"))
+	o := reservedDeposit(t, st, chat)
+	res, _ := b.bands.Get(bands.ProviderTron, o.Des)
+	row, _ := b.getUSDTRow(bands.ProviderTron, o.Des)
+
+	// One second older than the grace allows — the amount matches exactly, which
+	// is the point: the amount is not enough on its own.
+	stale := row.SinceMS - b.usdtVerifyGrace.Milliseconds() - 1000
+	w.set(*trxTx(hash64("9"), res.Amount, stale))
+	b.tickOnchain(ctx, bands.ProviderTron)
+
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 0 {
+		t.Errorf("credited %d VND for a transfer that predates the deposit — a recycled band amount "+
+			"just paid this customer with someone else's money", bal)
+	}
+	if _, still := b.bands.Get(bands.ProviderTron, o.Des); !still {
+		t.Error("the band was released by a refusal — a stale transfer must change nothing")
+	}
+	// A fresh transfer for the same band still settles, so the gate is a window
+	// and not a blanket refusal.
+	w.set(*trxTx(hash64("8"), res.Amount, b.now().UnixMilli()))
+	b.tickOnchain(ctx, bands.ProviderTron)
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 150250 {
+		t.Errorf("balance after a fresh transfer = %d VND, want 150250 — the freshness gate is refusing valid payments", bal)
 	}
 }
 

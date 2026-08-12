@@ -401,9 +401,14 @@ func (b *Bot) adoptUSDTAmount(p bands.Provider, amount, chatID, des string, tota
 
 // ---- deposit starts ---------------------------------------------------------
 
-// startBep20Deposit / startTronDeposit create an on-chain USDT top-up credited
-// when the customer submits a CONFIRMED tx hash — start_bep20_deposit
-// (telegram_bot.py:9478-9525) and start_tron_deposit (@9935-9962).
+// startBep20Deposit / startTronDeposit create an on-chain USDT top-up —
+// start_bep20_deposit (telegram_bot.py:9478-9525) and start_tron_deposit
+// (@9935-9962).
+//
+// HOW IT GETS CREDITED differs by rail now. TRON is watched: usdtwatch.go
+// reads the seller address and credits the payment on its own, and the
+// customer's hash paste is only the fallback for what the watcher could not
+// attribute. BEP20 is still hash-paste only.
 //
 // PICKED amount, like an order (see reserveUSDTAmount): a hands-free watcher
 // attributes an incoming payment by amount alone, so two customers depositing
@@ -1130,8 +1135,8 @@ func (b *Bot) verifyUSDTTxid(ctx context.Context, chatID int64, chain, des, txha
 // settleUSDTMatch credits a CONFIRMED on-chain payment for order `des` and
 // resolves the deposit session. This is the ONE settle path shared by the
 // customer-pasted-hash flow (verifyUSDTTxid's deposit branch, above) and the
-// (future) on-chain watcher that will spot a payment without any hash paste —
-// both must dedupe and notify identically, so neither gets its own copy of
+// on-chain watcher that spots a payment without any hash paste (usdtwatch.go)
+// — both must dedupe and notify identically, so neither gets its own copy of
 // this logic.
 //
 // recvVND/frm/recvStr are passed through rather than recomputed here: they
