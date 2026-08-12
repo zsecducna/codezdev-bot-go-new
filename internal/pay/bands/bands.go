@@ -127,9 +127,11 @@ func (p Params) SpacingOK() bool { return p.Step >= p.MinGap() }
 // ReserveUpwardOnly), so more upward slots means fewer customers refused
 // USDT_BUSY under concurrent same-price traffic. The cost is a wider
 // worst-case gap between the amount a customer is quoted and the amount they
-// actually asked for — up to just under SlotSpanWholeUnits whole units (e.g.
-// up to ~1.89 USDT at the shipped 21-cent BEP20/TRON step) before the last
-// upward slot is tried.
+// actually asked for. The picker tries k < Slots() (9 at the shipped 21-cent
+// BEP20/TRON step, since Slots() = 200//21 = 9), so the worst case is the
+// LAST tried slot, k=8: 8*21 = 168 cents = ~1.68 USDT, not the full 2 whole
+// units — k=9 (189 cents, still under the 200-cent span) is never tried
+// because the loop stops at Slots()=9 (see Slots()/uniqueAmountUnits).
 const SlotSpanWholeUnits = 2
 
 // Slots is the number of UPWARD slots the picker will try:
@@ -154,8 +156,19 @@ func (p Params) Validate() error {
 	if p.Decimals < 0 || p.Decimals > 9 {
 		return fmt.Errorf("bands: Decimals must be in [0,9], got %d", p.Decimals)
 	}
+	// A Step wider than one whole unit is rejected outright, independent of
+	// SlotSpanWholeUnits: it means the FIRST upward slot (base+step) already
+	// quotes the customer more than 1 unit above their ask, which reads as a
+	// misconfiguration rather than a legitimate wide-step tradeoff. This is
+	// stricter than "does at least one slot exist" — with SlotSpanWholeUnits=2
+	// a Step in (one whole unit, two whole units] would still produce exactly
+	// one slot and pass that weaker check, but that slot still overshoots by
+	// more than a unit, so it is rejected here too.
+	if scale := pow10Int64(p.Decimals); int64(p.Step) > scale {
+		return fmt.Errorf("bands: Step %d exceeds one whole unit (%d) at %d decimals: first upward slot would overshoot the ask by more than 1 unit", p.Step, scale, p.Decimals)
+	}
 	if p.Slots() < 1 {
-		return fmt.Errorf("bands: Step %d exceeds one whole unit at %d decimals (no slots)", p.Step, p.Decimals)
+		return fmt.Errorf("bands: Step %d exceeds the %d-whole-unit slot span at %d decimals (no slots)", p.Step, SlotSpanWholeUnits, p.Decimals)
 	}
 	return nil
 }
@@ -170,7 +183,8 @@ func (p Params) Validate() error {
 // It also makes every downstream multiplication provably overflow-free:
 // rescaleUnits' up-scale is bounded by the same whole-unit cap at the target
 // precision, i.e. 10^7 * 10^9 = 10^16 at the Decimals<=9 ceiling, well under
-// int64's 9.22e18; the picker's baseU + k*step stays within one unit of that.
+// int64's 9.22e18; the picker's baseU + k*step stays within SlotSpanWholeUnits
+// (2) units of that.
 const maxWholeUnits = 10_000_000
 
 // amountRE is an ALLOWLIST of the only syntax a stored amount may have: an

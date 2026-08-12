@@ -50,11 +50,29 @@ func TestParamsValidateRejectsBadGeometry(t *testing.T) {
 		"negative tol":  {Step: 21, Tol: -1, Decimals: 2},
 		"bad decimals":  {Step: 21, Tol: 10, Decimals: -1},
 		"step too wide": {Step: 201, Tol: 10, Decimals: 2}, // 200//201 = 0 slots
+		// Pins hands-free-deposits fix-round-2 finding 2: with
+		// SlotSpanWholeUnits=2, a Step in (one whole unit, two whole units]
+		// still produces 1 slot (200//150 = 1) and would pass the older
+		// "at least one slot" check, but its first upward slot already
+		// overshoots the customer's ask by more than one whole unit — that
+		// is a misconfiguration, not a legitimate wide-step tradeoff, so
+		// Validate must reject it explicitly.
+		"step exceeds one whole unit": {Step: 150, Tol: 10, Decimals: 2},
 	}
 	for name, p := range cases {
 		if err := p.Validate(); err == nil {
 			t.Errorf("%s: Validate() = nil, want error", name)
 		}
+	}
+}
+
+// TestParamsValidateAllowsStepAtExactlyOneWholeUnit pins the boundary: a Step
+// equal to (not exceeding) one whole unit is fine — only strictly wider than
+// one unit is rejected (hands-free-deposits fix-round-2 finding 2).
+func TestParamsValidateAllowsStepAtExactlyOneWholeUnit(t *testing.T) {
+	p := Params{Step: 100, Tol: 10, Decimals: 2}
+	if err := p.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil for Step == one whole unit", err)
 	}
 }
 
