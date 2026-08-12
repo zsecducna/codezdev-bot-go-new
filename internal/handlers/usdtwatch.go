@@ -173,6 +173,8 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 		// before the matcher on every later tick. Durable rather than in-memory
 		// because this project deploys often, and a process-local memory would
 		// only shrink the window to "until the next restart".
+		outcome := "credited nothing, quarantined"
+		detail := "recv=" + recvStr + " from=" + tx.Frm + " units=" + fmtInt(tx.Units)
 		if qwerr := b.store.MarkAmbiguousTxn(ledgerID, string(p), recvStr,
 			float64(b.now().UnixNano())/1e9); qwerr != nil {
 			// Nothing was credited either way, so the money is not at risk right
@@ -182,15 +184,25 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 			// simply the next tick.
 			log.Printf("usdt watch [%s]: QUARANTINE WRITE FAILED for %s: %v — this transfer is NOT protected and may be auto-credited later",
 				p, ledgerID, qwerr)
+			// And the durable record must say so too. The whole point of auditing
+			// this path is that the DB answers what the bot decided AND whether
+			// the decision stuck; a row reading "quarantined" after the
+			// quarantine write failed asserts a protection that is not there, so
+			// the one case actually needing a human looks exactly like the
+			// routine one. Distinct wording, and the cause in the detail, so an
+			// operator querying the trail sees it without cross-reading logs.
+			outcome = "credited nothing, QUARANTINE WRITE FAILED"
+			detail += " quarantine_err=" + qwerr.Error()
 		}
 		log.Printf("usdt watch [%s]: AMBIGUOUS %s from=%s recv=%s (%d units) — two or more live deposits match, credited nothing, quarantined for manual attribution",
 			p, ledgerID, tx.Frm, recvStr, tx.Units)
 		// The quarantine row and this audit row are different things and both
 		// are needed: the quarantine is the durable GATE that changes what
 		// later ticks do, this is the durable RECORD of what happened and when.
+		// Same action either way, so one query by action still returns every
+		// ambiguity; only the outcome distinguishes the failed write.
 		// No chat id — no single customer owns an ambiguous payment.
-		b.auditWatch("", p, "ambiguous", ledgerID, "credited nothing, quarantined",
-			"recv="+recvStr+" from="+tx.Frm+" units="+fmtInt(tx.Units))
+		b.auditWatch("", p, "ambiguous", ledgerID, outcome, detail)
 		return
 	default: // bands.MatchNone
 		// Routine and not an error: not every transfer to the shop's address is

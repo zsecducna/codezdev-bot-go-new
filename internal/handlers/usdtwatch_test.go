@@ -2,6 +2,9 @@ package handlers
 
 import (
 	"context"
+	"errors"
+	"math"
+	"math/big"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -9,6 +12,7 @@ import (
 
 	"codezdev-bot/internal/pay/bands"
 	"codezdev-bot/internal/pay/tron"
+	"codezdev-bot/internal/store"
 )
 
 // ---- harness ----------------------------------------------------------------
@@ -495,6 +499,187 @@ func TestWatcherAuditsTheDecisionsItRefuses(t *testing.T) {
 	}
 	if got.Target != "trx:"+ambiguousHash {
 		t.Errorf("audit target = %q, want %q", got.Target, "trx:"+ambiguousHash)
+	}
+}
+
+// adoptWatchedDeposit installs a synthetic live DEPOSIT band straight into the
+// registry.
+//
+// The refusals below are about a band whose ORDER ROW is wrong — missing, not a
+// deposit, or owned by an unparseable chat id. The normal deposit flow cannot
+// produce any of those (it writes the order and the band together, consistently),
+// so the band has to be adopted by hand against an order the test shaped itself.
+// Adopt is the same entry point rehydrateOnchainPending uses after a restart, so
+// this is a real production shape and not a test-only door.
+func adoptWatchedDeposit(t *testing.T, b *Bot, des, chatID, amount string) bands.Reservation {
+	t.Helper()
+	if err := b.bands.Adopt(bands.Reservation{
+		Provider:  bands.ProviderTron,
+		Des:       des,
+		ChatID:    chatID,
+		Amount:    amount,
+		CreatedAt: b.now(),
+		Deadline:  b.now().Add(time.Hour),
+		IsDeposit: true,
+	}); err != nil {
+		t.Fatalf("adopt band %s: %v", des, err)
+	}
+	res, ok := b.bands.Get(bands.ProviderTron, des)
+	if !ok {
+		t.Fatalf("band %s did not stick", des)
+	}
+	return res
+}
+
+// tickAuditRow drives one tick over a single transfer and returns the audit row
+// the watcher wrote for the named verdict. Fails the test when there is none:
+// "the bot silently did nothing" is the regression these tests exist to catch.
+func tickAuditRow(t *testing.T, b *Bot, w *watchFake, st *store.Store, verdict, hash, amount string) *store.AuditRow {
+	t.Helper()
+	w.set(*trxTx(hash, amount, b.now().UnixMilli()))
+	b.tickOnchain(context.Background(), bands.ProviderTron)
+	got := latestAuditRow(t, st, "usdt_trx_watch_"+verdict)
+	if got == nil {
+		t.Fatalf("no usdt_trx_watch_%s audit row — that refusal exists only in a log line", verdict)
+	}
+	if got.Target != "trx:"+hash {
+		t.Errorf("audit target = %q, want %q — a refusal not keyed on the ledger id cannot be found "+
+			"by the same query that finds the credit", got.Target, "trx:"+hash)
+	}
+	return got
+}
+
+// TestWatcherAuditsRefusalsOnABrokenOrderRow covers the three verdicts the
+// watcher reaches AFTER a clean amount match, when the order behind the matched
+// band turns out to be unusable. Each is a payment that arrived and was not
+// credited, so each is a support ticket in waiting — and until the audit rows
+// existed, answering it meant grepping logs on the box.
+func TestWatcherAuditsRefusalsOnABrokenOrderRow(t *testing.T) {
+	// The matched band's order row has vanished. The band outlives it until the
+	// sweep, and in the meantime there is nothing to credit against.
+	t.Run("order_gone", func(t *testing.T) {
+		b, _, st, _, _ := newUSDTBot(t)
+		w := installWatchFake(b)
+		res := adoptWatchedDeposit(t, b, "ORDERGONE", "4720", "6.01000")
+
+		got := tickAuditRow(t, b, w, st, "order_gone", hash64("b1"), res.Amount)
+		if got.ActorChat != "4720" {
+			t.Errorf("audit chat = %q, want \"4720\" — the band still names its owner even though "+
+				"the order row does not", got.ActorChat)
+		}
+	})
+
+	// The order exists but is a PRODUCT order, which the watcher must never
+	// wallet-credit. Reaching this means the deposit flag and the order table
+	// disagree, so the row is the only trace of a real bug.
+	t.Run("not_deposit", func(t *testing.T) {
+		b, _, st, _, _ := newUSDTBot(t)
+		w := installWatchFake(b)
+		const des, chat = "NOTDEP", "4721"
+		if err := st.CreateOrder(des, chat, "vi", "kiro_pro", "", 1, 150000); err != nil {
+			t.Fatalf("create order: %v", err)
+		}
+		res := adoptWatchedDeposit(t, b, des, chat, "6.01000")
+
+		got := tickAuditRow(t, b, w, st, "not_deposit", hash64("b2"), res.Amount)
+		if got.ActorChat != chat {
+			t.Errorf("audit chat = %q, want %q", got.ActorChat, chat)
+		}
+		if bal, _ := st.GetBalance(chat); bal != 0 {
+			t.Errorf("balance = %d VND, want 0 — a product order was wallet-credited", bal)
+		}
+	})
+
+	// The order's own chat id is not a number. settleUSDTMatch keys the credit on
+	// it, so proceeding would pay chat "0" — a stranger. The row must NOT be filed
+	// under the same unusable value it is reporting.
+	t.Run("bad_chat", func(t *testing.T) {
+		b, _, st, _, _ := newUSDTBot(t)
+		w := installWatchFake(b)
+		const des, badChat = "BADCHAT", "not-a-number"
+		if err := st.CreateOrder(des, badChat, "vi", depositProduct, "", 1, 150000); err != nil {
+			t.Fatalf("create order: %v", err)
+		}
+		res := adoptWatchedDeposit(t, b, des, badChat, "6.01000")
+
+		got := tickAuditRow(t, b, w, st, "bad_chat", hash64("b3"), res.Amount)
+		if got.ActorChat != "" {
+			t.Errorf("audit chat = %q, want empty — filing the row under the very chat id it is "+
+				"reporting as unusable makes it unfindable", got.ActorChat)
+		}
+		if bal, _ := st.GetBalance("0"); bal != 0 {
+			t.Errorf("chat \"0\" balance = %d VND, want 0 — the unparseable owner was credited to a stranger", bal)
+		}
+	})
+}
+
+// TestWatcherAuditsAHeldPaymentItCannotValue is the no_rate verdict. Without a
+// usable USDT rate the payment cannot be turned into VND at all, and crediting 0
+// would lose the customer's money outright — so the watcher holds and retries.
+// A HELD payment is the case most likely to be reported as "my deposit never
+// arrived", and the reason it is held has to be answerable from the database.
+func TestWatcherAuditsAHeldPaymentItCannotValue(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, _ := newUSDTBot(t)
+	w := installWatchFake(b)
+	const chat = 4722
+
+	b.Process(ctx, callbackUpdate(chat, "dep:trx"))
+	b.Process(ctx, textUpdate(chat, "6"))
+	o := reservedDeposit(t, st, chat)
+	res, _ := b.bands.Get(bands.ProviderTron, o.Des)
+	// The rail's own converter is a seam; break it the way a missing or garbage
+	// admin rate breaks it in production.
+	b.tronUsdtToVND = func(*big.Rat) (int64, error) { return 0, errors.New("no usdt rate configured") }
+
+	got := tickAuditRow(t, b, w, st, "no_rate", hash64("b4"), res.Amount)
+	if got.ActorChat != fmtInt(chat) {
+		t.Errorf("audit chat = %q, want %q", got.ActorChat, fmtInt(chat))
+	}
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 0 {
+		t.Errorf("balance = %d VND, want 0 — an unvaluable payment must not be credited at a guessed rate", bal)
+	}
+	// Held, not refused: the band and its order stay put so a later tick with a
+	// working rate still credits the customer.
+	if _, still := b.bands.Get(bands.ProviderTron, o.Des); !still {
+		t.Error("the band was released on a rate failure — its amount can now be re-quoted to someone else")
+	}
+}
+
+// TestWatcherAuditsAnAttributedPaymentThatDidNotCredit is the uncredited verdict:
+// the transfer was attributed to exactly one deposit and the credit itself still
+// failed. Nothing moved, so the next tick retries — which is precisely why it
+// needs a durable record: a failure that silently retries forever looks identical
+// to one that never happened.
+//
+// The credit is forced to fail by pushing the customer's balance to the top of
+// the int64 range first, so the store's own `amount + excluded.amount` cannot
+// produce a storable integer. The mechanism is incidental; what is being pinned
+// is what the watcher records when store.Credit returns an error.
+func TestWatcherAuditsAnAttributedPaymentThatDidNotCredit(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, _ := newUSDTBot(t)
+	w := installWatchFake(b)
+	const chat = 4723
+
+	b.Process(ctx, callbackUpdate(chat, "dep:trx"))
+	b.Process(ctx, textUpdate(chat, "6"))
+	o := reservedDeposit(t, st, chat)
+	res, _ := b.bands.Get(bands.ProviderTron, o.Des)
+	if _, err := st.CreditBalance(fmtInt(chat), math.MaxInt64); err != nil {
+		t.Fatalf("seed balance: %v", err)
+	}
+
+	got := tickAuditRow(t, b, w, st, "uncredited", hash64("b5"), res.Amount)
+	if got.ActorChat != fmtInt(chat) {
+		t.Errorf("audit chat = %q, want %q", got.ActorChat, fmtInt(chat))
+	}
+	// The order and the band are untouched, which is what makes the retry real.
+	if still, _ := st.GetOrder(o.Des); still == nil || still.Status != "reserved" {
+		t.Errorf("order status = %s, want reserved — a failed credit must not close the deposit", orderStatus(still))
+	}
+	if _, still := b.bands.Get(bands.ProviderTron, o.Des); !still {
+		t.Error("the band was released after a failed credit — the retry has nothing left to match against")
 	}
 }
 
