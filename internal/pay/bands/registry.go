@@ -76,6 +76,20 @@ type Reservation struct {
 	// stops blocking anyone once it is DefaultEvictAfter stale AND the picker is
 	// under pressure (telegram_bot.py:9438-9446).
 	Deadline time.Time
+	// IsDeposit marks a WALLET TOP-UP band, as opposed to a product order's.
+	//
+	// It exists for attribution, not for allocation: the picker treats both
+	// kinds identically (an amount must be unique across every live session
+	// whatever it is for), but the hands-free watcher must credit ONLY
+	// deposits. A product order is paid through a different flow entirely and
+	// settling one by wallet-credit would pay money out for goods that were
+	// never delivered — so MatchIncoming filters on this flag rather than
+	// trusting the caller to re-check afterwards.
+	//
+	// FALSE IS THE SAFE DEFAULT, which is why the field is phrased this way
+	// round: a row planted by some future path that forgets to set it is
+	// simply invisible to the watcher, not eligible for a wallet credit.
+	IsDeposit bool
 }
 
 // Config builds a Registry.
@@ -153,8 +167,10 @@ func (r *Registry) Params(p Provider) (Params, bool) {
 //
 // Re-reserving an existing Des overwrites its row and — deliberately — does not
 // let the old row block the new pick (a row can never collide with itself).
+// isDeposit=false: this is the PRODUCT ORDER entry point, so the row it plants
+// is invisible to the hands-free watcher (see Reservation.IsDeposit).
 func (r *Registry) Reserve(p Provider, base, chatID, des string, deadline time.Time) (Reservation, error) {
-	return r.reserve(p, base, chatID, des, deadline, true)
+	return r.reserve(p, base, chatID, des, deadline, true, false)
 }
 
 // ReserveUpwardOnly is Reserve's twin for a money path where quoting BELOW the
@@ -167,13 +183,20 @@ func (r *Registry) Reserve(p Provider, base, chatID, des string, deadline time.T
 // ErrBandExhausted on exhaustion — is identical to Reserve; it just never
 // takes uniqueAmountUnits' downward fallback, so exhaustion happens one slot
 // sooner (Slots() upward tries only, no last resort).
+//
+// It is ALSO where Reservation.IsDeposit is set true. Upward-only and
+// deposit-ness are two consequences of the same fact — this is the wallet
+// top-up path — and both are decided here, at the one entry point that knows
+// it, rather than re-derived downstream from `allowDownward` (which is a
+// picker knob and would be free to change for a non-deposit reason).
 func (r *Registry) ReserveUpwardOnly(p Provider, base, chatID, des string, deadline time.Time) (Reservation, error) {
-	return r.reserve(p, base, chatID, des, deadline, false)
+	return r.reserve(p, base, chatID, des, deadline, false, true)
 }
 
 // reserve is Reserve/ReserveUpwardOnly's shared body; allowDownward gates the
-// picker's last-resort downward slot (see uniqueAmountUnits).
-func (r *Registry) reserve(p Provider, base, chatID, des string, deadline time.Time, allowDownward bool) (Reservation, error) {
+// picker's last-resort downward slot (see uniqueAmountUnits) and isDeposit is
+// stamped onto the stored row (see Reservation.IsDeposit).
+func (r *Registry) reserve(p Provider, base, chatID, des string, deadline time.Time, allowDownward, isDeposit bool) (Reservation, error) {
 	if des == "" {
 		return Reservation{}, fmt.Errorf("bands: Reserve needs a non-empty des")
 	}
@@ -204,6 +227,7 @@ func (r *Registry) reserve(p Provider, base, chatID, des string, deadline time.T
 		Decimals:  prm.Decimals,
 		CreatedAt: r.now(),
 		Deadline:  deadline,
+		IsDeposit: isDeposit,
 		seq:       r.stampSeq(),
 	}
 	r.rows[p][des] = res
@@ -301,6 +325,12 @@ func (r *Registry) collisionUnits(reqP Provider, prm Params, chatID, des string,
 // CreatedAt (a persisted row with no usable ts) starts the Sweep grace clock
 // now — the safe direction, since it can only delay freeing a band, never free
 // one early.
+//
+// IsDeposit is taken from the caller VERBATIM: nothing in a persisted band row
+// says what the money was for, so the rehydrating caller must re-derive it from
+// the order it just read (handlers.adoptPersisted does, from o.Product). An
+// omitted flag reads as "product order", which only hides the row from the
+// watcher — never the reverse.
 func (r *Registry) Adopt(res Reservation) error {
 	if res.Des == "" {
 		return fmt.Errorf("bands: Adopt needs a non-empty des")
@@ -352,6 +382,32 @@ func (r *Registry) Len(p Provider) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.rows[p])
+}
+
+// DepositRows is a locked copy of every DEPOSIT row on one rail — exactly the
+// candidate set MatchIncoming will run MatchReceipt over.
+//
+// It exists so the hands-free watcher's "is anyone depositing?" gate and the
+// matcher itself cannot disagree about what counts as a candidate. If the gate
+// applied its own rule — filtered on Deadline, say — it would skip the chain
+// fetch for a band MatchIncoming would happily have matched, and a payment made
+// just after a session expired (recoverable for the whole pending grace) would
+// silently never be seen. So: NO deadline filter here either, deliberately.
+//
+// The watcher also reads the oldest CreatedAt off this slice to bound its chain
+// query, which is the second reason it returns rows rather than a count.
+func (r *Registry) DepositRows(p Provider) []Reservation {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]Reservation, 0, len(r.rows[p]))
+	for _, res := range r.rows[p] {
+		if !res.IsDeposit {
+			continue
+		}
+		out = append(out, res)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Des < out[j].Des }) // stable logs
+	return out
 }
 
 // OtherAmounts lists the unique amounts of every OTHER live session on the same

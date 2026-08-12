@@ -152,14 +152,17 @@ const (
 	// "within tolerance", round it UP to the quote, and hand the money pump
 	// straight back.
 	//
-	// SCOPE, for whoever wires the watcher: the reasoning above is about
-	// DEPOSITS, where crediting less is a coherent outcome. A PRODUCT ORDER
-	// settled by shortfall has no such option — stock is indivisible, so the
-	// order either delivers in full for up to min(0.5, 5%) under its price, or
-	// does not deliver. Reservation carries no deposit-vs-order flag today (see
-	// MatchReceipt), so this matcher cannot make that distinction and does not
-	// try to. Decide it deliberately when the watcher lands; do not let it fall
-	// out of whichever branch happens to be written first.
+	// SCOPE: the reasoning above is about DEPOSITS, where crediting less is a
+	// coherent outcome. A PRODUCT ORDER settled by shortfall has no such option
+	// — stock is indivisible, so the order either delivers in full for up to
+	// min(0.5, 5%) under its price, or does not deliver.
+	//
+	// That question was settled by NOT ASKING IT. Reservation.IsDeposit now
+	// separates the two, and MatchIncoming — the only entry point the watcher
+	// uses — considers deposit rows only, so no product order can reach this
+	// verdict at all. MatchReceipt itself stays flag-agnostic: it is the pure
+	// rule, and the day product orders want hands-free settlement they get a
+	// deliberate decision of their own rather than inheriting this one.
 	MatchShortfall
 
 	// MatchAmbiguous: two or more live bands could claim this receipt. Credit
@@ -203,9 +206,11 @@ func (k MatchKind) String() string {
 // coin flip — but it is a routine outcome, not a rare one, and the unmatched
 // path must be built to be used rather than as a tripwire nobody watches.
 //
-// (Reservation carries no deposit-vs-order flag either, which the watcher will
-// need for the same reason MatchShortfall describes. Flagged, deliberately not
-// invented here.)
+// KIND IS ALSO THE CALLER'S FILTER. This function weighs every row it is
+// handed, deposit or product order alike; MatchIncoming is what narrows the set
+// to deposits (Reservation.IsDeposit). Anyone calling MatchReceipt directly with
+// a mixed slice gets exactly what they asked for, which on the watcher's path
+// would be a wallet credit against an undelivered order.
 //
 // AN OVERPAY beyond Tol is deliberately MatchNone rather than a match. The
 // ruling defines two shapes and both are "at most the quote"; a receipt above a
@@ -252,10 +257,19 @@ func MatchReceipt(p Params, recvUnits int64, live []Reservation) (Reservation, M
 	return Reservation{}, MatchAmbiguous
 }
 
-// MatchIncoming is MatchReceipt against the registry's own live rows for one
-// rail, taken atomically. This is the entry point the hands-free watcher wants:
-// the candidate set must be read in ONE lock section, or a row reserved midway
-// through the scan could make an ambiguous receipt look unambiguous.
+// MatchIncoming is MatchReceipt against the registry's own live DEPOSIT rows for
+// one rail, taken atomically. This is the entry point the hands-free watcher
+// wants: the candidate set must be read in ONE lock section, or a row reserved
+// midway through the scan could make an ambiguous receipt look unambiguous.
+//
+// DEPOSITS ONLY (Reservation.IsDeposit), and that is a money rule, not a
+// convenience. The watcher's one action is a wallet credit; a product order's
+// band matching here would credit a wallet for an order whose stock is still
+// sitting reserved and undelivered. Product orders are paid through their own
+// hash-paste flow and are simply not candidates for attribution by amount.
+// Filtering INSIDE the lock also keeps the ambiguity verdict honest: a product
+// order sharing the window must not make a deposit's receipt look ambiguous, or
+// a perfectly attributable payment would be held for manual review.
 //
 // Same-provider only, matching RecvMatchesAnyOtherBand: a payment arrives on one
 // chain and can only belong to a session on that chain. (The picker's collision
@@ -273,6 +287,9 @@ func (r *Registry) MatchIncoming(p Provider, recvUnits int64) (Reservation, Matc
 	}
 	live := make([]Reservation, 0, len(r.rows[p]))
 	for _, res := range r.rows[p] {
+		if !res.IsDeposit {
+			continue // a product order is never attributed by amount alone
+		}
 		live = append(live, res)
 	}
 	res, kind := MatchReceipt(prm, recvUnits, live)

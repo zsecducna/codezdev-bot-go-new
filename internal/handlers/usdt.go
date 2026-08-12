@@ -380,9 +380,11 @@ func (b *Bot) releaseUnpersisted(p bands.Provider, des string) {
 // verify compares against.
 func (b *Bot) adoptUSDTAmount(p bands.Provider, amount, chatID, des string, total, sinceMS int64, deadline time.Time) error {
 	now := b.now()
+	// IsDeposit: this function only ever served the deposit path (see the doc
+	// comment above), so the flag is a constant here rather than a parameter.
 	if err := b.bands.Adopt(bands.Reservation{
 		Provider: p, Des: des, ChatID: chatID, Amount: amount,
-		CreatedAt: now, Deadline: deadline,
+		CreatedAt: now, Deadline: deadline, IsDeposit: true,
 	}); err != nil {
 		return err
 	}
@@ -1415,7 +1417,13 @@ func (b *Bot) rehydrateOnchainPending(p bands.Provider) {
 			b.dropUSDTPending(p, r.des) // vanished / past grace -> drop
 			continue
 		}
-		if aerr := b.adoptPersisted(p, r.des, r.chatID, r.amount, r.total, r.sinceMS, r.ts, r.deadline); aerr != nil {
+		// Nothing in the persisted band row records what the money was for, so
+		// deposit-ness is re-derived from the ORDER we just read — the same
+		// test startOnchainDeposit's product constant makes on the way in. Both
+		// branches above guarantee o != nil here (live and inGrace each require
+		// it), so this cannot silently read false off a vanished order.
+		if aerr := b.adoptPersisted(p, r.des, r.chatID, r.amount, r.total, r.sinceMS, r.ts, r.deadline,
+			o.Product == depositProduct); aerr != nil {
 			log.Printf("%s rehydrate: adopt %s failed: %v", p, r.des, aerr)
 			continue
 		}
@@ -1430,10 +1438,13 @@ func (b *Bot) rehydrateOnchainPending(p bands.Provider) {
 // the rail-side rows. CreatedAt is the row's own write time, which is what
 // Sweep's grace is measured from (bands: "grace anchors CreatedAt"), so a
 // restart does not silently extend a band's life.
-func (b *Bot) adoptPersisted(p bands.Provider, des, chatID, amount string, total, sinceMS int64, ts, deadline float64) error {
+//
+// isDeposit is the caller's, for the reason bands.Adopt spells out: the
+// persisted row does not record it, so it must come from the order.
+func (b *Bot) adoptPersisted(p bands.Provider, des, chatID, amount string, total, sinceMS int64, ts, deadline float64, isDeposit bool) error {
 	if err := b.bands.Adopt(bands.Reservation{
 		Provider: p, Des: des, ChatID: chatID, Amount: amount,
-		CreatedAt: tsToTime(ts), Deadline: tsToTime(deadline),
+		CreatedAt: tsToTime(ts), Deadline: tsToTime(deadline), IsDeposit: isDeposit,
 	}); err != nil {
 		return err
 	}

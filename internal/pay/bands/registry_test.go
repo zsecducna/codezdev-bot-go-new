@@ -75,10 +75,86 @@ func newTestRegistry(t *testing.T) (*Registry, *fakeClock) {
 
 // adopt is a test shortcut for planting a pre-existing pending row (what
 // Python's tests do by writing straight into _bep20_pending).
+//
+// IsDeposit: true, because these rows stand in for rehydrated pending DEPOSIT
+// sessions — the only kind MatchIncoming considers. Allocation tests are
+// indifferent to the flag (the picker avoids every live row whatever it is
+// for); adoptOrder below is the deliberate opposite for the tests that are not.
 func adopt(t *testing.T, r *Registry, p Provider, des, chat, amount string, deadline time.Time) {
+	t.Helper()
+	if err := r.Adopt(Reservation{Provider: p, Des: des, ChatID: chat, Amount: amount, Deadline: deadline, IsDeposit: true}); err != nil {
+		t.Fatalf("Adopt(%s): %v", des, err)
+	}
+}
+
+// adoptOrder plants a live PRODUCT ORDER row: same band, same lock, same
+// blocking power over the picker — but invisible to attribution by amount.
+func adoptOrder(t *testing.T, r *Registry, p Provider, des, chat, amount string, deadline time.Time) {
 	t.Helper()
 	if err := r.Adopt(Reservation{Provider: p, Des: des, ChatID: chat, Amount: amount, Deadline: deadline}); err != nil {
 		t.Fatalf("Adopt(%s): %v", des, err)
+	}
+}
+
+// TestMatchIncomingIgnoresProductOrders is the money assertion behind
+// Reservation.IsDeposit. The watcher's only action is a WALLET CREDIT, so a
+// product order's band must never be attributable by amount: matching one would
+// pay the customer's wallet for goods whose stock is still sitting reserved and
+// undelivered, and the customer would then have both the balance and an order
+// they can still pay for from it.
+//
+// The transfer here lands EXACTLY on the order's quoted amount — the strongest
+// possible evidence, and still not enough, because the evidence was never the
+// problem. Attribution by amount is only sound for a flow whose settlement is
+// "credit what arrived", which is deposits and nothing else.
+func TestMatchIncomingIgnoresProductOrders(t *testing.T) {
+	r, _ := newTestRegistry(t)
+	adoptOrder(t, r, ProviderTron, "order-1", "7", "120.01000", tLive)
+
+	recv := mustUnitsAt(t, "120.01000")
+	res, kind, err := r.MatchIncoming(ProviderTron, recv)
+	if err != nil {
+		t.Fatalf("MatchIncoming: %v", err)
+	}
+	if kind != MatchNone {
+		t.Errorf("MatchIncoming on a live PRODUCT ORDER band = (%s, %s), want none — the watcher "+
+			"would have wallet-credited an order whose stock was never delivered", res.Des, kind)
+	}
+
+	// And the flag must not merely DEMOTE the order row to a weaker verdict: a
+	// deposit sharing the window has to still match cleanly, not come back
+	// ambiguous because a product order was standing next to it.
+	adopt(t, r, ProviderTron, "dep-1", "8", "120.01000", tLive)
+	res, kind, err = r.MatchIncoming(ProviderTron, recv)
+	if err != nil || kind != MatchExact || res.Des != "dep-1" {
+		t.Errorf("MatchIncoming with a deposit beside the order = (%s, %s, %v), want (dep-1, exact, nil)",
+			res.Des, kind, err)
+	}
+}
+
+// TestDepositRowsMatchesMatchIncomingsCandidateSet pins the shared-rule
+// invariant: the watcher decides whether to make an RPC call at all from
+// DepositRows, then attributes through MatchIncoming. If those two disagreed
+// about what a candidate is, the gate could skip a fetch for a band the matcher
+// would have matched — a deposit silently never credited.
+func TestDepositRowsMatchesMatchIncomingsCandidateSet(t *testing.T) {
+	r, _ := newTestRegistry(t)
+	adoptOrder(t, r, ProviderTron, "order-1", "7", "120.01000", tLive)
+	if rows := r.DepositRows(ProviderTron); len(rows) != 0 {
+		t.Fatalf("DepositRows with only a product order = %d rows, want 0 — the watcher would "+
+			"poll a public RPC on a timer with nobody depositing", len(rows))
+	}
+	// A row PAST its deadline is still a candidate, exactly as it is for
+	// MatchIncoming: recovering a late payment inside the pending grace is the
+	// whole reason the row is kept.
+	adopt(t, r, ProviderTron, "dep-dead", "8", "120.01000", tDead)
+	rows := r.DepositRows(ProviderTron)
+	if len(rows) != 1 || rows[0].Des != "dep-dead" {
+		t.Fatalf("DepositRows = %v, want the one dead-but-in-grace deposit row", rows)
+	}
+	if _, kind, _ := r.MatchIncoming(ProviderTron, mustUnitsAt(t, "120.01000")); kind != MatchExact {
+		t.Errorf("MatchIncoming on a dead-but-listed row = %s, want exact — the gate and the "+
+			"matcher must agree on the candidate set", kind)
 	}
 }
 
