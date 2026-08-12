@@ -14,6 +14,13 @@ import (
 
 // AuditRow mirrors one `audit` row (store.py:77-83): append-only trail of
 // destructive actions (account delete / password reset / tenant cleanup).
+//
+// Count is unused (zero-value) by RecentAudit's raw rows — it is populated
+// only by RecentAuditCollapsed, which folds repeated (action, target) rows
+// into one entry and needs somewhere to carry the true occurrence total.
+// Reusing this struct rather than inventing a wrapper type keeps both call
+// sites returning the same []AuditRow shape; a caller that never asks for
+// the collapsed view simply never sees a non-zero Count.
 type AuditRow struct {
 	TS        float64
 	ActorChat string
@@ -22,6 +29,7 @@ type AuditRow struct {
 	Target    string
 	Outcome   string
 	Detail    string
+	Count     int
 }
 
 // LogAction appends one destructive-action row to the audit trail
@@ -40,18 +48,27 @@ func (s *Store) LogAction(actorChat, actorKind, action, target, outcome, detail 
 	}
 }
 
+// auditFilterClause builds the optional free-text WHERE clause shared by
+// RecentAudit and RecentAuditCollapsed, so the two queries can never drift
+// apart on what "matches the filter" means — a collapsed view is only
+// correct if it narrows on the exact same predicate the raw view uses.
+// Returns "" (no args) when query is empty.
+func auditFilterClause(query string) (string, []any) {
+	if query == "" {
+		return "", nil
+	}
+	like := "%" + query + "%"
+	return " WHERE actor_chat LIKE ? OR target LIKE ? OR action LIKE ? " +
+			"OR detail LIKE ? OR actor_kind LIKE ? OR outcome LIKE ?",
+		[]any{like, like, like, like, like, like}
+}
+
 // RecentAudit returns recent audit rows, newest first (store.py:536-550).
 // query: optional case-insensitive substring filter over actor_chat / target /
 // action / detail / actor_kind / outcome ("" = no filter).
 func (s *Store) RecentAudit(limit int, query string) ([]AuditRow, error) {
-	q := "SELECT ts, actor_chat, actor_kind, action, target, outcome, detail FROM audit"
-	var args []any
-	if query != "" {
-		like := "%" + query + "%"
-		q += " WHERE actor_chat LIKE ? OR target LIKE ? OR action LIKE ? " +
-			"OR detail LIKE ? OR actor_kind LIKE ? OR outcome LIKE ?"
-		args = append(args, like, like, like, like, like, like)
-	}
+	where, args := auditFilterClause(query)
+	q := "SELECT ts, actor_chat, actor_kind, action, target, outcome, detail FROM audit" + where
 	q += " ORDER BY id DESC LIMIT ?"
 	args = append(args, limit)
 	rows, err := s.db.Query(q, args...)
@@ -75,6 +92,102 @@ func (s *Store) RecentAudit(limit int, query string) ([]AuditRow, error) {
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// RecentAuditCollapsed returns recent audit rows collapsed to the latest row
+// per distinct (action, target) pair, with Count set to the TRUE number of
+// matching rows in that group. store.py has no equivalent — this exists
+// only because of a Go-port-era failure mode: the hands-free deposit
+// watcher (usdtwatch.go) writes ONE audit row per tick for every payment
+// still stuck ambiguous/quarantined/stale, so a single stubborn transfer
+// can leave a thousand+ identical rows in the trail and bury every other
+// admin action behind them in RecentAudit's un-deduplicated top-N. This
+// collapses the DISPLAY only — the audit table itself, and RecentAudit's
+// raw fidelity, are untouched — so a stuck payment shows up as ONE entry
+// with an occurrence count instead of drowning everything else.
+//
+// query: same optional free-text filter as RecentAudit, and it is applied
+// BEFORE grouping (via the shared auditFilterClause) — a filtered view must
+// narrow the candidate rows first and group what's left, not group
+// everything and then filter the groups.
+//
+// limit caps the number of DISTINCT (action, target) GROUPS returned, not
+// raw rows — a single group can represent far more than `limit` rows.
+//
+// Implementation: modernc.org/sqlite (this repo's driver) is targeted with
+// plain ANSI SQL rather than window functions, in three simple steps
+// merged in Go instead of one dense query, on the theory that three
+// queries that are each easy to eyeball beat one clever one that isn't:
+//  1. find the max `id` (= latest row) per (action, target) group within
+//     the filtered set, capped at `limit` groups, newest group first;
+//  2. join those ids back to their full rows;
+//  3. separately COUNT(*) GROUP BY action, target over the same filtered
+//     set, then merge each row's true count onto it in Go.
+func (s *Store) RecentAuditCollapsed(limit int, query string) ([]AuditRow, error) {
+	where, args := auditFilterClause(query)
+
+	// Steps 1+2: latest row per group, capped at `limit` groups.
+	q := "SELECT a.ts, a.actor_chat, a.actor_kind, a.action, a.target, a.outcome, a.detail " +
+		"FROM audit a JOIN (" +
+		"SELECT action, target, MAX(id) AS max_id FROM audit" + where +
+		" GROUP BY action, target ORDER BY max_id DESC LIMIT ?" +
+		") g ON a.id = g.max_id ORDER BY a.id DESC"
+	rowArgs := append(append([]any{}, args...), limit)
+	rows, err := s.db.Query(q, rowArgs...)
+	if err != nil {
+		return nil, err
+	}
+	var out []AuditRow
+	for rows.Next() {
+		var (
+			a                                              AuditRow
+			ts                                             sql.NullFloat64
+			chat, kind, action, target, outcome, detailCol sql.NullString
+		)
+		if err := rows.Scan(&ts, &chat, &kind, &action, &target, &outcome, &detailCol); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		a.TS = ts.Float64
+		a.ActorChat, a.ActorKind, a.Action = chat.String, kind.String, action.String
+		a.Target, a.Outcome, a.Detail = target.String, outcome.String, detailCol.String
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	if len(out) == 0 {
+		return out, nil
+	}
+
+	// Step 3: true total per group over the SAME filtered set.
+	cq := "SELECT action, target, COUNT(*) FROM audit" + where + " GROUP BY action, target"
+	crows, err := s.db.Query(cq, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer crows.Close()
+	counts := make(map[[2]string]int)
+	for crows.Next() {
+		// NullString, not string: mirrors the Step 1/2 scan above so a
+		// legacy row with a NULL action/target (RecentAudit tolerates this
+		// today) can't make this whole collapsed view error out.
+		var action, target sql.NullString
+		var c int
+		if err := crows.Scan(&action, &target, &c); err != nil {
+			return nil, err
+		}
+		counts[[2]string{action.String, target.String}] = c
+	}
+	if err := crows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].Count = counts[[2]string{out[i].Action, out[i].Target}]
+	}
+	return out, nil
 }
 
 // AuditRetentionFloor is the minimum window PruneAudit will ever honor,

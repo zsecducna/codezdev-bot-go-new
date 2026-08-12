@@ -2305,7 +2305,8 @@ func (b *Bot) cbAdmAudit(cc *cbCtx) {
 
 // sendAuditLog is _send_audit (§8.2), default limit 25 (distinct from
 // store.RecentAudit's own internal default — this admin viewer always passes
-// 25 explicitly).
+// 25 explicitly). Reads via RecentAuditCollapsed so a flood of identical
+// rows from one stuck payment collapses to one entry with a count.
 func (b *Bot) sendAuditLog(ctx context.Context, chatID int64, query string) {
 	const limit = 25
 	head := "📜 AUDIT LOG"
@@ -2316,7 +2317,12 @@ func (b *Bot) sendAuditLog(ctx context.Context, chatID int64, query string) {
 		b.send(ctx, chatID, head+" (last 0)\n\n(no matching entries)", admNav("admroot"))
 		return
 	}
-	rows, err := b.store.RecentAudit(limit, query)
+	// RecentAuditCollapsed, not RecentAudit: a stuck hands-free-deposit
+	// payment writes one raw row per watcher tick, and without collapsing,
+	// a single stubborn transfer can fill this whole view and hide every
+	// other admin action behind it. The DB keeps every raw row regardless
+	// — this only changes what the admin sees.
+	rows, err := b.store.RecentAuditCollapsed(limit, query)
 	if err != nil {
 		b.send(ctx, chatID, "⚠️ Could not read the audit log.", admNav("admroot"))
 		return
@@ -2330,6 +2336,11 @@ func (b *Bot) sendAuditLog(ctx context.Context, chatID int64, query string) {
 	for _, r := range rows {
 		entry := fmtWhen(r.TS, i18n.EN) + " · " + auditEmoji(r.ActorKind) + " " + r.ActorKind + " " + r.ActorChat + "\n" +
 			"  " + r.Action + " → " + r.Target
+		// Only a repeated (action, target) pair earns a count suffix — an
+		// ordinary single-occurrence row renders exactly as it always has.
+		if r.Count > 1 {
+			entry += " (×" + itoa(r.Count) + ")"
+		}
 		if r.Outcome != "" {
 			entry += "\n  ⮑ " + r.Outcome
 		}

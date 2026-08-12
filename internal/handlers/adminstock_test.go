@@ -210,3 +210,45 @@ func TestCapRenProdWarnsWhenSettingsCarryFails(t *testing.T) {
 		t.Errorf("rename reply = %q, want it to warn that suspend/private flags did not carry over to the new name", renameReply)
 	}
 }
+
+// TestSendAuditLogCollapsesRepeatedActionTargetWithCount is the display-side
+// regression pin for the audit-flood fix: sendAuditLog now reads via
+// RecentAuditCollapsed instead of RecentAudit, so a stuck hands-free-deposit
+// payment that logs the same (action, target) 50 times must render as ONE
+// entry carrying a "×50" count — not 50 separate lines burying everything
+// else on the admin's screen. An ordinary, never-repeated row seeded
+// alongside it must render exactly as before, with no count suffix at all,
+// proving the common case is untouched.
+func TestSendAuditLogCollapsesRepeatedActionTargetWithCount(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, _ := newBuyBot(t, "1")
+
+	for range 50 {
+		st.LogAction("1", "admin", "watch_ambiguous", "tx-stuck", "still unresolved", "")
+	}
+	st.LogAction("1", "admin", "delete_account", "user123", "ok", "")
+
+	b.sendAuditLog(ctx, 1, "")
+
+	if got := f.sendCount(); got != 1 {
+		t.Fatalf("sendCount = %d, want 1", got)
+	}
+	text := f.Sends[0].Text
+	if !strings.Contains(text, "watch_ambiguous → tx-stuck") {
+		t.Fatalf("audit text missing the collapsed entry, got %q", text)
+	}
+	if !strings.Contains(text, "watch_ambiguous → tx-stuck (×50)") {
+		t.Errorf("audit text = %q, want the repeated entry to carry a (×50) count suffix", text)
+	}
+	if !strings.Contains(text, "delete_account → user123") {
+		t.Fatalf("audit text missing the ordinary single-occurrence entry, got %q", text)
+	}
+	if strings.Contains(text, "delete_account → user123 (×") {
+		t.Errorf("audit text = %q, an ordinary single-occurrence row must not get a count suffix", text)
+	}
+	// Exactly one "(×" in the whole message: the 50-times entry must not
+	// have been split back into raw rows, each somehow tagged.
+	if n := strings.Count(text, "(×"); n != 1 {
+		t.Errorf("count-suffix occurrences = %d, want exactly 1 (one collapsed entry, not 50 raw rows)", n)
+	}
+}

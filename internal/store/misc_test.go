@@ -233,3 +233,164 @@ func TestPruneAuditFutureCutoffClampsToFloor(t *testing.T) {
 		t.Errorf("surviving row = %+v, want the single row target=within-floor", rows)
 	}
 }
+
+// ---- RecentAuditCollapsed ---------------------------------------------
+//
+// Covers the flood-collapsing display path: the hands-free deposit watcher
+// (usdtwatch.go) writes one audit row per tick for every payment still stuck
+// unresolved, so a single stubborn transfer can leave hundreds of identical
+// rows in the trail. RecentAuditCollapsed folds those down for the admin
+// audit screen; RecentAudit itself is untouched (proven separately above).
+
+// seedAuditRowFull inserts one audit row with an explicit action/target/
+// outcome and ts, for tests that need to distinguish (action, target)
+// groups or drive the free-text filter against a specific column.
+func seedAuditRowFull(t *testing.T, s *Store, ts float64, action, target, outcome string) {
+	t.Helper()
+	if _, err := s.db.Exec(
+		"INSERT INTO audit(ts, actor_chat, actor_kind, action, target, outcome, detail) "+
+			"VALUES (?,?,?,?,?,?,?)",
+		ts, "1", "admin", action, target, outcome, ""); err != nil {
+		t.Fatalf("seed audit row action=%q target=%q: %v", action, target, err)
+	}
+}
+
+// TestRecentAuditCollapsedFoldsRepeatedRow is the core flood scenario: one
+// (action, target) pair logged 50 times (the same stuck payment re-flagged
+// on every watcher tick) must collapse to a SINGLE entry whose Count carries
+// the true total, not the raw row count leaking through uncollapsed.
+//
+// Falsification: if grouping were dropped (or grouped on the wrong columns),
+// this would return 50 rows instead of 1, or Count would come back 0/1
+// instead of 50.
+func TestRecentAuditCollapsedFoldsRepeatedRow(t *testing.T) {
+	s := newTestStore(t)
+	for i := range 50 {
+		seedAuditRowFull(t, s, 1_000_000_000.0+float64(i), "watch_ambiguous", "tx-stuck", "still unresolved")
+	}
+
+	rows, err := s.RecentAuditCollapsed(25, "")
+	if err != nil {
+		t.Fatalf("RecentAuditCollapsed: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1 collapsed entry for the single repeated group", len(rows))
+	}
+	if rows[0].Count != 50 {
+		t.Errorf("Count = %d, want 50 (true total, not an approximation)", rows[0].Count)
+	}
+	if rows[0].Action != "watch_ambiguous" || rows[0].Target != "tx-stuck" {
+		t.Errorf("collapsed row = %+v, want action=watch_ambiguous target=tx-stuck", rows[0])
+	}
+}
+
+// TestRecentAuditCollapsedKeepsDistinctGroupsSeparate proves two different
+// (action, target) pairs, each repeated, are never merged into one group —
+// only rows that share BOTH columns collapse together.
+func TestRecentAuditCollapsedKeepsDistinctGroupsSeparate(t *testing.T) {
+	s := newTestStore(t)
+	for i := range 3 {
+		seedAuditRowFull(t, s, 1_000_000_000.0+float64(i), "watch_ambiguous", "tx-a", "")
+	}
+	for i := range 7 {
+		seedAuditRowFull(t, s, 1_000_000_100.0+float64(i), "watch_quarantine", "tx-b", "")
+	}
+
+	rows, err := s.RecentAuditCollapsed(25, "")
+	if err != nil {
+		t.Fatalf("RecentAuditCollapsed: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2 (distinct groups must not merge)", len(rows))
+	}
+	counts := map[string]int{}
+	for _, r := range rows {
+		counts[r.Action+"/"+r.Target] = r.Count
+	}
+	if counts["watch_ambiguous/tx-a"] != 3 {
+		t.Errorf("watch_ambiguous/tx-a count = %d, want 3", counts["watch_ambiguous/tx-a"])
+	}
+	if counts["watch_quarantine/tx-b"] != 7 {
+		t.Errorf("watch_quarantine/tx-b count = %d, want 7", counts["watch_quarantine/tx-b"])
+	}
+}
+
+// TestRecentAuditCollapsedFilterAppliesBeforeGrouping pins the ordering the
+// task requires: the free-text filter must narrow the ROW set first, and
+// grouping/picking-the-latest must run on what's left — not the reverse
+// (group everything, pick a representative row, then filter on it).
+//
+// Group (action=A, target=T) has an OLD row whose outcome matches the
+// filter ("apple") and four newer rows that do NOT ("banana"). If filtering
+// ran after grouping, the group's representative (latest) row would be a
+// "banana" row, it wouldn't match the "apple" filter, and the whole group
+// would vanish from a filtered query. Filtering the rows first means only
+// the "apple" row is ever a grouping candidate, so the group survives with
+// that row as its (only, and therefore latest) representative.
+func TestRecentAuditCollapsedFilterAppliesBeforeGrouping(t *testing.T) {
+	s := newTestStore(t)
+	seedAuditRowFull(t, s, 1_000_000_000.0, "watch_ambiguous", "tx-a", "apple")
+	for i := range 4 {
+		seedAuditRowFull(t, s, 1_000_000_100.0+float64(i), "watch_ambiguous", "tx-a", "banana")
+	}
+
+	rows, err := s.RecentAuditCollapsed(25, "apple")
+	if err != nil {
+		t.Fatalf("RecentAuditCollapsed: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1 — filtering must narrow to the single "+
+			"apple row before grouping, not drop the whole group", len(rows))
+	}
+	if rows[0].Outcome != "apple" {
+		t.Errorf("outcome = %q, want apple (the only row matching the filter)", rows[0].Outcome)
+	}
+	if rows[0].Count != 1 {
+		t.Errorf("Count = %d, want 1 — only the apple row matches the filter, "+
+			"the 4 banana rows must not be counted in", rows[0].Count)
+	}
+}
+
+// TestRecentAuditCollapsedSingleOccurrenceCountIsOne is the regression
+// anchor for the common case: an ordinary, never-repeated row must come
+// back with Count exactly 1 (not 0), so the caller's ">1" check to suppress
+// the count suffix behaves correctly.
+func TestRecentAuditCollapsedSingleOccurrenceCountIsOne(t *testing.T) {
+	s := newTestStore(t)
+	seedAuditRowFull(t, s, 1_000_000_000.0, "delete_account", "user123", "ok")
+
+	rows, err := s.RecentAuditCollapsed(25, "")
+	if err != nil {
+		t.Fatalf("RecentAuditCollapsed: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Count != 1 {
+		t.Fatalf("got %+v, want a single row with Count=1", rows)
+	}
+}
+
+// TestRecentAuditCollapsedLimitCapsGroups constructs raw-row count (30)
+// that would exceed a small limit (2) while distinct-group count (2) does
+// not, and confirms `limit` caps GROUPS, not raw rows — both groups must
+// still appear.
+func TestRecentAuditCollapsedLimitCapsGroups(t *testing.T) {
+	s := newTestStore(t)
+	for i := range 15 {
+		seedAuditRowFull(t, s, 1_000_000_000.0+float64(i), "watch_ambiguous", "tx-a", "")
+	}
+	for i := range 15 {
+		seedAuditRowFull(t, s, 1_000_001_000.0+float64(i), "watch_quarantine", "tx-b", "")
+	}
+
+	rows, err := s.RecentAuditCollapsed(2, "")
+	if err != nil {
+		t.Fatalf("RecentAuditCollapsed: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2 — limit=2 caps at 2 GROUPS even though "+
+			"30 raw rows exist", len(rows))
+	}
+	total := rows[0].Count + rows[1].Count
+	if total != 30 {
+		t.Errorf("combined Count = %d, want 30 (15+15 across both groups)", total)
+	}
+}
