@@ -331,6 +331,93 @@ func TestWatcherCreditsNothingWhenAmbiguous(t *testing.T) {
 	}
 }
 
+// TestWatcherQuarantineSurvivesTheCompetitionAndARestart is the durable half of
+// the ambiguity refusal, and the reason `ambiguous_txns` exists.
+//
+// Refusing per tick is not enough. The transfer is deliberately left unconsumed
+// in the processed ledger so a human can still settle it, which also means a
+// later tick re-examines it — and once the competing deposit settles, the very
+// same transfer looks unambiguous and would be credited to whichever deposit
+// survived. Waiting produced no new evidence about whose money it is, so that
+// is exactly as much of a guess as crediting it in the first place.
+//
+// The second half rebuilds the Bot against the SAME store, which is the whole
+// point of durable over in-memory: this project deploys often, so a
+// process-local memory would only shrink the window to "until the next deploy".
+func TestWatcherQuarantineSurvivesTheCompetitionAndARestart(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, _ := newUSDTBot(t)
+	w := installWatchFake(b)
+	const first, second = 4712, 4713
+
+	b.Process(ctx, callbackUpdate(first, "dep:trx"))
+	b.Process(ctx, textUpdate(first, "6"))
+	o1 := reservedDeposit(t, st, first)
+	r1, _ := b.bands.Get(bands.ProviderTron, o1.Des)
+
+	b.Process(ctx, callbackUpdate(second, "dep:trx"))
+	b.Process(ctx, textUpdate(second, "6"))
+	o2 := reservedDeposit(t, st, second)
+	r2, _ := b.bands.Get(bands.ProviderTron, o2.Des)
+
+	// A receipt short of the lower quote by 0.10 USDT: beyond Tol for either, and
+	// inside both fee allowances, so neither band can claim it.
+	lowUnits, err := bands.AmountUnits(min(r1.Amount, r2.Amount), tron.AmountDecimals())
+	if err != nil {
+		t.Fatalf("amount units: %v", err)
+	}
+	shortUnits := lowUnits - 10_000
+	if _, kind, merr := b.bands.MatchIncoming(bands.ProviderTron, shortUnits); merr != nil || kind != bands.MatchAmbiguous {
+		t.Fatalf("MatchIncoming(%d) = (%s, %v), want ambiguous", shortUnits, kind, merr)
+	}
+	ambiguousHash := hash64("7")
+	ambiguous := *trxTx(ambiguousHash, bands.FormatUnits(shortUnits, tron.AmountDecimals()), b.now().UnixMilli())
+
+	w.set(ambiguous)
+	b.tickOnchain(ctx, bands.ProviderTron)
+
+	if held, qerr := st.AmbiguousTxnExists("trx:" + ambiguousHash); qerr != nil || !held {
+		t.Fatalf("AmbiguousTxnExists = (%t, %v), want (true, nil) — the refusal was not recorded", held, qerr)
+	}
+	// It must stay OUT of the processed ledger: a human still has to be able to
+	// credit it by hand through the hash-paste path.
+	if used, terr := st.TxnExists("trx:" + ambiguousHash); terr != nil || used {
+		t.Fatalf("TxnExists = (%t, %v), want (false, nil) — quarantine must not consume the transfer", used, terr)
+	}
+
+	// Now thin the competition out the way production would: the first deposit
+	// is settled by ITS OWN payment, so only one band is left standing.
+	w.set(ambiguous, *trxTx(hash64("6"), r1.Amount, b.now().UnixMilli()))
+	b.tickOnchain(ctx, bands.ProviderTron)
+	if bal, _ := st.GetBalance(fmtInt(first)); bal != 150250 {
+		t.Fatalf("first depositor balance = %d VND, want 150250 — its own payment should have settled", bal)
+	}
+	if b.bands.Len(bands.ProviderTron) != 1 {
+		t.Fatalf("expected exactly one surviving band, got %d", b.bands.Len(bands.ProviderTron))
+	}
+	// The ambiguous transfer is now a clean shortfall match for the survivor.
+	// It must STILL not be credited.
+	b.tickOnchain(ctx, bands.ProviderTron)
+	if bal, _ := st.GetBalance(fmtInt(second)); bal != 0 {
+		t.Errorf("survivor credited %d VND from a quarantined transfer — attribution by attrition", bal)
+	}
+
+	// ---- restart: a brand new Bot and band registry, same database ----------
+	b2 := New(Deps{TG: &fakeTG{}, Store: st, Stock: b.stock, Config: b.cfg, AdminID: "999"})
+	defer b2.Shutdown() // st is closed by the first bot's cleanup, not here
+	w2 := installWatchFake(b2)
+	b2.rehydrateOnchainPending(bands.ProviderTron)
+	if b2.bands.Len(bands.ProviderTron) != 1 {
+		t.Fatalf("rebuilt bot rehydrated %d bands, want 1 — without a live band the tick would "+
+			"skip for the wrong reason and prove nothing", b2.bands.Len(bands.ProviderTron))
+	}
+	w2.set(ambiguous)
+	b2.tickOnchain(ctx, bands.ProviderTron)
+	if bal, _ := st.GetBalance(fmtInt(second)); bal != 0 {
+		t.Errorf("a restarted bot credited %d VND from a quarantined transfer — the refusal did not survive the deploy", bal)
+	}
+}
+
 // TestWatcherIgnoresATransferOlderThanItsBand is the per-band freshness gate.
 //
 // The chain query's lower bound is the OLDEST live deposit's start, which is

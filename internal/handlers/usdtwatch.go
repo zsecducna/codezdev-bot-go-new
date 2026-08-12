@@ -33,8 +33,10 @@ import (
 //     Reservation.IsDeposit; the extra product check below is a second lock on
 //     the same door, because the cost of it being wrong is money out for goods
 //     never delivered.
-//   - It never guesses. An amount that two live deposits could both claim is
-//     logged and left alone — see the MatchAmbiguous branch.
+//   - It never guesses, and never un-guesses later. An amount two live deposits
+//     could both claim is logged, left uncredited, and QUARANTINED durably, so
+//     no later tick can credit it once the competition thins out. See the
+//     MatchAmbiguous branch and the ambiguous_txns table.
 //   - It never frees a band. Every failure here (fetch, DB read, rate) logs and
 //     returns, so the next tick retries; releasing a live amount on a read error
 //     could hand it to another order and let one payment settle the wrong one.
@@ -107,6 +109,18 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 	if used {
 		return
 	}
+	// QUARANTINE, checked BEFORE the matcher so a transfer a human already owns
+	// can never be re-attributed by a later tick's changed band set. This is the
+	// durable half of the ambiguity refusal — see the ambiguous_txns table.
+	// A read failure skips, same fail-closed direction as the ledger read above.
+	held, qerr := b.store.AmbiguousTxnExists(ledgerID)
+	if qerr != nil {
+		log.Printf("usdt watch [%s]: quarantine read failed for %s: %v", p, ledgerID, qerr)
+		return
+	}
+	if held {
+		return
+	}
 	res, kind, merr := b.bands.MatchIncoming(p, tx.Units)
 	if merr != nil {
 		log.Printf("usdt watch [%s]: match failed for %s: %v", p, ledgerID, merr)
@@ -125,18 +139,31 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 		// on this line yet; raising it to the owners is a later task, and this
 		// log is the record that task will read.
 		//
-		// SCOPE, stated because the obvious reading is wrong: this refusal is
-		// per tick, not permanent. The transfer is left UNCONSUMED (no ledger
-		// row), deliberately, so a human can still settle it — but that also
-		// means a later tick re-examines it, and once the competing band
-		// settles or is swept the same transfer becomes unambiguous and is
-		// credited to whichever deposit survived. That is attribution by
-		// attrition rather than by evidence. Making the refusal stick needs
-		// somewhere durable to record "a human owns this one", which is the
-		// same storage the owner-alert task is designing; it is deliberately
-		// not invented here. Until then this line also repeats every tick for
-		// as long as both bands are live.
-		log.Printf("usdt watch [%s]: AMBIGUOUS %s from=%s recv=%s (%d units) — two or more live deposits match, credited nothing, needs manual attribution",
+		// THE REFUSAL IS PERMANENT, and it has to be. Left to per-tick logic it
+		// would not be: the transfer is deliberately left UNCONSUMED in the
+		// processed ledger so a human can still settle it, which also means a
+		// later tick re-examines it — and once the competing band settles or is
+		// swept the very same transfer looks unambiguous and would be credited
+		// to whichever deposit happened to survive. That is attribution by
+		// attrition rather than by evidence, and it is exactly as wrong as
+		// guessing was in the first place; waiting does not produce the missing
+		// information.
+		//
+		// So the sighting is recorded durably (ambiguous_txns) and checked
+		// before the matcher on every later tick. Durable rather than in-memory
+		// because this project deploys often, and a process-local memory would
+		// only shrink the window to "until the next restart".
+		if qwerr := b.store.MarkAmbiguousTxn(ledgerID, string(p), recvStr,
+			float64(b.now().UnixNano())/1e9); qwerr != nil {
+			// Nothing was credited either way, so the money is not at risk right
+			// now — but the protection did not take, and a later tick may
+			// auto-credit this once the bands change. Loud, because that is a
+			// silent wrong-customer credit waiting to happen and the retry is
+			// simply the next tick.
+			log.Printf("usdt watch [%s]: QUARANTINE WRITE FAILED for %s: %v — this transfer is NOT protected and may be auto-credited later",
+				p, ledgerID, merr)
+		}
+		log.Printf("usdt watch [%s]: AMBIGUOUS %s from=%s recv=%s (%d units) — two or more live deposits match, credited nothing, quarantined for manual attribution",
 			p, ledgerID, tx.Frm, recvStr, tx.Units)
 		return
 	default: // bands.MatchNone

@@ -293,6 +293,37 @@ func (s *Store) initSchema() error {
 		"CREATE TABLE IF NOT EXISTS tron_pending (" +
 			"des TEXT PRIMARY KEY, chat_id TEXT, amount TEXT, total INTEGER, " +
 			"min_ts INTEGER, deadline REAL, ts REAL)",
+		// Incoming on-chain transfers the hands-free deposit watcher could NOT
+		// attribute, because two or more live deposits could each claim the
+		// amount (internal/handlers/usdtwatch.go, bands.MatchAmbiguous). No
+		// Python ancestor — the watcher is new in the Go port.
+		//
+		// WHY THIS IS A SEPARATE TABLE AND NOT A FLAG ON `processed`: a row in
+		// `processed` means CREDITED, and TxnExists is read as exactly that by
+		// the settle paths. A quarantined transfer is the opposite — money that
+		// arrived and was deliberately NOT credited — so recording it there
+		// would corrupt a meaning other code already depends on.
+		//
+		// WHY DURABLE rather than an in-memory set: without it the refusal only
+		// holds until the competing band settles or sweeps, at which point the
+		// same transfer looks unambiguous and is auto-credited to whichever
+		// deposit happened to survive — attribution by attrition. A process-local
+		// set would additionally forget everything on each deploy.
+		//
+		// Columns are the minimum the skip and a human's investigation need:
+		// txn_id is both the lookup key and (as PK) the write's own dedupe;
+		// provider says which chain to go looking on; amount is what a human
+		// compares against the candidate bands; first_seen is when it arrived.
+		// Nothing here is pre-built for the resolution UI — that is a later
+		// task's to design.
+		//
+		// ROWS ARE NEVER DELETED by this code, and that is safe: if the customer
+		// later pastes the hash, the verify path credits it (it does not consult
+		// this table — the human-driven route must stay open) and the watcher's
+		// own processed-ledger pre-filter skips it from then on, so a stale row
+		// is inert. Clearing them belongs to the human-resolution workflow.
+		"CREATE TABLE IF NOT EXISTS ambiguous_txns (" +
+			"txn_id TEXT PRIMARY KEY, provider TEXT, amount TEXT, first_seen REAL)",
 		// Banned chats — persistent backing for the in-memory ban gate
 		// (store.py:146-150).
 		"CREATE TABLE IF NOT EXISTS banned (" +

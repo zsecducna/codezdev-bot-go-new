@@ -84,6 +84,37 @@ func (s *Store) TxnExists(txnID string) (bool, error) {
 	return err == nil, err
 }
 
+// AmbiguousTxnExists reports whether this transfer was already quarantined as
+// unattributable by the hands-free watcher (see the ambiguous_txns table in
+// store.go for what that means and why it is durable).
+//
+// Read-only, and keyed on the PK, so the watcher can ask it about every
+// transfer on every tick. Deliberately separate from TxnExists: that one means
+// "already credited", this one means "arrived, and must never be credited
+// automatically".
+func (s *Store) AmbiguousTxnExists(txnID string) (bool, error) {
+	var one int
+	err := s.db.QueryRow("SELECT 1 FROM ambiguous_txns WHERE txn_id=?", txnID).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// MarkAmbiguousTxn quarantines a transfer the watcher refused to attribute.
+//
+// Idempotent by the txn_id PK: the watcher re-sees the same transfer on every
+// tick for as long as it stays unattributable, and the FIRST sighting is the
+// one worth keeping (first_seen is how long the money has been waiting on a
+// human). A repeat insert is therefore ignored, not an error.
+func (s *Store) MarkAmbiguousTxn(txnID, provider, amount string, ts float64) error {
+	_, err := s.db.Exec(
+		"INSERT INTO ambiguous_txns(txn_id, provider, amount, first_seen) VALUES (?,?,?,?) "+
+			"ON CONFLICT(txn_id) DO NOTHING",
+		txnID, provider, amount, ts)
+	return err
+}
+
 // MarkTxn records a txn as processed WITHOUT crediting balance
 // (store.py:712-727). Used for QR PURCHASES: the money pays for accounts
 // directly, so it must NOT also top up the wallet (free credit). Returns true
