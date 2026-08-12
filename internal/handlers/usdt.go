@@ -1033,75 +1033,9 @@ func (b *Bot) verifyUSDTTxid(ctx context.Context, chatID int64, chain, des, txha
 
 	// ---- settle: DEPOSIT ----------------------------------------------------
 	if isDeposit {
-		// No claim-jack band gate — a deposit credits the SUBMITTER's own wallet
-		// against their own desired amount, so a neighbour-band collision must not
-		// false-reject (@9745-9751).
-		desiredUnits, aerr := bands.AmountUnits(expected, prm.Decimals)
-		if aerr != nil {
-			log.Printf("usdt deposit (%s) bad stored amount %q for %s: %v", chain, expected, des, aerr)
-			return b.txidNotFound(ctx, chatID, lang, quiet)
-		}
-		// DEPOSIT_MATCH_TOL_UNITS is read through b.envInt (the config.Load
-		// snapshot), NOT bands.DepositMatchTolUnits() — that helper uses the
-		// pay package's raw os.Getenv, which production never populates
-		// (config.Load deliberately does not write os.Environ and systemd
-		// exports no EnvironmentFile), so the knob silently did nothing on
-		// the live deposit-credit path while working in local testing. Same
-		// class as tasks #10/#17/#22/#23.
-		//
-		// ClampDepositTol caps whatever that resolves to at this rail's own
-		// band half-width. The two knobs live in different .env sections and
-		// are tuned independently, so a deposit tolerance wider than the band
-		// spacing is a reachable operator mistake — and it would make one
-		// receipt equidistant-and-matching for two live orders' amounts.
-		creditVND, _ := bands.DepositCredit(recvUnits, desiredUnits, o.Total, recvVND,
-			bands.ClampDepositTol(prm,
-				b.envInt("DEPOSIT_MATCH_TOL_UNITS", bands.DefaultDepositMatchTolUnits)))
-		credited, bal, cerr := b.store.Credit(chatStr, creditVND, ledgerID) // atomic dedupe + credit
-		if cerr != nil {
-			log.Printf("usdt deposit credit failed [des=%s %s]: %v", des, ledgerID, cerr)
+		if !b.settleUSDTMatch(ctx, p, des, ledgerID, recvUnits, recvVND, o, lang, chatID, prm, expected, frm, recvStr) {
 			return b.txidNotFound(ctx, chatID, lang, quiet) // nothing moved -> retry
 		}
-		if !credited {
-			b.send(ctx, chatID, pc.TxidAlreadyUsed.T(lang), nil)
-			return true
-		}
-		// Close the deposit order so it shows in history/revenue, then drop the row
-		// (@9760-9762). The wallet is already credited above, so settlePaid is NOT
-		// used here: it would credit o.Total a second time.
-		if _, cerr := b.store.ClaimOrder(des, "reserved", "paid"); cerr != nil {
-			log.Printf("usdt deposit paid-claim failed [des=%s]: %v", des, cerr)
-		}
-		if _, cerr := b.store.ClaimOrder(des, "paid", "delivered"); cerr != nil {
-			log.Printf("usdt deposit delivered-claim failed [des=%s]: %v", des, cerr)
-		}
-		b.dropUSDTPending(p, des)
-		// The wallet above is already credited correctly (that math never
-		// calls usdtStr) — this line only formats the audit-row description.
-		// auditAmount (money.go) guarantees it can never render "+ USDT"
-		// with the amount silently missing; see its doc comment for why,
-		// and for why this particular call site's invalid-rate branch is
-		// actually unreachable today (usdtToVNDFor above already gates the
-		// same rate) but kept anyway as by-construction protection rather
-		// than per-site (task #15 — this call site used to hand-guard the
-		// same gap, now collapsed into the shared helper).
-		creditDesc := b.auditAmount("+", creditVND)
-		b.audit(chatStr, "usdt_"+chain+"_deposit", ledgerID,
-			creditDesc,
-			fmt.Sprintf("from=%s recv=%s balance=%d", frm, recvStr, bal))
-		b.send(ctx, chatID, i18n.F(i18n.C().Deposit.OK.T(lang),
-			"amount", b.usdtDisp(creditVND), "balance", b.usdtDisp(bal)), nil)
-		// notify_admin_deposit (telegram_bot.py:9861-9862) — method falls back
-		// to the chain's own rail label exactly like Python's
-		// `o.get("tier") or ("USDT BEP20" if chain == "bsc" else "USDT TRC20")`.
-		method := o.Tier
-		if method == "" {
-			method = "USDT TRC20"
-			if chain == chainBSC {
-				method = "USDT BEP20"
-			}
-		}
-		b.notifyAdminDeposit(ctx, chatID, creditVND, bal, method)
 		return true
 	}
 
@@ -1188,6 +1122,106 @@ func (b *Bot) verifyUSDTTxid(ctx context.Context, chatID int64, chain, des, txha
 		fmt.Sprintf("from=%s want=%s balance=%d", frm, expected, bal))
 	b.send(ctx, chatID, i18n.F(pc.TxidPayMismatch.T(lang),
 		"recv", recvStr, "want", expected, "balance", b.usdtDisp(bal)), nil)
+	return true
+}
+
+// settleUSDTMatch credits a CONFIRMED on-chain payment for order `des` and
+// resolves the deposit session. This is the ONE settle path shared by the
+// customer-pasted-hash flow (verifyUSDTTxid's deposit branch, above) and the
+// (future) on-chain watcher that will spot a payment without any hash paste —
+// both must dedupe and notify identically, so neither gets its own copy of
+// this logic.
+//
+// recvVND/frm/recvStr are passed through rather than recomputed here: they
+// come from the specific on-chain transfer the caller looked up (recvVND via
+// the rail's own USD_TO_VND conversion of the tx's exact `big.Rat` amount,
+// frm/recvStr straight off the tx), and re-deriving them from recvUnits alone
+// would lose precision the caller already has in hand (see the recvStr/
+// recvUnits rounding-vs-floor note at this file's call site). o/lang/prm/
+// expected are likewise the caller's already-validated order/snapshot data —
+// re-fetching them here could race a sweep/expiry between the caller's checks
+// and this call, which the caller's single read cannot.
+//
+// Returns true when the payment was settled (or was already settled — the
+// dedupe case, store.Credit's ledgerID PK match); false when nothing could be
+// credited (bad stored amount, or the credit call itself errored). On false
+// the caller decides what to tell the customer — verifyUSDTTxid re-arms via
+// txidNotFound; a silent watcher would just retry on the next tick.
+func (b *Bot) settleUSDTMatch(ctx context.Context, p bands.Provider, des, ledgerID string, recvUnits, recvVND int64, o *store.Order, lang i18n.Lang, chatID int64, prm bands.Params, expected, frm, recvStr string) bool {
+	pc := i18n.C().Pay
+	chain := ledgerPrefix(p) // "bsc" | "trx" — same string space as ledgerID's own prefix
+	chatStr := fmtInt(chatID)
+
+	// No claim-jack band gate — a deposit credits the SUBMITTER's own wallet
+	// against their own desired amount, so a neighbour-band collision must not
+	// false-reject (@9745-9751).
+	desiredUnits, aerr := bands.AmountUnits(expected, prm.Decimals)
+	if aerr != nil {
+		log.Printf("usdt deposit (%s) bad stored amount %q for %s: %v", chain, expected, des, aerr)
+		return false
+	}
+	// DEPOSIT_MATCH_TOL_UNITS is read through b.envInt (the config.Load
+	// snapshot), NOT bands.DepositMatchTolUnits() — that helper uses the
+	// pay package's raw os.Getenv, which production never populates
+	// (config.Load deliberately does not write os.Environ and systemd
+	// exports no EnvironmentFile), so the knob silently did nothing on
+	// the live deposit-credit path while working in local testing. Same
+	// class as tasks #10/#17/#22/#23.
+	//
+	// ClampDepositTol caps whatever that resolves to at this rail's own
+	// band half-width. The two knobs live in different .env sections and
+	// are tuned independently, so a deposit tolerance wider than the band
+	// spacing is a reachable operator mistake — and it would make one
+	// receipt equidistant-and-matching for two live orders' amounts.
+	creditVND, _ := bands.DepositCredit(recvUnits, desiredUnits, o.Total, recvVND,
+		bands.ClampDepositTol(prm,
+			b.envInt("DEPOSIT_MATCH_TOL_UNITS", bands.DefaultDepositMatchTolUnits)))
+	credited, bal, cerr := b.store.Credit(chatStr, creditVND, ledgerID) // atomic dedupe + credit
+	if cerr != nil {
+		log.Printf("usdt deposit credit failed [des=%s %s]: %v", des, ledgerID, cerr)
+		return false // nothing moved -> retry
+	}
+	if !credited {
+		b.send(ctx, chatID, pc.TxidAlreadyUsed.T(lang), nil)
+		return true
+	}
+	// Close the deposit order so it shows in history/revenue, then drop the row
+	// (@9760-9762). The wallet is already credited above, so settlePaid is NOT
+	// used here: it would credit o.Total a second time.
+	if _, cerr := b.store.ClaimOrder(des, "reserved", "paid"); cerr != nil {
+		log.Printf("usdt deposit paid-claim failed [des=%s]: %v", des, cerr)
+	}
+	if _, cerr := b.store.ClaimOrder(des, "paid", "delivered"); cerr != nil {
+		log.Printf("usdt deposit delivered-claim failed [des=%s]: %v", des, cerr)
+	}
+	b.dropUSDTPending(p, des)
+	// The wallet above is already credited correctly (that math never
+	// calls usdtStr) — this line only formats the audit-row description.
+	// auditAmount (money.go) guarantees it can never render "+ USDT"
+	// with the amount silently missing; see its doc comment for why,
+	// and for why this particular call site's invalid-rate branch is
+	// actually unreachable today (the caller's usdtToVNDFor gate already
+	// excludes it before recvVND ever reaches here) but kept anyway as
+	// by-construction protection rather than per-site (task #15 — this
+	// call site used to hand-guard the same gap, now collapsed into the
+	// shared helper).
+	creditDesc := b.auditAmount("+", creditVND)
+	b.audit(chatStr, "usdt_"+chain+"_deposit", ledgerID,
+		creditDesc,
+		fmt.Sprintf("from=%s recv=%s balance=%d", frm, recvStr, bal))
+	b.send(ctx, chatID, i18n.F(i18n.C().Deposit.OK.T(lang),
+		"amount", b.usdtDisp(creditVND), "balance", b.usdtDisp(bal)), nil)
+	// notify_admin_deposit (telegram_bot.py:9861-9862) — method falls back
+	// to the chain's own rail label exactly like Python's
+	// `o.get("tier") or ("USDT BEP20" if chain == "bsc" else "USDT TRC20")`.
+	method := o.Tier
+	if method == "" {
+		method = "USDT TRC20"
+		if chain == chainBSC {
+			method = "USDT BEP20"
+		}
+	}
+	b.notifyAdminDeposit(ctx, chatID, creditVND, bal, method)
 	return true
 }
 
