@@ -262,10 +262,14 @@ func seedAuditRowFull(t *testing.T, s *Store, ts float64, action, target, outcom
 //
 // Falsification: if grouping were dropped (or grouped on the wrong columns),
 // this would return 50 rows instead of 1, or Count would come back 0/1
-// instead of 50.
+// instead of 50. The TS assertion additionally pins WHICH row represents
+// the group: the query picks MAX(id) (the newest row), so a regression to
+// MIN(id) (oldest) would leave Count and the row count unchanged but flip
+// TS to the oldest seeded value instead of the newest.
 func TestRecentAuditCollapsedFoldsRepeatedRow(t *testing.T) {
 	s := newTestStore(t)
-	for i := range 50 {
+	const seedCount = 50
+	for i := range seedCount {
 		seedAuditRowFull(t, s, 1_000_000_000.0+float64(i), "watch_ambiguous", "tx-stuck", "still unresolved")
 	}
 
@@ -281,6 +285,10 @@ func TestRecentAuditCollapsedFoldsRepeatedRow(t *testing.T) {
 	}
 	if rows[0].Action != "watch_ambiguous" || rows[0].Target != "tx-stuck" {
 		t.Errorf("collapsed row = %+v, want action=watch_ambiguous target=tx-stuck", rows[0])
+	}
+	wantTS := 1_000_000_000.0 + float64(seedCount-1) // the LAST (newest) seeded row
+	if rows[0].TS != wantTS {
+		t.Errorf("TS = %v, want %v (the newest row must represent the group, not the oldest)", rows[0].TS, wantTS)
 	}
 }
 
