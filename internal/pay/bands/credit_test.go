@@ -85,11 +85,6 @@ func TestDepositCredit(t *testing.T) {
 // fee-shortfall path (match.go) is deliberately far too wide to disambiguate by
 // spacing, which is exactly why it carries an explicit ambiguity check instead
 // of relying on a proof like this one.
-//
-// SCOPE: this proof covers the EXACT path only, and that is not a weakness. The
-// fee-shortfall path (match.go) is deliberately far too wide to disambiguate by
-// spacing, which is exactly why it carries an explicit ambiguity check instead
-// of relying on a proof like this one.
 func TestDepositTolCannotSpanTwoBands(t *testing.T) {
 	p := shippedParams
 	if got := 2 * DefaultDepositMatchTolUnits; int64(got) >= int64(p.MinGap()) {
