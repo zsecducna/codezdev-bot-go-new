@@ -409,9 +409,10 @@ func GetIncomingTransfersConf(addr string, minTSMS int64, apiKey string, pageLim
 //
 //   - the watcher settles what it CAN see and tries again next tick, so losing
 //     the tail costs a delay, not a deposit;
-//   - the by-hash lookup must NOT conclude "no such payment" from a window it
-//     knows is incomplete — that is a terminal answer shown to a customer who
-//     really did pay. It propagates instead, and the verify path re-arms.
+//   - the by-hash lookup searches what it got and answers from a HIT, but must
+//     NOT conclude "no such payment" from a window it knows is incomplete —
+//     that is a terminal answer shown to a customer who really did pay. On a
+//     miss it propagates instead, and the verify path re-arms.
 //
 // Returned WITH the partial slice, so a caller that wants the rows can take
 // them (errors.Is) and one that needs certainty cannot miss the caveat.
@@ -550,11 +551,14 @@ func FindConfirmedTransferByHash(addr, txhash string, minTSMS int64, apiKey stri
 // pageLimit/base are the caller-resolved TRON_PAGE_LIMIT/TRON_API_BASE (see
 // PageLimit's/apiBase's doc comments).
 //
-// A TRUNCATED window is propagated as an error rather than searched: "(nil,
-// nil)" from here is a TERMINAL "no such payment" shown to a customer, and
-// concluding that from a window known to be incomplete would tell someone who
-// really did pay that they did not. The verify path turns the error into a
-// retry instead.
+// A TRUNCATED window is SEARCHED, and then propagated only if the hash is not
+// in it. The two halves of that are not symmetrical: "(nil, nil)" from here is
+// a TERMINAL "no such payment" shown to a customer, and concluding it from a
+// window known to be incomplete would tell someone who really did pay that
+// they did not — so absence never answers from a partial read, and the verify
+// path turns the error into a retry. A hash that IS among the rows read is
+// proven present regardless of what was missed after it, and refusing that
+// would be refusing on evidence already in hand.
 //
 // Cost note: minTSMS bounds this to one order's payment window — minutes — so
 // in practice the first page ends it (TronGrid omits its continuation when the
@@ -574,13 +578,22 @@ func FindConfirmedTransferByHashConf(addr, txhash string, minTSMS int64, apiKey 
 		return nil, nil
 	}
 	transfers, err := GetIncomingTransfersConf(addr, minTSMS, apiKey, pageLimit, base)
-	if err != nil {
-		return nil, err
-	}
+	// SCAN BEFORE REACTING TO THE ERROR, and the asymmetry is the whole point: a
+	// truncated window makes ABSENCE unprovable, but it does not make a PRESENT
+	// row less real. The hash the customer pasted either is in the rows that came
+	// back or it is not, and if it is, refusing to say so would be refusing on
+	// evidence we already hold. Only when the hash is genuinely absent from
+	// everything read does the truncation matter, and that case still propagates
+	// below. (On a real failure — a dead endpoint, a mid-window page error —
+	// GetIncomingTransfersConf hands back no rows at all, so this loop is a
+	// no-op and the error falls straight through.)
 	for i := range transfers {
 		if strings.ToLower(transfers[i].ID) == want {
 			return &transfers[i], nil
 		}
+	}
+	if err != nil {
+		return nil, err
 	}
 	return nil, nil
 }

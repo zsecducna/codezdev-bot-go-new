@@ -340,3 +340,44 @@ func TestFindConfirmedTransferByHashRefusesToAnswerFromATruncatedWindow(t *testi
 			"who really paid that they did not", err)
 	}
 }
+
+// TestFindConfirmedTransferByHashAnswersFromATruncatedWindowWhenItHasTheHash is
+// the other half of the rule above, and the half that costs a customer money if
+// it is missing.
+//
+// A truncated window makes ABSENCE unprovable. It does not make a row that IS
+// in the window less real. Refusing a hash the read already returned would be
+// refusing on evidence in hand — and this path is a PRODUCT ORDER payment
+// (cbPayOnchain -> verifyUSDTTxid -> here), which the hands-free watcher
+// deliberately never touches, so there is no second flow to rescue it.
+//
+// The server here never sends a last page, so the guard fires and the window is
+// genuinely truncated; the target sits on page 1, inside what was read.
+func TestFindConfirmedTransferByHashAnswersFromATruncatedWindowWhenItHasTheHash(t *testing.T) {
+	want := strings.Repeat("deadbeef", 8) // 64 hex chars, what hashRE demands
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			w.Write([]byte(trc20Page("more", want))) // the payment, on a page that WAS read
+			return
+		}
+		w.Write([]byte(trc20Page("more", "id"+strconv.Itoa(calls)))) // never the last page
+	}))
+	defer srv.Close()
+
+	tx, err := FindConfirmedTransferByHashConf("T"+strings.Repeat("A", 33), want, 0, "", 1, srv.URL)
+	if err != nil {
+		t.Fatalf("error = %v, want nil — the hash was in the rows that came back, so truncation "+
+			"further along the window says nothing about it", err)
+	}
+	if tx == nil || tx.ID != want {
+		t.Fatalf("transfer = %v, want the one with id %s — a real payment refused because the read "+
+			"stopped AFTER it", tx, want)
+	}
+	if calls != maxTransferPages {
+		t.Errorf("made %d requests, want %d — the window really must be truncated, or this test "+
+			"passes without exercising the case", calls, maxTransferPages)
+	}
+}
