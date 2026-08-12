@@ -653,9 +653,13 @@ func TestWatcherAuditsAHeldPaymentItCannotValue(t *testing.T) {
 // to one that never happened.
 //
 // The credit is forced to fail by pushing the customer's balance to the top of
-// the int64 range first, so the store's own `amount + excluded.amount` cannot
-// produce a storable integer. The mechanism is incidental; what is being pinned
-// is what the watcher records when store.Credit returns an error.
+// the int64 range first. SQLite does not raise on integer overflow — it redoes
+// the `amount + excluded.amount` in floating point and stores a REAL — so the
+// error actually comes from store.Credit's read-back scanning that REAL into an
+// int64. Either way the call returns an error, which is the only thing this test
+// needs; the mechanism is incidental, and if a driver ever changed here the test
+// would fail loudly rather than pass for the wrong reason (the assertions below
+// are all on the uncredited verdict, which no other branch writes).
 func TestWatcherAuditsAnAttributedPaymentThatDidNotCredit(t *testing.T) {
 	ctx := context.Background()
 	b, _, st, _, _ := newUSDTBot(t)

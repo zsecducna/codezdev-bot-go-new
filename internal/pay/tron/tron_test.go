@@ -347,9 +347,12 @@ func TestFindConfirmedTransferByHashRefusesToAnswerFromATruncatedWindow(t *testi
 //
 // A truncated window makes ABSENCE unprovable. It does not make a row that IS
 // in the window less real. Refusing a hash the read already returned would be
-// refusing on evidence in hand — and this path is a PRODUCT ORDER payment
-// (cbPayOnchain -> verifyUSDTTxid -> here), which the hands-free watcher
-// deliberately never touches, so there is no second flow to rescue it.
+// refusing on evidence in hand — and for one of this path's two callers there
+// is no second chance. verifyUSDTTxid serves both a deposit hash-paste (where
+// the hands-free watcher would eventually credit the same transfer anyway) and
+// a PRODUCT ORDER payment via cbPayOnchain, which the watcher deliberately
+// never touches because its only action is a wallet credit. So a wrongly
+// refused order payment has nothing else to rescue it.
 //
 // The server here never sends a last page, so the guard fires and the window is
 // genuinely truncated; the target sits on page 1, inside what was read.

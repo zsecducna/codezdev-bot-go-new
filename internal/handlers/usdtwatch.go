@@ -191,6 +191,13 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 			// the one case actually needing a human looks exactly like the
 			// routine one. Distinct wording, and the cause in the detail, so an
 			// operator querying the trail sees it without cross-reading logs.
+			//
+			// Note what this row can and cannot promise: it never LIES, but it
+			// can be MISSING. If the quarantine write failed because the database
+			// itself is unavailable, the audit insert is going to the SAME
+			// database and LogAction is best-effort — it swallows its own error.
+			// The log line above is the backstop for precisely that case, which
+			// is why it stays rather than being replaced by the row.
 			outcome = "credited nothing, QUARANTINE WRITE FAILED"
 			detail += " quarantine_err=" + qwerr.Error()
 		}
@@ -336,7 +343,10 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 //
 //   - MatchNone. Most transfers to a shop address are not deposits anyone is
 //     waiting on, and a row per non-match would bury the decisions that matter
-//     under noise. Only transfers that are ABOUT a live deposit band earn a row.
+//     under noise. A transfer earns a row only once it is ABOUT a live deposit
+//     band — or is one a human already owns, which is the quarantine skip
+//     above: that gate runs before the matcher on purpose, so its row is
+//     written whether or not a band still matches the amount.
 //   - Read failures (the ledger, the quarantine, GetOrder). "We could not look"
 //     is not a verdict about the transfer, and the row would need the very
 //     database that just failed.
@@ -345,7 +355,12 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 // record: the chain query starts at the OLDEST live deposit's own start, so once
 // the bands older than a refused transfer are swept, that transfer falls out of
 // the window and is never fetched again. A refusal repeats for hours at worst,
-// not forever, and the audit-retention janitor prunes what is left.
+// not forever, and the audit-retention janitor prunes what is left. Bounded is
+// not free, though: at a 20s tick and a 2h pending grace one refused transfer
+// can write a few hundred identical rows, which is more than the admin audit
+// screen's unfiltered tail shows at once. Querying the table by action or
+// target is unaffected; reading the last N rows by eye is. Collapsing a repeat
+// into its first sighting is the fix if that becomes a nuisance in practice.
 //
 // chatID is the actor: the matched band's owner when the decision is about a
 // known deposit, and empty when nobody owns the transfer yet — an ambiguous
