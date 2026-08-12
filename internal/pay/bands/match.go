@@ -138,12 +138,28 @@ const (
 	//     skims. Forgiving the amount silently would contradict the instruction
 	//     and train customers out of following it.
 	//
-	// This needs no enforcement code, which is the point: a shortfall candidate
-	// exists only when the gap EXCEEDS Tol (anything within Tol is MatchExact
-	// and never reaches here), so DepositCredit's own tolerance test already
-	// fails for it and it already credits the actual received amount. The two
-	// rules compose correctly by construction rather than by a caller
-	// remembering to special-case one of them.
+	// This needs no enforcement code, which is the point — but the composition
+	// rests on TWO things, and naming only the first is how it would get broken:
+	//
+	//   1. a shortfall candidate exists only when the gap EXCEEDS Tol (anything
+	//      within Tol is MatchExact and never reaches here), and
+	//   2. ClampDepositTol caps the configured deposit tolerance at p.Tol.
+	//
+	// Together those give gap > tolUnits always, so DepositCredit's own
+	// tolerance test fails and it credits the actual received amount without
+	// anyone special-casing it. Drop the CLAMP and (1) alone is not enough:
+	// DEPOSIT_MATCH_TOL_UNITS=40000 would make a 0.3 shortfall on a 120 deposit
+	// "within tolerance", round it UP to the quote, and hand the money pump
+	// straight back.
+	//
+	// SCOPE, for whoever wires the watcher: the reasoning above is about
+	// DEPOSITS, where crediting less is a coherent outcome. A PRODUCT ORDER
+	// settled by shortfall has no such option — stock is indivisible, so the
+	// order either delivers in full for up to min(0.5, 5%) under its price, or
+	// does not deliver. Reservation carries no deposit-vs-order flag today (see
+	// MatchReceipt), so this matcher cannot make that distinction and does not
+	// try to. Decide it deliberately when the watcher lands; do not let it fall
+	// out of whichever branch happens to be written first.
 	MatchShortfall
 
 	// MatchAmbiguous: two or more live bands could claim this receipt. Credit
@@ -172,6 +188,24 @@ func (k MatchKind) String() string {
 // p.Decimals the same way the picker's collision set does.
 //
 // The returned Reservation is meaningful only for MatchExact and MatchShortfall.
+//
+// LIVENESS IS THE CALLER'S FILTER, not this function's: every row handed in is
+// a candidate, including sessions past their deadline but inside the pending
+// grace. That is right for the exact path — recovering a late payment is what
+// the grace exists for — but it does inflate the SHORTFALL path's ambiguity
+// rate, because a dead-but-in-grace band keeps competing for short receipts.
+//
+// Size the operator workload accordingly, because "ambiguity almost never
+// fires" is true of exact matching and NOT of this: two customers depositing
+// the same round amount are quoted 0.00101 apart, which is far inside any
+// fee-shaped window, so a skimmed payment from either goes to manual
+// attribution. That is the correct outcome — the alternative is crediting a
+// coin flip — but it is a routine outcome, not a rare one, and the unmatched
+// path must be built to be used rather than as a tripwire nobody watches.
+//
+// (Reservation carries no deposit-vs-order flag either, which the watcher will
+// need for the same reason MatchShortfall describes. Flagged, deliberately not
+// invented here.)
 //
 // AN OVERPAY beyond Tol is deliberately MatchNone rather than a match. The
 // ruling defines two shapes and both are "at most the quote"; a receipt above a

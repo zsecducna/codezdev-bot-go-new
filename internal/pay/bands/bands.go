@@ -435,10 +435,18 @@ func slotClear(cu int64, usedU []blocker) bool {
 }
 
 // RecvMatchesBand reports whether a received amount (already floored to
-// `p.Decimals` units by the rail's chain reader) settles `expected`: the fuzzy
-// +/-Tol match, so a customer who drops a cent or two still confirms. This is
-// the `matched` decision at telegram_bot.py:9745
+// `p.Decimals` units by the rail's chain reader) settles `expected`: the
+// +/-Tol match. This is the `matched` decision at telegram_bot.py:9745
 // (`abs(recv_units - want_units) <= mod.AMOUNT_MATCH_TOL`).
+//
+// "Fuzzy" is the wrong word for it now, and the old phrasing here — "a customer
+// who drops a cent or two still confirms" — was left over from the 2-decimal
+// era and is FALSE by a factor of twenty at the shipped geometry: Tol is 50
+// units = 0.00050 USDT, a fiftieth of a cent, so a customer who really does
+// drop a cent lands 1000 units out and does NOT confirm here. What catches that
+// customer is the separate fee-shortfall rule in match.go, which is a different
+// mechanism with its own ambiguity check — not this one, and widening Tol is
+// not how to reach it.
 //
 // An underpay of up to Tol is absorbed as goodwill; the picker's MinGap
 // spacing is what guarantees a receipt matches at most ONE live amount

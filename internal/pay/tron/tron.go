@@ -409,7 +409,10 @@ type MatchedTransfer struct {
 // (a string like "5.23"), else (nil, nil).
 //
 // Matches when: amount (floored to AmountDecimals) is within AmountMatchTol
-// of expected (so a customer who drops a cent or two still confirms), the
+// of expected — 0.00050 USDT at the shipped geometry, i.e. essentially the
+// exact figure, NOT the "cent or two" of slack this comment claimed while the
+// rail still ran at 2 decimals. A genuinely short payment is handled by
+// bands/match.go's fee-shortfall rule instead. Also requires that the
 // tx is at or after minTSMS (the order's own creation time — so a recycled
 // amount's older payment can't settle a newer order), and the tx isn't
 // already consumed. Rows are already only_confirmed, so finality needs no

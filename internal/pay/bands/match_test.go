@@ -73,8 +73,13 @@ func TestFeeAllowanceIsProportional(t *testing.T) {
 // A 10.00000 quote short by exactly 0.50000 must be accepted: 5% of the QUOTE is
 // 0.50000, so the shortfall sits exactly on the allowance. Computed from what
 // ARRIVED (9.50000) the allowance would be 5% of 9.50000 = 0.47500, and the same
-// payment would be refused. Any smaller shortfall passes under both readings, so
-// this boundary is the only case that tells them apart.
+// payment would be refused.
+//
+// This is ONE case in the discriminating set, not the only one — the review pass
+// enumerated over a million (quote, shortfall) pairs that tell the two readings
+// apart, the whole interval between the receipt-derived and quote-derived
+// allowances. A shortfall at the quote-derived boundary is simply the clearest
+// and most extreme member of that set, which is why it is the one pinned here.
 //
 // The direction matters because the received amount is attacker-controlled: if
 // the allowance shrank as the underpayment grew it would bind exactly when it
