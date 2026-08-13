@@ -1012,8 +1012,9 @@ func (b *Bot) tronAddrStr() string {
 
 // tronAPIKeyStr resolves the TronGrid API key through cfg — see
 // config.Config.TRONAPIKey's doc comment; internal/pay/tron does not import
-// internal/config, so this is the bridge that lets b.tronByHash pass a
-// resolved key in rather than the package reading raw env itself.
+// internal/config, so this is the bridge that lets the watcher's
+// tronTransfersSince seam pass a resolved key in rather than the package
+// reading raw env itself.
 func (b *Bot) tronAPIKeyStr() string {
 	if b.cfg == nil {
 		return ""

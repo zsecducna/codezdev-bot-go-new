@@ -40,24 +40,26 @@ func TestCaptureChainOrder(t *testing.T) {
 		t.Errorf("capture chain %v is not an in-order subsequence of canonical", got)
 	}
 	// M2.2 registers the buy-quantity capture; M2.3 adds the deposit-amount
-	// capture ahead of it (deposit #44 < purchase #48); M2.5 splices the two
-	// API-key captures between them (#45/#46); the USDT slice puts pending_txid
-	// (#43) ahead of pending_deposit, so a pasted 64-hex tx hash is never misread
-	// as a deposit amount (telegram_bot.py:18976); the M2.6 login-code slice puts
-	// pending_code (#36) FIRST — it is the highest-priority customer capture in the
-	// Python priority comment @3632 (`code > sell > deposit > apikey > …`).
-	// Together they match the Python priority comment @3632, including the
-	// M2.6 promo/referral ordercode capture (#47) between apikeyrc and purchase.
-	// `code > … > txid > deposit > apikey > apikeyrc > ordercode > purchase`.
+	// capture ahead of it (deposit #46 < purchase #50); M2.5 splices the two
+	// API-key captures between them (#47/#48); the M2.6 login-code slice puts
+	// pending_code (#38) ahead of pending_deposit — it is the highest-priority
+	// customer capture in the Python priority comment @3632
+	// (`code > sell > deposit > apikey > …`). Together they match that priority
+	// comment, including the M2.6 promo/referral ordercode capture (#49)
+	// between apikeyrc and purchase.
+	// `code > … > deposit > apikey > apikeyrc > ordercode > purchase`.
+	// (The customer tx-hash capture "txid" is gone: deposits now credit
+	// hands-free via the watcher with no hash paste, so there is no such
+	// capture to splice in.)
 	// adminsettings.go's 7 captures (setrate/setkirourl/setkirokey/
 	// setkiroacct/setbep20/settron/setmaxqty, canonical #10-#23) are spliced
-	// in ahead of "code" (#37-ish) by registerAdminSettings running after
+	// in ahead of "code" (#38-ish) by registerAdminSettings running after
 	// registerCodeCapture (dispatch.go).
 	// adminpricing.go (🏷️ PRICING & DISCOUNTS) splices its 11 captures in
 	// last: setapiprice/setapimin/setapimax/setkiroprice/setkiromin/
 	// setkiromax/setapicap (canonical #11-#17) ahead of "setkirourl" (#18);
-	// discount/promo (#34/#36) ahead of "code" (#37); tier/price (#41/#42)
-	// ahead of "txid" (#44).
+	// discount/promo (#35/#37) ahead of "code" (#38); tier/price (#42/#43)
+	// ahead of "deposit" (#46).
 	// adminusers.go (👥 CUSTOMERS / 🛡️ ADMIN ROLES / whitelist / resellers)
 	// registers next-to-last: custlookup/addadmin/addreseller/addwl/rmadmin
 	// land ahead of "setrate" (canonical #5-#9, all before #10), and
@@ -87,7 +89,7 @@ func TestCaptureChainOrder(t *testing.T) {
 		"refund",
 		"discount", "reseller_discount", "promo", "code",
 		"hold",
-		"tier", "price", "txid", "deposit", "apikey", "apikeyrc",
+		"tier", "price", "deposit", "apikey", "apikeyrc",
 		"ordercode", "purchase",
 	}
 	if len(got) != len(want) {
@@ -101,14 +103,15 @@ func TestCaptureChainOrder(t *testing.T) {
 	if CanonicalCaptureOrder[len(CanonicalCaptureOrder)-1] != "purchase" {
 		t.Errorf("purchase must be the last canonical capture")
 	}
-	// The canonical list itself must stay unique + the pinned length (46 —
+	// The canonical list itself must stay unique + the pinned length (45 —
 	// adminstock.go's Go-only "provpool" entry, captures.go, brought it from
 	// 49 to 50; M3/M4 fix earlier removed "addbal", which moved to the step-9
 	// adminText chain; AWS IDC provisioning removal took "idcprov" back out,
 	// 50 to 49; AWS-sell removal took "sell"/"setawsprice"/"awsreject" back
-	// out, 49 to 46).
-	if len(CanonicalCaptureOrder) != 46 {
-		t.Errorf("canonical order length = %d, want 46", len(CanonicalCaptureOrder))
+	// out, 49 to 46; the hands-free-deposits work removed the customer
+	// tx-hash capture "txid", 46 to 45).
+	if len(CanonicalCaptureOrder) != 45 {
+		t.Errorf("canonical order length = %d, want 45", len(CanonicalCaptureOrder))
 	}
 	seen := map[string]bool{}
 	for _, n := range CanonicalCaptureOrder {

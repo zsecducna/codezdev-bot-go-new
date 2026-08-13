@@ -1086,8 +1086,8 @@ func (b *Bot) capSetBep20(c *Ctx) bool {
 	// §4.4's literal "read from the s map already in hand": a bare map read
 	// would report "(unset)" for a shop whose address was only ever supplied
 	// via env, which is a wrong "old" value, not merely an imprecise one.
-	// Task #17 (fixed): the customer pay screen (usdt.go's sendUSDTScreen) and
-	// the by-hash verify path (b.bep20ByHash, dispatch.go) now both resolve
+	// Task #17 (fixed): the customer deposit screen (usdt.go's sendUSDTScreen)
+	// and the hands-free watcher's chain reads (dispatch.go) both resolve
 	// through b.bep20AddrStr() -> cfg.BEP20Address(), the SAME getter used
 	// here — so this "old" value is not merely the shop's notional source of
 	// truth, it is the actual live customer-facing address a write here

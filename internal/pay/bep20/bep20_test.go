@@ -213,32 +213,6 @@ func TestMatchPaymentConf_HonoursInjectedMinConf(t *testing.T) {
 	}
 }
 
-// TestConfirmedAt_HonoursInjectedMinConf pins GetTransferToSellerByHashConf's
-// MinConfirmations plumbing (task #42 item 2) at the pure confirmedAt helper,
-// without a live RPC round trip. Same discriminator as MatchPaymentConf's
-// test above: the env value alone must NOT decide the outcome.
-func TestConfirmedAt_HonoursInjectedMinConf(t *testing.T) {
-	t.Setenv("BEP20_MIN_CONF", "1") // would wrongly pass 8 confs if read directly
-
-	// 8 confs deep (latest=1008, block=1000): injected minConf=12 rejects it
-	// (old code consulting raw MinConfirmations()==1 would have confirmed).
-	if confirmedAt(true, 1008, 1000, 42, 12) {
-		t.Error("confirmedAt = true, want false (8 confs < injected minConf=12)")
-	}
-	// Same depth, looser injected minConf=5 -> confirms.
-	if !confirmedAt(true, 1008, 1000, 42, 5) {
-		t.Error("confirmedAt = false, want true (8 confs >= injected minConf=5)")
-	}
-	// A reverted receipt never confirms regardless of depth.
-	if confirmedAt(false, 1008, 1000, 42, 1) {
-		t.Error("confirmedAt = true, want false (success=false must always reject)")
-	}
-	// A missing block timestamp never confirms regardless of depth.
-	if confirmedAt(true, 1008, 1000, 0, 1) {
-		t.Error("confirmedAt = true, want false (ts=0 must always reject)")
-	}
-}
-
 // TestUsdtToVNDRejectsUnusableRate pins the guard added with task #22. Deleting
 // the `rate <= 0` check in UsdtToVND must fail here, so the two cases that
 // matter most carry their own consequence in the failure message:

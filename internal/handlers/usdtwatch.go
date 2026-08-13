@@ -16,27 +16,22 @@ import (
 
 // ---- the hands-free on-chain deposit watcher ---------------------------------
 //
-// WHAT THIS REPLACES. Until now a USDT top-up was only credited when the
-// customer pasted their transaction hash on their own deposit screen
-// (verifyUSDTTxid). That works, but it puts the last and most error-prone step
-// of a payment on the customer: they must come back to Telegram, find the right
-// screen, and paste a 64-character string. The ones who do not are the support
-// queue.
-//
-// The watcher removes that step for the common case. It reads the seller
-// address's own incoming transfers and attributes each one by AMOUNT ALONE,
-// which is possible because every deposit is quoted a unique amount (bands: the
+// This is the SOLE way a USDT top-up is credited. It reads the seller address's
+// own incoming transfers and attributes each one by AMOUNT ALONE, which is
+// possible because every deposit is quoted a unique amount (bands: the
 // 0.01000-0.01999 jitter). The customer sends the amount they were shown and
-// their balance moves on its own.
+// their balance moves on its own — they never paste a transaction hash, and the
+// deposit screen has no "I have paid" button. (An earlier customer-pastes-a-hash
+// credit path existed alongside this watcher and was removed once the watcher
+// proved itself in production.)
 //
 // WHAT IT DELIBERATELY DOES NOT DO:
 //
-//   - It never settles a PRODUCT ORDER. Those are still hash-paste, they are
-//     paid through cbPayOnchain, and settleUSDTMatch is deposit-only logic
-//     (it wallet-credits). bands.MatchIncoming enforces this at the source via
-//     Reservation.IsDeposit; the extra product check below is a second lock on
-//     the same door, because the cost of it being wrong is money out for goods
-//     never delivered.
+//   - It never settles a PRODUCT ORDER. Products are paid from wallet balance
+//     (paybal:), and settleUSDTMatch is deposit-only logic (it wallet-credits).
+//     bands.MatchIncoming enforces this at the source via Reservation.IsDeposit;
+//     the extra product check below is a second lock on the same door, because
+//     the cost of it being wrong is money out for goods never delivered.
 //   - It never guesses, and never un-guesses later. An amount two live deposits
 //     could both claim is logged, left uncredited, and QUARANTINED durably, so
 //     no later tick can credit it once the competition thins out. See the
@@ -222,8 +217,8 @@ type watchedTransfer struct {
 // must not stop the next one in the same batch from being credited.
 func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm bands.Params, wt watchedTransfer) {
 	// The ledger id is the dedupe key and its shape is fixed: "trx:" + the
-	// transaction id, identical to what the hash-paste path writes. The two
-	// flows MUST agree here or a payment could be credited once by each.
+	// transaction id. settleUSDTMatch writes the same key when it credits, so a
+	// transfer can never be credited twice.
 	ledgerID := ledgerPrefix(p) + ":" + wt.id
 	// Cheap pre-filter, NOT the dedupe. Most transfers on a busy address are
 	// ones we already settled, and this skips the order read and the rate
@@ -241,8 +236,8 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 	// Rendered here, above the refusals, because every one of them records the
 	// amount in its audit row — an operator asking "what did the bot decide
 	// about this transaction" needs the figure on the row itself, not a second
-	// lookup. Same rendering as the hash-paste path: the RAIL's precision, so
-	// two bands 0.00101 apart do not collapse onto one string.
+	// lookup. Rendered at the RAIL's precision, so two bands 0.00101 apart do
+	// not collapse onto one string.
 	recv := wt.recv
 	recvStr := recv.FloatString(prm.Decimals)
 
@@ -369,14 +364,14 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 		// Task 6: a real transfer matching NO open deposit — a wrong-amount
 		// payment, a late transfer after its band was swept, or (rarely on a
 		// deposit-only address) an unrelated transfer. The watcher can't credit
-		// it, so the owner gets ONE nudge to attribute it by hand — which matters
-		// more once Task 7 removes the customer's paste-a-hash fallback. Deduped
-		// by MarkTxn: it consumes the ledger id WITHOUT crediting (its documented
-		// QR-purchase purpose), so the next tick's TxnExists prefilter skips it
-		// and this fires exactly once per transfer. NOT audited — MatchNone is
-		// routine noise in the audit view; the DM + the processed row are the
-		// record here. If this turns out noisy on a busy address, gate it behind
-		// an alert_unmatched setting rather than silencing it outright.
+		// it, and there is no customer paste-a-hash fallback any more, so the
+		// owner gets ONE nudge to attribute it by hand. Deduped by MarkTxn: it
+		// consumes the ledger id WITHOUT crediting (its documented QR-purchase
+		// purpose), so the next tick's TxnExists prefilter skips it and this
+		// fires exactly once per transfer. NOT audited — MatchNone is routine
+		// noise in the audit view; the DM + the processed row are the record
+		// here. If this turns out noisy on a busy address, gate it behind an
+		// alert_unmatched setting rather than silencing it outright.
 		if isNew, merr := b.store.MarkTxn(ledgerID, "", 0); merr != nil {
 			log.Printf("usdt watch [%s]: mark_txn (unmatched dedupe) failed for %s: %v", p, ledgerID, merr)
 		} else if isNew {
@@ -396,12 +391,9 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 	// then land exactly on a NEW deposit quoted the same amount. Crediting it
 	// would pay one customer with another customer's money.
 	//
-	// The hash-paste path has always applied this check per order
-	// (verifyUSDTTxid's "outside_window" reject); the watcher must agree with it
-	// or the two flows disagree about the same transfer. There is deliberately
-	// no UPPER bound here — the watcher has no "I have paid" tap to bound
-	// against, and a payment arriving after its session started is exactly what
-	// is expected.
+	// There is deliberately no UPPER bound here — the watcher has no "I have
+	// paid" tap to bound against, and a payment arriving after its session
+	// started is exactly what is expected.
 	lo := int64(0)
 	if row, ok := b.getUSDTRow(p, res.Des); ok {
 		lo = row.SinceMS
@@ -412,7 +404,7 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 	if lo <= 0 {
 		// Unreachable in practice — Reserve stamps CreatedAt and Adopt backfills
 		// it — but this is a money gate, so an unanchorable band refuses rather
-		// than accepts. The hash-paste path can still settle it.
+		// than accepts.
 		log.Printf("usdt watch [%s]: deposit %s has no usable start time, refusing to attribute %s", p, res.Des, ledgerID)
 		b.auditWatch(res.ChatID, p, "no_start", ledgerID, "refused, band has no start time",
 			"recv="+recvStr+" from="+wt.frm+" des="+res.Des)
@@ -455,7 +447,11 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 	}
 	// settleUSDTMatch keys the wallet credit on fmtInt(chatID), so an
 	// unparseable owner would credit chat "0" — a stranger's balance. Fail
-	// closed; the customer can still settle by pasting the hash.
+	// closed. There is no longer a customer paste-a-hash fallback (Task 7 removed
+	// it), so a payment held here needs the OWNER to attribute it by hand — hence
+	// the DM, for parity with the MatchNone/MatchAmbiguous branches. Unreachable
+	// in practice (o.ChatID is fmtInt-produced, always parseable), but a money
+	// gate refuses rather than guesses.
 	chatID, cerr := strconv.ParseInt(o.ChatID, 10, 64)
 	if cerr != nil {
 		log.Printf("usdt watch [%s]: order %s has unparseable chat id %q: %v", p, res.Des, o.ChatID, cerr)
@@ -464,17 +460,19 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 		// unusable value it is reporting.
 		b.auditWatch("", p, "bad_chat", ledgerID, "refused, order owner is unparseable",
 			"recv="+recvStr+" from="+wt.frm+" des="+res.Des+" chat_id="+o.ChatID)
+		b.notifyOwners(ctx, fmt.Sprintf(
+			"⚠️ Matched %s deposit can't be credited — order %s has an unparseable owner (%s). %s USDT from %s (tx %s); needs manual attribution.",
+			ledgerPrefix(p), res.Des, o.ChatID, recvStr, wt.frm, wt.id))
 		return
 	}
 	// Deliberately NO status check. A payment that lands just after its session
 	// expired still credits the customer's wallet, inside the pending grace —
-	// that is what the grace is for, and it is exactly what the hash-paste path
-	// does with the same late payment.
+	// that is what the grace is for.
 	recvVND, verr := b.usdtToVNDFor(p, recv)
 	if verr != nil {
 		// No usable rate means we cannot value the credit. Crediting 0 would
 		// lose the customer's money outright, so hold and retry once the rate
-		// is fixed (same call the hash-paste path makes, same reasoning).
+		// is fixed.
 		log.Printf("usdt watch [%s]: rate error for %s: %v", p, res.Des, verr)
 		b.auditWatch(o.ChatID, p, "no_rate", ledgerID, "held, cannot value the payment",
 			"recv="+recvStr+" from="+wt.frm+" des="+res.Des)
@@ -549,9 +547,10 @@ func (b *Bot) auditWatch(chatID string, p bands.Provider, verdict, ledgerID, out
 // whatever is still outstanding and credits it, which is the property the
 // per-deposit-goroutine design lacked.
 //
-// The grace subtraction mirrors verifyUSDTTxid's own window lower bound
-// (o.TS - grace): block timestamps and our clock are not the same clock, and a
-// query bound one second too tight silently drops a matchable payment.
+// The grace subtraction mirrors the per-band freshness lower bound (the band's
+// own start minus grace, applied in settleWatchedTransfer): block timestamps and
+// our clock are not the same clock, and a query bound one second too tight
+// silently drops a matchable payment.
 func (b *Bot) watchSinceMS(p bands.Provider, live []bands.Reservation) int64 {
 	oldest := int64(0)
 	for _, res := range live {

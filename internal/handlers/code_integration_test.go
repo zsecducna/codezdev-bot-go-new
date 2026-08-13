@@ -636,7 +636,7 @@ func TestCaptureChainOrderWithCode(t *testing.T) {
 	names := b.captureNames()
 
 	// adminsettings.go's 7 captures land ahead of "code", and
-	// adminpricing.go's 11 captures land ahead of "setkirourl"/"code"/"txid"
+	// adminpricing.go's 11 captures land ahead of "setkirourl"/"code"/"deposit"
 	// (dispatch_test.go's TestCaptureChainOrder documents the canonical
 	// positions). adminusers.go's captures land next-to-last: custlookup/
 	// addadmin/addreseller/addwl/rmadmin ahead of "setrate"; reseller_discount
@@ -659,7 +659,7 @@ func TestCaptureChainOrderWithCode(t *testing.T) {
 		"refund",
 		"discount", "reseller_discount", "promo", "code",
 		"hold",
-		"tier", "price", "txid", "deposit", "apikey", "apikeyrc",
+		"tier", "price", "deposit", "apikey", "apikeyrc",
 		"ordercode", "purchase",
 	}
 	if len(names) != len(want) {

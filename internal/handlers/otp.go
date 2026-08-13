@@ -94,16 +94,16 @@ var otpUsernameRE = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 // registerOTP attaches the login-code capture + callback routes. Called from New.
 //
-// pending_code is capture #36 (handlers-go.md §2.2) — ahead of every capture the
-// earlier slices registered (#43+), so it is SPLICED in before "txid" rather than
+// pending_code is capture #38 (handlers-go.md §2.2) — ahead of every capture the
+// earlier slices registered, so it is SPLICED in before "deposit" rather than
 // appended, keeping the chain an in-order subsequence of CanonicalCaptureOrder.
 //
 // otpstop: / otpkeep are appended: they sit at @15645-15661 in the Python chain,
 // but no earlier-registered route prefix-matches "otp…", so appending cannot be
 // shadowed by first-match dispatch and the effective behaviour is identical.
 func (b *Bot) registerOTP() {
-	b.insertCapturesBefore("txid",
-		stage{name: "code", fn: (*Bot).capCode}, // #36 @18341 peek
+	b.insertCapturesBefore("deposit",
+		stage{name: "code", fn: (*Bot).capCode}, // #38 @18341 peek
 	)
 	b.cbRoutes = append(b.cbRoutes,
 		cbRoute{key: "otpstop:", fn: (*Bot).cbOTPStop},             // @15645

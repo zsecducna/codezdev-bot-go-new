@@ -1,20 +1,22 @@
 package handlers
 
-// usdt.go — the USDT rails: USDT BEP20 and USDT TRC20 (customer-driven
-// verify-by-tx-hash, no poller). Ports:
+// usdt.go — the USDT rails: USDT BEP20 and USDT TRC20. Ports:
 //
-//	paybsc: / paytrx:              @15947/15990 -> cbPayBSC / cbPayTRX
 //	start_bep20_deposit         @9478   -> startBep20Deposit
 //	start_tron_deposit          @9935   -> startTronDeposit
 //	_send_bep20_qr / _send_tron_qr @9457/9907 -> sendOnchainQR
 //	_send_usdt_screen           @9580   -> sendUSDTScreen
-//	usdtpaid:                   @16032  -> cbUSDTPaid
-//	pending_txid capture        @18978  -> capTxid (capture #43)
-//	_verify_usdt_txid           @9652   -> verifyUSDTTxid
-//	_poll_usdt_confirm          @9850   -> pollUSDTConfirm
 //	_prune_usdt_pending         @9606   -> bands.Registry.Sweep + expirySweepOnce
 //	_expiry_sweep_once          @9313   -> expirySweepOnce
 //	_startup_recovery           @9995   -> StartupRecovery
+//
+// HOW A DEPOSIT GETS CREDITED. Every on-chain USDT top-up is credited HANDS-FREE
+// by the watcher in usdtwatch.go, which reads the seller address's own incoming
+// transfers and attributes each one by AMOUNT ALONE (possible because every
+// deposit is quoted a unique amount). The customer never pastes a transaction
+// hash: the deposit screen is the address + the exact amount (+ optional QR), and
+// their balance moves once the transfer confirms on-chain. Product orders are
+// paid from wallet balance (paybal:), never on-chain.
 //
 // USDT migration note (2026-08-06): Binance Pay (the shared poller, its
 // reconcile pass, and start_binance_deposit / cbPayBNB) was removed — the
@@ -25,18 +27,14 @@ package handlers
 // providers, but nothing about how it works changed.
 //
 // registry owns amount / chat / deadline / created-at; usdtRows holds only the
-// rail-specific extras (VND total, TRON's min_ts floor, and the on-chain
-// [t_start, t_click] freshness window) that a Reservation deliberately does not
-// carry.
+// rail-specific extras (VND total and the since-ms floor the watcher anchors its
+// chain query on) that a Reservation deliberately does not carry.
 //
 // MONEY INVARIANTS (CLAUDE.md):
 //   - Settlement goes through the ONE shared chokepoint: settlePaid's
 //     reserved->paid CAS. Never both credit a wallet and deliver the same order.
 //   - Deposit/credit idempotency lives in the STORAGE layer: store.Credit /
 //     store.MarkTxn are PK-guarded on the ledger id ("bsc:"/"trx:" + hash).
-//   - An underpay never delivers: a PAY order settles only when the received
-//     amount is inside its own band; anything else is banked to the wallet or
-//     refused.
 //   - bands.ErrBandExhausted -> USDT_BUSY. NEVER fall back to a colliding amount.
 //   - No st.mu / usdtMu / DB transaction is held across chain RPC or Telegram I/O.
 //   - Every goroutine is workers-registry tracked and drained by Shutdown.
@@ -48,7 +46,6 @@ import (
 	"log"
 	"math"
 	"math/big"
-	"regexp"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -57,72 +54,24 @@ import (
 	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/pay/bands"
-	"codezdev-bot/internal/pay/tron"
 	"codezdev-bot/internal/store"
 	"codezdev-bot/internal/tg"
 )
 
-// txHashRE is the shape gate the pending_txid capture applies BEFORE any chain
-// round-trip (telegram_bot.py:18988 `_re.fullmatch(r"[0-9a-fA-F]{64}", hexpart)`).
-// A clearly-wrong paste gets a precise message and keeps the slot armed.
-var txHashRE = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
-
-// usdtRow is the rail-side half of one pending USDT session — the fields Python
-// keeps in _binance_pending / _bep20_pending / _tron_pending (@9070-9072,
-// @9391-9393, @9895-9897) that the bands.Reservation does not carry.
+// usdtRow is the rail-side half of one pending USDT session — the fields the
+// bands.Reservation deliberately does not carry.
 type usdtRow struct {
-	// Total is the order's VND total (what the wallet is credited on a second
-	// Binance payment, and the DESIRED top-up for an on-chain deposit).
+	// Total is the order's VND total (the DESIRED top-up for an on-chain deposit).
 	Total int64
-	// SinceMS is Binance's `since_ms` pay/transactions floor, and TRON's `min_ts`
-	// verify-query floor. Unused for BEP20 (verify is by-hash, from_block=0).
+	// SinceMS is the row's own start stamp in epoch milliseconds — the floor the
+	// hands-free watcher anchors its chain query and the per-band freshness gate
+	// on (usdtwatch.go). Survives a restart via the persisted pending row.
 	SinceMS int64
-	// TStart / TClick are the on-chain freshness window (epoch seconds). TClick is
-	// 0 until "I have made the payment" is tapped; the verify then upper-bounds at
-	// `now` instead (safe — the UNIQUE AMOUNT is the real binding, @9678-9682).
-	TStart float64
-	TClick float64
-}
-
-// registerUSDT attaches the USDT rails' capture + callback routes.
-//
-// pending_txid is capture #43 (handlers-go.md §2.2) — it must sit BEFORE
-// pending_deposit (#44) so a pasted 64-hex hash is never misread as a deposit
-// amount (telegram_bot.py:18976 "Consumed before the deposit/qty handlers").
-//
-// The paybsc:/paytrx: callback routes are NOT appended here: M2.2 registered
-// them as documented stubs, and dispatchCB is first-match-wins, so an
-// appended route would be shadowed forever. rebindCBRoute swaps the real
-// handler into the stub's EXISTING slot, which also keeps the route order
-// pinned. paybnb: (Binance Pay) stays a stub — Binance Pay was removed by the
-// USDT-only migration (S3).
-func (b *Bot) registerUSDT() {
-	b.insertCapturesBefore("deposit",
-		stage{name: "txid", fn: (*Bot).capTxid}, // #43 @18978 peek
-	)
-	b.rebindCBRoute("paybsc:", (*Bot).cbPayBSC) // @15947
-	b.rebindCBRoute("paytrx:", (*Bot).cbPayTRX) // @15990
-	// usdtpaid: has no stub to replace — append it (it is the last of the
-	// pay-screen callbacks in the Python chain, @16032).
-	b.cbRoutes = append(b.cbRoutes, cbRoute{key: "usdtpaid:", fn: (*Bot).cbUSDTPaid})
-}
-
-// rebindCBRoute replaces the handler of an already-registered route key in place,
-// preserving its position in the first-match dispatch order. Appends when the key
-// is not registered (so the rails still work if the stubs are ever removed).
-func (b *Bot) rebindCBRoute(key string, fn func(b *Bot, cc *cbCtx)) {
-	for i := range b.cbRoutes {
-		if b.cbRoutes[i].key == key {
-			b.cbRoutes[i].fn = fn
-			return
-		}
-	}
-	b.cbRoutes = append(b.cbRoutes, cbRoute{key: key, fn: fn})
 }
 
 // ---- chain <-> provider plumbing -------------------------------------------
 
-// chain codes as they appear in callback data and the pending_txid slot
+// chain codes as they appear in callback data and the deposit screen's caption
 // (telegram_bot.py:9584 `chain: 'bsc' | 'trx'`).
 const (
 	chainBSC = "bsc"
@@ -169,19 +118,17 @@ func ledgerPrefix(p bands.Provider) string {
 //
 // That branch is real, not dead. Its callers split into two kinds by what
 // "" is allowed to do:
-//   - startOnchainDeposit (~line 420) and cbPayOnchain (~line 607) are
-//     customer-facing quotes: both test usdtStr == "" and ABANDON rather
-//     than quote a broken price. Quoting wrong is worse than not quoting —
-//     deliberate, and it stays this way.
-//   - the on-chain settle audit line (~line 986) does NOT call usdtStr
-//     directly any more (task #15) — it goes through auditAmount
-//     (money.go), which can never render "+ USDT" with the amount silently
-//     missing; it falls back to the raw VND figure plus an explicit marker
-//     instead. adminusers.go's admin-credit/-debit audit lines route
-//     through the same helper. See auditAmount's doc comment for the full
-//     reasoning, including why that fallback is unreachable at BOTH of
-//     today's call sites (an identical rate check already gates each one
-//     upstream — usdtToVNDFor here, adminUsdtToVnd in adminpricing.go) and
+//   - startOnchainDeposit is a customer-facing quote: it tests usdtStr == ""
+//     and ABANDONS rather than quotes a broken price. Quoting wrong is worse
+//     than not quoting — deliberate, and it stays this way.
+//   - the on-chain settle audit line does NOT call usdtStr directly (task #15)
+//     — it goes through auditAmount (money.go), which can never render "+ USDT"
+//     with the amount silently missing; it falls back to the raw VND figure
+//     plus an explicit marker instead. adminusers.go's admin-credit/-debit
+//     audit lines route through the same helper. See auditAmount's doc comment
+//     for the full reasoning, including why that fallback is unreachable at
+//     BOTH of today's call sites (an identical rate check already gates each
+//     one upstream — usdtToVNDFor here, adminUsdtToVnd in adminpricing.go) and
 //     is kept anyway as by-construction protection for the next
 //     audit/description site, which may have no such upstream gate.
 func (b *Bot) usdtStr(vnd int64) string {
@@ -261,26 +208,13 @@ func (b *Bot) getUSDTRow(p bands.Provider, des string) (usdtRow, bool) {
 	return *r, true
 }
 
-// markUSDTClick stamps t_click (the upper bound of the [start, click] freshness
-// window) — the usdtpaid: branch @16057-16060. Reports false when the row is gone
-// (past the grace / never created), which is the caller's ORDER_GONE signal.
-func (b *Bot) markUSDTClick(p bands.Provider, des string, at float64) bool {
-	b.usdtMu.Lock()
-	defer b.usdtMu.Unlock()
-	r, ok := b.usdtRows[p][des]
-	if !ok {
-		return false
-	}
-	r.TClick = at
-	return true
-}
-
 // persistUSDTPending writes the rail's persisted pending row so a restart can
-// rehydrate the band + the customer can still submit a hash
+// rehydrate the band the hands-free watcher attributes the next transfer against
 // (store.bep20_pending_add / tron_pending_add).
 func (b *Bot) persistUSDTPending(p bands.Provider, des, chatID, amount string, total, sinceMS int64, deadline float64) error {
 	if p == bands.ProviderBEP20 {
-		// from_block is unused (verify is by-hash, not eth_getLogs) -> 0 (@9520).
+		// from_block is unused (the BEP20 watcher fetches its own block range
+		// via eth_getLogs, not per-pending) -> 0 (@9520).
 		return b.store.Bep20PendingAdd(des, chatID, amount, total, 0, deadline)
 	}
 	return b.store.TronPendingAdd(des, chatID, amount, total, sinceMS, deadline)
@@ -341,9 +275,11 @@ func (b *Bot) reserveUSDTAmount(p bands.Provider, baseUSDT, chatID, des string, 
 	if err != nil {
 		return "", err
 	}
+	// SinceMS is the row's own start in epoch ms — the floor the hands-free
+	// watcher anchors its chain query and the per-band freshness gate on. It is
+	// the reservation's CreatedAt, which Sweep's grace is also measured from.
 	b.putUSDTRow(p, des, usdtRow{
 		Total: total, SinceMS: sinceMS,
-		TStart: float64(res.CreatedAt.UnixNano()) / 1e9,
 	})
 	// A session that is not PERSISTED cannot survive a restart: the Binance
 	// reconcile would never see it and an on-chain submit would hit ORDER_GONE
@@ -370,45 +306,16 @@ func (b *Bot) releaseUnpersisted(p bands.Provider, des string) {
 	b.usdtMu.Unlock()
 }
 
-// adoptUSDTAmount records a NON-picked amount: the customer's DESIRED top-up
-// amount, verbatim. As of the hands-free-deposits work it has no caller on the
-// deposit path any more — startOnchainDeposit below now calls
-// reserveUSDTAmount instead, so every deposit's amount is unique too — but the
-// function itself stays until Task 7 deletes it along with the rest of the
-// customer-pastes-a-hash flow. The row still enters the registry so it (a)
-// blocks other orders' pickers and (b) supplies the `expected` amount the
-// verify compares against.
-func (b *Bot) adoptUSDTAmount(p bands.Provider, amount, chatID, des string, total, sinceMS int64, deadline time.Time) error {
-	now := b.now()
-	// IsDeposit: this function only ever served the deposit path (see the doc
-	// comment above), so the flag is a constant here rather than a parameter.
-	if err := b.bands.Adopt(bands.Reservation{
-		Provider: p, Des: des, ChatID: chatID, Amount: amount,
-		CreatedAt: now, Deadline: deadline, IsDeposit: true,
-	}); err != nil {
-		return err
-	}
-	b.putUSDTRow(p, des, usdtRow{Total: total, SinceMS: sinceMS, TStart: float64(now.UnixNano()) / 1e9})
-	// Same rule as reserveUSDTAmount: never show a pay/deposit screen for a
-	// session a restart could strand.
-	if perr := b.persistUSDTPending(p, des, chatID, amount, total, sinceMS,
-		float64(deadline.UnixNano())/1e9); perr != nil {
-		b.releaseUnpersisted(p, des)
-		return fmt.Errorf("usdt: persist pending [%s %s]: %w", p, des, perr)
-	}
-	return nil
-}
-
 // ---- deposit starts ---------------------------------------------------------
 
 // startBep20Deposit / startTronDeposit create an on-chain USDT top-up —
 // start_bep20_deposit (telegram_bot.py:9478-9525) and start_tron_deposit
 // (@9935-9962).
 //
-// HOW IT GETS CREDITED differs by rail now. TRON is watched: usdtwatch.go
-// reads the seller address and credits the payment on its own, and the
-// customer's hash paste is only the fallback for what the watcher could not
-// attribute. BEP20 is still hash-paste only.
+// HOW IT GETS CREDITED. The deposit is credited HANDS-FREE by the watcher in
+// usdtwatch.go: it reads the seller address's incoming transfers and attributes
+// each one by amount, with no hash paste and no "I have paid" tap. Both rails
+// work the same way.
 //
 // PICKED amount, like an order (see reserveUSDTAmount): a hands-free watcher
 // attributes an incoming payment by amount alone, so two customers depositing
@@ -459,9 +366,9 @@ func (b *Bot) startOnchainDeposit(ctx context.Context, chatID int64, lang i18n.L
 	// hard limit (see depositTimeout's field comment in dispatch.go).
 	deadline := now.Add(b.depositTimeout) // wall-clock so it survives a restart
 	// PICKED amount now, not adopted verbatim — see the doc comment above
-	// startBep20Deposit/startTronDeposit for why. Mirrors cbPayOnchain's
-	// order-pay call below: no caller-side log, sendBandError already logs a
-	// non-exhaustion failure itself, so logging here too would double it up.
+	// startBep20Deposit/startTronDeposit for why. No caller-side log:
+	// sendBandError already logs a non-exhaustion failure itself, so logging
+	// here too would double it up.
 	// allowDownward=false: a deposit must never be quoted below what the
 	// customer asked to send (see reserveUSDTAmount's doc comment).
 	picked, err := b.reserveUSDTAmount(p, amount, fmtInt(chatID), des, vnd, now.UnixMilli(), deadline, false)
@@ -500,15 +407,13 @@ func (b *Bot) sendBandError(ctx context.Context, chatID int64, lang i18n.Lang, e
 
 // ---- pay screens ------------------------------------------------------------
 
-// sendUSDTScreen shows the on-chain pay/deposit screen: the seller address, the
-// EXACT amount to send, and the "I have made the payment" button that arms the
-// verify-by-hash flow — _send_usdt_screen (telegram_bot.py:9580-9594).
+// sendUSDTScreen shows the on-chain deposit screen: the seller address and the
+// EXACT amount to send (optionally a QR), hands-free — _send_usdt_screen
+// (telegram_bot.py:9580-9594). There is no "I have made the payment" button any
+// more: the watcher (usdtwatch.go) credits the deposit by amount alone once it
+// confirms on-chain, so the customer has nothing to tap and no hash to paste.
 func (b *Bot) sendUSDTScreen(ctx context.Context, chatID int64, lang i18n.Lang, chain, des, amount string) {
 	c := &i18n.C().Pay
-	// _usdt_paid_markup @9570: the single button carrying (chain, des).
-	markup := &tg.InlineKeyboardMarkup{InlineKeyboard: [][]tg.InlineKeyboardButton{
-		{{Text: c.USDTPaidBtn.T(lang), CallbackData: cbData("usdtpaid", chain, des)}},
-	}}
 	// The receiving address MUST be the config-layered value (settings.json's
 	// admin-set address overriding .env/ambient), not bep20.Address()/
 	// tron.Address() — those read raw env only and never see a /setbep20 or
@@ -522,12 +427,11 @@ func (b *Bot) sendUSDTScreen(ctx context.Context, chatID int64, lang i18n.Lang, 
 	// consistent with each other, even though both could be stale. A wizard
 	// rotation now makes the caption correct while a configured QR image
 	// still encodes the OLD address: a customer who scans the code pays the
-	// wrong address, and the by-hash verify (also on the NEW address) would
-	// never find that payment. Rather than ship a QR that can silently
-	// disagree with the text next to it, drop the QR the moment its raw-env
-	// address stops matching the effective one, falling back to the
-	// text-only caption below (which is always correct) until the operator
-	// updates the QR to match.
+	// wrong address, and the watcher (also on the NEW address) would never
+	// see that payment. Rather than ship a QR that can silently disagree with
+	// the text next to it, drop the QR the moment its raw-env address stops
+	// matching the effective one, falling back to the text-only caption below
+	// (which is always correct) until the operator updates the QR to match.
 	//
 	// TASK #41 FIX: that drop-on-mismatch comparison used to read
 	// bep20.Address()/tron.Address() — a bare os.Getenv, exactly like
@@ -565,7 +469,7 @@ func (b *Bot) sendUSDTScreen(ctx context.Context, chatID int64, lang i18n.Lang, 
 			qrURL, qrPath = b.envQRStr("TRON_QR_URL"), b.envQRStr("TRON_QR_PATH")
 		}
 	}
-	b.sendOnchainQR(ctx, chatID, caption, qrURL, qrPath, markup)
+	b.sendOnchainQR(ctx, chatID, caption, qrURL, qrPath)
 }
 
 // envAddrStr resolves the RAW .env-snapshot value of an address env var
@@ -600,14 +504,11 @@ func (b *Bot) envQRStr(key string) string {
 // sendOnchainQR is _send_bep20_qr / _send_tron_qr (telegram_bot.py:9457-9476,
 // 9907-9933): hosted URL, else uploaded file, else text-only, with the caption
 // in Markdown so the address renders as a copyable code block.
-//
-// The local-file path cannot carry a keyboard (multipart), so — exactly like
-// Python (@9470-9473) — it follows the image with a one-line button message.
-func (b *Bot) sendOnchainQR(ctx context.Context, chatID int64, caption, qrURL, qrPath string, markup *tg.InlineKeyboardMarkup) {
+func (b *Bot) sendOnchainQR(ctx context.Context, chatID int64, caption, qrURL, qrPath string) {
 	if qrURL != "" {
 		if _, err := b.tg.SendPhotoURLOpts(ctx, tg.SendPhotoURLParams{
 			ChatID: chatID, Photo: qrURL, Caption: caption,
-			ParseMode: "Markdown", ReplyMarkup: markup,
+			ParseMode: "Markdown",
 		}); err == nil {
 			return
 		} else {
@@ -615,52 +516,16 @@ func (b *Bot) sendOnchainQR(ctx context.Context, chatID int64, caption, qrURL, q
 		}
 	} else if qrPath != "" {
 		if _, err := b.tg.SendPhoto(ctx, chatID, qrPath, caption); err == nil {
-			// multipart can't carry a keyboard -> follow-up button message (@9471).
-			b.send(ctx, chatID, "👇", markup)
 			return
 		} else {
 			log.Println("usdt qr send error:", err)
 		}
 	}
 	if _, err := b.tg.SendMessage(ctx, tg.SendMessageParams{
-		ChatID: chatID, Text: caption, ParseMode: "Markdown", ReplyMarkup: markup,
+		ChatID: chatID, Text: caption, ParseMode: "Markdown",
 	}); err != nil {
 		log.Println("usdt screen send failed:", err)
 	}
-}
-
-// ---- pay-by-USDT callbacks --------------------------------------------------
-
-// payableOrder is the shared ownership + method + hard-expiry gate every
-// pay-by-USDT button runs (telegram_bot.py:15903-15922, 15952-15972,
-// 15995-16015). Returns nil after messaging the customer when the tap must not
-// proceed.
-//
-// The window check uses the order's REAL hard expiry (creation +
-// DEPOSIT_TIMEOUT_S), so a re-tap can never extend payment past it.
-func (b *Bot) payableOrder(cc *cbCtx, prefix, method string, configured func() bool, noID i18n.Str) *store.Order {
-	des := strings.TrimPrefix(cc.Data, prefix)
-	o, err := b.store.GetOrder(des)
-	// Ownership guard: a `des` can leak (it is shown in QR transfer content), so a
-	// payment button must only act for the chat that actually owns the order.
-	if err != nil || o == nil || o.Status != "reserved" || o.ChatID != fmtInt(cc.ChatID) {
-		b.send(cc.Ctx, cc.ChatID, i18n.C().Buy.OrderGone.T(b.langFor(cc.ChatID, "en")), nil)
-		return nil
-	}
-	lang := langSafe(o)
-	if !b.payEnabled(method) {
-		b.send(cc.Ctx, cc.ChatID, i18n.C().Buy.PayMethodOff.T(lang), nil)
-		return nil
-	}
-	if !configured() { // the button only renders when set, but guard a stale tap
-		b.send(cc.Ctx, cc.ChatID, noID.T(lang), nil)
-		return nil
-	}
-	if !b.orderTS(o).Add(b.expiryTimeout).After(b.now()) {
-		b.send(cc.Ctx, cc.ChatID, i18n.C().Buy.OrderGone.T(lang), nil)
-		return nil
-	}
-	return o
 }
 
 // orderTS converts an order's stored epoch-seconds creation stamp to a time.
@@ -669,475 +534,11 @@ func (b *Bot) orderTS(o *store.Order) time.Time {
 	return time.Unix(sec, int64(frac*1e9))
 }
 
-// cbPayBSC / cbPayTRX pay a reserved order on-chain — the paybsc: (@15947) and
-// paytrx: (@15990) branches. The UNIQUE amount binds the payment to THIS order
-// (anti-claim-jack); there is no poller, the customer pastes their tx hash.
-func (b *Bot) cbPayBSC(cc *cbCtx) { b.cbPayOnchain(cc, chainBSC) }
-func (b *Bot) cbPayTRX(cc *cbCtx) { b.cbPayOnchain(cc, chainTRX) }
-
-// cbPayOnchain is the shared body of the two branches above (line-for-line twins
-// in Python apart from their rail constants).
-func (b *Bot) cbPayOnchain(cc *cbCtx, chain string) {
-	c := &i18n.C().Pay
-	p, _ := providerForChain(chain)
-	prefix, method, noID, configured := "paybsc:", "bep20", c.BEP20NoID, b.bep20Configured
-	if chain == chainTRX {
-		prefix, method, noID, configured = "paytrx:", "tron", c.TronNoID, b.tronConfigured
-	}
-	o := b.payableOrder(cc, prefix, method, configured, noID)
-	if o == nil {
-		return
-	}
-	lang := langSafe(o)
-	base := b.usdtStr(o.Total)
-	if base == "" {
-		b.send(cc.Ctx, cc.ChatID, noID.T(lang), nil)
-		return
-	}
-	created := b.orderTS(o)
-	// allowDownward=true: an order MAY absorb the last-resort downward slot's
-	// undercharge as a seller cost, unlike a deposit — this is Reserve's
-	// original, unchanged behavior.
-	amount, err := b.reserveUSDTAmount(p, base, o.ChatID, o.Des,
-		o.Total, created.UnixMilli(), created.Add(b.expiryTimeout), true)
-	if err != nil {
-		b.sendBandError(cc.Ctx, cc.ChatID, lang, err, noID)
-		return
-	}
-	b.sendUSDTScreen(cc.Ctx, cc.ChatID, lang, chain, o.Des, amount)
-}
-
-// cbUSDTPaid handles "I have made the payment" — the usdtpaid: branch
-// (telegram_bot.py:16032-16065). Records the click time (the upper bound of the
-// [start, click] freshness window) and arms pending_txid so the NEXT plain text
-// is verified as the tx hash.
-func (b *Bot) cbUSDTPaid(cc *cbCtx) {
-	parts := strings.SplitN(cc.Data, ":", 3)
-	if len(parts) != 3 {
-		return
-	}
-	chain, des := parts[1], parts[2]
-	p, ok := providerForChain(chain)
-	if !ok {
-		return
-	}
-	o, err := b.store.GetOrder(des)
-	lang := b.langFor(cc.ChatID, "en")
-	if o != nil {
-		lang = langSafe(o)
-	}
-	// Ownership guard (a des can leak in the screen text). NOTE: status is NOT
-	// required to be 'reserved' — an order that just expired is still recoverable
-	// while its pending row survives the grace, so a late tap can still submit the
-	// hash (the verify then refunds-to-wallet / credits, @16046-16048).
-	if err != nil || o == nil || o.ChatID != fmtInt(cc.ChatID) {
-		b.send(cc.Ctx, cc.ChatID, i18n.C().Buy.OrderGone.T(lang), nil)
-		return
-	}
-	if !b.markUSDTClick(p, des, float64(b.now().UnixNano())/1e9) {
-		// Pending row gone (past the grace, or never created) -> the unique amount
-		// is no longer reserved; ask them to reopen the payment screen (@16062).
-		b.send(cc.Ctx, cc.ChatID, i18n.C().Buy.OrderGone.T(lang), nil)
-		return
-	}
-	cc.st.ClearCustomerPending() // drop stale sibling captures first (@16066)
-	cc.st.mu.Lock()
-	cc.st.Txid = &TxidCtx{Chain: chain, Des: des}
-	cc.st.mu.Unlock()
-	b.send(cc.Ctx, cc.ChatID, i18n.C().Pay.EnterTxid.T(lang), nil)
-}
-
-// ---- pending_txid capture (#43, @18978) -------------------------------------
-
-// capTxid is capture-chain entry #43, pending_txid — the on-chain tx-hash capture
-// (telegram_bot.py:18978-19027). PEEK semantics: an escaping text (a "/command"
-// or a tapped keyboard label) leaves the slot armed and falls through.
-//
-// A bad SHAPE is answered precisely and keeps the slot armed (no chain
-// round-trip). A well-formed hash CLAIMS the slot (so a second paste during the
-// wait can't re-enter), then verifies once QUIETLY: an unconfirmed tx is not
-// reported as "not found" — a background poll keeps checking and settles
-// automatically once it confirms.
-func (b *Bot) capTxid(c *Ctx) bool {
-	c.st.mu.Lock()
-	armed := c.st.Txid != nil
-	c.st.mu.Unlock()
-	if !armed {
-		return false
-	}
-	// peek escape (@18978's `and` guards).
-	if strings.HasPrefix(c.Text, "/") || labelToCmd(c.Text) != "" {
-		return false
-	}
-	pc := &i18n.C().Pay
-	raw := strings.TrimSpace(c.Text)
-	// Shape-check FIRST so a clearly-wrong paste gets a precise message and stays
-	// armed. BSC: 0x + 64 hex; TRON: bare 64 hex (0x tolerated) — @18986-18991.
-	hexPart := raw
-	if len(raw) >= 2 && strings.EqualFold(raw[:2], "0x") {
-		hexPart = raw[2:]
-	}
-	if !txHashRE.MatchString(hexPart) {
-		b.send(c.Ctx, c.ChatID, pc.TxidBadFormat.T(c.Lang), nil)
-		return true // keep pending for a valid retry
-	}
-	// Atomically CLAIM the capture (double-submit guard, @18996).
-	c.st.mu.Lock()
-	cap := c.st.Txid
-	c.st.Txid = nil
-	c.st.mu.Unlock()
-	if cap == nil {
-		return true // lost the claim to a concurrent duplicate message
-	}
-	b.send(c.Ctx, c.ChatID, pc.TxidChecking.T(c.Lang), nil)
-	// Panic-guarded: Python's `except -> terminal = False` (@19141) turns a blown-up
-	// verify into "keep checking in the background" rather than dropping the hash.
-	terminal := b.verifyUSDTTxidSafe(c.Ctx, c.ChatID, cap.Chain, cap.Des, raw, true)
-	if terminal {
-		return true
-	}
-	// Not terminal -> keep checking in the background. One poll per chat, and at
-	// most maxUSDTPolls globally, decided in ONE atomic step (@19000-19007).
-	st := c.st
-	started, capped := b.tryStartUSDTPoll(st)
-	switch {
-	case started:
-		chain, des := cap.Chain, cap.Des
-		if !b.workers.TryGo(func(stop <-chan struct{}) {
-			b.pollUSDTConfirm(st, c.ChatID, chain, des, raw, stop)
-		}) {
-			// Registry shutting down -> free the slot so the chat isn't locked out
-			// and tell them to retry rather than silently dropping the credit
-			// (@19012-19019). The hash is still submittable: nothing was consumed.
-			b.endUSDTPoll(st)
-			b.send(c.Ctx, c.ChatID, pc.TxidNotFound.T(c.Lang), nil)
-			return true
-		}
-		b.send(c.Ctx, c.ChatID, pc.TxidWaiting.T(c.Lang), nil)
-	case capped:
-		b.send(c.Ctx, c.ChatID, pc.TxidNotFound.T(c.Lang), nil)
-	default:
-		// A poll for this chat is already running -> they already saw TXID_WAITING.
-	}
-	return true
-}
-
-// tryStartUSDTPoll is the atomic test-and-set behind "one confirmation poll per
-// chat, at most USDT_MAX_POLLS globally" (_usdt_polling @9856 + USDT_MAX_POLLS
-// @9853). Returns (started, capped); (false,false) means this chat already has a
-// live poll. Both locks are released before any I/O (handlers-go.md §8).
-func (b *Bot) tryStartUSDTPoll(st *ChatState) (started, capped bool) {
-	b.usdtPollMu.Lock()
-	defer b.usdtPollMu.Unlock()
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.USDTPolling {
-		return false, false
-	}
-	if b.usdtPolls >= b.maxUSDTPolls {
-		return false, true
-	}
-	st.USDTPolling = true
-	b.usdtPolls++
-	return true, false
-}
-
-// endUSDTPoll releases a chat's confirmation-poll slot (the `finally` at @9877).
-func (b *Bot) endUSDTPoll(st *ChatState) {
-	b.usdtPollMu.Lock()
-	defer b.usdtPollMu.Unlock()
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.USDTPolling {
-		st.USDTPolling = false
-		if b.usdtPolls > 0 {
-			b.usdtPolls--
-		}
-	}
-}
-
-// pollUSDTConfirm keeps re-checking a submitted hash until it CONFIRMS (then
-// settles) or usdtConfirmWait elapses — _poll_usdt_confirm
-// (telegram_bot.py:9850-9878). Retries are quiet (no per-cycle message); the
-// FINAL attempt is not, so a still-missing tx gets one closing note.
-func (b *Bot) pollUSDTConfirm(st *ChatState, chatID int64, chain, des, txhash string, stop <-chan struct{}) {
-	defer b.endUSDTPoll(st)
-	ctx := context.Background() // the request ctx is long gone
-	deadline := b.now().Add(b.usdtConfirmWait)
-	for b.now().Before(deadline) {
-		select {
-		case <-stop:
-			return // shutdown before the window elapsed
-		case <-time.After(b.usdtConfirmPoll):
-		}
-		// Per-attempt panic guard (Python @9862 "never let a cycle kill the poll"):
-		// one faulted attempt must not end the poll or take the bot down.
-		if b.verifyUSDTTxidSafe(ctx, chatID, chain, des, txhash, true) {
-			return // terminal (settled / window / used)
-		}
-	}
-	// Window elapsed: one last, NON-quiet attempt so the customer gets a final
-	// word (@9872, guarded the same way at @9868).
-	b.verifyUSDTTxidSafe(ctx, chatID, chain, des, txhash, false)
-}
-
-// ---- verify-by-hash engine --------------------------------------------------
-
-// verifyUSDTTxid verifies a customer-submitted on-chain tx hash for order `des`
-// and settles it — _verify_usdt_txid (telegram_bot.py:9652-9843).
-//
-// PAY-for-order: the UNIQUE per-order amount binds a payment to exactly one
-// order; the [start, click] window + the processed-ledger PK + confirmed-only
-// complete the proof.
-// DEPOSIT: also a picked amount (the request plus the 0.01000-0.01999 jitter),
-// but no claim-jack band gate — a deposit credits the SUBMITTER's own wallet, so
-// it is credited the actual received amount, or the requested total when that is
-// larger and the receipt is within DEPOSIT_MATCH_TOL_UNITS (bands.DepositCredit);
-// the window + confirmed + hash-dedupe are the deposit's defenses. tx.from is
-// logged for forensics, NEVER used as an auth gate.
-//
-// `quiet` (confirmation-poll retries) suppresses the "not found / not confirmed
-// yet" messages so the background poll can keep re-checking silently; terminal
-// outcomes always message.
-// `redirected` is the DEPTH-1 guard: a verify rerouted from a sibling session
-// never redirects again.
-//
-// Returns true if TERMINAL (clear pending_txid), false to RE-ARM / keep polling.
-func (b *Bot) verifyUSDTTxid(ctx context.Context, chatID int64, chain, des, txhash string, quiet, redirected bool) bool {
-	pc := &i18n.C().Pay
-	p, ok := providerForChain(chain)
-	if !ok {
-		return true
-	}
-	o, err := b.store.GetOrder(des)
-	lang := b.langFor(chatID, "en")
-	if o != nil {
-		lang = langSafe(o)
-	}
-	// Ownership/existence: a des can leak, so only the owning chat may settle it.
-	if err != nil || o == nil || o.ChatID != fmtInt(chatID) {
-		b.send(ctx, chatID, i18n.C().Buy.OrderGone.T(lang), nil)
-		return true
-	}
-	isDeposit := o.Product == depositProduct
-
-	// ONE locked read for the expected amount. Snapshot also returns the sibling
-	// amounts (Python's `other_amounts`, taken in the same `with lock` block at
-	// @9685-9689), but this port does NOT use that stale list: the claim-jack gate
-	// and the sibling redirect below each take their own fresh locked read AFTER
-	// the (seconds-long) chain lookup. Fresher is the money-safe direction here —
-	// the gate's `false` is the ACCEPT side of a refusal, so a session reserved
-	// during the lookup should be able to block, not be invisible. Bands are spaced
-	// >= 2*tol+1 apart, so a fresh row can never turn a correct payment into a
-	// false conflict, and a same-chat row is caught by the redirect first.
-	res, _, live := b.bands.Snapshot(p, des)
-	if !live {
-		// Session amount gone (settled/expired/swept) -> nothing to verify against.
-		b.send(ctx, chatID, i18n.C().Buy.OrderGone.T(lang), nil)
-		return true
-	}
-	expected := res.Amount
-	prm, _ := b.bands.Params(p)
-	row, _ := b.getUSDTRow(p, des)
-	// Window LOWER bound = order creation (the earliest a payment for it could
-	// exist). UPPER bound = the "I've paid" tap; lost across a restart -> now
-	// (still safe — the unique amount is the real binding, @9676-9682).
-	winLo := o.TS
-	tClick := row.TClick
-	if tClick == 0 {
-		tClick = float64(b.now().UnixNano()) / 1e9
-	}
-	grace := b.usdtVerifyGrace.Seconds()
-
-	// ---- fetch the ONE confirmed transfer named by the hash ------------------
-	var (
-		txID      string
-		txTS      float64 // epoch seconds
-		recvUnits int64
-		recv      *big.Rat
-		frm       string
-	)
-	switch p {
-	case bands.ProviderBEP20:
-		tx, lerr := b.bep20ByHash(txhash)
-		if lerr != nil {
-			log.Printf("usdt verify (%s) lookup error for %s: %v", chain, des, lerr)
-			return b.txidNotFound(ctx, chatID, lang, quiet) // transient -> let them retry
-		}
-		if tx == nil || !tx.Confirmed {
-			return b.txidNotFound(ctx, chatID, lang, quiet) // re-arm: maybe not confirmed yet
-		}
-		txID, txTS, recvUnits, recv, frm = tx.ID, float64(tx.TS), tx.Units, tx.Amount, tx.Frm
-	default: // TRON
-		minTSMS := int64((winLo - grace) * 1000)
-		tx, lerr := b.tronByHash(txhash, minTSMS)
-		if lerr != nil {
-			log.Printf("usdt verify (%s) lookup error for %s: %v", chain, des, lerr)
-			return b.txidNotFound(ctx, chatID, lang, quiet)
-		}
-		if tx == nil {
-			return b.txidNotFound(ctx, chatID, lang, quiet)
-		}
-		txID, txTS, recvUnits, frm = tx.ID, float64(tx.TS)/1000.0, tx.Units, tx.Frm
-		recv = new(big.Rat).SetFrac(tx.Value, pow10BigInt(tron.TokenDecimals))
-	}
-	// Rendered at the RAIL's precision, not a hardcoded 2 dp. Bands are now
-	// 0.00101 USDT apart, so a 2-dp render collapses ten distinct slots onto one
-	// string — it would show "120.01" for every one of them, in the customer's
-	// amount-mismatch message and in every audit line an operator would use to
-	// reconstruct which order a payment was meant for.
-	recvStr := recv.FloatString(prm.Decimals)
-	chatStr := fmtInt(chatID)
-	ledgerID := ledgerPrefix(p) + ":" + txID
-
-	// ---- freshness window: creation - grace <= tx_ts <= click + grace --------
-	if txTS < winLo-grace || txTS > tClick+grace {
-		// Before the terminal reject: the tx may have been paid for ANOTHER of this
-		// SAME chat's sessions (during THAT session's window) and merely submitted
-		// from the newest screen — the dominant prod pattern after an expired-order
-		// retry. Redirect once; the recursion re-applies the ownership check and
-		// re-computes the window against the sibling order (@9724-9734).
-		if sib, okSib := b.bands.ResolveRedirect(p, chatStr, des, recvUnits, redirected); okSib {
-			b.audit(chatStr, "usdt_"+chain+"_redirect", ledgerID,
-				"recv="+recvStr+" rerouted to own sibling order (window)",
-				"from="+frm+" des="+des+" -> "+sib)
-			return b.verifyUSDTTxid(ctx, chatID, chain, sib, txhash, quiet, true)
-		}
-		b.audit(chatStr, "usdt_"+chain+"_reject", ledgerID, "outside_window",
-			fmt.Sprintf("from=%s recv=%s tx_ts=%d lo=%d click=%d",
-				frm, recvStr, int64(txTS), int64(winLo), int64(tClick)))
-		b.send(ctx, chatID, pc.TxidWindow.T(lang), nil)
-		return true
-	}
-
-	matched, merr := bands.RecvMatchesBand(prm, expected, recvUnits)
-	if merr != nil { // an unparseable stored amount must never read as "matched"
-		log.Printf("usdt verify (%s) band compare failed for %s: %v", chain, des, merr)
-		matched = false
-	}
-	recvVND, verr := b.usdtToVNDFor(p, recv)
-	if verr != nil {
-		// No usable USD_TO_VND rate -> we cannot value the credit. Crediting 0
-		// (or delivering against an unpriced payment) would lose the customer's
-		// money; re-arm instead so a fixed rate settles it on the next attempt.
-		//
-		// Since task #22 the rate resolves through b.usdRateStr()
-		// (config.Config.USDToVND), which always answers something — an absent
-		// USD_TO_VND now falls back to config.DefaultUSDToVND rather than
-		// erroring here, which is the point: quoting at the compiled default
-		// while refusing to credit at it was the worse half of that bug.
-		//
-		// What can still reach this branch, traced through USDToVND rather
-		// than assumed: a hand-edited settings.json usd_to_vnd that is
-		// negative, or positive but under 1 and so truncated to "0"; or, when
-		// settings.json carries no usable value, an environment-snapshot
-		// USD_TO_VND that is non-numeric, zero, or negative. A NON-NUMERIC
-		// settings.json value does NOT reach here — truthyFloat reads it as 0
-		// and USDToVND falls through to the env/default instead.
-		log.Printf("usdt verify (%s) rate error for %s: %v", chain, des, verr)
-		return b.txidNotFound(ctx, chatID, lang, quiet)
-	}
-
-	// ---- settle: DEPOSIT ----------------------------------------------------
-	if isDeposit {
-		if !b.settleUSDTMatch(ctx, p, des, ledgerID, recvUnits, recvVND, o, lang, chatID, prm, expected, frm, recvStr) {
-			return b.txidNotFound(ctx, chatID, lang, quiet) // nothing moved -> retry
-		}
-		return true
-	}
-
-	// ---- settle: PAY order --------------------------------------------------
-	if matched {
-		// Dedupe-only (the on-chain transfer pays for the accounts directly; no
-		// wallet credit), THEN deliver. MarkTxn's processed-PK is the atomic gate ->
-		// one hash delivers once even across racing submits (@9773-9776).
-		isNew, kerr := b.store.MarkTxn(ledgerID, chatStr, recvVND)
-		if kerr != nil {
-			log.Printf("usdt mark_txn failed [%s]: %v", ledgerID, kerr)
-			return b.txidNotFound(ctx, chatID, lang, quiet) // nothing consumed -> retry
-		}
-		if !isNew {
-			b.send(ctx, chatID, pc.TxidAlreadyUsed.T(lang), nil)
-			return true
-		}
-		settledClean := true
-		if _, serr := b.settlePaid(ctx, des); serr != nil {
-			// Mirror the QR worker: if NOTHING moved (still 'reserved'), release the
-			// dedupe claim, KEEP the pending row, and re-arm so a retry settles; if
-			// money already moved, keep the mark (re-settling would double-pay) and
-			// flag for manual review (@9782-9797).
-			o2, _ := b.store.GetOrder(des)
-			if o2 != nil && o2.Status == "reserved" {
-				if uerr := b.store.UnmarkTxn(ledgerID); uerr != nil {
-					log.Printf("usdt unmark_txn failed [%s]: %v", ledgerID, uerr)
-				}
-				log.Printf("usdt %s: settle failed pre-claim for %s, will retry: %v", chain, des, serr)
-				return b.txidNotFound(ctx, chatID, lang, quiet) // re-arm: keep the row
-			}
-			settledClean = false
-			log.Printf("usdt %s: MANUAL REVIEW %s %s %sUSDT — settle raised after money moved (status=%s): %v",
-				chain, des, ledgerID, recvStr, orderStatus(o2), serr)
-		}
-		b.dropUSDTPending(p, des) // only after a settled (or money-moved) outcome
-		outcome := recvStr + " USDT"
-		if !settledClean {
-			outcome = recvStr + " USDT — settle raised after money moved (MANUAL REVIEW)"
-		}
-		b.audit(chatStr, "usdt_"+chain+"_pay", ledgerID, outcome, "from="+frm+" des="+des)
-		return true
-	}
-
-	// ---- mismatch -----------------------------------------------------------
-	// FIRST: if the amount lands in the band of ANOTHER pending session owned by
-	// THIS SAME chat, it is not a claim-jack — the customer paid one of their OWN
-	// earlier sessions and submitted the hash from the newest screen. Redirect:
-	// ownership is identical, hash-dedupe still applies, and settling an expired
-	// sibling refunds to their wallet (@9812-9821).
-	if sib, okSib := b.bands.ResolveRedirect(p, chatStr, des, recvUnits, redirected); okSib {
-		b.audit(chatStr, "usdt_"+chain+"_redirect", ledgerID,
-			"recv="+recvStr+" rerouted to own sibling order",
-			"from="+frm+" des="+des+" -> "+sib)
-		return b.verifyUSDTTxid(ctx, chatID, chain, sib, txhash, quiet, true)
-	}
-	// Cross-chat band match: refuse (claim-jack defense — the payment may belong to
-	// another customer's session). Same-provider comparison, matching Python
-	// (@9824-9829). An error here is the ACCEPT side of a money refusal, so it
-	// fails CLOSED: treat it as a conflict rather than crediting.
-	conflict, cerr := b.bands.RecvMatchesAnyOtherBand(p, des, recvUnits)
-	if cerr != nil {
-		log.Printf("usdt verify (%s) claim-jack gate error for %s: %v", chain, des, cerr)
-		conflict = true
-	}
-	if conflict {
-		b.audit(chatStr, "usdt_"+chain+"_reject", ledgerID, "amount_conflict",
-			"from="+frm+" recv="+recvStr+" want="+expected)
-		b.send(ctx, chatID, pc.TxidAmountConflict.T(lang), nil)
-		return true
-	}
-	// Genuine self-misfund: bank it to the wallet and leave the order open to pay
-	// from balance (@9830-9840).
-	credited, bal, crerr := b.store.Credit(chatStr, recvVND, ledgerID)
-	if crerr != nil {
-		log.Printf("usdt mismatch credit failed [%s]: %v", ledgerID, crerr)
-		return b.txidNotFound(ctx, chatID, lang, quiet)
-	}
-	if !credited {
-		b.send(ctx, chatID, pc.TxidAlreadyUsed.T(lang), nil)
-		return true
-	}
-	b.audit(chatStr, "usdt_"+chain+"_pay_mismatch", ledgerID, "+"+recvStr+" USDT to wallet",
-		fmt.Sprintf("from=%s want=%s balance=%d", frm, expected, bal))
-	b.send(ctx, chatID, i18n.F(pc.TxidPayMismatch.T(lang),
-		"recv", recvStr, "want", expected, "balance", b.usdtDisp(bal)), nil)
-	return true
-}
-
 // settleUSDTMatch credits a CONFIRMED on-chain payment for order `des` and
-// resolves the deposit session. This is the ONE settle path shared by the
-// customer-pasted-hash flow (verifyUSDTTxid's deposit branch, above) and the
-// on-chain watcher that spots a payment without any hash paste (usdtwatch.go)
-// — both must dedupe and notify identically, so neither gets its own copy of
-// this logic.
+// resolves the deposit session. This is the ONE settle path: the hands-free
+// on-chain watcher (usdtwatch.go) spots a payment by amount alone — with no hash
+// paste — and routes every credit through here so dedupe and notify are shared,
+// not duplicated.
 //
 // recvVND/frm/recvStr are passed through rather than recomputed here: they
 // come from the specific on-chain transfer the caller looked up (recvVND via
@@ -1153,9 +554,8 @@ func (b *Bot) verifyUSDTTxid(ctx context.Context, chatID int64, chain, des, txha
 //
 // Returns true when the payment was settled (or was already settled — the
 // dedupe case, store.Credit's ledgerID PK match); false when nothing could be
-// credited (bad stored amount, or the credit call itself errored). On false
-// the caller decides what to tell the customer — verifyUSDTTxid re-arms via
-// txidNotFound; a silent watcher would just retry on the next tick.
+// credited (bad stored amount, or the credit call itself errored). On false the
+// caller holds the band and retries on the next tick.
 func (b *Bot) settleUSDTMatch(ctx context.Context, p bands.Provider, des, ledgerID string, recvUnits, recvVND int64, o *store.Order, lang i18n.Lang, chatID int64, prm bands.Params, expected, frm, recvStr string) bool {
 	pc := i18n.C().Pay
 	chain := ledgerPrefix(p) // "bsc" | "trx" — same string space as ledgerID's own prefix
@@ -1234,15 +634,6 @@ func (b *Bot) settleUSDTMatch(ctx context.Context, p bands.Provider, des, ledger
 	return true
 }
 
-// txidNotFound sends TXID_NOTFOUND unless the caller is a quiet retry, and always
-// reports NON-terminal so the capture re-arms / the poll keeps checking.
-func (b *Bot) txidNotFound(ctx context.Context, chatID int64, lang i18n.Lang, quiet bool) bool {
-	if !quiet {
-		b.send(ctx, chatID, i18n.C().Pay.TxidNotFound.T(lang), nil)
-	}
-	return false
-}
-
 // usdtToVNDFor values a received on-chain amount in VND using the rail's own
 // converter (bep20_pay.usdt_to_vnd / tron_pay.usdt_to_vnd).
 func (b *Bot) usdtToVNDFor(p bands.Provider, recv *big.Rat) (int64, error) {
@@ -1268,57 +659,34 @@ func orderStatus(o *store.Order) string {
 // ---- panic isolation for the USDT money loops --------------------------------
 //
 // Python wraps EVERY long-lived USDT money loop in `try/except Exception` so an
-// unexpected failure logs and the loop keeps going: the poller's per-cycle
-// `except ... continue` (telegram_bot.py:9243-9245), _poll_usdt_confirm's
-// per-attempt except (@9862, @9868), _startup_recovery's per-step excepts
-// (@10001-10019) and the sweep-loop except (@10022), and the txid handler's
-// `except -> terminal = False` (@19141-19143).
+// unexpected failure logs and the loop keeps going: _startup_recovery's
+// per-step excepts (@10001-10019) and the sweep-loop except (@10022).
 //
 // Go's error returns only cover the failures a callee chose to name. The Python
 // guards ALSO catch programming faults, and in Go those are panics — which,
 // untracked, unwind straight out of the goroutine and kill the WHOLE process.
 // On the settle path that is the worst possible failure mode: a single nil-deref
-// under settlePaid/deliverPaid takes down all three rails, and because
+// under settlePaid/deliverPaid takes down both rails, and because
 // StartupRecovery replays the same pending row on the next boot it becomes a
 // crash loop. The update workers already recover for exactly this reason
 // (cmd/bot/main.go "one bad update can't kill a worker"); these goroutines did
-// not. The two helpers below restore that parity at the same granularity Python
-// retries at.
+// not. safeStep restores that parity at the same granularity Python retries at.
 
-// safeStep runs one recovery/sweep step with the panic guard Python's per-step
-// `except Exception` provides. A faulted step is logged and SKIPPED; the caller
-// continues with the next step / the next tick.
+// safeStep runs one recovery/sweep/watcher step with the panic guard Python's
+// per-step `except Exception` provides. A faulted step is logged and SKIPPED;
+// the caller continues with the next step / the next tick.
 func safeStep(tag string, fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
 			// Value suppressed, stack kept — same policy as otp.go:465-470.
-			// safeStep is generic: `fn` is any poller step, including ones that
-			// credit balances and deliver purchased goods, so the recovered
-			// value can be built from a credential-holding local. `tag` is a
-			// caller-supplied constant and is safe to print.
+			// safeStep is generic: `fn` is any watcher/sweep step, including
+			// ones that credit balances, so the recovered value can be built
+			// from a credential-holding local. `tag` is a caller-supplied
+			// constant and is safe to print.
 			log.Printf("%s: recovered from panic (payload suppressed)\n%s", tag, debug.Stack())
 		}
 	}()
 	fn()
-}
-
-// verifyUSDTTxidSafe is verifyUSDTTxid with the panic guard of Python's verify
-// call sites (@9862/@9868 in the confirm poll, @19141 in the txid capture).
-//
-// A faulted attempt reports NON-terminal, which is the money-safe direction: the
-// capture re-arms / the background poll keeps checking, so the customer's hash is
-// never silently dropped by a fault that moved nothing.
-func (b *Bot) verifyUSDTTxidSafe(ctx context.Context, chatID int64, chain, des, txhash string, quiet bool) (terminal bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			// Value suppressed, stack kept — same policy as otp.go:465-470.
-			// chain and des are non-secret identifiers and stay, so the log line
-			// still says WHICH order faulted.
-			log.Printf("usdt verify (%s) panic for %s (payload suppressed)\n%s", chain, des, debug.Stack())
-			terminal = false // nothing consumed -> let the caller retry
-		}
-	}()
-	return b.verifyUSDTTxid(ctx, chatID, chain, des, txhash, quiet, false)
 }
 
 // audit writes one customer-actor audit row (_audit @… -> store.LogAction). The
@@ -1343,12 +711,12 @@ func tsToTime(ts float64) time.Time {
 // rehydrate + the periodic expiry backstop, on a tracked goroutine so it never
 // delays startup and Shutdown drains it.
 //
-// BEP20 and TRON only LOAD their pending rows — verify is customer-driven
-// by-hash, so there is no poller and no reconcile. (Binance Pay used to
-// additionally rehydrate AND reconcile through its own shared poller; that
-// rail was removed by the USDT-only migration, S3.) Then a light expiry
-// sweep keeps running so a restart-orphaned checkout still expires and its
-// band is eventually freed.
+// BEP20 and TRON only LOAD their pending rows so the hands-free watcher
+// (started just below) keeps attributing transfers to them across a restart.
+// (Binance Pay used to additionally rehydrate AND reconcile through its own
+// shared poller; that rail was removed by the USDT-only migration, S3.) Then a
+// light expiry sweep keeps running so a restart-orphaned checkout still expires
+// and its band is eventually freed.
 func (b *Bot) StartupRecovery(ctx context.Context) {
 	b.workers.Go(func(stop <-chan struct{}) {
 		// Each step is panic-isolated exactly as Python isolates them
@@ -1412,16 +780,12 @@ func (b *Bot) StartupRecovery(ctx context.Context) {
 }
 
 // rehydrateOnchainPending LOADS persisted BEP20/TRON pending rows back into the
-// band registry (no poller, no settle) so (a) the unique-amount picker keeps
-// avoiding collisions with sessions that predate the restart and (b) a customer
-// can still submit their hash — including a LATE submit on an order that already
-// expired but is within usdtPendingGrace. Rows whose order vanished or is past
-// the grace are pruned (_rehydrate_bep20_pending @9527 / _rehydrate_tron_pending
-// @9965).
-//
-// t_start comes from the row's write time; t_click is unknown post-restart, so
-// the verify window upper-bounds at 'now' (safe — the unique amount is the
-// binding).
+// band registry (no settle) so (a) the unique-amount picker keeps avoiding
+// collisions with sessions that predate the restart and (b) the hands-free
+// watcher keeps attributing incoming transfers to them — including a LATE
+// transfer on an order that already expired but is within usdtPendingGrace.
+// Rows whose order vanished or is past the grace are pruned
+// (_rehydrate_bep20_pending @9527 / _rehydrate_tron_pending @9965).
 func (b *Bot) rehydrateOnchainPending(p bands.Provider) {
 	type row struct {
 		des, chatID, amount string
@@ -1491,7 +855,7 @@ func (b *Bot) adoptPersisted(p bands.Provider, des, chatID, amount string, total
 	}); err != nil {
 		return err
 	}
-	b.putUSDTRow(p, des, usdtRow{Total: total, SinceMS: sinceMS, TStart: ts})
+	b.putUSDTRow(p, des, usdtRow{Total: total, SinceMS: sinceMS})
 	return nil
 }
 

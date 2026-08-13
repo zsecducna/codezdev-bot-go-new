@@ -579,10 +579,9 @@ func (c *Client) SendPhoto(ctx context.Context, chatID int64, filePath, caption 
 // (Telegram fetches the image itself). Distinct from SendPhoto, which uploads a
 // local file via multipart.
 // SendPhotoURLParams is the full JSON sendPhoto payload for a URL photo. The
-// BEP20/TRON pay screens send the address as a Markdown code block AND attach
-// the "I have made the payment" inline button to the photo itself
-// (telegram_bot.py:9461-9466, 9911-9916), so parse_mode + reply_markup are
-// part of the payload there.
+// USDT deposit screens send the address as a Markdown code block
+// (telegram_bot.py:9461-9466, 9911-9916), so parse_mode is part of the payload
+// there; reply_markup stays available for any future inline keyboard.
 type SendPhotoURLParams struct {
 	ChatID      int64  `json:"chat_id"`
 	Photo       string `json:"photo"`

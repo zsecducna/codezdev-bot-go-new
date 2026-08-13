@@ -57,7 +57,6 @@ var CanonicalCaptureOrder = []string{
 	"hold",              // 41 @18437 peek (RE-ARMS on invalid quantity — py_stock_spec.md §3.4/§11)
 	"tier",              // 42 @18464 peek
 	"price",             // 43 @18499 peek
-	"txid",              // 45 @18534 peek
 	"deposit",           // 46 @18586 peek
 	"apikey",            // 47 @18614 peek
 	"apikeyrc",          // 48 @18640 peek

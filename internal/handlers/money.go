@@ -114,10 +114,10 @@ func (b *Bot) usdtDisp(vnd int64) string {
 // So this reimplements usdtStr's own trim/parse/fallback shape but keeps
 // the VND number in the fallback branch instead of discarding it.
 //
-// NOT for customer-facing quotes. startOnchainDeposit and cbPayOnchain
-// (usdt.go) must keep calling usdtStr directly and ABANDONING the flow
-// when it returns "" — a customer quote may not be approximate, only an
-// audit row may fall back to an explicit marker instead of a number.
+// NOT for customer-facing quotes. startOnchainDeposit (usdt.go) must keep
+// calling usdtStr directly and ABANDONING the flow when it returns "" — a
+// customer quote may not be approximate, only an audit row may fall back to an
+// explicit marker instead of a number.
 // Routing a customer quote through this function would silently hand out
 // a fallback STRING as if it were a price.
 func (b *Bot) auditAmount(sign string, vnd int64) string {

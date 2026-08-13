@@ -43,8 +43,8 @@ type docSend struct {
 
 // photoSend records one sendPhoto call. PhotoURL carries the hosted image URL
 // (SendPhotoURLOpts) or the LOCAL file path (SendPhoto), so a test can assert
-// on either QR path; Markup is the inline keyboard attached to the photo (the
-// BEP20/TRON "I have made the payment" button).
+// on either QR path; Markup is the inline keyboard attached to the photo, if
+// any (the USDT deposit screen no longer attaches one).
 type photoSend struct {
 	ChatID   int64
 	PhotoURL string

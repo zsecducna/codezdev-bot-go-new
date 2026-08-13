@@ -8,14 +8,14 @@ import (
 )
 
 // customerClearFields / adminClearFields are the EXACT field sets
-// ClearCustomerPending / ClearAdminPending must touch (handlers-go.md §3: 9
+// ClearCustomerPending / ClearAdminPending must touch (handlers-go.md §3: 8
 // customer slots, 46 admin slots). TestClearListsExact asserts the code clears
 // precisely these — a new slot added to one clear method but not the expected
 // list (or vice versa) fails the test, mirroring the Python "sibling captures
 // never collide" invariant.
 var customerClearFields = []string{
 	"Purchase", "Deposit", "APIKey", "APIKeyRC", "OrderCode",
-	"Code", "CustReset", "CustDelete", "Txid",
+	"Code", "CustReset", "CustDelete",
 }
 
 var adminClearFields = []string{
@@ -101,8 +101,8 @@ func TestClearListsExact(t *testing.T) {
 		}
 	})
 	// Guard the documented counts so a future edit can't silently drift them.
-	if len(customerClearFields) != 9 {
-		t.Errorf("expected 9 customer clear fields, have %d", len(customerClearFields))
+	if len(customerClearFields) != 8 {
+		t.Errorf("expected 8 customer clear fields, have %d", len(customerClearFields))
 	}
 	if len(adminClearFields) != 46 {
 		t.Errorf("expected 46 admin clear fields, have %d", len(adminClearFields))

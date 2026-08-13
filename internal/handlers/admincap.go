@@ -207,13 +207,15 @@ func stdAdminCbCap(data string) (cap string, governed bool) {
 // "sellpay:") that used to be ported here as forward-compatible placeholders
 // are gone: the whole AWS-sell feature (internal/awssell, internal/awsval,
 // the awsadm: admin tree) was removed — user decision, full rip-out, never
-// shipped past the store layer.
+// shipped past the store layer. The on-chain product-pay prefixes ("paybsc",
+// "paytrx") and the deposit "I've paid" button ("usdtpaid:") went with the
+// tx-hash credit path: products pay from wallet balance and deposits credit
+// hands-free via the watcher, so no customer button emits them any more.
 var customerCBPrefixes = []string{
 	"buy:", "buyx:", "buygo:", "buyqty:", "tier:", "back:", "setlang:",
 	"apikey", "kiroapi",
 	"ss:", "refreq:", "hist", "redl:", "cancelord:", "keepord", "applycode:",
 	"otpkeep", "otpstop:", "dep:", "paybal", "paybnb",
-	"paybsc", "paytrx", "usdtpaid:",
 }
 
 // isAdminCB reports whether data is a privileged/admin callback the

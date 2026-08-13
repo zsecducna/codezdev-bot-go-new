@@ -34,11 +34,10 @@ type TG interface {
 	GetChat(ctx context.Context, chatID int64) (*tg.Chat, error)
 	// SendDocument uploads a local file (order delivery, _deliver_paid @7817).
 	SendDocument(ctx context.Context, chatID int64, filePath, caption string) (*tg.Message, error)
-	// SendPhotoURLOpts posts a photo by URL with parse_mode + reply_markup — the
-	// BEP20/TRON pay screens attach the "I have made the payment" button to the
-	// QR photo and render the address as a Markdown code block
-	// (_send_bep20_qr @9457, _send_tron_qr @9907). The plain-SendPhotoURL variant
-	// (no options) was dropped along with SePay and Binance Pay, its only
+	// SendPhotoURLOpts posts a photo by URL with parse_mode — the BEP20/TRON
+	// deposit screens render the QR photo with the address as a Markdown code
+	// block (_send_bep20_qr @9457, _send_tron_qr @9907). The plain-SendPhotoURL
+	// variant (no options) was dropped along with SePay and Binance Pay, its only
 	// callers (S1/S3).
 	SendPhotoURLOpts(ctx context.Context, p tg.SendPhotoURLParams) (*tg.Message, error)
 	// SendPhoto uploads a LOCAL image file — the *_QR_PATH fallback the
@@ -127,20 +126,11 @@ type Bot struct {
 	// rail-specific timestamps which stay with the rails"). Keyed provider -> des.
 	usdtRows map[bands.Provider]map[string]*usdtRow
 
-	// usdtPollMu guards usdtPolls AND the per-chat st.USDTPolling test-and-set, so
-	// "one confirm-poll per chat, at most USDT_MAX_POLLS globally" is decided in
-	// ONE atomic step (_usdt_polling @9856-9860 + USDT_MAX_POLLS @9853).
-	usdtPollMu   sync.Mutex
-	usdtPolls    int
-	maxUSDTPolls int
-
 	// USDT timing knobs (telegram_bot.py:9541-9558). Fields so tests can shrink
 	// them; New reads the env defaults.
 	expirySweepInterval time.Duration // EXPIRY_SWEEP_INTERVAL 120s
 	usdtPendingGrace    time.Duration // USDT_PENDING_GRACE_S 2h
 	usdtVerifyGrace     time.Duration // USDT_VERIFY_GRACE_S 120s
-	usdtConfirmWait     time.Duration // USDT_CONFIRM_WAIT_S 300s
-	usdtConfirmPoll     time.Duration // USDT_CONFIRM_POLL_S 20s
 	// usdtWatchInterval is the hands-free deposit watcher's cadence
 	// (USDT_WATCH_INTERVAL_S 20s, usdtwatch.go). It is how long a customer
 	// waits between their transfer confirming and their balance moving, so
@@ -181,11 +171,9 @@ type Bot struct {
 	// with fakes (or httptest-backed real clients) instead of live chain RPC,
 	// while New binds the real internal/pay/* clients.
 	bep20Configured func() bool
-	bep20ByHash     func(txhash string) (*bep20.TransferByHash, error)
 	bep20UsdtToVND  func(usdt *big.Rat) (int64, error)
 
 	tronConfigured func() bool
-	tronByHash     func(txhash string, minTSMS int64) (*tron.Transfer, error)
 	tronUsdtToVND  func(usdt *big.Rat) (int64, error)
 	// tronTransfersSince lists confirmed incoming USDT transfers to the seller
 	// address since an epoch-ms bound — the hands-free watcher's one chain read
@@ -295,7 +283,7 @@ type Bot struct {
 	// passes after its first (immediate) iteration, coalescing a burst of
 	// pastes/file uploads into one edited message instead of one per input. A
 	// Bot field (not a bare const) so tests can shrink it, the same pattern
-	// as every other timing knob on this struct (otpCooldown, usdtConfirmPoll, …).
+	// as every other timing knob on this struct (otpCooldown, expirySweepInterval, …).
 	upstockRenderThrottle time.Duration
 }
 
@@ -448,8 +436,6 @@ func New(d Deps) *Bot {
 	b.auditPruneInterval = 24 * time.Hour
 	b.usdtPendingGrace = time.Duration(b.envInt("USDT_PENDING_GRACE_S", 2*3600)) * time.Second
 	b.usdtVerifyGrace = time.Duration(b.envInt("USDT_VERIFY_GRACE_S", 120)) * time.Second
-	b.usdtConfirmWait = time.Duration(b.envInt("USDT_CONFIRM_WAIT_S", 300)) * time.Second
-	b.usdtConfirmPoll = b.envDuration("USDT_CONFIRM_POLL_S", 20*time.Second, usdtConfirmPollMinInterval)
 	// USDT_WATCH_INTERVAL_S default 20s: the watcher makes ONE TronGrid call
 	// per tick no matter how many deposits are open (and none at all when
 	// none are), so 20s keeps the customer's wait short while staying far
@@ -457,7 +443,6 @@ func New(d Deps) *Bot {
 	// envInt*time.Second, for the reason above it — a configured 0 would
 	// turn this into an unthrottled loop against a third-party API.
 	b.usdtWatchInterval = b.envDuration("USDT_WATCH_INTERVAL_S", 20*time.Second, usdtWatchMinInterval)
-	b.maxUSDTPolls = max(b.envInt("USDT_MAX_POLLS", 200), 1)
 	// Chain/exchange clients. The receiving address is resolved LIVE on every
 	// call through b.bep20AddrStr()/b.tronAddrStr() (settings.json's admin-set
 	// address overriding .env/ambient, config.Config.BEP20Address()/
@@ -473,15 +458,6 @@ func New(d Deps) *Bot {
 	// reads consulted the wrong source (raw os.Getenv, which never sees a
 	// settings.json write) instead of this getter.
 	b.bep20Configured = func() bool { return bep20.ValidAddress(b.bep20AddrStr()) }
-	b.bep20ByHash = func(txhash string) (*bep20.TransferByHash, error) {
-		// BEP20_MIN_CONF is REORG SAFETY — the confirmation depth at which a
-		// transfer is deep enough to settle. Read through b.envInt for the
-		// same reason as the address beside it: the pay package's raw reader
-		// never sees .env in production, so the operator's chosen depth was
-		// silently ignored and every settle used the compiled default.
-		return bep20.GetTransferToSellerByHashConf(b.bep20AddrStr(), txhash,
-			b.envInt("BEP20_MIN_CONF", bep20.DefaultMinConfirmations))
-	}
 	b.tronConfigured = func() bool { return tron.ValidAddress(b.tronAddrStr()) }
 	// b.tronAPIKeyStr() is read per call, same as the address above — task
 	// #16: the raw os.Getenv("TRON_API_KEY") apiGet used to read only ever
@@ -489,21 +465,9 @@ func New(d Deps) *Bot {
 	// unauthenticated on the deposit-verification path. config.Config.
 	// TRONAPIKey() is the bridge; internal/pay/tron stays free of an
 	// internal/config import (see apiGet's doc comment).
-	b.tronByHash = func(txhash string, minTSMS int64) (*tron.Transfer, error) {
-		// TRON_PAGE_LIMIT and TRON_API_BASE join the API key on the config
-		// chain for the same reason it is already there. TrimRight mirrors
-		// what the package's own raw apiBase() does, so a hand-edited .env
-		// with a trailing slash does not produce a doubled separator.
-		return tron.FindConfirmedTransferByHashConf(b.tronAddrStr(), txhash, minTSMS, b.tronAPIKeyStr(),
-			b.envInt("TRON_PAGE_LIMIT", tron.DefaultPageLimit),
-			strings.TrimRight(b.cfg.EnvOr("TRON_API_BASE", tron.DefaultAPIBase), "/"))
-	}
 	// The watcher's fetch resolves address, API key, page limit and base
-	// through exactly the same config chain as the by-hash lookup above —
-	// deliberately identical, because the two read the SAME address and a
-	// divergence would mean the watcher polling one address while the
-	// customer's hash is verified against another.
-	// TRON_PAGE_LIMIT is now the size of ONE page, not a ceiling on the whole
+	// through exactly that config chain.
+	// TRON_PAGE_LIMIT is the size of ONE page, not a ceiling on the whole
 	// window: GetIncomingTransfersConf follows TronGrid's fingerprint
 	// continuation until the window is exhausted, and logs for itself if it
 	// ever hits its own runaway guard. Nothing to check here.
@@ -536,8 +500,8 @@ func New(d Deps) *Bot {
 	// two ways: an admin running adm:setrate moved the quote and left
 	// crediting on the environment value, and a process with no USD_TO_VND set
 	// at all quoted at config.DefaultUSDToVND while crediting returned an
-	// error, which verifyUSDTTxid turns into a re-arm — a refusal to credit a
-	// payment that had already been made at a correctly quoted amount.
+	// error, which the hands-free watcher turns into a hold — a refusal to
+	// credit a payment that had already been made at a correctly quoted amount.
 	//
 	// The rate concept itself is slated to disappear in the USDT migration's
 	// slice S5, when the ledger flips to micro-USDT and there is nothing left
@@ -573,12 +537,8 @@ func New(d Deps) *Bot {
 	// self-service group refund). Registered last so its captures can be
 	// PREPENDED into their canonical slots (#45/#46) ahead of pending_purchase.
 	b.registerAPIKey()
-	// USDT rails last: pending_txid is capture #43, ahead of every capture the
-	// earlier slices registered (#44+), so registerUSDT splices it in before
-	// "deposit" and the chain stays an in-order subsequence of the canonical list.
-	b.registerUSDT()
-	// M2.6 login-code suite last: pending_code is capture #36, ahead of every
-	// capture registered above (#43+), so registerOTP splices it in before "txid"
+	// M2.6 login-code suite: pending_code is capture #38, ahead of every capture
+	// the earlier slices registered, so registerOTP splices it in before "deposit"
 	// and the chain stays an in-order subsequence of the canonical list.
 	b.registerOTP()
 	// M2.6 promo/referral code capture: pending_ordercode is #47, between
@@ -600,8 +560,8 @@ func New(d Deps) *Bot {
 	// 🏷️ PRICING & DISCOUNTS (adminpricing.go). Its captures (setapiprice
 	// through setapicap, canonically #11-#17; discount/promo #34/#36;
 	// tier/price #41/#42) splice ahead of anchors registerAdminSettings /
-	// registerOTP / registerUSDT already landed ("setkirourl", "code",
-	// "txid") — this MUST run last so those anchors already exist in the
+	// registerOTP / registerDeposit already landed ("setkirourl", "code",
+	// "deposit") — this MUST run last so those anchors already exist in the
 	// chain.
 	b.registerAdminPricing()
 	// 👥 CUSTOMERS / 🛡️ ADMIN ROLES / whitelist / resellers (adminusers.go).
@@ -675,22 +635,14 @@ const (
 	// stock sweep above, just scoped to orders that actually expired
 	// rather than every product on every tick.
 	expirySweepMinInterval = 5 * time.Second
-	// usdtConfirmPollMinInterval is USDT_CONFIRM_POLL_S's floor —
-	// pre-existing (predates task #30). Each poll is an outbound chain RPC
-	// call (BEP20/TRON), not a local lock or the shared DB connection, so
-	// this floor can be the lowest of the four — but zero still means
-	// hammering an external chain-explorer API on every scheduler tick,
-	// risking a rate-limit ban on the very address the shop verifies
-	// deposits against.
-	usdtConfirmPollMinInterval = 2 * time.Second
 	// usdtWatchMinInterval is USDT_WATCH_INTERVAL_S's floor (usdtwatch.go).
-	// Each tick with any deposit open is an outbound TronGrid call, like the
-	// confirm poll above — but UNLIKE it, this loop runs for the whole life
-	// of every open deposit rather than for one customer's few-minute
-	// confirm wait, so a misconfigured value here sustains the rate-limit
-	// pressure instead of spiking it. Hence a higher floor than the confirm
-	// poll's: getting the shop's own address rate-limited would break the
-	// verification path for every rail at once.
+	// Each tick with any deposit open is an outbound TronGrid call. Zero means
+	// hammering a third-party API on every scheduler tick, risking a rate-limit
+	// ban on the very address the shop watches deposits against; this loop also
+	// runs for the whole life of every open deposit, so a misconfigured value
+	// here sustains the rate-limit pressure instead of spiking it: getting the
+	// shop's own address rate-limited would break deposit crediting for every
+	// rail at once.
 	usdtWatchMinInterval = 5 * time.Second
 )
 

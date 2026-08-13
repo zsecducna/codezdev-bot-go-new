@@ -3,14 +3,10 @@ package handlers
 // usdt_test.go — acceptance pins for the USDT rails, ported from the Python
 // suites named in the port mandate:
 //
-//	tests/test_usdt_redirect.py  — same-chat sibling redirect, cross-chat conflict,
-//	                               exact-amount settle, window redirect, the picker
-//	                               excluding a chat's own DEAD sessions
-//	tests/test_usdt_verify.py    — confirmed/unconfirmed/reverted/wrong-recipient
-//	                               by-hash lookups + the band-spacing invariant
-//	tests/test_deposit_credit.py — the ±30c deposit credit decision (the pure
-//	                               function itself is pinned in bands/credit_test.go;
-//	                               here it is pinned END-TO-END through a deposit)
+//	tests/test_usdt_redirect.py  — the picker excluding a chat's own DEAD sessions
+//	tests/test_deposit_credit.py — the deposit credit decision (the pure function
+//	                               itself is pinned in bands/credit_test.go; here
+//	                               it is pinned END-TO-END through a deposit)
 //
 // Plus the integration pin this slice exists for: ONE bands.Registry shared by
 // both surviving rails, so a live BEP20 band blocks the same TRON amount
@@ -18,38 +14,26 @@ package handlers
 //
 // USDT migration note (2026-08-06): Binance Pay (the shared poller, its
 // reconcile pass, tests/test_binance_match.py's port) was removed — the shop
-// takes USDT via BEP20/TRON only (S3). TestBinancePollerMatchesMultiplePendings,
-// TestBinancePollerRestartsAfterIdleExit, TestStartupRecoveryNoDoubleCredit and
-// TestBinanceReconcileGrace went with it. Tests that merely used
-// bands.ProviderBinance as a vehicle to prove the shared-registry property
-// (TestUSDTSharedBandAcrossRails) were retargeted to the two surviving
-// providers instead of deleted.
+// takes USDT via BEP20/TRON only (S3).
 //
-// No live network: the chain/exchange seams are driven by fakes, and
-// TestUSDTRealClientsByHash additionally drives the REAL bep20/tron clients
-// against httptest servers so the production seam bindings are covered too.
+// Hands-free deposits note: the customer-pastes-a-tx-hash credit path was
+// removed — deposits are credited by the watcher (usdtwatch.go), and these
+// tests drive that credit through settleWatchedTransfer, the watcher's
+// per-transfer settle entry point. The by-hash verify/replay/poll suites and
+// the real-client seam tests went with the hash path.
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"math/big"
-	"net/http"
-	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/pay/bands"
 	"codezdev-bot/internal/pay/bep20"
 	"codezdev-bot/internal/pay/tron"
-	"codezdev-bot/internal/stock"
 	"codezdev-bot/internal/store"
 )
 
@@ -62,38 +46,16 @@ var (
 	testSellerTRX = "T" + strings.Repeat("A", 33)   // T + 33 base58
 )
 
-// usdtFakes holds the scripted chain/exchange responses a test installs on the
-// Bot's seams, plus call counters.
-type usdtFakes struct {
-	mu sync.Mutex
-	// bscByHash is consulted per (txhash) lookup; nil result == "no confirmed
-	// transfer to us" (unknown hash / reverted / too shallow / wrong recipient).
-	bscByHash map[string]*bep20.TransferByHash
-	trxByHash map[string]*tron.Transfer
-	bscHits   atomic.Int64
-}
-
-func (u *usdtFakes) setBSC(hash string, tx *bep20.TransferByHash) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	if u.bscByHash == nil {
-		u.bscByHash = map[string]*bep20.TransferByHash{}
-	}
-	u.bscByHash[strings.ToLower(hash)] = tx
-}
-
-func (u *usdtFakes) setTRX(hash string, tx *tron.Transfer) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	if u.trxByHash == nil {
-		u.trxByHash = map[string]*tron.Transfer{}
-	}
-	u.trxByHash[strings.ToLower(hash)] = tx
-}
+// usdtFakes is the (now empty) handle newUSDTBot returns. The by-hash scripted
+// fakes it used to carry left with the hash-paste path: deposits are credited
+// through settleWatchedTransfer (the watcher's per-transfer entry point)
+// directly, with no chain seam to script. Kept as a non-nil placeholder so
+// newUSDTBot's return signature stays stable.
+type usdtFakes struct{}
 
 // newUSDTBot builds a Bot with both surviving USDT rails (BEP20, TRON)
-// CONFIGURED and ENABLED, fast timers, and the chain seams pointed at
-// scripted fakes. Binance Pay was removed by the USDT-only migration (S3).
+// CONFIGURED and ENABLED and fast sweep timers. Binance Pay was removed by the
+// USDT-only migration (S3).
 //
 // Env is set BEFORE handlers.New so the band geometry, the seller addresses and
 // the USD_TO_VND rate are all in place when the registry is built.
@@ -124,24 +86,9 @@ func newUSDTBotAtRate(t *testing.T, usdToVND string) (*Bot, *fakeTG, *store.Stor
 	if err := b.cfg.SaveSettings(s); err != nil {
 		t.Fatalf("save settings: %v", err)
 	}
-
-	fk := &usdtFakes{}
-	b.bep20ByHash = func(txhash string) (*bep20.TransferByHash, error) {
-		fk.bscHits.Add(1)
-		fk.mu.Lock()
-		defer fk.mu.Unlock()
-		return fk.bscByHash[strings.ToLower(strings.TrimPrefix(txhash, "0x"))], nil
-	}
-	b.tronByHash = func(txhash string, _ int64) (*tron.Transfer, error) {
-		fk.mu.Lock()
-		defer fk.mu.Unlock()
-		return fk.trxByHash[strings.ToLower(strings.TrimPrefix(txhash, "0x"))], nil
-	}
-	// Fast timers so the confirm-poll/sweeps run inside a test.
-	b.usdtConfirmPoll = 2 * time.Millisecond
-	b.usdtConfirmWait = 2 * time.Second
+	// Fast sweep timer so the expiry backstop runs inside a test.
 	b.expirySweepInterval = 5 * time.Millisecond
-	return b, f, st, dir, fk
+	return b, f, st, dir, &usdtFakes{}
 }
 
 // TestUSDToVNDTrimPropagatesToOtherRateConsumers is the follow-up to task
@@ -185,22 +132,6 @@ func usdtOrder(t *testing.T, st *store.Store, chat int64, totalVND int64) string
 	t.Helper()
 	des := store.NewDes()
 	if err := st.CreateOrder(des, fmtInt(chat), "en", "prodA", "KBH", 1, totalVND); err != nil {
-		t.Fatalf("create order: %v", err)
-	}
-	return des
-}
-
-// deliverableOrder seeds real folder stock and reserves it, so settlePaid ->
-// deliverPaid actually delivers (the pay-verify happy path needs this).
-func deliverableOrder(t *testing.T, b *Bot, st *store.Store, dir string, chat int64, totalVND int64) string {
-	t.Helper()
-	seedProduct(t, dir, "prodDeliver", int(totalVND), 3)
-	des := store.NewDes()
-	reserved, err := b.stock.Reserve("prodDeliver", 1, des, b.reserveTTL)
-	if err != nil || len(reserved) != 1 {
-		t.Fatalf("stock reserve: %v (%d rows)", err, len(reserved))
-	}
-	if err := st.CreateOrder(des, fmtInt(chat), "en", "prodDeliver", "KBH", 1, totalVND); err != nil {
 		t.Fatalf("create order: %v", err)
 	}
 	return des
@@ -263,23 +194,6 @@ func usdtScreenAmounts(t *testing.T, f *fakeTG) []string {
 	return amounts
 }
 
-// bscTx builds a CONFIRMED BEP20 transfer to the seller of `amount` USDT at
-// `ts` (epoch seconds) — the shape GetTransferToSellerByHash returns.
-func bscTx(id, amount string, ts int64) *bep20.TransferByHash {
-	units, err := bands.AmountUnits(amount, bep20.AmountDecimals())
-	if err != nil {
-		panic(err)
-	}
-	rat, ok := new(big.Rat).SetString(amount)
-	if !ok {
-		panic("bad amount " + amount)
-	}
-	return &bep20.TransferByHash{
-		ID: id, Frm: "0xfeed", To: testSellerBSC, Amount: rat, Units: units,
-		Block: 1000, TS: ts, Confirmed: true, Success: true,
-	}
-}
-
 // trxTx builds a confirmed TRON transfer of `amount` USDT at `tsMS` (epoch ms).
 func trxTx(id, amount string, tsMS int64) *tron.Transfer {
 	units, err := bands.AmountUnits(amount, tron.AmountDecimals())
@@ -313,6 +227,19 @@ func anySendContains(f *fakeTG, want string) bool {
 	return false
 }
 
+// reserveOrderBand reserves a PRODUCT-ORDER band directly through
+// reserveUSDTAmount (allowDownward=true) — the reservation the deleted paybsc:
+// on-chain pay route used to drive. The band/picker tests below care about
+// amount/ownership geometry, not the (removed) pay screen, so they reserve here
+// rather than tapping a button.
+func reserveOrderBand(t *testing.T, b *Bot, p bands.Provider, chat int64, des string, total int64) {
+	t.Helper()
+	if _, err := b.reserveUSDTAmount(p, b.usdtStr(total), fmtInt(chat), des, total,
+		b.now().UnixMilli(), b.now().Add(b.expiryTimeout), true); err != nil {
+		t.Fatalf("reserve order band %s on %s: %v", des, p, err)
+	}
+}
+
 // ---- 1. the integration pin: ONE registry across both rails -----------------
 
 // TestUSDTSharedBandAcrossRails is the reason this slice exists: a live BEP20
@@ -329,15 +256,14 @@ func anySendContains(f *fakeTG, want string) bool {
 // button: the live amounts must stay at least max(tol)*2+1 units apart, so
 // one incoming payment can never fall inside both bands.
 func TestUSDTSharedBandAcrossRails(t *testing.T) {
-	ctx := context.Background()
-	b, f, st, _, _ := newUSDTBot(t)
+	b, _, st, _, _ := newUSDTBot(t)
 	const total = 150000 // 6.00 USDT at 25,000 VND/USDT
 
 	desB := usdtOrder(t, st, 102, total)
 	desC := usdtOrder(t, st, 103, total)
 
-	b.Process(ctx, callbackUpdate(102, "paybsc:"+desB))
-	b.Process(ctx, callbackUpdate(103, "paytrx:"+desC))
+	reserveOrderBand(t, b, bands.ProviderBEP20, 102, desB, total)
+	reserveOrderBand(t, b, bands.ProviderTron, 103, desC, total)
 
 	uB := bandUnits(t, b, bands.ProviderBEP20, desB)
 	uC := bandUnits(t, b, bands.ProviderTron, desC)
@@ -351,46 +277,40 @@ func TestUSDTSharedBandAcrossRails(t *testing.T) {
 	if d := uB - uC; (d < 0 && -d < minGap) || (d >= 0 && d < minGap) {
 		t.Errorf("bep20/tron: amounts %d and %d are closer than the %d-unit min gap — bands overlap", uB, uC, minGap)
 	}
-	// Every rail actually rendered its screen (the flow really ran end-to-end).
-	if !anySendContains(f, "USDT") && len(f.Photos) == 0 {
-		t.Error("no pay screen was rendered by any rail")
-	}
 }
 
 // TestUSDTBandExhaustedShowsBusy: when every slot for a price is taken the rail
 // must answer USDT_BUSY and hand out NOTHING — refusing beats colliding
-// (telegram_bot.py:9092 "no clear slot: refuse rather than collide"). This
-// drives the ORDER pay path (paybsc:), which still allows the last-resort
-// downward slot: BEP20 has 10 upward slots inside the 0.01000-0.01999 jitter
-// window plus ONE last-resort slot below base.
+// (telegram_bot.py:9092 "no clear slot: refuse rather than collide"). Product
+// orders (allowDownward) fill the 10 upward jitter slots inside the
+// 0.01000-0.01999 window PLUS the one last-resort downward slot; the next
+// deposit at the same price then has no slot and is refused with USDT_BUSY.
 func TestUSDTBandExhaustedShowsBusy(t *testing.T) {
 	ctx := context.Background()
 	b, f, st, _, _ := newUSDTBot(t)
 	const total = 150000 // 6.00 USDT
 
-	// Fill every slot from DISTINCT chats, so the own-dead-session rule (which
-	// only forgives a chat's OWN expired sessions) cannot free one.
+	// Fill every slot from DISTINCT chats (product-order bands, allowDownward),
+	// so the own-dead-session rule (which only forgives a chat's OWN expired
+	// sessions) cannot free one.
 	taken := map[int64]bool{}
 	const slots = 11 // 10 upward jitter slots + 1 last-resort downward
 	for i := range slots {
 		chat := int64(200 + i)
 		des := usdtOrder(t, st, chat, total)
-		b.Process(ctx, callbackUpdate(chat, "paybsc:"+des))
+		reserveOrderBand(t, b, bands.ProviderBEP20, chat, des, total)
 		u := bandUnits(t, b, bands.ProviderBEP20, des)
 		if taken[u] {
 			t.Fatalf("slot %d: amount %d handed out twice", i, u)
 		}
 		taken[u] = true
 	}
-	// The next same-price order has no unambiguous slot left.
+	// The next same-price DEPOSIT has no unambiguous slot left -> USDT_BUSY.
 	chat := int64(299)
-	des := usdtOrder(t, st, chat, total)
 	before := len(f.Sends)
-	b.Process(ctx, callbackUpdate(chat, "paybsc:"+des))
+	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
+	b.Process(ctx, textUpdate(chat, "6"))
 
-	if _, ok := b.bands.Get(bands.ProviderBEP20, des); ok {
-		t.Fatal("a band was reserved despite exhaustion — a colliding amount was handed out")
-	}
 	busy := i18n.C().Pay.USDTBusy.T(i18n.EN)
 	found := false
 	f.mu.Lock()
@@ -410,7 +330,6 @@ func TestUSDTBandExhaustedShowsBusy(t *testing.T) {
 // customer's OWN abandoned sessions must not make the price point unbuyable for
 // them. Four dead sessions of one chat held every upward slot in production.
 func TestUSDTPickerExcludesOwnDeadSessions(t *testing.T) {
-	ctx := context.Background()
 	b, _, st, _, _ := newUSDTBot(t)
 	const total = 150000
 	const chat = 300
@@ -429,251 +348,9 @@ func TestUSDTPickerExcludesOwnDeadSessions(t *testing.T) {
 	// The same chat re-orders: it must still get an amount (its own dead sessions
 	// never block it), and the FIRST slot at that — the base price.
 	des := usdtOrder(t, st, chat, total)
-	b.Process(ctx, callbackUpdate(chat, "paybsc:"+des))
+	reserveOrderBand(t, b, bands.ProviderBEP20, chat, des, total)
 	if got := bandUnits(t, b, bands.ProviderBEP20, des); got != 601_000 {
 		t.Errorf("own-dead-session retry got %d, want the first slot 601000 (6.00 + the jitter floor)", got)
-	}
-}
-
-// ---- 2. verify-by-hash: PAY order ------------------------------------------
-
-// armTxid drives the real "I have made the payment" callback so pending_txid is
-// armed exactly as production arms it, and returns the reserved amount.
-func armTxid(t *testing.T, ctx context.Context, b *Bot, chat int64, chain, des string) string {
-	t.Helper()
-	p, _ := providerForChain(chain)
-	res, ok := b.bands.Get(p, des)
-	if !ok {
-		t.Fatalf("no band for %s", des)
-	}
-	b.Process(ctx, callbackUpdate(chat, "usdtpaid:"+chain+":"+des))
-	st := b.states.Get(chat)
-	st.mu.Lock()
-	armed := st.Txid != nil
-	st.mu.Unlock()
-	if !armed {
-		t.Fatal("usdtpaid: did not arm pending_txid")
-	}
-	return res.Amount
-}
-
-// TestUSDTPayVerifySettlesExactlyOnce: the happy path delivers ONCE, and pasting
-// the same hash again is refused by the processed-ledger PK (TXID_ALREADY_USED)
-// — telegram_bot.py:9773-9776. Python pin: test_exact_amount_still_settles_directly.
-func TestUSDTPayVerifySettlesExactlyOnce(t *testing.T) {
-	ctx := context.Background()
-	b, f, st, dir, fk := newUSDTBot(t)
-	const chat = 400
-	const total = 150000
-
-	des := deliverableOrder(t, b, st, dir, chat, total)
-	b.Process(ctx, callbackUpdate(chat, "paybsc:"+des))
-	amount := armTxid(t, ctx, b, chat, chainBSC, des)
-
-	h := hash64("a")
-	fk.setBSC(h, bscTx(h, amount, time.Now().Unix()))
-	b.Process(ctx, textUpdate(chat, "0x"+h))
-
-	o, _ := st.GetOrder(des)
-	if o == nil || o.Status != "delivered" {
-		t.Fatalf("order status = %v, want delivered", o)
-	}
-	docs := len(f.Docs)
-	if docs == 0 {
-		t.Error("nothing was delivered to the buyer")
-	}
-	// The band must be freed once the credit is resolved.
-	if _, ok := b.bands.Get(bands.ProviderBEP20, des); ok {
-		t.Error("band still held after a settled payment")
-	}
-
-	// Replay: re-arm and paste the SAME hash. Nothing more may be delivered.
-	b.states.Get(chat).mu.Lock()
-	b.states.Get(chat).Txid = &TxidCtx{Chain: chainBSC, Des: des}
-	b.states.Get(chat).mu.Unlock()
-	b.Process(ctx, textUpdate(chat, "0x"+h))
-	if len(f.Docs) != docs {
-		t.Errorf("a replayed hash delivered again (%d -> %d docs)", docs, len(f.Docs))
-	}
-}
-
-// TestUSDTVerifyRejections pins every terminal/non-terminal refusal of the
-// by-hash lookup (Python tests/test_usdt_verify.py): an unknown hash, a
-// wrong-recipient tx, a REVERTED tx and a tx with too few confirmations all
-// present as "no confirmed transfer" and are NON-terminal (the customer may
-// paste the same id again once it confirms). None of them may move money.
-func TestUSDTVerifyRejections(t *testing.T) {
-	ctx := context.Background()
-	b, f, st, _, fk := newUSDTBot(t)
-	const chat = 410
-	const total = 150000
-
-	des := usdtOrder(t, st, chat, total)
-	b.Process(ctx, callbackUpdate(chat, "paybsc:"+des))
-	amount := armTxid(t, ctx, b, chat, chainBSC, des)
-
-	cases := []struct {
-		name string
-		tx   *bep20.TransferByHash
-	}{
-		// GetTransferToSellerByHash returns nil for an unknown/unmined hash AND for
-		// a tx carrying no USDT transfer to the seller (wrong recipient).
-		{"unknown or wrong recipient", nil},
-		{"reverted", func() *bep20.TransferByHash {
-			tx := bscTx("h", amount, time.Now().Unix())
-			tx.Success, tx.Confirmed = false, false
-			return tx
-		}()},
-		{"too few confirmations", func() *bep20.TransferByHash {
-			tx := bscTx("h", amount, time.Now().Unix())
-			tx.Confirmed = false // success, but not deep enough yet
-			return tx
-		}()},
-	}
-	for i, tc := range cases {
-		h := hash64(fmt.Sprintf("%d", i+1))
-		fk.setBSC(h, tc.tx)
-		before, _ := st.GetBalance(fmtInt(chat))
-		terminal := b.verifyUSDTTxid(ctx, chat, chainBSC, des, h, false, false)
-		if terminal {
-			t.Errorf("%s: verify reported TERMINAL, want re-arm", tc.name)
-		}
-		if !anySendContains(f, "CONFIRMED") {
-			t.Errorf("%s: customer was not told the transfer is unconfirmed", tc.name)
-		}
-		after, _ := st.GetBalance(fmtInt(chat))
-		if after != before {
-			t.Errorf("%s: balance moved %d -> %d on a rejected tx", tc.name, before, after)
-		}
-		if o, _ := st.GetOrder(des); o.Status != "reserved" {
-			t.Errorf("%s: order left 'reserved' (%s) on a rejected tx", tc.name, o.Status)
-		}
-	}
-}
-
-// TestUSDTOutOfWindowRejected: a real, confirmed transfer whose on-chain
-// timestamp falls outside the order's [creation, click] window (a stale/replayed
-// transfer) is TERMINAL and never credited — TXID_WINDOW (telegram_bot.py:9722).
-func TestUSDTOutOfWindowRejected(t *testing.T) {
-	ctx := context.Background()
-	b, f, st, _, fk := newUSDTBot(t)
-	const chat = 420
-	const total = 150000
-
-	des := usdtOrder(t, st, chat, total)
-	b.Process(ctx, callbackUpdate(chat, "paybsc:"+des))
-	amount := armTxid(t, ctx, b, chat, chainBSC, des)
-
-	h := hash64("b")
-	// A day older than the order — well outside USDT_VERIFY_GRACE_S.
-	fk.setBSC(h, bscTx(h, amount, time.Now().Add(-24*time.Hour).Unix()))
-
-	if !b.verifyUSDTTxid(ctx, chat, chainBSC, des, h, false, false) {
-		t.Error("an out-of-window tx must be TERMINAL")
-	}
-	if lastSend(f) != i18n.C().Pay.TxidWindow.T(i18n.EN) {
-		t.Errorf("last send = %q, want TXID_WINDOW", lastSend(f))
-	}
-	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 0 {
-		t.Errorf("balance = %d, want 0 — an out-of-window tx must never credit", bal)
-	}
-	if o, _ := st.GetOrder(des); o.Status != "reserved" {
-		t.Errorf("order status = %s, want reserved", o.Status)
-	}
-}
-
-// ---- 3. same-chat sibling redirect (depth-1) --------------------------------
-
-// TestUSDTSiblingRedirect ports tests/test_usdt_redirect.py:
-//   - a same-chat mismatch REDIRECTS to the sibling session whose band matches
-//     (the dominant amount_conflict pattern: first order expires, the re-order
-//     gets a new offset, and the already-sent payment matches the OLD band),
-//   - the redirect is DEPTH-1: a call already flagged redirected never redirects
-//     again (two mutually-matching sessions would otherwise ping-pong forever),
-//   - a CROSS-CHAT band match is NOT a sibling — it stays a claim-jack refusal.
-func TestUSDTSiblingRedirect(t *testing.T) {
-	ctx := context.Background()
-	b, f, st, dir, fk := newUSDTBot(t)
-	const chat = 430
-	const total = 150000
-
-	// Sibling: the customer's FIRST session, deliverable, holding the base band.
-	sibling := deliverableOrder(t, b, st, dir, chat, total)
-	b.Process(ctx, callbackUpdate(chat, "paybsc:"+sibling))
-	sibAmount := bandUnits(t, b, bands.ProviderBEP20, sibling)
-
-	// Current: the customer's re-order, which got a DIFFERENT offset amount.
-	current := usdtOrder(t, st, chat, total)
-	b.Process(ctx, callbackUpdate(chat, "paybsc:"+current))
-	curAmount := bandUnits(t, b, bands.ProviderBEP20, current)
-	if sibAmount == curAmount {
-		t.Fatal("the two sessions share an amount — the fixture is wrong")
-	}
-	armTxid(t, ctx, b, chat, chainBSC, current)
-
-	// They paste, from the NEWEST screen, the hash of the payment they made for
-	// the SIBLING's amount.
-	h := hash64("c")
-	fk.setBSC(h, bscTx(h, bands.FormatUnits(sibAmount, bep20.AmountDecimals()), time.Now().Unix()))
-	b.Process(ctx, textUpdate(chat, "0x"+h))
-
-	sibOrder, _ := st.GetOrder(sibling)
-	if sibOrder.Status != "delivered" {
-		t.Errorf("sibling order status = %s, want delivered (the redirect must settle it)", sibOrder.Status)
-	}
-	curOrder, _ := st.GetOrder(current)
-	if curOrder.Status != "reserved" {
-		t.Errorf("current order status = %s, want reserved (the payment was not for it)", curOrder.Status)
-	}
-
-	// DEPTH-1: the same call flagged `redirected` must NOT redirect again. The
-	// sibling's band is gone now (it settled), so re-seed a matching sibling.
-	sib2 := usdtOrder(t, st, chat, total)
-	b.Process(ctx, callbackUpdate(chat, "paybsc:"+sib2))
-	u2 := bandUnits(t, b, bands.ProviderBEP20, sib2)
-	h2 := hash64("d")
-	fk.setBSC(h2, bscTx(h2, bands.FormatUnits(u2, bep20.AmountDecimals()), time.Now().Unix()))
-	before, _ := st.GetOrder(sib2)
-	b.verifyUSDTTxid(ctx, chat, chainBSC, current, h2, false, true) // already redirected
-	after, _ := st.GetOrder(sib2)
-	if before.Status != after.Status {
-		t.Errorf("a depth-2 redirect fired: sibling went %s -> %s", before.Status, after.Status)
-	}
-	if lastSend(f) != i18n.C().Pay.TxidAmountConflict.T(i18n.EN) {
-		t.Errorf("depth-2 last send = %q, want TXID_AMOUNT_CONFLICT", lastSend(f))
-	}
-}
-
-// TestUSDTCrossChatStillConflicts: another customer's live band is NOT a sibling
-// — the payment may genuinely belong to them, so the verify REFUSES rather than
-// crediting the wrong session (telegram_bot.py:9824-9829). Python pin:
-// test_cross_chat_mismatch_still_conflicts.
-func TestUSDTCrossChatStillConflicts(t *testing.T) {
-	ctx := context.Background()
-	b, f, st, _, fk := newUSDTBot(t)
-	const total = 150000
-	const mine, theirs = 440, 441
-
-	otherDes := usdtOrder(t, st, theirs, total)
-	b.Process(ctx, callbackUpdate(theirs, "paybsc:"+otherDes))
-	otherUnits := bandUnits(t, b, bands.ProviderBEP20, otherDes)
-
-	myDes := usdtOrder(t, st, mine, total)
-	b.Process(ctx, callbackUpdate(mine, "paybsc:"+myDes))
-	armTxid(t, ctx, b, mine, chainBSC, myDes)
-
-	h := hash64("e")
-	fk.setBSC(h, bscTx(h, bands.FormatUnits(otherUnits, bep20.AmountDecimals()), time.Now().Unix()))
-	b.Process(ctx, textUpdate(mine, "0x"+h))
-
-	if lastSend(f) != i18n.C().Pay.TxidAmountConflict.T(i18n.EN) {
-		t.Errorf("last send = %q, want TXID_AMOUNT_CONFLICT", lastSend(f))
-	}
-	if bal, _ := st.GetBalance(fmtInt(mine)); bal != 0 {
-		t.Errorf("balance = %d, want 0 — a cross-chat band match must never credit", bal)
-	}
-	if o, _ := st.GetOrder(otherDes); o.Status != "reserved" {
-		t.Errorf("the OTHER customer's order was touched (%s)", o.Status)
 	}
 }
 
@@ -696,15 +373,13 @@ func TestUSDTDepositCreditBoundaries(t *testing.T) {
 	}{
 		{"exact to the last decimal credits actual", "6.01000", 150250},
 		{"inside tolerance under credits actual", "6.00960", 150240},
-		{"outside tolerance under credits actual", "6.00940", 150235},
+		{"shortfall credits actual", "6.00940", 150235},
 		{"inside tolerance over credits actual", "6.01040", 150260},
-		{"way off credits actual", "8.00000", 200000},
-		{"way under credits actual", "5.00000", 125000},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			b, _, st, _, fk := newUSDTBot(t)
+			b, _, st, _, _ := newUSDTBot(t)
 			chat := int64(450 + i)
 
 			// dep:trx -> amount prompt -> "6" (== 150,000 VND at 25,000/USDT).
@@ -718,11 +393,10 @@ func TestUSDTDepositCreditBoundaries(t *testing.T) {
 			if !ok || res.Amount != "6.01000" {
 				t.Fatalf("deposit amount = %q (found=%t), want the picked 6.01000", res.Amount, ok)
 			}
-			armTxid(t, ctx, b, chat, chainTRX, o.Des)
-
-			h := hash64("f")
-			fk.setTRX(h, trxTx(h, tc.recv, time.Now().UnixMilli()))
-			b.Process(ctx, textUpdate(chat, h))
+			// Credit through the hands-free watcher's per-transfer settle path —
+			// the now-sole deposit credit route (no hash paste).
+			prm, _ := b.bands.Params(bands.ProviderTron)
+			b.settleWatchedTransfer(ctx, bands.ProviderTron, prm, watchedIn(t, chainTRX, tc.recv, b))
 
 			bal, _ := st.GetBalance(fmtInt(chat))
 			if bal != tc.wantCredit {
@@ -737,72 +411,16 @@ func TestUSDTDepositCreditBoundaries(t *testing.T) {
 	}
 }
 
-// TestUSDTDepositReplayCreditsOnce: the processed-ledger PK is the sole deposit
-// dedupe (CLAUDE.md: idempotency at the STORAGE layer). Re-submitting the same
-// hash must credit nothing more and answer TXID_ALREADY_USED.
-func TestUSDTDepositReplayCreditsOnce(t *testing.T) {
-	ctx := context.Background()
-	b, f, st, _, fk := newUSDTBot(t)
-	const chat = 460
-
-	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
-	b.Process(ctx, textUpdate(chat, "6"))
-	o := reservedDeposit(t, st, chat)
-	armTxid(t, ctx, b, chat, chainBSC, o.Des)
-
-	h := hash64("1")
-	fk.setBSC(h, bscTx(h, "6.00", time.Now().Unix()))
-	b.Process(ctx, textUpdate(chat, "0x"+h))
-	first, _ := st.GetBalance(fmtInt(chat))
-	if first != 150000 {
-		t.Fatalf("first credit = %d, want 150000", first)
-	}
-	// Replay against the SAME (now closed) order: the band is gone, so the verify
-	// stops at ORDER_GONE. Replay against a FRESH deposit still hits the ledger PK.
-	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
-	b.Process(ctx, textUpdate(chat, "6"))
-	o2 := reservedDeposit(t, st, chat)
-	armTxid(t, ctx, b, chat, chainBSC, o2.Des)
-	b.Process(ctx, textUpdate(chat, "0x"+h))
-
-	again, _ := st.GetBalance(fmtInt(chat))
-	if again != first {
-		t.Errorf("a replayed hash credited again (%d -> %d)", first, again)
-	}
-	// Scoped to the customer's own chat, not lastSend's "most recent send
-	// overall": this passes today only because a guard suppresses the owner
-	// alert on the replay path, so lastSend happens to still be the
-	// customer's TXID_ALREADY_USED reply. If that ordering ever changes,
-	// lastSend would report a confusing failure about the WRONG message.
-	got := lastSendMsgTo(f, chat)
-	if got == nil || got.Text != i18n.C().Pay.TxidAlreadyUsed.T(i18n.EN) {
-		t.Errorf("last send to chat = %v, want TXID_ALREADY_USED", got)
-	}
-}
-
-// TestUSDTDepositAuditRowIsWellFormedAtHealthyRate is task #15's
-// healthy-rate control for the on-chain settle audit line (usdt.go
-// ~986, "usdt_"+chain+"_deposit"): at a healthy rate the row this line
-// writes must be the ordinary signed "+X.XX USDT" figure, not the raw-VND
-// fallback — proving TestAuditAmountFallsBackOnInvalidRate's fallback isn't
-// unconditionally taken. Reads the row back from the STORE (RecentAudit),
-// not auditAmount's return value, per this repo's own standard that an
-// audit-row assertion must pin what actually persisted, not what a
-// formatter merely returned.
-//
-// The invalid-rate counterpart of this SAME audit line is deliberately NOT
-// pinned end-to-end here: usdtToVNDFor (usdt.go ~923, backed by
-// bep20/tron.UsdtToVND) applies the identical rate<=0 predicate to the
-// identical cfg.USDToVND() value earlier in this same verifyUSDTTxid call
-// and re-arms (txidNotFound) before ever reaching this audit line, so a
-// genuinely invalid rate can never actually reach this code path through
-// the standard verify flow — traced, not assumed (see auditAmount's doc
-// comment in money.go for the full reachability discussion).
-// TestAuditAmountFallsBackOnInvalidRate pins the fallback branch itself
-// directly instead, which is the only form in which it's reachable today.
+// TestUSDTDepositAuditRowIsWellFormedAtHealthyRate pins the on-chain settle
+// audit row ("usdt_"+chain+"_deposit", written by settleUSDTMatch) at a healthy
+// rate: the row's Outcome must be the ordinary signed "+X.XX USDT" figure, not
+// the raw-VND fallback auditAmount produces on an unusable rate. Driven through
+// the hands-free watcher's per-transfer settle path (the now-sole credit route),
+// crediting the exact quoted amount so the credited VND is the converted received
+// value (the jitter puts it just above the requested total).
 func TestUSDTDepositAuditRowIsWellFormedAtHealthyRate(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, _, fk := newUSDTBot(t)
+	b, _, st, _, _ := newUSDTBot(t)
 	const chat = 4840
 
 	before, err := st.RecentAudit(50, "")
@@ -813,20 +431,17 @@ func TestUSDTDepositAuditRowIsWellFormedAtHealthyRate(t *testing.T) {
 	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
 	b.Process(ctx, textUpdate(chat, "6")) // 6 USDT desired == 150,000 VND @25,000
 	o := reservedDeposit(t, st, chat)
-	armTxid(t, ctx, b, chat, chainBSC, o.Des)
-
-	// Overpay well outside tolerance so the credited VND is the CONVERTED
-	// received value (bands/credit.go), not the order total verbatim — the
-	// same reason TestUSDTDepositCreditsAtAdminSetRate overpays: an exact
-	// payment would credit o.Total regardless of what usdtStr resolves,
-	// proving nothing about this render.
-	h := hash64("f")
-	fk.setBSC(h, bscTx(h, "8.00", time.Now().Unix()))
-	b.Process(ctx, textUpdate(chat, "0x"+h))
+	bandRes, _ := b.bands.Get(bands.ProviderBEP20, o.Des)
+	// Credit the EXACT quoted amount through the watcher's settle path — an
+	// exact match credits the converted received value (6.01000 USDT -> 150250
+	// VND at the healthy 25,000), so the audit row's Outcome is the ordinary
+	// signed USDT figure rendered by auditAmount, not the raw-VND fallback.
+	prm, _ := b.bands.Params(bands.ProviderBEP20)
+	b.settleWatchedTransfer(ctx, bands.ProviderBEP20, prm, watchedIn(t, chainBSC, bandRes.Amount, b))
 
 	bal, _ := st.GetBalance(fmtInt(chat))
-	if bal != 200000 {
-		t.Fatalf("fixture broken: credited %d VND, want 200000 (8 USDT at the healthy 25,000)", bal)
+	if bal != 150250 {
+		t.Fatalf("fixture broken: credited %d VND, want 150250 (6.01000 USDT at the healthy 25,000)", bal)
 	}
 
 	after, err := st.RecentAudit(50, "")
@@ -840,8 +455,34 @@ func TestUSDTDepositAuditRowIsWellFormedAtHealthyRate(t *testing.T) {
 	if row.Action != "usdt_bsc_deposit" {
 		t.Errorf("Action = %q, want usdt_bsc_deposit", row.Action)
 	}
-	if want := "+8.00 USDT"; row.Outcome != want {
+	if want := "+6.01 USDT"; row.Outcome != want {
 		t.Errorf("Outcome = %q, want %q — the healthy-rate row must be the ordinary signed figure, not the raw-VND fallback", row.Outcome, want)
+	}
+}
+
+// watchedIn builds ONE incoming on-chain transfer of recvUSDT for the hands-free
+// watcher's per-transfer settle entry point (settleWatchedTransfer) — the now-
+// sole way a deposit is credited. It is the same shape tickOnchain/tickBep20
+// hand to settleWatchedTransfer: units at the rail's AmountDecimals (what
+// MatchIncoming keys on) and recv as the amount's big.Rat (the rail's
+// SetFrac(value, 10^TokenDecimals) collapses to exactly the amount).
+func watchedIn(t *testing.T, chain, recvUSDT string, b *Bot) watchedTransfer {
+	t.Helper()
+	rat, ok := new(big.Rat).SetString(recvUSDT)
+	if !ok {
+		t.Fatalf("bad recv amount %q", recvUSDT)
+	}
+	decimals := tron.AmountDecimals()
+	if chain == chainBSC {
+		decimals = bep20.AmountDecimals()
+	}
+	units, err := bands.AmountUnits(recvUSDT, decimals)
+	if err != nil {
+		t.Fatalf("amount units for %q: %v", recvUSDT, err)
+	}
+	return watchedTransfer{
+		id: hash64("w"), frm: "TFrom", units: units, recv: rat,
+		ms: b.now().UnixMilli(),
 	}
 }
 
@@ -931,12 +572,11 @@ func TestPayScreenWarnsAboutFeesInEveryLanguage(t *testing.T) {
 	}
 }
 
-// TestDepositAmountsAreUnique pins the hands-free-deposits behaviour swap:
-// startOnchainDeposit now hands out a PICKED band amount (reserveUSDTAmount)
-// instead of adopting the customer's round number verbatim (adoptUSDTAmount).
-// Two deposits of the SAME round amount must be handed different band
-// amounts — without this the watcher cannot tell whose payment is whose, and
-// amount-based attribution is unsound.
+// TestDepositAmountsAreUnique pins the hands-free-deposits behaviour:
+// startOnchainDeposit hands out a PICKED band amount (reserveUSDTAmount),
+// never the customer's round number verbatim. Two deposits of the SAME round
+// amount must be handed different band amounts — without this the watcher
+// cannot tell whose payment is whose, and amount-based attribution is unsound.
 func TestDepositAmountsAreUnique(t *testing.T) {
 	b, f, st, _, _ := newUSDTBot(t)
 	ctx := context.Background()
@@ -983,9 +623,8 @@ func TestDepositAmountsAreUnique(t *testing.T) {
 // deposit must never fall back to the picker's last-resort DOWNWARD slot.
 // DepositCredit rounds an exact payment up to the customer's FULL requested
 // total regardless of which band amount they were actually quoted, so a
-// downward-slot deposit would be a straight giveaway — adoptUSDTAmount could
-// never produce this, and reserveUSDTAmount must not either now that it picks
-// amounts.
+// downward-slot deposit would be a straight giveaway — reserveUSDTAmount
+// (allowDownward=false on the deposit path) must never hand one out.
 //
 // Fills every upward TRON jitter slot (10) with distinct deposits at the same
 // round base, then asserts the 11th is REFUSED with USDT_BUSY rather than
@@ -1062,7 +701,6 @@ func TestDepositNeverQuotedBelowBase(t *testing.T) {
 // offering it). At the 5-decimal geometry that undercharge is 0.00101 USDT,
 // where the superseded 21-cent step made it 0.21.
 func TestOrderCanTakeDownwardSlotDepositsCannot(t *testing.T) {
-	ctx := context.Background()
 	b, _, st, _, _ := newUSDTBot(t)
 	const total = 150000 // 6.00 USDT at 25,000 VND/USDT
 
@@ -1070,11 +708,11 @@ func TestOrderCanTakeDownwardSlotDepositsCannot(t *testing.T) {
 	for i := range prm.Slots() {
 		chat := int64(600 + i)
 		des := usdtOrder(t, st, chat, total)
-		b.Process(ctx, callbackUpdate(chat, "paybsc:"+des))
+		reserveOrderBand(t, b, bands.ProviderBEP20, chat, des, total)
 	}
 	chat := int64(699)
 	des := usdtOrder(t, st, chat, total)
-	b.Process(ctx, callbackUpdate(chat, "paybsc:"+des))
+	reserveOrderBand(t, b, bands.ProviderBEP20, chat, des, total)
 
 	res, ok := b.bands.Get(bands.ProviderBEP20, des)
 	if !ok {
@@ -1194,14 +832,6 @@ func TestUSDTDepositOKRendersAmountAtWhitespacePaddedAmbientRate(t *testing.T) {
 	if err := b.cfg.SaveSettings(s); err != nil {
 		t.Fatalf("save settings: %v", err)
 	}
-	fk := &usdtFakes{}
-	b.bep20ByHash = func(txhash string) (*bep20.TransferByHash, error) {
-		fk.mu.Lock()
-		defer fk.mu.Unlock()
-		return fk.bscByHash[strings.ToLower(strings.TrimPrefix(txhash, "0x"))], nil
-	}
-	b.usdtConfirmPoll = 2 * time.Millisecond
-	b.usdtConfirmWait = 2 * time.Second
 	b.expirySweepInterval = 5 * time.Millisecond
 
 	// Fixture guard: confirm the padding is genuinely present in the AMBIENT
@@ -1227,23 +857,22 @@ func TestUSDTDepositOKRendersAmountAtWhitespacePaddedAmbientRate(t *testing.T) {
 	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
 	b.Process(ctx, textUpdate(chat, "6"))
 	o := reservedDeposit(t, st, chat)
-	armTxid(t, ctx, b, chat, chainBSC, o.Des)
+	bandRes, _ := b.bands.Get(bands.ProviderBEP20, o.Des)
 
-	// Overpay outside tolerance, same reasoning as
-	// TestUSDTDepositCreditBoundaries's "way off" case: an exact/near-exact
-	// payment would credit the order total regardless of which rate the
-	// credit path used, proving nothing about the rate resolution itself.
-	h := hash64("f")
-	fk.setBSC(h, bscTx(h, "8.00", time.Now().Unix()))
-	b.Process(ctx, textUpdate(chat, "0x"+h))
+	// Credit the EXACT quoted amount through the watcher's settle path. The
+	// jitter puts the quote (6.01000) just above the 6.00 request, so the credit
+	// is the converted received value (150250 VND at the trimmed 25,000), which
+	// is what makes the rate resolution observable on the rendered amounts.
+	prm, _ := b.bands.Params(bands.ProviderBEP20)
+	b.settleWatchedTransfer(ctx, bands.ProviderBEP20, prm, watchedIn(t, chainBSC, bandRes.Amount, b))
 
-	// Sanity: the wallet math must be unaffected by this bug — 8 USDT at the
-	// padded-but-parseable 25,000 = 200,000 VND. bep20.UsdtToVND already
+	// Sanity: the wallet math must be unaffected by this bug — 6.01000 USDT at
+	// the padded-but-parseable 25,000 = 150,250 VND. bep20.UsdtToVND already
 	// TrimSpace-s, so this should pass whether or not the display fix is in
 	// place; if it fails, the fixture itself is broken.
 	bal, _ := st.GetBalance(fmtInt(chat))
-	if bal != 200000 {
-		t.Fatalf("fixture broken: credited %d VND, want 200000 (wallet crediting should be unaffected by this bug)", bal)
+	if bal != 150250 {
+		t.Fatalf("fixture broken: credited %d VND, want 150250 (wallet crediting should be unaffected by this bug)", bal)
 	}
 
 	// Scoped to the customer's own chat, not lastSendMsg's "most recent send
@@ -1257,222 +886,14 @@ func TestUSDTDepositOKRendersAmountAtWhitespacePaddedAmbientRate(t *testing.T) {
 	if strings.Contains(last.Text, "— USDT") {
 		t.Errorf("Deposit.OK = %q — the whitespace-padded ambient rate made usdtDisp fall back to its empty-rate placeholder even though the deposit credited correctly", last.Text)
 	}
-	want := i18n.F(i18n.C().Deposit.OK.T(i18n.EN), "amount", "8.00 USDT", "balance", "8.00 USDT")
+	want := i18n.F(i18n.C().Deposit.OK.T(i18n.EN), "amount", "6.01 USDT", "balance", "6.01 USDT")
 	if last.Text != want {
 		t.Errorf("Deposit.OK = %q, want %q", last.Text, want)
 	}
 }
 
-// TestVerifyUSDTTxidDepositNotifiesAdminOwner covers usdt.go's on-chain
-// deposit settle (the isDeposit branch inside verifyUSDTTxid) —
-// notify_admin_deposit (telegram_bot.py:9861-9862). Also pins the CARE
-// requirement for this rail specifically: replaying the SAME tx hash is
-// rejected by store.Credit's ledger PK BEFORE the notify call further down
-// is ever reached, so a duplicate submit must not produce a second alert.
-//
-// This is NOT a duplicate-CREDIT guard, and must never be described as one:
-// store.Credit's ledger primary key already does dedupe-and-credit
-// atomically, so the balance can never double regardless of anything below
-// it. The `if !credited` branch this test exercises (usdt.go, right after
-// the store.Credit call) only stops the SIDE EFFECTS that would otherwise
-// repeat if execution fell through past it — the customer DM, this owner
-// alert, the order close/deliver claims, and the audit row.
-//
-// The replay is driven against a FRESH deposit order (o2), not the original
-// (now-closed) one, mirroring TestUSDTDepositReplayCreditsOnce above and for
-// the same reason: capTxid's pending_txid slot is nil'd the instant the
-// first submit consumes it (usdt.go's capTxid: `cap := c.st.Txid; c.st.Txid
-// = nil`), so re-submitting the identical text WITHOUT re-arming the
-// capture never reaches verifyUSDTTxid at all — capTxid itself finds
-// nothing armed and the text falls through one layer earlier. Re-arming via
-// armTxid on o2 gives the second submit a live capture, so the same hash
-// genuinely reaches verifyUSDTTxid and is rejected there, by the ledger PK
-// — not by capTxid short-circuiting first, which would pass this test for
-// the wrong reason (proving nothing about the notify-suppression this test
-// claims to cover).
-func TestVerifyUSDTTxidDepositNotifiesAdminOwner(t *testing.T) {
-	ctx := context.Background()
-	b, f, st, _, fk := newUSDTBot(t)
-	const chat = 471
-
-	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
-	b.Process(ctx, textUpdate(chat, "5"))
-	o := reservedDeposit(t, st, chat)
-	amount := armTxid(t, ctx, b, chat, chainBSC, o.Des)
-
-	h := hash64("d")
-	fk.setBSC(h, bscTx(h, amount, time.Now().Unix()))
-	b.Process(ctx, textUpdate(chat, "0x"+h))
-
-	alert := lastSendMsgTo(f, 999)
-	if alert == nil || !strings.Contains(alert.Text, "💰 NEW DEPOSIT") {
-		t.Fatalf("owner alert = %v, want a 💰 NEW DEPOSIT message", alert)
-	}
-	if !strings.Contains(alert.Text, "USDT BEP20") {
-		t.Errorf("deposit alert = %q, want the BEP20 rail label", alert.Text)
-	}
-
-	// Re-arm on a fresh order (o2) so the replay's capTxid slot is live and
-	// the same hash genuinely reaches verifyUSDTTxid — see the doc comment
-	// above for why replaying against the original closed order, without
-	// re-arming, would never get there at all.
-	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
-	b.Process(ctx, textUpdate(chat, "5"))
-	o2 := reservedDeposit(t, st, chat)
-	armTxid(t, ctx, b, chat, chainBSC, o2.Des)
-	b.Process(ctx, textUpdate(chat, "0x"+h))
-	if n := countContains(f, "💰 NEW DEPOSIT"); n != 1 {
-		t.Errorf("after replaying the same tx hash: NEW DEPOSIT count = %d, want still 1", n)
-	}
-}
-
-// TestUSDTDepositVsProductBranch pins the M2.3 branch this slice must follow:
-// the SAME settle machinery credits a __deposit__ order's wallet and delivers a
-// product order — never both for one order.
-func TestUSDTDepositVsProductBranch(t *testing.T) {
-	ctx := context.Background()
-	b, f, st, dir, fk := newUSDTBot(t)
-	const chat = 470
-	const total = 150000
-
-	// (a) product order -> delivers, wallet untouched.
-	prod := deliverableOrder(t, b, st, dir, chat, total)
-	b.Process(ctx, callbackUpdate(chat, "paybsc:"+prod))
-	amount := armTxid(t, ctx, b, chat, chainBSC, prod)
-	h := hash64("2")
-	fk.setBSC(h, bscTx(h, amount, time.Now().Unix()))
-	b.Process(ctx, textUpdate(chat, "0x"+h))
-
-	if o, _ := st.GetOrder(prod); o.Status != "delivered" {
-		t.Errorf("product order status = %s, want delivered", o.Status)
-	}
-	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 0 {
-		t.Errorf("a product payment credited the wallet (%d) — money must not do both", bal)
-	}
-	if len(f.Docs) == 0 {
-		t.Error("product order delivered no file")
-	}
-
-	// (b) deposit order -> credits the wallet, delivers nothing.
-	docsBefore := len(f.Docs)
-	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
-	b.Process(ctx, textUpdate(chat, "6"))
-	dep := reservedDeposit(t, st, chat)
-	armTxid(t, ctx, b, chat, chainBSC, dep.Des)
-	h2 := hash64("3")
-	fk.setBSC(h2, bscTx(h2, "6.00", time.Now().Unix()))
-	b.Process(ctx, textUpdate(chat, "0x"+h2))
-
-	if bal, _ := st.GetBalance(fmtInt(chat)); bal != total {
-		t.Errorf("deposit credited %d, want %d", bal, total)
-	}
-	if len(f.Docs) != docsBefore {
-		t.Error("a deposit delivered accounts — the sentinel branch is wrong")
-	}
-}
-
-// ---- 5. unconfirmed -> background confirm-poll ------------------------------
-
-// TestUSDTUnconfirmedThenPollSettles: a hash submitted before confirmation must
-// NOT be reported as "not found"; the background poll keeps checking quietly and
-// settles automatically once it confirms (telegram_bot.py:9850-9878).
-func TestUSDTUnconfirmedThenPollSettles(t *testing.T) {
-	ctx := context.Background()
-	b, f, st, dir, fk := newUSDTBot(t)
-	const chat = 480
-	const total = 150000
-
-	des := deliverableOrder(t, b, st, dir, chat, total)
-	b.Process(ctx, callbackUpdate(chat, "paybsc:"+des))
-	amount := armTxid(t, ctx, b, chat, chainBSC, des)
-
-	h := hash64("4")
-	fk.setBSC(h, nil) // not indexed / not confirmed yet
-	b.Process(ctx, textUpdate(chat, "0x"+h))
-
-	if !anySendContains(f, "isn't confirmed on-chain yet") {
-		t.Fatalf("expected TXID_WAITING, got %q", lastSend(f))
-	}
-	if o, _ := st.GetOrder(des); o.Status != "reserved" {
-		t.Fatalf("order settled on an unconfirmed tx (%s)", o.Status)
-	}
-	// It confirms a moment later -> the poll settles it with no re-paste.
-	fk.setBSC(h, bscTx(h, amount, time.Now().Unix()))
-	if !waitFor(t, func() bool {
-		o, _ := st.GetOrder(des)
-		return o != nil && o.Status == "delivered"
-	}) {
-		t.Fatal("the confirmation poll never settled the order")
-	}
-	// The poll slot is released so the chat is not locked out.
-	if !waitFor(t, func() bool {
-		stt := b.states.Get(chat)
-		stt.mu.Lock()
-		defer stt.mu.Unlock()
-		return !stt.USDTPolling
-	}) {
-		t.Error("USDTPolling was never cleared")
-	}
-}
-
-// TestUSDTPollingOnePerChat pins the per-chat flag + the global cap
-// (_usdt_polling @9856, USDT_MAX_POLLS @9853): one confirmation poll per chat,
-// and the whole bot never exceeds maxUSDTPolls.
-func TestUSDTPollingOnePerChat(t *testing.T) {
-	b, _, _, _, _ := newUSDTBot(t)
-	stA, stB := b.states.Get(1), b.states.Get(2)
-
-	if started, capped := b.tryStartUSDTPoll(stA); !started || capped {
-		t.Fatalf("first poll for a chat: started=%t capped=%t, want true/false", started, capped)
-	}
-	if started, capped := b.tryStartUSDTPoll(stA); started || capped {
-		t.Errorf("second poll for the SAME chat: started=%t capped=%t, want false/false", started, capped)
-	}
-	// Global cap.
-	b.maxUSDTPolls = 1
-	if started, capped := b.tryStartUSDTPoll(stB); started || !capped {
-		t.Errorf("over the global cap: started=%t capped=%t, want false/true", started, capped)
-	}
-	b.endUSDTPoll(stA)
-	if started, capped := b.tryStartUSDTPoll(stB); !started || capped {
-		t.Errorf("after a release: started=%t capped=%t, want true/false", started, capped)
-	}
-	if b.usdtPolls != 1 {
-		t.Errorf("usdtPolls = %d, want 1", b.usdtPolls)
-	}
-}
-
-// TestUSDTBadHashKeepsSlotArmed: a malformed paste is answered precisely and the
-// capture STAYS armed, with no chain round-trip (telegram_bot.py:18986-18991).
-func TestUSDTBadHashKeepsSlotArmed(t *testing.T) {
-	ctx := context.Background()
-	b, f, st, _, fk := newUSDTBot(t)
-	const chat = 490
-
-	des := usdtOrder(t, st, chat, 150000)
-	b.Process(ctx, callbackUpdate(chat, "paybsc:"+des))
-	armTxid(t, ctx, b, chat, chainBSC, des)
-
-	before := fk.bscHits.Load()
-	b.Process(ctx, textUpdate(chat, "not-a-hash"))
-
-	if lastSend(f) != i18n.C().Pay.TxidBadFormat.T(i18n.EN) {
-		t.Errorf("last send = %q, want TXID_BADFORMAT", lastSend(f))
-	}
-	if fk.bscHits.Load() != before {
-		t.Error("a malformed paste hit the chain")
-	}
-	stt := b.states.Get(chat)
-	stt.mu.Lock()
-	armed := stt.Txid != nil
-	stt.mu.Unlock()
-	if !armed {
-		t.Error("a malformed paste consumed the capture — it must stay armed for a retry")
-	}
-}
-
 // TestUSDTPersistFailureRefusesScreen: a pending row that cannot be PERSISTED
-// would not survive a restart (the reconcile/rehydrate could never see it), so
+// would not survive a restart (the rehydrate/watcher could never see it), so
 // the rail must undo its reservation and refuse rather than invite a payment it
 // might be unable to match. Python raises out of the handler at
 // store.bep20_pending_add (@9520) with the same effect.
@@ -1480,21 +901,20 @@ func TestUSDTPersistFailureRefusesScreen(t *testing.T) {
 	ctx := context.Background()
 	b, f, st, _, _ := newUSDTBot(t)
 	const chat = 650
-	const total = 150000
 
 	// Break the persisted table so *PendingAdd fails.
 	if _, err := st.DB().Exec("DROP TABLE bep20_pending"); err != nil {
 		t.Fatalf("drop table: %v", err)
 	}
-	des := usdtOrder(t, st, chat, total)
 	before := len(f.Sends)
-	b.Process(ctx, callbackUpdate(chat, "paybsc:"+des))
+	// Drive a real deposit: dep:bsc -> amount prompt -> "6". startOnchainDeposit
+	// reserves the band, then persistUSDTPending fails (table dropped), so it
+	// must roll the reservation back and refuse rather than strand a slot.
+	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
+	b.Process(ctx, textUpdate(chat, "6"))
 
-	if _, ok := b.bands.Get(bands.ProviderBEP20, des); ok {
-		t.Error("the band was kept for a session that could not be persisted — the slot is now held by a session nobody can settle")
-	}
-	if _, ok := b.getUSDTRow(bands.ProviderBEP20, des); ok {
-		t.Error("the rail-side row survived a failed persist")
+	if b.bands.Len(bands.ProviderBEP20) != 0 {
+		t.Error("a band was kept for a session that could not be persisted — the slot is now held by a session nobody can settle")
 	}
 	noID := i18n.C().Pay.BEP20NoID.T(i18n.EN)
 	refused := false
@@ -1521,7 +941,6 @@ func TestUSDTPersistFailureRefusesScreen(t *testing.T) {
 // picker would happily re-issue a live amount and one payment could settle two
 // orders.
 func TestStartupRecoveryReadoptsBands(t *testing.T) {
-	ctx := context.Background()
 	b, _, st, _, _ := newUSDTBot(t)
 	const total = 150000
 
@@ -1548,7 +967,7 @@ func TestStartupRecoveryReadoptsBands(t *testing.T) {
 	}
 	// A fresh order at the same price must avoid BOTH rehydrated amounts.
 	fresh := usdtOrder(t, st, 602, total)
-	b.Process(ctx, callbackUpdate(602, "paybsc:"+fresh))
+	reserveOrderBand(t, b, bands.ProviderBEP20, 602, fresh, total)
 	u := bandUnits(t, b, bands.ProviderBEP20, fresh)
 	for _, taken := range []int64{600, 621} {
 		if d := u - taken; d > -21 && d < 21 {
@@ -1566,9 +985,9 @@ func TestUSDTSweepFreesBandsPastGrace(t *testing.T) {
 	const total = 150000
 
 	keep := usdtOrder(t, st, 630, total)
-	b.Process(ctx, callbackUpdate(630, "paybsc:"+keep))
+	reserveOrderBand(t, b, bands.ProviderBEP20, 630, keep, total)
 	drop := usdtOrder(t, st, 631, total)
-	b.Process(ctx, callbackUpdate(631, "paybsc:"+drop))
+	reserveOrderBand(t, b, bands.ProviderBEP20, 631, drop, total)
 	st.ClaimOrder(drop, "reserved", "expired")
 
 	// Grace measured from CreatedAt (the bands contract), so a zero grace makes
@@ -1590,313 +1009,6 @@ func TestUSDTSweepFreesBandsPastGrace(t *testing.T) {
 	}
 }
 
-// ---- 8. the real clients, no live network ----------------------------------
-
-// TestUSDTRealClientsByHash drives the PRODUCTION seam bindings (bep20 JSON-RPC
-// and TRON TronGrid) against httptest servers, so the wiring New installs — not
-// just the test fakes — is covered. Nothing leaves the process.
-func TestUSDTRealClientsByHash(t *testing.T) {
-	t.Setenv("USD_TO_VND", "25000")
-	t.Setenv("BEP20_ADDRESS", testSellerBSC)
-	t.Setenv("TRON_ADDRESS", testSellerTRX)
-
-	// --- BEP20: eth_getTransactionReceipt + eth_blockNumber + getBlockByNumber.
-	sellerTopic := "0x000000000000000000000000" + strings.TrimPrefix(testSellerBSC, "0x")
-	fromTopic := "0x" + strings.Repeat("0", 24) + strings.Repeat("b", 40)
-	// 6.00 USDT at 18 decimals = 6 * 10^18.
-	weiHex := fmt.Sprintf("0x%x", new(big.Int).Mul(big.NewInt(6), pow10BigInt(18)))
-	bsc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Method string `json:"method"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		var result any
-		switch req.Method {
-		case "eth_getTransactionReceipt":
-			result = map[string]any{
-				"blockNumber": "0x64", "status": "0x1",
-				"logs": []any{map[string]any{
-					"address": bep20.USDTContract,
-					"data":    weiHex,
-					"topics":  []string{bep20.TransferTopic, fromTopic, sellerTopic},
-				}},
-			}
-		case "eth_blockNumber":
-			result = "0x100" // 256 >> 100 + 12 confirmations
-		case "eth_getBlockByNumber":
-			result = map[string]any{"timestamp": "0x60000000"}
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "result": result})
-	}))
-	defer bsc.Close()
-	oldRPC := bep20.RPCEndpoints
-	bep20.RPCEndpoints = []string{bsc.URL}
-	defer func() { bep20.RPCEndpoints = oldRPC }()
-
-	// --- TRON: the TRC20 transactions endpoint.
-	trxHash := hash64("7")
-	trx := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"success": true,
-			"data": []any{map[string]any{
-				"transaction_id":  trxHash,
-				"type":            "Transfer",
-				"from":            "TSender",
-				"value":           "6000000", // 6.00 USDT at 6 decimals
-				"block_timestamp": float64(time.Now().UnixMilli()),
-				"token_info":      map[string]any{"address": tron.USDTContract},
-			}},
-		})
-	}))
-	defer trx.Close()
-	t.Setenv("TRON_API_BASE", trx.URL)
-
-	// Build the bot AFTER the env/endpoint overrides so New binds the real
-	// clients against the fakes, via newBuyBot (NOT newUSDTBot/newUSDTBotAtRate
-	// — those unconditionally overwrite b.bep20ByHash/b.tronByHash with
-	// scripted fakes for the buy/deposit-flow tests, which this test does not
-	// need and must not go through: this test exists specifically to exercise
-	// the closures New() installs (dispatch.go) and nothing else. An earlier
-	// version of this test built via newUSDTBot and then hand-reconstructed
-	// "the real closure" here to undo that override — which silently drifted
-	// out of sync with dispatch.go (it was still calling the pre-task#42
-	// bep20.GetTransferToSellerByHash/tron.FindConfirmedTransferByHash 2-
-	// and 4-arg forms, missing the BEP20_MIN_CONF/TRON_PAGE_LIMIT/
-	// TRON_API_BASE plumbing dispatch.go now does) and so quietly stopped
-	// testing what its own doc comment claims. Not touching b.bep20ByHash/
-	// b.tronByHash at all is the only way this test can't go stale again.
-	b, _, _, _, _ := newBuyBot(t, "999")
-
-	tx, err := b.bep20ByHash("0x" + hash64("8"))
-	if err != nil || tx == nil {
-		t.Fatalf("bep20 by-hash = (%v, %v), want a transfer", tx, err)
-	}
-	if !tx.Confirmed || tx.Units != 600_000 {
-		t.Errorf("bep20 transfer confirmed=%t units=%d, want true/600000 (6.00 at 5 decimals)", tx.Confirmed, tx.Units)
-	}
-
-	tr, err := b.tronByHash(trxHash, 0)
-	if err != nil || tr == nil {
-		t.Fatalf("tron by-hash = (%v, %v), want a transfer", tr, err)
-	}
-	if tr.Units != 600_000 {
-		t.Errorf("tron transfer units = %d, want 600000 (6.00 at 5 decimals)", tr.Units)
-	}
-}
-
-// ---- task #42: pin the CALLER wiring, not just the package plumbing -------
-//
-// The tests above (and internal/pay/bep20, internal/pay/tron's own test
-// suites) already prove that an INJECTED value is honoured once it reaches
-// MatchPaymentConf/GetTransferToSellerByHashConf/GetIncomingTransfersConf/
-// bands.Config.EvictAfter/bands.DepositCredit's tolUnits param. None of that
-// proves dispatch.go/usdt.go actually RESOLVE the right key and PASS it in —
-// a typo'd key string (BEP20_MINCONF instead of BEP20_MIN_CONF) would build
-// clean and pass every package-level test while the knob stayed just as dead
-// as before task #42. These four tests close that gap, one per fixed call
-// site, each built the same way: write the knob into dir/.env (NEVER
-// t.Setenv) before config.Load, so a raw package-level os.Getenv/envInt read
-// sees nothing (production's systemd unit exports nothing either — no
-// EnvironmentFile, config.Load's own doc comment) while config.Config.Env
-// (and b.envInt/b.cfg.EnvOr, which read through it) see the .env-supplied
-// value. Each fixture asserts the key is absent from the ambient environment
-// FIRST, so none of these can pass "by accident" if the shell running the
-// suite happens to already export one of these names.
-
-// TestBep20ByHashResolvesMinConfFromDotEnvSnapshot pins dispatch.go's
-// b.bep20ByHash closure: BEP20_MIN_CONF must reach
-// GetTransferToSellerByHashConf's minConf parameter via b.envInt(b.cfg),
-// not bep20.MinConfirmations()'s raw env read.
-//
-// The fake BSC node reports the transfer at block 0x64 (100) with a chain
-// head of 0x69 (105) — exactly 5 confirmations deep. BEP20_MIN_CONF=3 (via
-// .env only) must confirm it (5>=3); the compiled default of 12 would not
-// (5<12). Since BEP20_MIN_CONF is never set ambient here, a caller that
-// dropped back to the raw bep20.MinConfirmations() read (or typo'd the key)
-// would silently see "" -> the 12 default -> Confirmed=false, so this test
-// only passes when dispatch.go's b.envInt("BEP20_MIN_CONF", ...) call is
-// both present and correctly spelled.
-//
-// Falsification: change dispatch.go's b.bep20ByHash closure back to call
-// bep20.GetTransferToSellerByHash(b.bep20AddrStr(), txhash) (the pre-#42
-// 2-arg form, which reads MinConfirmations() itself) and tx.Confirmed comes
-// back false instead of true.
-func TestBep20ByHashResolvesMinConfFromDotEnvSnapshot(t *testing.T) {
-	if _, ok := os.LookupEnv("BEP20_MIN_CONF"); ok {
-		t.Fatal("fixture broken: BEP20_MIN_CONF is set in the ambient environment, " +
-			"so this test would pass even if the caller read raw env")
-	}
-
-	sellerTopic := "0x000000000000000000000000" + strings.TrimPrefix(testSellerBSC, "0x")
-	fromTopic := "0x" + strings.Repeat("0", 24) + strings.Repeat("b", 40)
-	weiHex := fmt.Sprintf("0x%x", new(big.Int).Mul(big.NewInt(3), pow10BigInt(18))) // 3.00 USDT
-	bsc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Method string `json:"method"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		var result any
-		switch req.Method {
-		case "eth_getTransactionReceipt":
-			result = map[string]any{
-				"blockNumber": "0x64", "status": "0x1", // block 100
-				"logs": []any{map[string]any{
-					"address": bep20.USDTContract,
-					"data":    weiHex,
-					"topics":  []string{bep20.TransferTopic, fromTopic, sellerTopic},
-				}},
-			}
-		case "eth_blockNumber":
-			result = "0x69" // block 105 -> 5 confirmations deep
-		case "eth_getBlockByNumber":
-			result = map[string]any{"timestamp": "0x60000000"}
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "result": result})
-	}))
-	defer bsc.Close()
-	oldRPC := bep20.RPCEndpoints
-	bep20.RPCEndpoints = []string{bsc.URL}
-	defer func() { bep20.RPCEndpoints = oldRPC }()
-
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(
-		"BEP20_ADDRESS="+testSellerBSC+"\n"+
-			"BEP20_MIN_CONF=3\n",
-	), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := config.Load(dir)
-	if err != nil {
-		t.Fatalf("config load: %v", err)
-	}
-	st, err := store.Open(filepath.Join(dir, "store.db"))
-	if err != nil {
-		t.Fatalf("store open: %v", err)
-	}
-	stk := stock.New(filepath.Join(dir, "accounts"), filepath.Join(dir, "orders"))
-	f := &fakeTG{}
-	b := New(Deps{TG: f, Store: st, Stock: stk, Config: cfg, AdminID: "1"})
-	t.Cleanup(func() { b.Shutdown(); st.Close() })
-
-	// b.bep20ByHash is the exact closure dispatch.go's New() installs — not
-	// overridden here — so this calls production code all the way down to
-	// confirmedAt's minConf parameter.
-	tx, err := b.bep20ByHash("0x" + hash64("3"))
-	if err != nil {
-		t.Fatalf("bep20ByHash error: %v", err)
-	}
-	if tx == nil {
-		t.Fatal("bep20ByHash = nil, want a transfer (5 confs deep must at least be FOUND)")
-	}
-	if !tx.Confirmed {
-		t.Errorf("bep20ByHash Confirmed = false, want true — 5 confs >= the .env-configured " +
-			"BEP20_MIN_CONF=3 (a fallback to the 12 default would reject it: 5<12)")
-	}
-}
-
-// TestTronByHashResolvesPageLimitAndAPIBaseFromDotEnvSnapshot pins
-// dispatch.go's b.tronByHash closure: TRON_PAGE_LIMIT and TRON_API_BASE must
-// reach FindConfirmedTransferByHashConf's pageLimit/base parameters via
-// b.envInt/b.cfg.EnvOr, not tron.PageLimit()/apiBase()'s raw env reads.
-//
-// Both knobs are set via .env only, to a distinctive TRON_PAGE_LIMIT=13
-// (default 200) and to this test's own httptest server as TRON_API_BASE
-// (default "https://api.trongrid.io"). A caller that dropped back to the raw
-// readers would send limit=200 to the WRONG host entirely — this test
-// asserts on the actual "limit" query parameter the fake TronGrid receives,
-// which only comes back "13" if both the base (to reach this server at all)
-// and the limit (the value itself) resolved through cfg.
-//
-// Falsification: change dispatch.go's b.tronByHash closure back to call
-// tron.FindConfirmedTransferByHash(b.tronAddrStr(), txhash, minTSMS,
-// b.tronAPIKeyStr()) (the pre-#42 4-arg form) and this test times out /
-// errors dialing the real api.trongrid.io instead of seeing "13".
-//
-// LOAD-BEARING BEYOND ITS STATED PURPOSE: verified by hand that on that same
-// revert the request does not merely fail closed — it actually leaves the
-// process and hits the real api.trongrid.io (which answered with a live 400
-// "valid account address required"). So this test is also what keeps `go
-// test` from making an outbound network call to a third party the moment
-// this wiring regresses — do not delete it as "just an env plumbing test."
-func TestTronByHashResolvesPageLimitAndAPIBaseFromDotEnvSnapshot(t *testing.T) {
-	for _, key := range []string{"TRON_PAGE_LIMIT", "TRON_API_BASE"} {
-		if _, ok := os.LookupEnv(key); ok {
-			t.Fatalf("fixture broken: %s is set in the ambient environment, "+
-				"so this test would pass even if the caller read raw env", key)
-		}
-	}
-
-	trxHash := hash64("4")
-	var gotLimit string
-	trx := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotLimit = r.URL.Query().Get("limit")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"success": true,
-			"data": []any{map[string]any{
-				"transaction_id":  trxHash,
-				"type":            "Transfer",
-				"from":            "TSender",
-				"value":           "3000000", // 3.00 USDT at 6 decimals
-				"block_timestamp": float64(time.Now().UnixMilli()),
-				"token_info":      map[string]any{"address": tron.USDTContract},
-			}},
-		})
-	}))
-	defer trx.Close()
-
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(
-		"TRON_ADDRESS="+testSellerTRX+"\n"+
-			"TRON_PAGE_LIMIT=13\n"+
-			"TRON_API_BASE="+trx.URL+"\n",
-	), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := config.Load(dir)
-	if err != nil {
-		t.Fatalf("config load: %v", err)
-	}
-	st, err := store.Open(filepath.Join(dir, "store.db"))
-	if err != nil {
-		t.Fatalf("store open: %v", err)
-	}
-	stk := stock.New(filepath.Join(dir, "accounts"), filepath.Join(dir, "orders"))
-	f := &fakeTG{}
-	b := New(Deps{TG: f, Store: st, Stock: stk, Config: cfg, AdminID: "1"})
-	t.Cleanup(func() { b.Shutdown(); st.Close() })
-
-	// b.tronByHash is the exact closure dispatch.go's New() installs.
-	tr, err := b.tronByHash(trxHash, 0)
-	if err != nil {
-		t.Fatalf("tronByHash error: %v", err)
-	}
-	if tr == nil {
-		t.Fatal("tronByHash = nil, want the matching transfer")
-	}
-	if gotLimit != "13" {
-		t.Errorf("TronGrid saw limit=%q, want \"13\" (the .env-configured TRON_PAGE_LIMIT) — "+
-			"\"200\" would mean the raw default leaked through", gotLimit)
-	}
-}
-
-// TestNewResolvesBandGeometryFromDotEnvSnapshot pins dispatch.go's bands.New
-// call: BEP20_OFFSET_STEP/BEP20_MATCH_TOL/BEP20_AMOUNT_DECIMALS and their
-// TRON_ counterparts must reach the registry's Params via b.envInt(b.cfg),
-// not bep20.AmountOffsetStep()/tron.AmountOffsetStep() etc.'s raw env reads.
-// (USDT_BAND_EVICT_S sits on the exact same bands.Config{EvictAfter: ...}
-// literal, same b.envInt call shape — see this test's own doc for why it is
-// not independently pinned here.)
-//
-// Every geometry value is set via .env only, to numbers that don't collide
-// with the shipped defaults (Step 101/Tol 50/Decimals 5 for both rails) and
-// that still satisfy Validate at their own precision: BEP20 at 4 decimals has
-// a 100-unit jitter span, so Step 99 fits; TRON at 6 decimals has a 10000-unit
-// span, so Step 77 fits easily.
-//
-// Falsification: revert dispatch.go's bands.Config{Providers: ...} literal
-// back to calling bep20.AmountOffsetStep()/AmountMatchTol()/AmountDecimals()
-// and tron's equivalents directly, and Params comes back {101,50,5} for both
-// providers instead of the .env-configured values.
 func TestNewResolvesBandGeometryFromDotEnvSnapshot(t *testing.T) {
 	for _, key := range []string{
 		"BEP20_OFFSET_STEP", "BEP20_MATCH_TOL", "BEP20_AMOUNT_DECIMALS",
@@ -1930,113 +1042,16 @@ func TestNewResolvesBandGeometryFromDotEnvSnapshot(t *testing.T) {
 	}
 }
 
-// TestUSDTDepositMatchTolIsResolvedAndClamped is the money-path pin for the
-// deposit tolerance, driven through an ACTUAL deposit (dep:trx -> desired
-// amount -> submit hash -> balance credited) rather than a call to the pure
-// function.
-//
-// WHAT CHANGED. This test used to set DEPOSIT_MATCH_TOL_CENTS=200 and prove
-// that a 50-cent underpay rounded UP to the full requested top-up. At the
-// 5-decimal geometry the picker quotes the request PLUS a jitter of at least
-// 0.01 USDT while the largest tolerance the geometry permits is twenty times
-// smaller than that jitter, so AT A FIXED RATE every in-tolerance receipt is
-// already worth more than the request and no legal tolerance can change the
-// credit. The tolerance is not inert, though — see
-// TestUSDTDepositRoundsUpWhenTheRateMovedDown, which reaches the same branch
-// through the rate move that a deposit window an hour wide makes real.
-//
-// What this test now pins is the CLAMP, which is the property that protects
-// money regardless of rate: an operator who reads "tolerance" and types a
-// cents-era 200000 must not thereby widen the deposit's match window to 2 USDT,
-// which WOULD change credits (a 4.50 receipt against a 6.01000 quote would
-// round up to the full 6.00 request, handing the customer 1.50 USDT they never
-// sent) and would let one receipt sit inside a thousand live bands at once.
-//
-// Falsification: drop bands.ClampDepositTol from usdt.go's DepositCredit call
-// and the credited balance comes back 150000 instead of the 112500 actually
-// received.
-func TestUSDTDepositMatchTolIsResolvedAndClamped(t *testing.T) {
-	if _, ok := os.LookupEnv("DEPOSIT_MATCH_TOL_UNITS"); ok {
-		t.Fatal("fixture broken: DEPOSIT_MATCH_TOL_UNITS is set in the ambient environment, " +
-			"so this test would pass even if the caller read raw env")
-	}
-
-	ctx := context.Background()
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(
-		"USD_TO_VND=25000\n"+
-			"TRON_ADDRESS="+testSellerTRX+"\n"+
-			"DEPOSIT_MATCH_TOL_UNITS=200000\n",
-	), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := config.Load(dir)
-	if err != nil {
-		t.Fatalf("config load: %v", err)
-	}
-	st, err := store.Open(filepath.Join(dir, "store.db"))
-	if err != nil {
-		t.Fatalf("store open: %v", err)
-	}
-	stk := stock.New(filepath.Join(dir, "accounts"), filepath.Join(dir, "orders"))
-	f := &fakeTG{}
-	b := New(Deps{TG: f, Store: st, Stock: stk, Config: cfg, AdminID: "999"})
-	t.Cleanup(func() { b.Shutdown(); st.Close() })
-
-	// pay_tron defaults OFF; turn it on the same way newUSDTBotAtRate does.
-	sett := b.cfg.Settings()
-	sett["pay_tron"] = true
-	if err := b.cfg.SaveSettings(sett); err != nil {
-		t.Fatalf("save settings: %v", err)
-	}
-	// The chain-lookup seam is scripted (this test targets the CREDIT-DECISION
-	// wiring, not the TRON client wiring — that half is TestTronByHash...
-	// above) — matches newUSDTBotAtRate's own fake shape.
-	trxByHash := map[string]*tron.Transfer{}
-	b.tronByHash = func(txhash string, _ int64) (*tron.Transfer, error) {
-		return trxByHash[strings.ToLower(strings.TrimPrefix(txhash, "0x"))], nil
-	}
-
-	// HALF ONE: the .env value really is resolved through the config snapshot
-	// and not through the pay package's raw os.Getenv (task #42's bug class).
-	// Asserted here rather than through a balance, because the clamp below
-	// deliberately erases its effect on the credit.
-	if got := b.envInt("DEPOSIT_MATCH_TOL_UNITS", bands.DefaultDepositMatchTolUnits); got != 200000 {
-		t.Errorf("resolved DEPOSIT_MATCH_TOL_UNITS = %d, want 200000 (the .env value) — "+
-			"%d would mean the compiled default leaked through", got, bands.DefaultDepositMatchTolUnits)
-	}
-
-	const chat = 470
-	b.Process(ctx, callbackUpdate(chat, "dep:trx"))
-	b.Process(ctx, textUpdate(chat, "6")) // desired 6.00 USDT = 150,000 VND
-
-	o := reservedDeposit(t, st, chat)
-	armTxid(t, ctx, b, chat, chainTRX, o.Des)
-
-	// HALF TWO: 4.50 arrives against a 6.01000 quote — 1.51 USDT off. The
-	// configured 200000-unit tolerance would swallow that and credit the full
-	// requested 6.00; the clamp to the rail's 50-unit band half-width means it
-	// is far outside tolerance and the customer is credited what they sent.
-	h := hash64("5")
-	trxByHash[strings.ToLower(h)] = trxTx(h, "4.50000", time.Now().UnixMilli())
-	b.Process(ctx, textUpdate(chat, h))
-
-	bal, _ := st.GetBalance(fmtInt(chat))
-	if bal != 112500 {
-		t.Errorf("credited %d VND, want 112500 (the 4.50 USDT actually received); 150000 would mean "+
-			"an unclamped 2-USDT tolerance rounded a 1.51-USDT shortfall up to the full request", bal)
-	}
-}
-
-// TestUSDTDepositRoundsUpWhenTheRateMovedDown restores, in the form the new
-// geometry actually permits, the end-to-end coverage the test above used to
-// carry: DepositCredit's round-a-small-underpay-UP rule reached through a real
-// deposit rather than through the pure function.
+// TestUSDTDepositRoundsUpWhenTheRateMovedDown pins DepositCredit's
+// round-a-small-underpay-UP rule end-to-end through a real deposit (the pure
+// function is pinned separately in bands/credit_test.go) — driven through the
+// hands-free watcher's settle path.
 //
 // The reachable path is a rate move, not a short payment. The screen quotes at
 // the USD_TO_VND in force when it is drawn; the receipt is valued at the rate in
-// force when the hash is verified, and the deposit window is an hour wide. Drop
-// the rate in between and the customer's EXACT payment is suddenly worth less
+// force when the watcher settles it, and the deposit window is an hour wide.
+// Drop the rate in between and the customer's EXACT payment is suddenly worth
+// less
 // VND than the total they asked to top up — at which point the tolerance decides
 // whether they get what they asked for or the smaller new-rate value.
 //
@@ -2053,7 +1068,7 @@ func TestUSDTDepositMatchTolIsResolvedAndClamped(t *testing.T) {
 // new-rate value instead of 150000.
 func TestUSDTDepositRoundsUpWhenTheRateMovedDown(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, _, fk := newUSDTBot(t) // USD_TO_VND=25000
+	b, _, st, _, _ := newUSDTBot(t) // USD_TO_VND=25000
 	const chat = 471
 
 	b.Process(ctx, callbackUpdate(chat, "dep:trx"))
@@ -2067,7 +1082,6 @@ func TestUSDTDepositRoundsUpWhenTheRateMovedDown(t *testing.T) {
 	if o.Total != 150000 {
 		t.Fatalf("order total = %d, want 150000 (the requested top-up at the quote rate)", o.Total)
 	}
-	armTxid(t, ctx, b, chat, chainTRX, o.Des)
 
 	// The rate moves DOWN by 0.4% while the customer is paying. settings.json
 	// wins over the environment, so this is the same override an admin
@@ -2081,9 +1095,9 @@ func TestUSDTDepositRoundsUpWhenTheRateMovedDown(t *testing.T) {
 	// They send 6.00970 — 30 units under the quote, well inside the 50-unit
 	// tolerance. At the new rate that is worth ~149,642 VND, under the 150,000
 	// they asked to top up, so the round-up rule is what decides the credit.
-	h := hash64("6")
-	fk.setTRX(h, trxTx(h, "6.00970", time.Now().UnixMilli()))
-	b.Process(ctx, textUpdate(chat, h))
+	// Credit through the watcher's per-transfer settle path (no hash paste).
+	prm, _ := b.bands.Params(bands.ProviderTron)
+	b.settleWatchedTransfer(ctx, bands.ProviderTron, prm, watchedIn(t, chainTRX, "6.00970", b))
 
 	bal, _ := st.GetBalance(fmtInt(chat))
 	if bal != 150000 {

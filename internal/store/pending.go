@@ -42,8 +42,9 @@ type TronPending struct {
 }
 
 // Bep20PendingAdd persists a pending USDT BEP20 order so its unique-amount
-// reservation + the customer-submitted verify-by-hash survive a restart
-// (store.py:767-776). INSERT OR REPLACE so a re-tap just refreshes the row.
+// reservation survives a restart and the hands-free watcher can still attribute
+// incoming transfers to it (store.py:767-776). INSERT OR REPLACE so a re-tap
+// just refreshes the row.
 func (s *Store) Bep20PendingAdd(des, chatID, amount string, total, fromBlock int64, deadline float64) error {
 	_, err := s.db.Exec("INSERT OR REPLACE INTO bep20_pending"+
 		"(des, chat_id, amount, total, from_block, deadline, ts) "+

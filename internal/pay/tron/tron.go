@@ -69,9 +69,8 @@ const (
 // TRON_API_BASE, tron_pay.py:37). Raw .env/ambient read only — same caveat
 // as Address()/PageLimit(): a production caller with a *config.Config
 // available should resolve TRON_API_BASE through it and pass the result into
-// apiGetConf/GetIncomingTransfersConf/FindConfirmedTransferByHashConf
-// instead. apiGet delegates here so it keeps working for callers with no
-// cfg to resolve from.
+// apiGetConf/GetIncomingTransfersConf instead. apiGet delegates here so it
+// keeps working for callers with no cfg to resolve from.
 func apiBase() string {
 	if v := os.Getenv("TRON_API_BASE"); v != "" {
 		return strings.TrimRight(v, "/")
@@ -113,10 +112,10 @@ func AmountOffsetStep() int {
 // systemd (no EnvironmentFile in production, config.Load's doc comment). A
 // production caller with a *config.Config available should resolve
 // TRON_PAGE_LIMIT through it and pass the result into
-// GetIncomingTransfersConf/FindConfirmedTransferByHashConf instead of
-// letting this package read it. GetIncomingTransfers/FindConfirmedTransferByHash
-// below delegate to the *Conf functions using this value, and survive only
-// as the low-level primitive and its default-argument callers.
+// GetIncomingTransfersConf instead of letting this package read it.
+// GetIncomingTransfers below delegates to GetIncomingTransfersConf using this
+// value, and survives only as the low-level primitive and its default-argument
+// caller.
 //
 // The max transfers to pull per poll cycle (TronGrid caps at 200,
 // tron_pay.py:55-57).
@@ -142,9 +141,6 @@ func envInt(key string, def int) int {
 // invalid address (tron_pay.py:59-62).
 var addrRE = regexp.MustCompile(`^T[1-9A-HJ-NP-Za-km-z]{33}$`)
 
-// hashRE is a 32-byte hex tx id (tron_pay.py:207).
-var hashRE = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
-
 // Address reads the RAW .env/ambient TRON_ADDRESS ("" if unset) — nothing
 // more. It does NOT see an admin's settings.json address change (task #17):
 // unlike the Python original, which mutated os.environ in-process on every
@@ -155,10 +151,10 @@ var hashRE = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 // matching, and Configured() gate must all resolve through
 // config.Config.TRONAddress() (settings.json overriding this env snapshot),
 // not this function; internal/handlers passes that resolved value into the
-// functions in this package that need it (FindConfirmedTransferByHash)
-// instead of letting them call Address() themselves. This function survives
-// only as the low-level env primitive those call sites build on — do not
-// call it directly for anything customer-facing.
+// functions in this package that need it (GetIncomingTransfers) instead of
+// letting them call Address() themselves. This function survives only as the
+// low-level env primitive those call sites build on — do not call it
+// directly for anything customer-facing.
 func Address() string {
 	return strings.TrimSpace(os.Getenv("TRON_ADDRESS"))
 }
@@ -404,15 +400,9 @@ func GetIncomingTransfersConf(addr string, minTSMS int64, apiKey string, pageLim
 // fired before the window was exhausted, so the rows returned are real but the
 // newest ones are missing.
 //
-// It is a sentinel rather than a plain error because the two callers must react
-// differently, and both reactions are correct:
-//
-//   - the watcher settles what it CAN see and tries again next tick, so losing
-//     the tail costs a delay, not a deposit;
-//   - the by-hash lookup searches what it got and answers from a HIT, but must
-//     NOT conclude "no such payment" from a window it knows is incomplete —
-//     that is a terminal answer shown to a customer who really did pay. On a
-//     miss it propagates instead, and the verify path re-arms.
+// It is a sentinel rather than a plain error so the watcher can react
+// correctly: it settles what it CAN see and tries again next tick, so losing
+// the tail costs a delay, not a deposit.
 //
 // Returned WITH the partial slice, so a caller that wants the rows can take
 // them (errors.Is) and one that needs certainty cannot miss the caveat.
@@ -524,76 +514,4 @@ func absInt64(n int64) int64 {
 		return -n
 	}
 	return n
-}
-
-// FindConfirmedTransferByHash is FindConfirmedTransferByHashConf using the
-// raw-env PageLimit()/apiBase() — kept for callers with no *config.Config to
-// resolve TRON_PAGE_LIMIT/TRON_API_BASE through (see their doc comments).
-func FindConfirmedTransferByHash(addr, txhash string, minTSMS int64, apiKey string) (*Transfer, error) {
-	return FindConfirmedTransferByHashConf(addr, txhash, minTSMS, apiKey, PageLimit(), apiBase())
-}
-
-// FindConfirmedTransferByHashConf finds ONE CONFIRMED incoming USDT (TRC20)
-// transfer to addr by tx hash — for the customer-submitted
-// payment-verification flow (the customer pastes their tx hash; there is no
-// background poller). Returns the matching transfer row or (nil, nil).
-//
-// Reuses GetIncomingTransfersConf, whose TronGrid query is only_to +
-// only_confirmed, so a returned row is GUARANTEED finalised
-// (network-confirmed) AND credited to the seller.
-//
-// minTSMS bounds the query to the order's [start - grace] floor, so a hash
-// older than the payment window, unknown, not yet confirmed, or not to the
-// seller all return (nil, nil). Hash compare is case-insensitive and
-// tolerant of a 0x prefix (TRON ids are bare 64-hex, tron_pay.py:188-213).
-// apiKey is forwarded to GetIncomingTransfersConf/apiGetConf — see apiGet's
-// doc comment; the caller resolves it via config.Config.TRONAPIKey().
-// pageLimit/base are the caller-resolved TRON_PAGE_LIMIT/TRON_API_BASE (see
-// PageLimit's/apiBase's doc comments).
-//
-// A TRUNCATED window is SEARCHED, and then propagated only if the hash is not
-// in it. The two halves of that are not symmetrical: "(nil, nil)" from here is
-// a TERMINAL "no such payment" shown to a customer, and concluding it from a
-// window known to be incomplete would tell someone who really did pay that
-// they did not — so absence never answers from a partial read, and the verify
-// path turns the error into a retry. A hash that IS among the rows read is
-// proven present regardless of what was missed after it, and refusing that
-// would be refusing on evidence already in hand.
-//
-// Cost note: minTSMS bounds this to one order's payment window — minutes — so
-// in practice the first page ends it (TronGrid omits its continuation when the
-// window fits). The paging ceiling only matters on an address busy enough to
-// overflow a page inside that window, which is also the only case where the old
-// single-page read was silently wrong.
-func FindConfirmedTransferByHashConf(addr, txhash string, minTSMS int64, apiKey string, pageLimit int, base string) (*Transfer, error) {
-	if txhash == "" || !ValidAddress(addr) {
-		return nil, nil
-	}
-	// Lowercase BEFORE stripping "0x" (exactly Python's
-	// `.strip().lower().replace("0x", "")`, tron_pay.py:206) so an
-	// uppercase "0X..." prefix is stripped too — stripping first would leave
-	// "0X" in place and wrongly reject the customer's pasted hash.
-	want := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(txhash)), "0x", "")
-	if !hashRE.MatchString(want) {
-		return nil, nil
-	}
-	transfers, err := GetIncomingTransfersConf(addr, minTSMS, apiKey, pageLimit, base)
-	// SCAN BEFORE REACTING TO THE ERROR, and the asymmetry is the whole point: a
-	// truncated window makes ABSENCE unprovable, but it does not make a PRESENT
-	// row less real. The hash the customer pasted either is in the rows that came
-	// back or it is not, and if it is, refusing to say so would be refusing on
-	// evidence we already hold. Only when the hash is genuinely absent from
-	// everything read does the truncation matter, and that case still propagates
-	// below. (On a real failure — a dead endpoint, a mid-window page error —
-	// GetIncomingTransfersConf hands back no rows at all, so this loop is a
-	// no-op and the error falls straight through.)
-	for i := range transfers {
-		if strings.ToLower(transfers[i].ID) == want {
-			return &transfers[i], nil
-		}
-	}
-	if err != nil {
-		return nil, err
-	}
-	return nil, nil
 }

@@ -60,7 +60,6 @@ type ChatState struct {
 	Purchase   *PurchaseCtx  // pending_purchase @1583 {product, tier}
 	OrderCode  *OrderCodeCtx // pending_ordercode @1587 {des}
 	Deposit    *DepositCtx   // pending_deposit @3447 {method}
-	Txid       *TxidCtx      // pending_txid @3455 {chain, des, startTs}
 	Code       *OTPCtx       // pending_code @3488
 	CustReset  *CustResetCtx // pending_custreset @3495
 	CustDelete *CustDelCtx   // pending_custdelete @3500
@@ -126,7 +125,6 @@ type ChatState struct {
 	// -> rendering=false) within one throttle tick even if ClearAdminPending
 	// fires mid-render.
 	UpstockDirty         bool
-	USDTPolling          bool        // _usdt_polling @9850 — one confirm-poll per chat
 	OTPSession           *OTPSession // _otp_session_* @8166-8228
 	LastMenu             int64       // last_menu — menu msg deleted on next callback @12280
 	ProductClicks        []time.Time // _product_click_allowed @12191 sliding window
@@ -152,10 +150,6 @@ type PurchaseCtx struct{ Product, Tier string } // pending_purchase @1583
 type PriceCtx struct{ Product, Code string }
 type OrderCodeCtx struct{ Des string }  // pending_ordercode @1587
 type DepositCtx struct{ Method string } // pending_deposit @3447
-type TxidCtx struct {                   // pending_txid @3455
-	Chain, Des string
-	StartTS    float64
-}
 
 // OTPCtx is the AWAIT phase of a login-code session — pending_code
 // (telegram_bot.py:3488), a bare `pending_code[chat_id] = True` flag in Python:
@@ -309,7 +303,6 @@ func (st *ChatState) ClearCustomerPending() {
 	st.Code = nil
 	st.CustReset = nil
 	st.CustDelete = nil
-	st.Txid = nil
 }
 
 // ClearAdminPending drops every half-finished ADMIN input flow for this chat —

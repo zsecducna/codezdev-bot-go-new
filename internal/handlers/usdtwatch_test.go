@@ -694,8 +694,8 @@ func TestWatcherAuditsAnAttributedPaymentThatDidNotCredit(t *testing.T) {
 // deliberately loose — but band amounts are RECYCLED as sessions finish, so a
 // transfer that was never credited can still be sitting in that window when a
 // NEW deposit is quoted the same amount. Attributing it would pay one customer
-// with another customer's money, and the hash-paste path has always refused it
-// (verifyUSDTTxid's "outside_window"). The two flows must agree.
+// with another customer's money, and the per-band freshness gate below refuses
+// it for exactly that reason.
 func TestWatcherIgnoresATransferOlderThanItsBand(t *testing.T) {
 	ctx := context.Background()
 	b, _, st, _, _ := newUSDTBot(t)

@@ -6,10 +6,11 @@ import "fmt"
 //
 // WHAT THIS FILE IS FOR, and how it differs from everything else in the package.
 //
-// The rest of `bands` answers "the customer told us which order this is — does
-// the amount agree?". That is the verify-by-hash path: the customer pastes a tx
-// hash on their own pay screen, so the order is NAMED, and MinGap only has to
-// stop a payment being claimed by a DIFFERENT session.
+// The rest of `bands` answered "the customer told us which order this is — does
+// the amount agree?" — the verify-by-hash matcher (RecvMatchesBand), where the
+// customer pasted a tx hash so the order was NAMED and MinGap only had to stop a
+// payment being claimed by a DIFFERENT session. (That path is gone; the matcher
+// is unused now and stays only as the package's named-order primitive.)
 //
 // This file answers the harder question the hands-free watcher asks: "a
 // payment arrived and nobody told us whose it is — which live order, if any,
@@ -265,8 +266,8 @@ func MatchReceipt(p Params, recvUnits int64, live []Reservation) (Reservation, M
 // DEPOSITS ONLY (Reservation.IsDeposit), and that is a money rule, not a
 // convenience. The watcher's one action is a wallet credit; a product order's
 // band matching here would credit a wallet for an order whose stock is still
-// sitting reserved and undelivered. Product orders are paid through their own
-// hash-paste flow and are simply not candidates for attribution by amount.
+// sitting reserved and undelivered. Product orders are paid from wallet balance
+// and are simply not candidates for attribution by amount.
 // Filtering INSIDE the lock also keeps the ambiguity verdict honest: a product
 // order sharing the window must not make a deposit's receipt look ambiguous, or
 // a perfectly attributable payment would be held for manual review.

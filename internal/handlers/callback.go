@@ -50,12 +50,12 @@ func (b *Bot) registerCatalog() {
 		cbRoute{key: "paybal:", fn: (*Bot).cbPayBalance},                      // @15819
 		// Pay-by-QR (SePay VietQR) and Pay-by-PayPal (Orders v2 API + webhook)
 		// were removed by the USDT-only migration (S1/S2) — SePay and PayPal are
-		// gone. Remaining pay-method buttons stay as stubs until their slices
-		// land; applycode/rmcode and the self-service routes are now real
-		// handlers wired in M2.6.
+		// gone. paybnb: stays a stub (Binance Pay was removed, S3); paybsc:/
+		// paytrx: were the on-chain product-pay routes and are gone too — products
+		// are paid from wallet balance (paybal:), and deposits credit hands-free
+		// via the watcher with no button. applycode/rmcode and the self-service
+		// routes are real handlers wired in M2.6.
 		cbRoute{key: "paybnb:", fn: (*Bot).cbPayMethodStub},
-		cbRoute{key: "paybsc:", fn: (*Bot).cbPayMethodStub},
-		cbRoute{key: "paytrx:", fn: (*Bot).cbPayMethodStub},
 		// M2.6: apply/remove promo-referral code on a reserved order (@16055/16069).
 		cbRoute{key: "applycode:", fn: (*Bot).cbApplyCode},
 		cbRoute{key: "rmcode:", fn: (*Bot).cbRemoveCode},

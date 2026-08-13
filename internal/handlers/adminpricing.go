@@ -43,14 +43,14 @@ import (
 // registerAdminPricing wires this file's 11 captures + the 6 standalone
 // tier/promo callback prefixes into the ordered dispatch tables. Called from
 // New (dispatch.go) AFTER registerAdminSettings, so insertCapturesBefore
-// finds "setkirourl"/"code"/"txid" already spliced into the chain:
+// finds "setkirourl"/"code"/"deposit" already spliced into the chain:
 //   - setapiprice/setapimin/setapimax/setkiroprice/setkiromin/setkiromax/
 //     setapicap (canonical #11-#17) land ahead of "setkirourl" (#18, already
 //     registered by registerAdminSettings) — setrate (#10) stays first.
-//   - discount/promo (#34/#36) land ahead of "code" (#37, already registered
+//   - discount/promo (#35/#37) land ahead of "code" (#38, already registered
 //     by registerOTP).
-//   - tier/price (#41/#42) land ahead of "txid" (#44, already registered by
-//     registerUSDT).
+//   - tier/price (#42/#43) land ahead of "deposit" (#46, already registered
+//     by registerDeposit).
 //
 // Together the result stays an in-order subsequence of CanonicalCaptureOrder
 // (captures.go / handlers-go.md §7).
@@ -68,7 +68,7 @@ func (b *Bot) registerAdminPricing() {
 		stage{name: "discount", fn: (*Bot).capDiscount},
 		stage{name: "promo", fn: (*Bot).capPromo},
 	)
-	b.insertCapturesBefore("txid",
+	b.insertCapturesBefore("deposit",
 		stage{name: "tier", fn: (*Bot).capTier},
 		stage{name: "price", fn: (*Bot).capPrice},
 	)

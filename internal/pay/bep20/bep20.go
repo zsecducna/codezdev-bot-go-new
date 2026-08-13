@@ -85,10 +85,9 @@ func AmountDecimals() int {
 // it does NOT see a value set only via .env under systemd (no
 // EnvironmentFile in production, config.Load's doc comment): a production
 // caller with a *config.Config available must resolve BEP20_MIN_CONF through
-// it and pass the result into MatchPaymentConf/GetTransferToSellerByHashConf
-// instead of letting this package read it. This function — and the
-// unparameterized MatchPayment/GetTransferToSellerByHash below, which
-// delegate to the *Conf functions using this value — survive only as the
+// it and pass the result into MatchPaymentConf instead of letting this package
+// read it. This function — and the unparameterized MatchPayment below, which
+// delegates to MatchPaymentConf using this value — survive only as the
 // low-level env primitive and its default-argument callers; do not call
 // them directly for anything customer-facing.
 //
@@ -140,9 +139,6 @@ func envInt(key string, def int) int {
 // addrRE is a BSC/EVM address shape check: 0x + 40 hex (bep20_pay.py:60).
 var addrRE = regexp.MustCompile(`^0x[0-9a-fA-F]{40}$`)
 
-// hashRE is a 32-byte hex tx hash, 0x-prefixed (bep20_pay.py:211).
-var hashRE = regexp.MustCompile(`^0x[0-9a-fA-F]{64}$`)
-
 // Address reads the RAW .env/ambient BEP20_ADDRESS ("" if unset) — nothing
 // more. It does NOT see an admin's settings.json address change (task #17):
 // unlike the Python original, which mutated os.environ in-process on every
@@ -153,9 +149,9 @@ var hashRE = regexp.MustCompile(`^0x[0-9a-fA-F]{64}$`)
 // matching, and Configured() gate must all resolve through
 // config.Config.BEP20Address() (settings.json overriding this env snapshot),
 // not this function; internal/handlers passes that resolved value into the
-// functions in this package that need it (GetTransferToSellerByHash) instead
-// of letting them call Address() themselves. This function survives only as
-// the low-level env primitive those call sites build on — do not call it
+// functions in this package that need it (GetIncomingTransfers) instead of
+// letting them call Address() themselves. This function survives only as the
+// low-level env primitive those call sites build on — do not call it
 // directly for anything customer-facing.
 func Address() string {
 	return strings.TrimSpace(os.Getenv("BEP20_ADDRESS"))
@@ -205,10 +201,11 @@ func QRPath() string {
 // a settings.json write nor config's compiled fallback.
 //
 // An empty, unparseable, or non-positive rate returns an error rather than
-// converting, so verifyUSDTTxid re-arms instead of acting on a value it
-// cannot trust. Every other consumer of this rate in internal/handlers
-// (usdtDisp, deposit's usdtToVND, vndToUSD) already refuses a non-positive
-// rate the same way; this converter was the one that did not.
+// converting, so the hands-free watcher holds the credit for the next tick
+// instead of acting on a value it cannot trust. Every other consumer of this
+// rate in internal/handlers (usdtDisp, deposit's usdtToVND, vndToUSD) already
+// refuses a non-positive rate the same way; this converter was the one that
+// did not.
 //
 // What the guard actually protects, stated precisely because the obvious
 // reading is too broad:
@@ -367,8 +364,7 @@ func LatestBlock() (int64, error) {
 // (settleWatchedTransfer compares a transfer's time against its band's start):
 // an eth_getLogs row carries no timestamp, and estimating one from the block
 // number is unsafe under variable block times, so the real timestamp is fetched
-// for each transfer that reaches the settle path. Mirrors the timestamp read
-// the hash-path already does (GetTransferToSellerByHashConf).
+// for each transfer that reaches the settle path.
 func BlockTimestamp(block int64) (int64, error) {
 	raw, err := rpc("eth_getBlockByNumber", []any{fmt.Sprintf("0x%x", block), false})
 	if err != nil {
@@ -487,9 +483,9 @@ type MatchedTransfer struct {
 
 // MatchPayment is MatchPaymentConf using the raw-env MinConfirmations() —
 // kept for callers with no *config.Config to resolve BEP20_MIN_CONF through
-// (see MinConfirmations's doc comment). Has no production caller today; the
-// live poller path does not exist for BEP20 (customer-submitted hash only,
-// via GetTransferToSellerByHash/Conf).
+// (see MinConfirmations's doc comment). Has no production caller today; BEP20
+// deposits are credited hands-free by the watcher (usdtwatch.go), which
+// matches through bands.MatchIncoming, not this helper.
 func MatchPayment(transfers []Transfer, expectedAmount string, minBlock, latest int64, isUsed func(txnID string) bool) (*MatchedTransfer, error) {
 	return MatchPaymentConf(transfers, expectedAmount, minBlock, latest, MinConfirmations(), isUsed)
 }
@@ -540,174 +536,4 @@ func absInt64(n int64) int64 {
 		return -n
 	}
 	return n
-}
-
-// TransferByHash is the result of looking up one transaction by hash
-// (bep20_pay.py:194-198): the USDT (BEP20) transfer it makes TO the seller
-// address, with confirmation status.
-type TransferByHash struct {
-	ID        string
-	Frm       string
-	To        string
-	Amount    *big.Rat
-	Units     int64
-	Block     int64
-	TS        int64
-	Confirmed bool
-	Success   bool
-}
-
-// logEntryWithAddr is one eth_getTransactionReceipt log row (includes the
-// emitting contract address, unlike eth_getLogs rows which are already
-// address-filtered).
-type logEntryWithAddr struct {
-	Address string   `json:"address"`
-	Data    string   `json:"data"`
-	Topics  []string `json:"topics"`
-}
-
-// receiptFull mirrors the subset of eth_getTransactionReceipt fields we need.
-type receiptFull struct {
-	BlockNumber string             `json:"blockNumber"`
-	Status      string             `json:"status"`
-	Logs        []logEntryWithAddr `json:"logs"`
-}
-
-// confirmedAt reports whether a looked-up transfer is settled: the receipt
-// succeeded, it is at least minConf blocks deep (latest-block), and a block
-// timestamp was actually found. Pulled out of GetTransferToSellerByHashConf
-// as a pure function so the MinConfirmations plumbing is pinnable by a test
-// without a live RPC round trip.
-func confirmedAt(success bool, latest, block int64, ts int64, minConf int) bool {
-	return success && (latest-block) >= int64(minConf) && ts > 0
-}
-
-// GetTransferToSellerByHash is GetTransferToSellerByHashConf using the
-// raw-env MinConfirmations() — kept for callers with no *config.Config to
-// resolve BEP20_MIN_CONF through (see MinConfirmations's doc comment).
-func GetTransferToSellerByHash(seller, txhash string) (*TransferByHash, error) {
-	return GetTransferToSellerByHashConf(seller, txhash, MinConfirmations())
-}
-
-// GetTransferToSellerByHashConf looks up ONE BSC transaction by hash and
-// returns the USDT (BEP20) transfer it makes TO seller, with confirmation
-// status — for the customer-submitted payment-verification flow (the
-// customer pastes their tx hash; there is no background poller). Returns
-// (nil, nil) when the hash is malformed, unknown, not yet mined, or carries
-// no USDT transfer to seller.
-//
-// seller is passed in by the caller rather than read from this package's own
-// Address() (task #17): the live receiving address is admin-settable via
-// settings.json (config.Config.BEP20Address(), which layers settings.json
-// over .env/ambient BEP20_ADDRESS), and this package deliberately does not
-// import internal/config to consult it — that would make a payment-rail
-// package depend on the bot's config layer for no reason beyond reading one
-// string. The caller (internal/handlers) already holds the resolved *Config
-// and is the right place to resolve "which address is live right now".
-// minConf is the same kind of caller-resolved value, for BEP20_MIN_CONF
-// (see MinConfirmations's doc comment).
-//
-// Confirmed is true only when the receipt SUCCEEDED and the tx is at least
-// minConf deep AND the block timestamp is known — so the caller never
-// credits an unconfirmed/reverted tx and always has a real on-chain
-// timestamp for the [start, click] freshness window. Multiple USDT
-// transfers to the seller inside one tx are summed (defensive; normally
-// one). Stdlib-only JSON-RPC over the same endpoint pool as the poller path
-// (bep20_pay.py:189-259).
-func GetTransferToSellerByHashConf(seller, txhash string, minConf int) (*TransferByHash, error) {
-	if txhash == "" || !ValidAddress(seller) {
-		return nil, nil
-	}
-	txhash = strings.TrimSpace(txhash)
-	if !hashRE.MatchString(txhash) { // 32-byte hex, 0x-prefixed
-		return nil, nil
-	}
-	sellerHex := strings.ToLower(strings.TrimPrefix(seller, "0x"))
-
-	raw, err := rpc("eth_getTransactionReceipt", []any{txhash})
-	if err != nil {
-		return nil, err
-	}
-	if len(raw) == 0 || string(raw) == "null" {
-		return nil, nil // unknown hash or not yet mined
-	}
-	var receipt receiptFull
-	if err := json.Unmarshal(raw, &receipt); err != nil {
-		return nil, fmt.Errorf("bep20: decode receipt: %w", err)
-	}
-	if receipt.BlockNumber == "" {
-		return nil, nil // unknown hash or not yet mined
-	}
-
-	// status: "0x1" success, "0x0" reverted. Fail CLOSED on a missing status
-	// field (money path) — a present "0x0" blocks a reverted transfer, and
-	// post-Byzantium BSC always returns status so this never false-rejects a
-	// real tx in practice.
-	success := receipt.Status == "0x1" || receipt.Status == "1"
-
-	block, err := parseHexInt64(receipt.BlockNumber)
-	if err != nil {
-		return nil, nil
-	}
-
-	totalWei := new(big.Int)
-	frm := ""
-	for _, lg := range receipt.Logs {
-		if !strings.EqualFold(lg.Address, USDTContract) {
-			continue // not the USDT contract
-		}
-		if len(lg.Topics) < 3 || !strings.EqualFold(lg.Topics[0], TransferTopic) {
-			continue // not a Transfer event
-		}
-		if len(lg.Topics[2]) < 40 || strings.ToLower(lg.Topics[2][len(lg.Topics[2])-40:]) != sellerHex {
-			continue // not credited TO the seller
-		}
-		wei, err := parseHexBigInt(lg.Data)
-		if err != nil {
-			continue // one malformed log must not void the lookup
-		}
-		totalWei.Add(totalWei, wei)
-		if len(lg.Topics[1]) >= 40 {
-			frm = "0x" + lg.Topics[1][len(lg.Topics[1])-40:] // last matched sender (one normally)
-		}
-	}
-	if totalWei.Sign() <= 0 {
-		return nil, nil // no USDT transfer to the seller in this tx
-	}
-
-	// Confirmation depth + block timestamp: one head read + one block read.
-	// A transient failure here yields confirmed=false (caller asks the
-	// customer to retry) rather than crediting on incomplete data.
-	var ts int64
-	var confirmed bool
-	if latest, err := LatestBlock(); err == nil {
-		if blkRaw, err := rpc("eth_getBlockByNumber", []any{fmt.Sprintf("0x%x", block), false}); err == nil && len(blkRaw) > 0 && string(blkRaw) != "null" {
-			var blk struct {
-				Timestamp string `json:"timestamp"`
-			}
-			if err := json.Unmarshal(blkRaw, &blk); err == nil && blk.Timestamp != "" {
-				if tsVal, err := parseHexInt64(blk.Timestamp); err == nil {
-					ts = tsVal
-				}
-			}
-			confirmed = confirmedAt(success, latest, block, ts, minConf)
-		}
-	}
-
-	return &TransferByHash{
-		// EVM tx hashes are case-insensitive on-chain, but the hands-free watcher
-		// builds its ledger id from eth_getLogs' transactionHash (lowercase per the
-		// JSON-RPC spec). Lowercase the pasted hash here so the two flows produce
-		// the SAME "bsc:<id>" key — or one transfer could be credited once by the
-		// watcher and again by a case-different paste.
-		ID:        strings.ToLower(txhash),
-		Frm:       frm,
-		To:        seller,
-		Amount:    new(big.Rat).SetFrac(totalWei, pow10(TokenDecimals)),
-		Units:     weiToUnits(totalWei),
-		Block:     block,
-		TS:        ts,
-		Confirmed: confirmed,
-		Success:   success,
-	}, nil
 }

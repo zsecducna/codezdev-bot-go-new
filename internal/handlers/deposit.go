@@ -222,10 +222,10 @@ func (b *Bot) startDepositMethod(ctx context.Context, chatID int64, lang i18n.La
 // single guard against double-delivery: only the winner delivers (or, for a
 // __deposit__ order, credits the wallet). A payment that lands AFTER expiry
 // refunds to the wallet so confirmed money is never dropped. Returns
-// (settled, err); the USDT verify-by-hash path (usdt.go) uses err to decide
-// whether to release its own dedupe mark. Reuses deliverPaid (M2.2) for the
-// folder-stock delivery — no duplicate settle logic. NO wallet debit here:
-// the money arrived off-wallet (on-chain).
+// (settled, err); a caller that pre-deduped (e.g. MarkTxn before delivery) uses
+// err to decide whether to release its dedupe mark. Reuses deliverPaid (M2.2)
+// for the folder-stock delivery — no duplicate settle logic. NO wallet debit
+// here: the money arrived off-wallet (on-chain).
 func (b *Bot) settlePaid(ctx context.Context, des string) (bool, error) {
 	won, err := b.store.ClaimOrder(des, "reserved", "paid")
 	if err != nil {

@@ -192,12 +192,13 @@ func (b *Bot) sendPayScreen(ctx context.Context, chatID int64, des, note string)
 	if b.payEnabled("balance") {
 		rows = append(rows, btnRow(c.PayBtnBalance.T(lang), cbData("paybal", des)))
 	}
-	if b.payEnabled("bep20") && b.bep20Configured() {
-		rows = append(rows, styledBtnRow(c.PayBtnBEP20.T(lang), cbData("paybsc", des), "primary"))
-	}
-	if b.payEnabled("tron") && b.tronConfigured() {
-		rows = append(rows, styledBtnRow(c.PayBtnTRON.T(lang), cbData("paytrx", des), "danger"))
-	}
+	// Products are wallet-balance only. The on-chain USDT rails are for DEPOSITS
+	// (hands-free, credited by the watcher); a product is paid by spending an
+	// existing balance, not by pasting a tx hash. The paybsc:/paytrx: routes and
+	// the on-chain product-pay flow (cbPayOnchain) were removed for that reason —
+	// do NOT re-add product buttons that emit those callback keys: they have no
+	// handler and a tap is a silent no-op (or a confusing permission-denied for a
+	// admin-as-customer).
 	// Apply- or remove-code button (@10197-10206). The apply/remove handlers are
 	// M2.6; the button renders now so the pay screen matches the Python layout.
 	if o.Code != nil && *o.Code != "" {
