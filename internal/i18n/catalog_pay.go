@@ -145,11 +145,15 @@ func buildPayCatalog() PayCatalog {
 		},
 		// USDT_PAID_BTN (telegram_bot.py:1391).
 		USDTPaidBtn: Str{VI: "✅ Tôi đã thanh toán", EN: "✅ I have made the payment", ZH: "✅ 我已完成付款"},
-		// ENTER_TXID (telegram_bot.py:1393).
+		// ENTER_TXID (telegram_bot.py:1393). Sent on the "I've paid" tap. The
+		// hands-free watcher credits a deposit with NO tap and NO hash, so this no
+		// longer demands one — it reassures the customer that verification is
+		// automatic. The pending_txid capture stays armed, so a pasted hash is
+		// still accepted as a manual fallback (capTxid) if the credit is slow.
 		EnterTxid: Str{
-			VI: "🔎 Dán MÃ GIAO DỊCH (tx ID/hash) của giao dịch bạn vừa chuyển. Bot sẽ kiểm tra trên chuỗi.",
-			EN: "🔎 Paste the TRANSACTION ID (tx hash) of the transfer you just made. The bot will verify it on-chain.",
-			ZH: "🔎 请粘贴您刚刚转账的交易 ID（哈希）。机器人将在链上验证。",
+			VI: "✅ Đã nhận — bot tự động xác nhận khoản nạp ngay khi giao dịch xác nhận trên chuỗi, bạn không cần làm gì cả. Nếu sau vài phút chưa thấy cộng tiền, dán mã giao dịch (tx hash) tại đây để bot kiểm tra lại.",
+			EN: "✅ Got it — your deposit is verified automatically once it confirms on-chain, so there's nothing to paste. If it hasn't credited after a few minutes, paste the transaction hash here and I'll check it.",
+			ZH: "✅ 已收到——您的充值会在链上确认后自动核实，无需粘贴任何内容。如果几分钟后仍未到账，请在此粘贴交易哈希，我会重新核实。",
 		},
 		// TXID_CHECKING (telegram_bot.py:1399).
 		TxidChecking: Str{
