@@ -11,12 +11,12 @@ import "fmt"
 // hash on their own pay screen, so the order is NAMED, and MinGap only has to
 // stop a payment being claimed by a DIFFERENT session.
 //
-// This file answers the harder question the hands-free watcher will ask: "a
+// This file answers the harder question the hands-free watcher asks: "a
 // payment arrived and nobody told us whose it is — which live order, if any,
-// does this amount identify?". Nothing calls it in production yet; the watcher
-// is a later task. It is written and tested now because the RULE is what the
-// fee-forgiveness ruling actually decided, and getting it wrong later means
-// crediting the wrong customer.
+// does this amount identify?". It IS called in production: settleWatchedTransfer
+// calls MatchIncoming once per incoming transfer (usdtwatch.go). It is written
+// and tested separately because the RULE is what the fee-forgiveness ruling
+// actually decided, and getting it wrong means crediting the wrong customer.
 //
 // THE RULING (user amendment, 2026-08-11). Two payment shapes must both settle:
 //

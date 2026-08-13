@@ -761,3 +761,35 @@ func TestWatcherFetchFailureHoldsEveryBand(t *testing.T) {
 		t.Errorf("balance after the retry tick = %d VND, want 150250 — a transient fetch error lost the deposit", bal)
 	}
 }
+
+// TestWatcherSettlesWhatATruncatedWindowReturned pins the ONE load-bearing line
+// that makes a truncated TronGrid read non-fatal (usdtwatch.go: the fetch error
+// check skips ErrWindowTruncated). A window that came back short is PARTIAL, not
+// failed: the transfers that did arrive are real payments and must be settled.
+// Without this a bare `err != nil` would drop every settleable transfer on a
+// truncated tick, and no other test would go red — the tron-layer tests only
+// prove ErrWindowTruncated is RETURNED with rows, never that the watcher credits
+// them. Fail message names the line so the next reader finds it.
+func TestWatcherSettlesWhatATruncatedWindowReturned(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, _ := newUSDTBot(t)
+	w := installWatchFake(b)
+	const chat = 4709
+
+	b.Process(ctx, callbackUpdate(chat, "dep:trx"))
+	b.Process(ctx, textUpdate(chat, "6"))
+	o := reservedDeposit(t, st, chat)
+	res, _ := b.bands.Get(bands.ProviderTron, o.Des)
+
+	// A truncated window still RETURNS the rows it managed to read before the
+	// tail was cut, alongside the truncation error.
+	w.mu.Lock()
+	w.err = tron.ErrWindowTruncated
+	w.mu.Unlock()
+	w.set(*trxTx(hash64("f"), res.Amount, b.now().UnixMilli()))
+	b.tickOnchain(ctx, bands.ProviderTron)
+
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 150250 {
+		t.Errorf("balance after a truncated tick = %d VND, want 150250 — a truncated window was treated as fatal and dropped a settleable transfer", bal)
+	}
+}

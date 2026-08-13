@@ -7,6 +7,7 @@ import (
 	"log"
 	"math/big"
 	"strconv"
+	"time"
 
 	"codezdev-bot/internal/pay/bands"
 	"codezdev-bot/internal/pay/tron"
@@ -175,8 +176,31 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 		// only shrink the window to "until the next restart".
 		outcome := "credited nothing, quarantined"
 		detail := "recv=" + recvStr + " from=" + tx.Frm + " units=" + fmtInt(tx.Units)
-		if qwerr := b.store.MarkAmbiguousTxn(ledgerID, string(p), recvStr,
-			float64(b.now().UnixNano())/1e9); qwerr != nil {
+		// The quarantine row is the durable gate against the attribution-by-
+		// attrition this branch exists to prevent (see the comment above it). A
+		// TRANSIENT write failure leaves the transfer unprotected, and the next
+		// tick is exactly when the damage happens — so the write is retried a few
+		// times with a short backoff before we give up and fall through to the
+		// loud "protection did not take" record below.
+		//
+		// Bounded, not unbounded, and the bound is the point: under a PERSISTENT
+		// outage store.Credit cannot succeed either, so no credit lands while the
+		// DB is down. The only residual corner is "DB down for the whole ~2h a
+		// competing band takes to be swept, then recovers" — narrow enough to
+		// name here rather than hide, and wider than the per-tick re-fetch's 20s
+		// backstop can always cover under load.
+		var qwerr error
+		for attempt := 0; attempt < 3; attempt++ {
+			qwerr = b.store.MarkAmbiguousTxn(ledgerID, string(p), recvStr,
+				float64(b.now().UnixNano())/1e9)
+			if qwerr == nil {
+				break
+			}
+			if attempt < 2 {
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+		if qwerr != nil {
 			// Nothing was credited either way, so the money is not at risk right
 			// now — but the protection did not take, and a later tick may
 			// auto-credit this once the bands change. Loud, because that is a
