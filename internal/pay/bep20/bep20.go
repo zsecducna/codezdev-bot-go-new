@@ -362,6 +362,31 @@ func LatestBlock() (int64, error) {
 	return parseHexInt64(hexStr)
 }
 
+// BlockTimestamp returns the epoch-MILLISECOND timestamp of a BSC block, via
+// eth_getBlockByNumber. The hands-free watcher uses it for the freshness anchor
+// (settleWatchedTransfer compares a transfer's time against its band's start):
+// an eth_getLogs row carries no timestamp, and estimating one from the block
+// number is unsafe under variable block times, so the real timestamp is fetched
+// for each transfer that reaches the settle path. Mirrors the timestamp read
+// the hash-path already does (GetTransferToSellerByHashConf).
+func BlockTimestamp(block int64) (int64, error) {
+	raw, err := rpc("eth_getBlockByNumber", []any{fmt.Sprintf("0x%x", block), false})
+	if err != nil {
+		return 0, err
+	}
+	var hdr struct {
+		Timestamp string `json:"timestamp"`
+	}
+	if err := json.Unmarshal(raw, &hdr); err != nil {
+		return 0, fmt.Errorf("bep20: decode eth_getBlockByNumber: %w", err)
+	}
+	ts, err := parseHexInt64(hdr.Timestamp)
+	if err != nil {
+		return 0, err
+	}
+	return ts * 1000, nil // epoch seconds -> ms, the domain the freshness check uses
+}
+
 func parseHexInt64(s string) (int64, error) {
 	s = strings.TrimPrefix(s, "0x")
 	n, err := strconv.ParseInt(s, 16, 64)
@@ -670,7 +695,12 @@ func GetTransferToSellerByHashConf(seller, txhash string, minConf int) (*Transfe
 	}
 
 	return &TransferByHash{
-		ID:        txhash,
+		// EVM tx hashes are case-insensitive on-chain, but the hands-free watcher
+		// builds its ledger id from eth_getLogs' transactionHash (lowercase per the
+		// JSON-RPC spec). Lowercase the pasted hash here so the two flows produce
+		// the SAME "bsc:<id>" key — or one transfer could be credited once by the
+		// watcher and again by a case-different paste.
+		ID:        strings.ToLower(txhash),
 		Frm:       frm,
 		To:        seller,
 		Amount:    new(big.Rat).SetFrac(totalWei, pow10(TokenDecimals)),

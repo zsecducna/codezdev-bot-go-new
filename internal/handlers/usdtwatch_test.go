@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"codezdev-bot/internal/pay/bands"
+	"codezdev-bot/internal/pay/bep20"
 	"codezdev-bot/internal/pay/tron"
 	"codezdev-bot/internal/store"
 )
@@ -791,5 +792,189 @@ func TestWatcherSettlesWhatATruncatedWindowReturned(t *testing.T) {
 
 	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 150250 {
 		t.Errorf("balance after a truncated tick = %d VND, want 150250 — a truncated window was treated as fatal and dropped a settleable transfer", bal)
+	}
+}
+
+// ---- the BEP20 hands-free watcher ------------------------------------------
+
+// bep20WatchFake stands in for the BSC eth_getLogs read (bep20Incoming) and the
+// chain head (bep20Head) — the two seams tickBep20 reads. fetchCalls counts for
+// the same reason watchFake does: "no live deposits -> zero RPC" is a property
+// only a counter proves.
+type bep20WatchFake struct {
+	mu         sync.Mutex
+	transfers  []bep20.Transfer
+	head       int64
+	fetchErr   error
+	headErr    error
+	fetchCalls atomic.Int64
+}
+
+func (w *bep20WatchFake) fetch(fromBlock int64) ([]bep20.Transfer, error) {
+	w.fetchCalls.Add(1)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// Respect fromBlock: a too-recent fetch bound must drop a transfer here, or
+	// the suite cannot see the regression where the window slides past a
+	// promptly-paid deposit (the original CRITICAL finding on this watcher).
+	var out []bep20.Transfer
+	for _, tx := range w.transfers {
+		if tx.Block >= fromBlock {
+			out = append(out, tx)
+		}
+	}
+	return out, w.fetchErr
+}
+func (w *bep20WatchFake) set(txs ...bep20.Transfer) {
+	w.mu.Lock()
+	w.transfers = txs
+	w.mu.Unlock()
+}
+func (w *bep20WatchFake) headFn() (int64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.head, w.headErr
+}
+
+// installBep20WatchFake points the bot's two BEP20 chain seams at a fake and
+// pins minConf at 12 so the confirmation-depth gate is deterministic rather
+// than env-dependent.
+func installBep20WatchFake(b *Bot, head int64) *bep20WatchFake {
+	w := &bep20WatchFake{head: head}
+	b.bep20Incoming = w.fetch
+	b.bep20Head = w.headFn
+	// The freshness-anchor seam. Production fetches the REAL block timestamp via
+	// eth_getBlockByNumber; the fake simulates one at 3s/block from the current
+	// head, so freshness (transfer time vs band start, ±grace) runs on
+	// deterministic numbers instead of wall-clock.
+	b.bep20BlockTS = func(block int64) (int64, error) {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		depth := w.head - block
+		if depth < 0 {
+			depth = 0
+		}
+		return b.now().UnixMilli() - depth*3000, nil
+	}
+	b.bep20MinConf = 12
+	return w
+}
+
+// bep20InTx builds an incoming BEP20 transfer in the eth_getLogs shape (a block
+// number, no timestamp) carrying `units` amount-units at `block`, from a fixed
+// sender. Wei is units scaled from AmountDecimals (5) to TokenDecimals (18).
+func bep20InTx(id string, units, block int64) bep20.Transfer {
+	wei := new(big.Int).Mul(big.NewInt(units), pow10BigInt(bep20.TokenDecimals-bep20.AmountDecimals()))
+	return bep20.Transfer{ID: id, Frm: "0xfeed", Wei: wei, Units: units, Block: block}
+}
+
+// TestBep20WatcherCreditsConfirmedTransfer is the BEP20 feature in one test: a
+// customer opens a deposit, sends the quoted amount, and once the transfer is
+// buried under enough confirmations their balance moves WITHOUT a pasted hash.
+func TestBep20WatcherCreditsConfirmedTransfer(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, _ := newUSDTBot(t)
+	const chat = 4801
+
+	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
+	b.Process(ctx, textUpdate(chat, "6"))
+	o := reservedDeposit(t, st, chat)
+	units := bandUnits(t, b, bands.ProviderBEP20, o.Des)
+
+	const head = 10_000
+	w := installBep20WatchFake(b, head)
+	// 20 blocks deep — well past minConf (12) — for exactly the quoted units.
+	w.set(bep20InTx(hash64("a"), units, head-20))
+	b.tickBep20(ctx, bands.ProviderBEP20)
+
+	if w.fetchCalls.Load() != 1 {
+		t.Errorf("fetch called %d times, want 1 — one eth_getLogs serves every open BEP20 deposit", w.fetchCalls.Load())
+	}
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal <= 0 {
+		t.Errorf("balance = %d after a confirmed BEP20 transfer, want >0 — the deposit was not credited hands-free", bal)
+	}
+	done, _ := st.GetOrder(o.Des)
+	if done == nil || done.Status != "delivered" {
+		t.Errorf("deposit order status = %s, want delivered", orderStatus(done))
+	}
+	if _, still := b.bands.Get(bands.ProviderBEP20, o.Des); still {
+		t.Error("the settled deposit's band is still live — its amount can be re-quoted")
+	}
+}
+
+// TestBep20WatcherWaitsForConfirmations pins the one line that makes a BEP20
+// credit reorg-safe: a transfer shallower than minConf is NOT settled (it can
+// still vanish in a reorg, and a credit is irreversible). Once the head buries
+// it past minConf, the next tick credits it.
+func TestBep20WatcherWaitsForConfirmations(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, _ := newUSDTBot(t)
+	const chat = 4802
+
+	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
+	b.Process(ctx, textUpdate(chat, "6"))
+	o := reservedDeposit(t, st, chat)
+	units := bandUnits(t, b, bands.ProviderBEP20, o.Des)
+
+	w := installBep20WatchFake(b, 10_000) // b.bep20MinConf pinned to 12
+	// 11 blocks deep — ONE short of minConf. Must NOT settle.
+	w.set(bep20InTx(hash64("b"), units, 10_000-11))
+	b.tickBep20(ctx, bands.ProviderBEP20)
+
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 0 {
+		t.Errorf("balance = %d before minConf confirmations — an unconfirmed BEP20 transfer was credited (reorg risk)", bal)
+	}
+	if _, still := b.bands.Get(bands.ProviderBEP20, o.Des); !still {
+		t.Fatal("the band was released before confirmation depth — a reorg could lose the credit")
+	}
+	// The head advances to bury the transfer; the next tick credits it.
+	w.head = (10_000 - 11) + 12
+	b.tickBep20(ctx, bands.ProviderBEP20)
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal <= 0 {
+		t.Errorf("balance = %d after the transfer buried past minConf — should have credited on the later tick", bal)
+	}
+}
+
+// TestBep20WatcherRefusesATransferOlderThanItsBand pins the block->ms freshness
+// estimate: a confirmed transfer whose estimated timestamp predates the deposit
+// (a recycled amount's older payment) is refused, exactly as TRON's timestamp
+// freshness refuses it. The band is held, not released.
+func TestBep20WatcherRefusesATransferOlderThanItsBand(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, _ := newUSDTBot(t)
+	const chat = 4804
+
+	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
+	b.Process(ctx, textUpdate(chat, "6"))
+	o := reservedDeposit(t, st, chat)
+	units := bandUnits(t, b, bands.ProviderBEP20, o.Des)
+
+	const head = 10_000
+	w := installBep20WatchFake(b, head)
+	// 50 blocks deep: past minConf, but its block->ms estimate (now - 150s) is
+	// well before the deposit's start once the 120s verify grace is applied.
+	w.set(bep20InTx(hash64("d"), units, head-50))
+	b.tickBep20(ctx, bands.ProviderBEP20)
+
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 0 {
+		t.Errorf("balance = %d — a transfer older than the deposit was credited (recycled-amount risk)", bal)
+	}
+	if _, still := b.bands.Get(bands.ProviderBEP20, o.Des); !still {
+		t.Error("the band was released for a stale transfer")
+	}
+}
+
+// TestBep20WatcherSkipsFetchWhenNoLiveBands is the no-RPC property: a bot with
+// no open BEP20 deposits must not poll a public BSC endpoint on a timer. Only a
+// call counter can prove it — a balance assertion would pass just as happily on
+// a bot that polls forever with nobody depositing.
+func TestBep20WatcherSkipsFetchWhenNoLiveBands(t *testing.T) {
+	ctx := context.Background()
+	b, _, _, _, _ := newUSDTBot(t)
+	w := installBep20WatchFake(b, 10_000)
+	// No deposit opened -> no live band -> the tick must not even fetch.
+	b.tickBep20(ctx, bands.ProviderBEP20)
+	if got := w.fetchCalls.Load(); got != 0 {
+		t.Errorf("eth_getLogs called %d times with no open deposits — a quiet shop must not poll BSC", got)
 	}
 }

@@ -1379,6 +1379,23 @@ func (b *Bot) StartupRecovery(ctx context.Context) {
 				}
 			}
 		})
+		// The BEP20 hands-free watcher (usdtwatch.go), on its own goroutine so a
+		// slow BSC RPC tick cannot delay TRON settlement or vice versa. Same
+		// shape and the same ordering constraint as TRON's loop above: started
+		// AFTER rehydration, so a first tick sees bands reloaded from the
+		// persisted rows rather than an empty registry.
+		b.workers.Go(func(watchStop <-chan struct{}) {
+			for {
+				safeStep("usdt watch (bep20)", func() { b.tickBep20(ctx, bands.ProviderBEP20) })
+				select {
+				case <-watchStop:
+					return
+				case <-ctx.Done():
+					return
+				case <-time.After(b.usdtWatchInterval):
+				}
+			}
+		})
 		for {
 			// Python guards the sweep body too (@10021-10024) so one bad row can
 			// never stop the backstop that frees bands and expires stale orders.

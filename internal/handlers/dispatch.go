@@ -193,6 +193,37 @@ type Bot struct {
 	// it is the only way to assert that a bot with no open deposits makes ZERO
 	// RPC calls, which is a property of the watcher, not of the network.
 	tronTransfersSince func(minTSMS int64) ([]tron.Transfer, error)
+	// bep20Incoming is the block-range twin of tronTransfersSince: incoming
+	// USDT transfers to the seller address from a block bound onward — the
+	// hands-free watcher's one BEP20 chain read (usdtwatch.go). Same seam
+	// discipline: a test fakes the BSC node, and the no-open-deposits ->
+	// zero-RPC property is pinned by counting calls through this field.
+	bep20Incoming func(fromBlock int64) ([]bep20.Transfer, error)
+	// bep20Head is LatestBlock() behind a seam. A BEP20 credit is irreversible
+	// and BSC reorgs, so the watcher only settles a transfer once
+	// (head - block) >= minConf bury it; the block->timestamp freshness
+	// estimate reads head too. A fake holds the chain still so "not confirmed
+	// enough yet" is deterministic instead of wall-clock dependent.
+	bep20Head func() (int64, error)
+	// bep20MinConf is the resolved confirmation depth (BEP20_MIN_CONF), read
+	// through config (b.envInt) for the same reason the crediting rate is: the
+	// snapshot, not raw env, is what every other money path agrees on.
+	bep20MinConf int
+	// bep20WatchLookback is the BEP20 watcher's fetch window in BLOCKS: it reads
+	// [head-lookback, head] every tick. A FIXED trailing window (not a timestamp-
+	// derived offset), so it cannot slide past a promptly-paid transfer the way a
+	// block-time estimate would under variable block times. Must (a) exceed
+	// minConf with margin, (b) cover the pending grace at the fastest plausible
+	// block time, and (c) stay under the BSC node's eth_getLogs range cap.
+	// Default 5000 covers ~2h at 1.5s blocks and sits under the common
+	// 10000-block cap; tune via BEP20_WATCH_LOOKBACK_BLOCKS if the node caps lower.
+	bep20WatchLookback int64
+	// bep20BlockTS fetches a block's real epoch-ms timestamp behind a seam (so a
+	// test holds it still). The freshness anchor MUST be the actual block time,
+	// not a block-number->time estimate: BSC's block time varies ~1.5-3s, which
+	// makes an estimate unsafe in both directions (miss real payments or accept
+	// stale ones).
+	bep20BlockTS func(block int64) (int64, error)
 
 	// ---- login-code (OTP) suite (M2.6, otp.go) ------------------------------
 	//
@@ -481,6 +512,20 @@ func New(d Deps) *Bot {
 			b.envInt("TRON_PAGE_LIMIT", tron.DefaultPageLimit),
 			strings.TrimRight(b.cfg.EnvOr("TRON_API_BASE", tron.DefaultAPIBase), "/"))
 	}
+	// The BEP20 watcher's three chain reads (usdtwatch.go): incoming transfers
+	// from a block bound, the chain head for the confirmation-depth gate, and
+	// the resolved min-confirmations. The address is the config-layered value
+	// (bep20AddrStr, not bep20.Address) for the same task-#17 reason the deposit
+	// screen uses it: a /setbep20 rotation has to reach the watcher too, or a
+	// customer pays the address they were shown while the watcher polls a stale
+	// one and never sees the payment.
+	b.bep20Incoming = func(fromBlock int64) ([]bep20.Transfer, error) {
+		return bep20.GetIncomingTransfers(b.bep20AddrStr(), fromBlock, nil)
+	}
+	b.bep20Head = bep20.LatestBlock
+	b.bep20MinConf = b.envInt("BEP20_MIN_CONF", bep20.DefaultMinConfirmations)
+	b.bep20WatchLookback = int64(b.envInt("BEP20_WATCH_LOOKBACK_BLOCKS", 5000))
+	b.bep20BlockTS = bep20.BlockTimestamp
 	// The USD->VND rate is bridged the same way, and for the same reason —
 	// task #22, another instance of this port keeping a config reader while
 	// dropping the config source. These two converters value the amount a
