@@ -978,3 +978,77 @@ func TestBep20WatcherSkipsFetchWhenNoLiveBands(t *testing.T) {
 		t.Errorf("eth_getLogs called %d times with no open deposits — a quiet shop must not poll BSC", got)
 	}
 }
+
+// ---- Task 6: owner alerts for unattributable money -------------------------
+
+// TestWatcherAlertsOnceForUnmatchedTransfer pins Task 6's MatchNone path: a
+// real transfer matching no open deposit DMs the owner EXACTLY ONCE. MarkTxn
+// consumes the ledger id without crediting, so the second tick's TxnExists
+// prefilter skips it — no re-alert. (Only a counter on the fakeTG can prove
+// "exactly once"; a balance assertion would pass just as well on a bot that
+// re-alerted every tick.)
+func TestWatcherAlertsOnceForUnmatchedTransfer(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, _ := newUSDTBot(t)
+	w := installWatchFake(b)
+	const chat = 4720
+
+	b.Process(ctx, callbackUpdate(chat, "dep:trx"))
+	b.Process(ctx, textUpdate(chat, "6"))
+	reservedDeposit(t, st, chat) // a live band so the watcher fetches
+
+	// 7.00 USDT: matches no live band (the only band is ~6.01x), so MatchNone.
+	w.set(*trxTx(hash64("u"), "7.00", b.now().UnixMilli()))
+	b.tickOnchain(ctx, bands.ProviderTron)
+
+	if n := countContains(f, "Unmatched"); n != 1 {
+		t.Errorf("unmatched owner alerts after tick 1 = %d, want 1", n)
+	}
+	// Second tick over the SAME transfer must NOT re-alert (MarkTxn dedupe).
+	b.tickOnchain(ctx, bands.ProviderTron)
+	if n := countContains(f, "Unmatched"); n != 1 {
+		t.Errorf("unmatched owner alerts after tick 2 = %d, want 1 — not deduped", n)
+	}
+}
+
+// TestWatcherAlertsOnAmbiguousTransfer pins Task 6's MatchAmbiguous path: an
+// ambiguous payment (two live deposits could both claim it) DMs the owner once,
+// on top of the existing quarantine + audit. Reuses the ambiguity shape from
+// TestWatcherCreditsNothingWhenAmbiguous (a transfer short of the lower quote,
+// inside both fee allowances).
+func TestWatcherAlertsOnAmbiguousTransfer(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, _ := newUSDTBot(t)
+	w := installWatchFake(b)
+	const first, second = 4721, 4722
+
+	b.Process(ctx, callbackUpdate(first, "dep:trx"))
+	b.Process(ctx, textUpdate(first, "6"))
+	r1, _ := b.bands.Get(bands.ProviderTron, reservedDeposit(t, st, first).Des)
+	b.Process(ctx, callbackUpdate(second, "dep:trx"))
+	b.Process(ctx, textUpdate(second, "6"))
+	r2, _ := b.bands.Get(bands.ProviderTron, reservedDeposit(t, st, second).Des)
+	if r1.Amount == r2.Amount {
+		t.Fatalf("both deposits quoted %s — picker did not separate them", r1.Amount)
+	}
+	lowUnits, err := bands.AmountUnits(min(r1.Amount, r2.Amount), tron.AmountDecimals())
+	if err != nil {
+		t.Fatalf("amount units: %v", err)
+	}
+	shortUnits := lowUnits - 10_000 // -0.10 USDT: beyond tol, inside both fee allowances
+	if _, kind, merr := b.bands.MatchIncoming(bands.ProviderTron, shortUnits); merr != nil || kind != bands.MatchAmbiguous {
+		t.Fatalf("MatchIncoming(%d) = %s (%v), want ambiguous — test not exercising the branch it claims", shortUnits, kind, merr)
+	}
+	w.set(*trxTx(hash64("amb"), bands.FormatUnits(shortUnits, tron.AmountDecimals()), b.now().UnixMilli()))
+
+	b.tickOnchain(ctx, bands.ProviderTron)
+
+	if n := countContains(f, "Ambiguous"); n != 1 {
+		t.Errorf("ambiguous owner alerts = %d, want 1", n)
+	}
+	// Neither depositor was credited (the quarantine's job; re-pinned here so the
+	// alert test also defends the no-credit half of the branch).
+	if bal, _ := st.GetBalance(fmtInt(first)); bal != 0 {
+		t.Errorf("first depositor credited %d on an ambiguous payment", bal)
+	}
+}

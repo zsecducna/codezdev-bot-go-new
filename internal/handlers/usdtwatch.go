@@ -355,10 +355,35 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 		// ambiguity; only the outcome distinguishes the failed write.
 		// No chat id — no single customer owns an ambiguous payment.
 		b.auditWatch("", p, "ambiguous", ledgerID, outcome, detail)
+		// Task 6: raise the quarantine to the owners as a DM. The quarantine row
+		// + audit row are the durable record; this is the nudge so real money
+		// sitting unattributed does not wait on someone reading the audit. One DM
+		// per sighting is correct because this branch is only reached on the
+		// FIRST one — the AmbiguousTxnExists prefilter at the top returns on every
+		// later tick, so a repeat never gets this far.
+		b.notifyOwners(ctx, fmt.Sprintf(
+			"⚠️ Ambiguous %s deposit — %s USDT from %s (tx %s). Two or more open deposits match this amount; credited nothing, quarantined for manual attribution.",
+			ledgerPrefix(p), recvStr, wt.frm, wt.id))
 		return
 	default: // bands.MatchNone
-		// Routine and not an error: not every transfer to the shop's address is
-		// a deposit someone is waiting on.
+		// Task 6: a real transfer matching NO open deposit — a wrong-amount
+		// payment, a late transfer after its band was swept, or (rarely on a
+		// deposit-only address) an unrelated transfer. The watcher can't credit
+		// it, so the owner gets ONE nudge to attribute it by hand — which matters
+		// more once Task 7 removes the customer's paste-a-hash fallback. Deduped
+		// by MarkTxn: it consumes the ledger id WITHOUT crediting (its documented
+		// QR-purchase purpose), so the next tick's TxnExists prefilter skips it
+		// and this fires exactly once per transfer. NOT audited — MatchNone is
+		// routine noise in the audit view; the DM + the processed row are the
+		// record here. If this turns out noisy on a busy address, gate it behind
+		// an alert_unmatched setting rather than silencing it outright.
+		if isNew, merr := b.store.MarkTxn(ledgerID, "", 0); merr != nil {
+			log.Printf("usdt watch [%s]: mark_txn (unmatched dedupe) failed for %s: %v", p, ledgerID, merr)
+		} else if isNew {
+			b.notifyOwners(ctx, fmt.Sprintf(
+				"⚠️ Unmatched %s transfer — %s USDT from %s (tx %s). No open deposit matches; needs manual attribution.",
+				ledgerPrefix(p), recvStr, wt.frm, wt.id))
+		}
 		return
 	}
 
