@@ -362,7 +362,7 @@ func (b *Bot) capTier(c *Ctx) bool {
 	// Task #13 Tier 3: capture the prior price (if any) BEFORE it is
 	// overwritten — "" when the tier never existed, so auditOldNew renders
 	// "(unset) -> <price>" rather than a misleading blank price.
-	oldVnd, hadOld := b.stock.ProductPrice(product, code)
+	oldMicro, hadOld := b.stock.ProductPrice(product, code)
 	existed, err := b.stock.SetProductPrice(product, code, int(micro))
 	if err != nil {
 		b.send(c.Ctx, c.ChatID, "❌ Failed to write price: "+err.Error(), admNav("admcat:pricing"))
@@ -374,7 +374,7 @@ func (b *Bot) capTier(c *Ctx) bool {
 	// settings.json key, since this writes a price file (spec §2 Tier 3).
 	oldStr := ""
 	if hadOld {
-		oldStr = b.usdtDisp(int64(oldVnd))
+		oldStr = b.usdtDisp(int64(oldMicro))
 	}
 	b.auditConfigSet(fmtInt(c.ChatID), "config_set_product_price", product+"/"+code, oldStr, b.usdtDisp(micro))
 	verb := "Added"
@@ -412,14 +412,14 @@ func (b *Bot) capPrice(c *Ctx) bool {
 	// Task #13 Tier 3: same before/after capture as capTier above — this is
 	// the SAME underlying stock.SetProductPrice mutation, reached via the
 	// edit-existing-tier wizard (pricetier:) instead of add-new (tieradd:).
-	oldVnd, hadOld := b.stock.ProductPrice(armed.Product, armed.Code)
+	oldMicro, hadOld := b.stock.ProductPrice(armed.Product, armed.Code)
 	if _, err := b.stock.SetProductPrice(armed.Product, armed.Code, int(micro)); err != nil {
 		b.send(c.Ctx, c.ChatID, "❌ Failed to write price: "+err.Error(), admNav("admcat:pricing"))
 		return true
 	}
 	oldStr := ""
 	if hadOld {
-		oldStr = b.usdtDisp(int64(oldVnd))
+		oldStr = b.usdtDisp(int64(oldMicro))
 	}
 	b.auditConfigSet(fmtInt(c.ChatID), "config_set_product_price", armed.Product+"/"+armed.Code, oldStr, b.usdtDisp(micro))
 	b.send(c.Ctx, c.ChatID,

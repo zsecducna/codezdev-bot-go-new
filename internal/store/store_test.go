@@ -92,6 +92,31 @@ func TestCheckMicroLedgerWrongUnitRefuses(t *testing.T) {
 	}
 }
 
+// TestCheckMicroLedgerMetaPresentRowMissingRefusesOnMoney: the M1
+// partial-restore window — meta table present but the ledger_unit ROW absent
+// (a partial restore kept the table + dropped the row), AND money rows present.
+// This must NOT self-mark micro (that would read the leftover VND rows as micro
+// ~40x); it refuses like the no-meta un-migrated case. Locks the !ok branch so
+// a future "simplification" can't drop the money-row check there.
+func TestCheckMicroLedgerMetaPresentRowMissingRefusesOnMoney(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnsureMicroLedger(); err != nil {
+		t.Fatalf("EnsureMicroLedger: %v", err)
+	}
+	if _, err := s.db.Exec("DELETE FROM meta WHERE key='ledger_unit'"); err != nil {
+		t.Fatalf("delete ledger_unit row: %v", err)
+	}
+	if _, _, err := s.Credit("999", 2_500_000, "TXN-legacy"); err != nil {
+		t.Fatalf("seed credit: %v", err)
+	}
+	if err := s.CheckMicroLedger(); !errors.Is(err, ErrUnmigratedVNDLedger) {
+		t.Fatalf("CheckMicroLedger (meta present, ledger_unit row missing, money rows) = %v, want ErrUnmigratedVNDLedger", err)
+	}
+	if _, ok := s.LedgerUnit(); ok {
+		t.Errorf("LedgerUnit after refusal = ok=true, want no marker written")
+	}
+}
+
 // TestEnsureMicroLedgerIsIdempotent: re-running EnsureMicroLedger must not
 // clobber an existing marker (INSERT OR IGNORE), so a bot that boots, then a
 // second boot, never flips the recorded unit.
