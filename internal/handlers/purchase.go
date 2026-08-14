@@ -181,7 +181,7 @@ func (b *Bot) sendPayScreen(ctx context.Context, chatID int64, des, note string)
 	if isAPIKey {
 		// SKU-correct undiscounted base for the discount % line: a kiro order's
 		// list price is the KIRO rate (recharges inherit the target key's class).
-		base = b.apikeyPriceVND(qty, b.orderSaleClass(o))
+		base = b.apikeyPriceMicro(qty, b.orderSaleClass(o))
 	}
 	pct := 0
 	if base > 0 {

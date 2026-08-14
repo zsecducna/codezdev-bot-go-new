@@ -128,6 +128,31 @@ func main() {
 	}
 	defer st.Close()
 
+	// Micro-USDT ledger-unit boot guard. Stored money flipped from VND to
+	// micro-USDT; an un-migrated VND store.db would be read as micro and every
+	// amount mis-priced by ~40x. CheckMicroLedger refuses to boot against an
+	// un-migrated DB (money rows present, no migration marker), self-marks a
+	// fresh empty DB, and boots only when meta.ledger_unit == "micro_usdt".
+	// The migrate-usdt tool writes that marker for a migrated DB.
+	if err := st.CheckMicroLedger(); err != nil {
+		log.Fatalf("ledger unit check failed: %v", err)
+	}
+
+	// Price-file boot guard — the on-disk twin of CheckMicroLedger above. The
+	// DB money columns flipped to micro-USDT, and so did the SECOND money store
+	// the DB migration missed: the per-product tier price files under ./accounts
+	// (price_<CODE>_USDT, read/written by internal/stock/catalog.go and charged
+	// verbatim by purchase.go). A price file still holding a VND-scale value
+	// (still named price_<CODE>_VND, never converted by migrate-prices) would
+	// be read as micro and undercharge every folder product ~40x at cutover.
+	// This refuses to boot naming one such file + the migrate-prices command,
+	// rather than silently mis-pricing stock. Runs once, before any sale can
+	// happen. The accounts path is the const above; reconfigure there if the
+	// data root ever moves.
+	if err := stock.CheckVndPriceFiles(accountsDir); err != nil {
+		log.Fatalf("price file check failed: %v", err)
+	}
+
 	// Customer refund-REQUEST store (Go port of /Users/z/Desktop/Kiro/refund_store.py,
 	// M2.6). This is a SEPARATE handle on the SAME store.db file — refund.Store
 	// owns its own `refund_requests` table, not a second database — so it opens

@@ -39,8 +39,11 @@ func newBuyBot(t *testing.T, adminID string) (*Bot, *fakeTG, *store.Store, *stoc
 }
 
 // seedProduct writes a product folder with `n` active password accounts and a
-// KBH (no-warranty) price file.
-func seedProduct(t *testing.T, dir, name string, priceVND, n int) {
+// KBH (no-warranty) price file. priceMicro is the unit price in MICRO-USDT
+// (the same unit ProductPrice reads since the VND->micro flip); the tests use
+// it as a token amount asserted arithmetically (total = unit x qty), so its
+// real-world magnitude does not matter.
+func seedProduct(t *testing.T, dir, name string, priceMicro, n int) {
 	t.Helper()
 	active := filepath.Join(dir, "accounts", name, "active")
 	if err := os.MkdirAll(active, 0o755); err != nil {
@@ -53,8 +56,8 @@ func seedProduct(t *testing.T, dir, name string, priceVND, n int) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(dir, "accounts", name, "price_KBH_VND"),
-		[]byte(strconv.Itoa(priceVND)), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "accounts", name, "price_KBH_USDT"),
+		[]byte(strconv.Itoa(priceMicro)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }

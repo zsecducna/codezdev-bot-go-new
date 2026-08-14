@@ -20,14 +20,12 @@ package handlers
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"math"
 	"strconv"
 	"strings"
 	"time"
 
-	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/kirogo"
 	"codezdev-bot/internal/store"
@@ -263,67 +261,37 @@ func commaFloat1(f float64) string {
 	return out
 }
 
-// usdtStrCfg is usdtDisp's exact arithmetic (money.go:19-31) minus the
-// " USDT" suffix and the "— USDT" fallback: a bare 2-decimal USDT string for
-// a VND amount, or "" on an unset/invalid rate. It reads the rate through
-// b.cfg.USDToVND() — settings.json's admin-set usd_to_vnd overriding .env,
-// else the compiled default — the SAME layered source the "Price: X / 100
-// credits" line above the opus estimate uses.
-//
-// Historical note (accurate as of the USDT-only migration, 2026-08-06):
-// before that migration this was deliberately NOT usdtStr (usdt.go), which
-// went through paypal.VndToUSD and read os.LookupEnv("USD_TO_VND") — raw
-// process env only, invisible to an admin's settings.json rate change. The
-// SePay/PayPal/Binance removal deleted that split: usdt.go's usdtStr now
-// routes through its own vndToUSD helper, which reads the SAME cfg.USDToVND()
-// config chain this function does. The two helpers are kept separate rather
-// than merged into one shared function because usdt.go's vndToUSD is itself
-// scaffolding slated for deletion in migration slice S5 — this function is
-// not.
-func (b *Bot) usdtStrCfg(vnd int64) string {
-	rateStr := config.DefaultUSDToVND
-	if b.cfg != nil {
-		rateStr = b.cfg.USDToVND()
-	}
-	rate, err := strconv.ParseFloat(rateStr, 64)
-	if err != nil || rate <= 0 {
-		return ""
-	}
-	usd := float64(vnd) / rate
-	// Python: cents = int(usd*100) + (1 if (usd*100) % 1 else 0) -> ceil to
-	// cent (mirrors usdtDisp's own rounding, money.go:29-31).
-	cents := math.Ceil(usd*100 - 1e-9)
-	return fmt.Sprintf("%.2f", cents/100)
-}
+// usdtStrCfg has been removed: the cent-rounded USDT quote it computed from a
+// VND amount via the USD→VND rate is now exactly what usdtStr (usdt.go) returns
+// for a micro-USDT amount. Its single caller (apikeyOpusEst) routes through
+// usdtStr directly — see that function's doc comment.
 
 // apikeyOpusEst is the rendered Opus-5 token-value estimate for a BEDROCK
 // price of 100 credits — _apikey_opus_est (Kiro commit 3069329). Pure over
-// its (vndPer100, lang) inputs on purpose (VND in, string out — no chat_id
-// read directly) so the arithmetic and its failure paths are directly
-// testable; it still depends on the live config rate exactly as the Python
-// original depends on its process env USD_TO_VND. Given R = the USDT price
-// of 100 credits and T = apikeyOpusTokensPer100():
+// its (microPer100, lang) inputs on purpose (micro-USDT in, string out — no
+// chat_id read directly) so the arithmetic and its failure paths are directly
+// testable. Given R = the USDT price of 100 credits and T =
+// apikeyOpusTokensPer100():
 //
 //	tokens per 1 USDT   = T / R
 //	USDT per 1M tokens  = R / (T / 1e6)
 //
 // Returns "" — NOT a zero or a placeholder number — whenever the estimate
-// can't be trusted: no price, or the config USD_TO_VND rate unset/invalid
-// (usdtStrCfg swallows that into ""). An empty block simply drops the lines
-// from the screen (i18n.F leaves an absent {opus} substitution as an empty
-// string), which is the correct behaviour for a number we can't stand
-// behind; a bogus "0 tokens per USDT" on a purchase screen would be worse
-// than silence.
-func (b *Bot) apikeyOpusEst(vndPer100 int64, lang i18n.Lang) string {
+// can't be trusted: no price, or a price the tokens-per-USDT math rejects.
+// An empty block simply drops the lines from the screen (i18n.F leaves an
+// absent {opus} substitution as an empty string), which is the correct
+// behaviour for a number we can't stand behind; a bogus "0 tokens per USDT"
+// on a purchase screen would be worse than silence.
+func (b *Bot) apikeyOpusEst(microPer100 int64, lang i18n.Lang) string {
 	tokensPer100 := b.apikeyOpusTokensPer100()
-	if vndPer100 <= 0 || tokensPer100 <= 0 {
+	if microPer100 <= 0 || tokensPer100 <= 0 {
 		return ""
 	}
-	// usdtStrCfg returns "" (not "0") when the config rate is unset/invalid;
-	// ParseFloat then errors on that empty string, which the rate<=0 check
-	// below turns into an empty block — same net effect as Python's
-	// `float(usdt_str(vnd) or 0)` + `if rate <= 0`.
-	rate, err := strconv.ParseFloat(b.usdtStrCfg(vndPer100), 64)
+	// usdtStr renders the cent-rounded USDT price of 100 credits from the
+	// stored micro amount. It never returns "" (micro is always valid), so the
+	// rate<=0 guard below only fires on a genuinely non-positive price — same
+	// net effect as Python's `float(usdt_str(vnd) or 0)` + `if rate <= 0`.
+	rate, err := strconv.ParseFloat(b.usdtStr(microPer100), 64)
 	if err != nil || rate <= 0 {
 		return ""
 	}
@@ -465,15 +433,15 @@ func (b *Bot) apikeyForSale(saleClass string) bool {
 	return b.apikeyRateUSDT(saleClassBedrock) > 0 && b.kiroGoConfigured()
 }
 
-// apikeyPriceVND is the VND total for `credits` at the SKU's admin
+// apikeyPriceMicro is the micro-USDT total for `credits` at the SKU's admin
 // USDT-per-100 rate — apikey_price_vnd (telegram_bot.py:6218-6226). 0 means
-// "not for sale" (rate or USD→VND conversion unset/bad).
-func (b *Bot) apikeyPriceVND(credits int64, saleClass string) int64 {
+// "not for sale" (rate unset/invalid or non-positive credits).
+func (b *Bot) apikeyPriceMicro(credits int64, saleClass string) int64 {
 	rate := b.apikeyRateUSDT(saleClass)
 	if rate <= 0 || credits <= 0 {
 		return 0
 	}
-	return b.usdtToVND(float64(credits) * rate / 100.0)
+	return b.usdtToMicro(float64(credits) * rate / 100.0)
 }
 
 // apikeyCodedTotal is (total, effectivePct, volumePct) for an API-key-family
@@ -499,7 +467,7 @@ func (b *Bot) apikeyPriceFor(chatID int64, credits int64, saleClass string) int6
 // apikeyRateDisp is the ADVERTISED (undiscounted) per-100-credits price string
 // — apikey_rate_disp (telegram_bot.py:6229-6234). Buy-menu / general display.
 func (b *Bot) apikeyRateDisp(saleClass string) string {
-	return b.usdtDisp(b.apikeyPriceVND(100, saleClass))
+	return b.usdtDisp(b.apikeyPriceMicro(100, saleClass))
 }
 
 // apikeyRateDispFor is the per-100-credits price for THIS buyer (reseller-

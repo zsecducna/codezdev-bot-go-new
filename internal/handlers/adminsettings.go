@@ -439,85 +439,6 @@ func (b *Bot) capSetMaxQty(c *Ctx) bool {
 	return true
 }
 
-// ---- adm:setrate (button + "setrate" capture) ------------------------------
-
-// rateMin / rateMax mirror RATE_MIN, RATE_MAX (telegram_bot.py:5282).
-//
-// DUPLICATED, deliberately: config.RateMin / config.RateMax (internal/config/
-// settings.go) hold the same two numbers and apply the same bound when READING
-// a hand-edited settings.json, so a rate this wizard could never have written
-// can never be used either. internal/handlers imports internal/config, so the
-// reverse import would cycle — hence two copies rather than one. **If this
-// range ever changes, change it there too**; that side carries the matching
-// pointer back here.
-const (
-	rateMin = 1000
-	rateMax = 200000
-)
-
-// cbSetRate arms the USD→VND rate wizard — telegram_bot.py:13953. Super-admin
-// only.
-func (b *Bot) cbSetRate(cc *cbCtx) {
-	if !b.settingsSuperAdminOnly(cc) {
-		return
-	}
-	cc.st.mu.Lock()
-	cc.st.SetRate = true
-	cc.st.mu.Unlock()
-	text := "💱 Current USD→VND rate: " + b.rateStr() + "\nSend the new rate (VND per 1 USD), e.g. 23000:"
-	b.send(cc.Ctx, cc.ChatID, text, backKB("admcat:settings"))
-}
-
-// capSetRate is the "setrate" capture (#10, POP semantics —
-// telegram_bot.py:18321). An out-of-range or non-numeric value requires a
-// retap to retry.
-func (b *Bot) capSetRate(c *Ctx) bool {
-	c.st.mu.Lock()
-	armed := c.st.SetRate
-	c.st.SetRate = false
-	c.st.mu.Unlock()
-	if !armed {
-		return false
-	}
-	if strings.HasPrefix(c.Text, "/") || labelToCmd(c.Text) != "" {
-		return false
-	}
-	raw := stripThousandsSeps(c.Text)
-	n, err := strconv.Atoi(raw)
-	if !isAllDigits(raw) || err != nil || n < rateMin || n > rateMax {
-		b.send(c.Ctx, c.ChatID,
-			"⚠️ Enter a whole number between "+commaInt(rateMin)+" and "+commaInt(rateMax)+" (VND per 1 USD), e.g. 23000.",
-			admNavRetry("admcat:settings", "💱 Set rate", "adm:setrate"))
-		return true
-	}
-	// H1 fix: a nil cfg or a failed SaveSettings must stop here with an
-	// explicit failure reply — never fall through to the ✅ success text.
-	if b.cfg == nil {
-		b.send(c.Ctx, c.ChatID, settingsNotConfigured, admNav("admcat:settings"))
-		return true
-	}
-	s := b.cfg.Settings()
-	s["usd_to_vnd"] = n
-	if err := b.cfg.SaveSettings(s); err != nil {
-		log.Println("adminsettings: save failed:", err)
-		b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:settings"))
-		return true
-	}
-	// Residual fix (Opus review of commit 11e033d): this used to say "New
-	// orders price PayPal/Binance at this rate" — both rails are gone (the
-	// USDT migration removed SePay+PayPal in this commit; Binance was cut
-	// earlier). Today the rate feeds vndToUSD (usdt.go), which prices every
-	// BEP20/TRON quote and every VND-denominated display conversion
-	// (money.go, adminpricing.go, apikey.go, deposit.go) — not any specific
-	// payment rail. The whole rate feature is slated to die in the USDT
-	// migration's S5 once the ledger moves to micro-USDT; until then this
-	// text must describe what the rate actually does today.
-	b.send(c.Ctx, c.ChatID,
-		"✅ USD→VND rate set to "+commaInt(n)+". New orders and USDT quotes price at this rate.",
-		admNav("admcat:settings"))
-	return true
-}
-
 // ---- adm:setkirourl (button + "setkirourl" capture) ------------------------
 
 // kiroURLRE mirrors r"https?://[^\s/]+\S*" fullmatch (telegram_bot.py:18543):
@@ -1523,7 +1444,6 @@ func (b *Bot) runBroadcast(ctx context.Context, ids []string, msg, photo string)
 // CanonicalCaptureOrder (handlers-go.md §7 / go_structure.md §2).
 func (b *Bot) registerAdminSettings() {
 	b.insertCapturesBefore("code",
-		stage{name: "setrate", fn: (*Bot).capSetRate},
 		stage{name: "setkirourl", fn: (*Bot).capSetKiroURL},
 		stage{name: "setkirokey", fn: (*Bot).capSetKiroKey},
 		stage{name: "setkiroacct", fn: (*Bot).capSetKiroAcct},

@@ -91,37 +91,25 @@ func newUSDTBotAtRate(t *testing.T, usdToVND string) (*Bot, *fakeTG, *store.Stor
 	return b, f, st, dir, &usdtFakes{}
 }
 
-// TestUSDToVNDTrimPropagatesToOtherRateConsumers is the follow-up to task
-// #25's whitespace-padded-ambient-rate fix. The original fix trimmed at two
-// call sites (money.go's usdtDisp, usdt.go's vndToUSD); a review swept every
-// ParseFloat(cfg.USDToVND()) call site in the handlers package and found
-// THREE more that read the exact same un-trimmed rate — deposit.go's
-// usdtToVND, apikey.go's usdtStrCfg, and adminpricing.go's adminUsdtToVnd.
-// Two of those three are FUNCTIONAL rejections, not cosmetic: a padded rate
-// used to make usdtToVND return 0, which fails capDeposit's >0 bound and
-// refuses the customer's deposit outright, and made adminUsdtToVnd return
-// (0,false), refusing an admin's typed price outright.
-//
-// The fix moved to the STRUCTURAL source instead of a fourth/fifth call-site
-// trim: config.USDToVND() (internal/config/settings.go) now trims once,
-// where the env-derived and settings.json-derived branches converge, so
-// every current AND future ParseFloat(cfg.USDToVND()) caller is correct by
-// construction rather than by each remembering to trim. This test verifies
-// — not assumes — that the source fix actually reaches all three other
-// consumers (adminpricing.go belongs to a different lane; this only CALLS
-// its existing method to verify behavior, it does not modify that file).
-func TestUSDToVNDTrimPropagatesToOtherRateConsumers(t *testing.T) {
-	t.Setenv("USD_TO_VND", " 25000 ")
+// TestMicroConvertersAreRateFree pins that the USDT<->micro converters no
+// longer depend on an exchange rate at all (the micro-USDT ledger has none).
+// The predecessor (TestUSDToVNDTrimPropagatesToOtherRateConsumers) existed to
+// prove a whitespace-padded USD_TO_VND reached every ParseFloat caller trimmed;
+// with the rate gone there is nothing to trim, and these three converters are
+// pure arithmetic over the input. An ambient USD_TO_VND env is set only to
+// prove it is now a no-op for them — they ignore it entirely.
+func TestMicroConvertersAreRateFree(t *testing.T) {
+	t.Setenv("USD_TO_VND", " 25000 ") // legacy/harmless: no converter reads it now
 	b, _, _, _, _ := newBuyBot(t, "999")
 
-	if got := b.usdtToVND(6); got != 150000 {
-		t.Errorf("deposit.go usdtToVND(6) = %d, want 150000 (6 USDT at the padded-but-trimmed 25,000) — 0 means the rate is still un-trimmed and a real deposit would be REJECTED OUTRIGHT", got)
+	if got := b.usdtToMicro(6); got != 6_000_000 {
+		t.Errorf("deposit.go usdtToMicro(6) = %d, want 6,000,000 (6 USDT * 1e6, rate-independent)", got)
 	}
-	if got := b.usdtStrCfg(150000); got != "6.00" {
-		t.Errorf("apikey.go usdtStrCfg(150000) = %q, want %q — empty means the rate is still un-trimmed", got, "6.00")
+	if got := b.usdtStr(6_000_000); got != "6.00" {
+		t.Errorf("usdt.go usdtStr(6_000_000) = %q, want %q (micro->2dp, rate-independent)", got, "6.00")
 	}
-	if vnd, ok := b.adminUsdtToVnd("6"); !ok || vnd != 150000 {
-		t.Errorf("adminpricing.go adminUsdtToVnd(\"6\") = (%d,%t), want (150000,true) — (0,false) means the rate is still un-trimmed and a real admin price edit would be REJECTED OUTRIGHT", vnd, ok)
+	if micro, ok := b.adminUsdtToMicro("6"); !ok || micro != 6_000_000 {
+		t.Errorf("adminpricing.go adminUsdtToMicro(\"6\") = (%d,%t), want (6_000_000,true) — rate-independent scaling", micro, ok)
 	}
 }
 
@@ -257,7 +245,7 @@ func reserveOrderBand(t *testing.T, b *Bot, p bands.Provider, chat int64, des st
 // one incoming payment can never fall inside both bands.
 func TestUSDTSharedBandAcrossRails(t *testing.T) {
 	b, _, st, _, _ := newUSDTBot(t)
-	const total = 150000 // 6.00 USDT at 25,000 VND/USDT
+	const total = 6_000_000 // 6.00 USDT (micro: 1 USDT = 1,000,000)
 
 	desB := usdtOrder(t, st, 102, total)
 	desC := usdtOrder(t, st, 103, total)
@@ -288,7 +276,7 @@ func TestUSDTSharedBandAcrossRails(t *testing.T) {
 func TestUSDTBandExhaustedShowsBusy(t *testing.T) {
 	ctx := context.Background()
 	b, f, st, _, _ := newUSDTBot(t)
-	const total = 150000 // 6.00 USDT
+	const total = 6_000_000 // 6.00 USDT (micro)
 
 	// Fill every slot from DISTINCT chats (product-order bands, allowDownward),
 	// so the own-dead-session rule (which only forgives a chat's OWN expired
@@ -331,7 +319,7 @@ func TestUSDTBandExhaustedShowsBusy(t *testing.T) {
 // them. Four dead sessions of one chat held every upward slot in production.
 func TestUSDTPickerExcludesOwnDeadSessions(t *testing.T) {
 	b, _, st, _, _ := newUSDTBot(t)
-	const total = 150000
+	const total = 6_000_000 // 6.00 USDT (micro)
 	const chat = 300
 
 	// Four DEAD sessions owned by this chat (deadline already passed).
@@ -369,12 +357,12 @@ func TestUSDTDepositCreditBoundaries(t *testing.T) {
 	cases := []struct {
 		name       string
 		recv       string // USDT actually received
-		wantCredit int64  // VND credited
+		wantCredit int64  // micro-USDT credited (1 USDT = 1,000,000 micro)
 	}{
-		{"exact to the last decimal credits actual", "6.01000", 150250},
-		{"inside tolerance under credits actual", "6.00960", 150240},
-		{"shortfall credits actual", "6.00940", 150235},
-		{"inside tolerance over credits actual", "6.01040", 150260},
+		{"exact to the last decimal credits actual", "6.01000", 6_010_000},
+		{"inside tolerance under credits actual", "6.00960", 6_009_600},
+		{"shortfall credits actual", "6.00940", 6_009_400},
+		{"inside tolerance over credits actual", "6.01040", 6_010_400},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -382,7 +370,7 @@ func TestUSDTDepositCreditBoundaries(t *testing.T) {
 			b, _, st, _, _ := newUSDTBot(t)
 			chat := int64(450 + i)
 
-			// dep:trx -> amount prompt -> "6" (== 150,000 VND at 25,000/USDT).
+			// dep:trx -> amount prompt -> "6" (== 6,000,000 micro; 6 USDT desired).
 			b.Process(ctx, callbackUpdate(chat, "dep:trx"))
 			b.Process(ctx, textUpdate(chat, "6"))
 
@@ -400,7 +388,7 @@ func TestUSDTDepositCreditBoundaries(t *testing.T) {
 
 			bal, _ := st.GetBalance(fmtInt(chat))
 			if bal != tc.wantCredit {
-				t.Errorf("credited %d VND, want %d", bal, tc.wantCredit)
+				t.Errorf("credited %d micro, want %d", bal, tc.wantCredit)
 			}
 			// The deposit order is closed (history/revenue) but NOTHING delivered.
 			done, _ := st.GetOrder(o.Des)
@@ -411,13 +399,13 @@ func TestUSDTDepositCreditBoundaries(t *testing.T) {
 	}
 }
 
-// TestUSDTDepositAuditRowIsWellFormedAtHealthyRate pins the on-chain settle
-// audit row ("usdt_"+chain+"_deposit", written by settleUSDTMatch) at a healthy
-// rate: the row's Outcome must be the ordinary signed "+X.XX USDT" figure, not
-// the raw-VND fallback auditAmount produces on an unusable rate. Driven through
-// the hands-free watcher's per-transfer settle path (the now-sole credit route),
-// crediting the exact quoted amount so the credited VND is the converted received
-// value (the jitter puts it just above the requested total).
+// TestUSDTDepositAuditRowIsWellFormed pins the on-chain settle audit row
+// ("usdt_"+chain+"_deposit", written by settleUSDTMatch): the row's Outcome must
+// be the ordinary signed "+X.XX USDT" figure rendered by auditAmount, never a
+// bare sign+unit. Driven through the hands-free watcher's per-transfer settle
+// path (the now-sole credit route), crediting the exact quoted amount so the
+// credited value is the converted received value (the jitter puts it just above
+// the requested total).
 func TestUSDTDepositAuditRowIsWellFormedAtHealthyRate(t *testing.T) {
 	ctx := context.Background()
 	b, _, st, _, _ := newUSDTBot(t)
@@ -429,19 +417,19 @@ func TestUSDTDepositAuditRowIsWellFormedAtHealthyRate(t *testing.T) {
 	}
 
 	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
-	b.Process(ctx, textUpdate(chat, "6")) // 6 USDT desired == 150,000 VND @25,000
+	b.Process(ctx, textUpdate(chat, "6")) // 6 USDT desired == 6,000,000 micro
 	o := reservedDeposit(t, st, chat)
 	bandRes, _ := b.bands.Get(bands.ProviderBEP20, o.Des)
 	// Credit the EXACT quoted amount through the watcher's settle path — an
-	// exact match credits the converted received value (6.01000 USDT -> 150250
-	// VND at the healthy 25,000), so the audit row's Outcome is the ordinary
-	// signed USDT figure rendered by auditAmount, not the raw-VND fallback.
+	// exact match credits the converted received value (6.01000 USDT ->
+	// 6,010,000 micro), so the audit row's Outcome is the ordinary signed
+	// USDT figure rendered by auditAmount.
 	prm, _ := b.bands.Params(bands.ProviderBEP20)
 	b.settleWatchedTransfer(ctx, bands.ProviderBEP20, prm, watchedIn(t, chainBSC, bandRes.Amount, b))
 
 	bal, _ := st.GetBalance(fmtInt(chat))
-	if bal != 150250 {
-		t.Fatalf("fixture broken: credited %d VND, want 150250 (6.01000 USDT at the healthy 25,000)", bal)
+	if bal != 6_010_000 {
+		t.Fatalf("fixture broken: credited %d micro, want 6,010,000 (6.01000 USDT)", bal)
 	}
 
 	after, err := st.RecentAudit(50, "")
@@ -514,7 +502,7 @@ func providerFor(t *testing.T, chain string) bands.Provider {
 // or a token that stops substituting in one language, both fail here.
 func TestPayScreenWarnsAboutFeesInEveryLanguage(t *testing.T) {
 	ctx := context.Background()
-	const vnd = 3000000 // 120.00 USDT at 25,000 VND/USDT
+	const vnd = 120_000_000 // 120.00 USDT (micro: 1 USDT = 1,000,000)
 
 	// Per-language markers for the two required statements, plus the
 	// five-decimal claim. Chosen from the catalog copy itself so a translation
@@ -580,7 +568,7 @@ func TestPayScreenWarnsAboutFeesInEveryLanguage(t *testing.T) {
 func TestDepositAmountsAreUnique(t *testing.T) {
 	b, f, st, _, _ := newUSDTBot(t)
 	ctx := context.Background()
-	const total = 3000000 // 120.00 USDT at 25,000 VND/USDT
+	const total = 120_000_000 // 120.00 USDT (micro: 1 USDT = 1,000,000)
 	b.startOnchainDeposit(ctx, 111, i18n.EN, total, chainTRX)
 	b.startOnchainDeposit(ctx, 222, i18n.EN, total, chainTRX)
 
@@ -638,7 +626,7 @@ func TestDepositAmountsAreUnique(t *testing.T) {
 func TestDepositNeverQuotedBelowBase(t *testing.T) {
 	ctx := context.Background()
 	b, f, _, _, _ := newUSDTBot(t)
-	const vnd = 3000000 // 120.00 USDT at 25,000 VND/USDT
+	const vnd = 120_000_000 // 120.00 USDT (micro: 1 USDT = 1,000,000)
 
 	prm, _ := b.bands.Params(bands.ProviderTron)
 	slots := prm.Slots()
@@ -702,7 +690,7 @@ func TestDepositNeverQuotedBelowBase(t *testing.T) {
 // where the superseded 21-cent step made it 0.21.
 func TestOrderCanTakeDownwardSlotDepositsCannot(t *testing.T) {
 	b, _, st, _, _ := newUSDTBot(t)
-	const total = 150000 // 6.00 USDT at 25,000 VND/USDT
+	const total = 6_000_000 // 6.00 USDT (micro: 1 USDT = 1,000,000)
 
 	prm, _ := b.bands.Params(bands.ProviderBEP20)
 	for i := range prm.Slots() {
@@ -731,127 +719,18 @@ func TestOrderCanTakeDownwardSlotDepositsCannot(t *testing.T) {
 // This does NOT just re-check the existing `if amount == ""` guard by
 // deleting it outright: that specific mutation changes nothing observable
 // here, because bands.Registry.Reserve (the deposit path since
-// hands-free-deposits; formerly Adopt, same guard either way) parses the base
-// amount via AmountUnits, which rejects "" too (empty is not a decimal), so
-// reserveUSDTAmount still fails and falls through to the same noID reply — a
-// wrong-reason pass. The same
-// is true of literally routing this line through auditAmount: its fallback
-// ("150000 VND (usdt rate unavailable)") isn't a decimal either, so
-// AmountUnits rejects THAT too and the quote still abandons — verified,
-// not assumed. What actually endangers a customer, and what this test is
-// built to catch, is a fallback that IS a valid decimal — e.g. a future
-// "simplification" that substitutes "0.00" for an empty usdtStr instead of
-// abandoning, which Adopt accepts and ships as a real pay screen quoting
-// zero. Verified red for exactly that mutation (usdt.go's
-// `if amount == "" { b.abandonUSDTStub(...); ...; return }` swapped for
-// `if amount == "" { amount = "0.00" }`), then restored — see the executor
-// report.
-func TestUSDTDepositQuoteAbandonsOnInvalidRate(t *testing.T) {
+// TestUSDTDepositOKRendersAmount pins the end-to-end property a successful
+// on-chain deposit must render: Deposit.OK shows the credited amount and the
+// new balance as real USDT figures, never a bare "— USDT" placeholder.
+//
+// (This was originally the task #25 whitespace-padded-ambient-rate regression
+// test. The padded-rate premise is gone with the USD→VND rate itself — the
+// micro-USDT ledger has no rate to mis-trim, so usdtDisp always renders a real
+// figure for a micro amount. The end-to-end OK-render property it pinned
+// survives and is still worth holding.)
+func TestUSDTDepositOKRendersAmount(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, _, _ := newUSDTBotAtRate(t, "not-a-number")
-	const chat = 4850
-
-	before := len(f.Sends)
-	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
-	b.Process(ctx, textUpdate(chat, "6"))
-
-	noID := i18n.C().Pay.BEP20NoID.T(i18n.EN)
-	refused := false
-	f.mu.Lock()
-	for _, s := range f.Sends[before:] {
-		if s.Text == noID {
-			refused = true
-		}
-		if strings.Contains(s.Text, "VND (usdt rate unavailable)") {
-			t.Errorf("a fallback audit string leaked into a customer-facing send: %q", s.Text)
-		}
-		if strings.Contains(s.Text, "Send EXACTLY") {
-			t.Error("a pay screen was shown despite the invalid rate")
-		}
-	}
-	f.mu.Unlock()
-	if !refused {
-		t.Errorf("customer was not told the rail is unavailable; sends since start: %+v", f.Sends[before:])
-	}
-
-	rows, err := st.OrdersForChat(fmtInt(chat), 20, []string{"reserved"}, nil)
-	if err != nil {
-		t.Fatalf("orders_for_chat: %v", err)
-	}
-	for _, o := range rows {
-		if o.Product == depositProduct {
-			t.Errorf("a reserved deposit order survived an invalid-rate quote: %+v", o)
-		}
-	}
-}
-
-// TestUSDTDepositOKRendersAmountAtWhitespacePaddedAmbientRate is task #25: a
-// customer must see the actual credited/balance amounts on a successful
-// deposit, not "credited — USDT, balance — USDT".
-//
-// Root cause, found by review and confirmed by probe before this test was
-// written: config.Load's env snapshot copies the AMBIENT process environment
-// verbatim (config.go:42-53) — only .env-FILE lines are trimmed, by
-// parseEnvLines. So an operator-exported `USD_TO_VND=" 25000 "` used to reach
-// every caller of cfg.USDToVND() with its whitespace intact. strconv.
-// ParseFloat rejects surrounding whitespace outright, so before this fix
-// usdtDisp/vndToUSD treated the padded-but-otherwise-valid rate as "no rate
-// configured" and fell back to "— USDT" — while bep20.UsdtToVND/tron.
-// UsdtToVND already TrimSpace the SAME rate string before parsing, so the
-// wallet credit itself was (and remains) correct. That asymmetry is exactly
-// what made the bug invisible to anyone checking the balance: the money was
-// always right, only the two customer-facing renders in Deposit.OK ("amount"
-// and "balance") were broken.
-//
-// Fixed at the SOURCE now, not just here: a follow-up review swept every
-// ParseFloat(cfg.USDToVND()) call site and found three MORE with the exact
-// same gap (deposit.go, apikey.go, adminpricing.go — two of them functional
-// rejections, not display bugs), so config.USDToVND() itself trims
-// (internal/config/settings.go). The trims in money.go/usdt.go are kept as
-// deliberate defence in depth on this money path but are now redundant —
-// this end-to-end test still passes through the real config chain, so it
-// exercises the source fix regardless of which layer is doing the trimming.
-//
-// t.Setenv is the deliberate, correct fixture shape HERE — unlike the
-// .env-FILE tests elsewhere in this package — because the defect lives
-// specifically in the un-trimmed AMBIENT path; a .env-file fixture would be
-// trimmed by parseEnvLines before it ever reached the bug. This bypasses
-// newUSDTBot (which hardcodes an unpadded "25000" and calls newBuyBot, i.e.
-// config.Load, before a caller could override it) so the padded value is in
-// place when config.Load builds its snapshot.
-func TestUSDTDepositOKRendersAmountAtWhitespacePaddedAmbientRate(t *testing.T) {
-	ctx := context.Background()
-
-	t.Setenv("USD_TO_VND", " 25000 ")
-	t.Setenv("BEP20_ADDRESS", testSellerBSC)
-	t.Setenv("TRON_ADDRESS", testSellerTRX)
-
-	b, f, st, _, _ := newBuyBot(t, "999")
-	s := b.cfg.Settings()
-	s["pay_bep20"] = true
-	if err := b.cfg.SaveSettings(s); err != nil {
-		t.Fatalf("save settings: %v", err)
-	}
-	b.expirySweepInterval = 5 * time.Millisecond
-
-	// Fixture guard: confirm the padding is genuinely present in the AMBIENT
-	// environment (not e.g. lost to shell quoting), so this test can't pass
-	// for the wrong reason. Checked against os.Getenv directly, deliberately
-	// NOT against b.cfg.USDToVND() — an earlier version of this guard
-	// asserted cfg.USDToVND() == " 25000 " (the raw, un-trimmed value), which
-	// broke the moment the fix moved to the structural source (config.
-	// USDToVND() itself now trims, internal/config/settings.go): that
-	// intermediate value became unreachable BY CONSTRUCTION, and the test
-	// correctly refused to pass on a premise that had silently gone false.
-	// This test's job is the END-TO-END property — a padded ambient rate
-	// still produces a correct Deposit.OK — which survives regardless of
-	// which layer does the trimming, so the only fixture assertion left is
-	// that the padding genuinely reached the ambient environment; where it
-	// gets trimmed is pinned separately in config_test.go
-	// (TestUSDToVNDPrecedence/whitespace-padded_ambient_rate_is_trimmed).
-	if env := os.Getenv("USD_TO_VND"); env != " 25000 " {
-		t.Fatalf("fixture broken: ambient USD_TO_VND = %q, want the padded %q", env, " 25000 ")
-	}
+	b, f, st, _, _ := newUSDTBot(t)
 
 	const chat = 4840
 	b.Process(ctx, callbackUpdate(chat, "dep:bsc"))
@@ -861,18 +740,13 @@ func TestUSDTDepositOKRendersAmountAtWhitespacePaddedAmbientRate(t *testing.T) {
 
 	// Credit the EXACT quoted amount through the watcher's settle path. The
 	// jitter puts the quote (6.01000) just above the 6.00 request, so the credit
-	// is the converted received value (150250 VND at the trimmed 25,000), which
-	// is what makes the rate resolution observable on the rendered amounts.
+	// is the received value in micro (6.01000 USDT -> 6,010,000 micro).
 	prm, _ := b.bands.Params(bands.ProviderBEP20)
 	b.settleWatchedTransfer(ctx, bands.ProviderBEP20, prm, watchedIn(t, chainBSC, bandRes.Amount, b))
 
-	// Sanity: the wallet math must be unaffected by this bug — 6.01000 USDT at
-	// the padded-but-parseable 25,000 = 150,250 VND. bep20.UsdtToVND already
-	// TrimSpace-s, so this should pass whether or not the display fix is in
-	// place; if it fails, the fixture itself is broken.
 	bal, _ := st.GetBalance(fmtInt(chat))
-	if bal != 150250 {
-		t.Fatalf("fixture broken: credited %d VND, want 150250 (wallet crediting should be unaffected by this bug)", bal)
+	if bal != 6_010_000 {
+		t.Fatalf("fixture broken: credited %d micro, want 6,010,000 (6.01000 USDT)", bal)
 	}
 
 	// Scoped to the customer's own chat, not lastSendMsg's "most recent send
@@ -884,7 +758,7 @@ func TestUSDTDepositOKRendersAmountAtWhitespacePaddedAmbientRate(t *testing.T) {
 		t.Fatal("no deposit confirmation sent")
 	}
 	if strings.Contains(last.Text, "— USDT") {
-		t.Errorf("Deposit.OK = %q — the whitespace-padded ambient rate made usdtDisp fall back to its empty-rate placeholder even though the deposit credited correctly", last.Text)
+		t.Errorf("Deposit.OK = %q — the credited amount rendered as the empty placeholder instead of a real figure", last.Text)
 	}
 	want := i18n.F(i18n.C().Deposit.OK.T(i18n.EN), "amount", "6.01 USDT", "balance", "6.01 USDT")
 	if last.Text != want {
@@ -1039,71 +913,6 @@ func TestNewResolvesBandGeometryFromDotEnvSnapshot(t *testing.T) {
 	if tronPrm.Step != 77 || tronPrm.Tol != 13 || tronPrm.Decimals != 6 {
 		t.Errorf("TRON params = %+v, want {Step:77 Tol:13 Decimals:6} (the .env-configured "+
 			"geometry) — {101 50 5} would mean the shipped defaults leaked through", tronPrm)
-	}
-}
-
-// TestUSDTDepositRoundsUpWhenTheRateMovedDown pins DepositCredit's
-// round-a-small-underpay-UP rule end-to-end through a real deposit (the pure
-// function is pinned separately in bands/credit_test.go) — driven through the
-// hands-free watcher's settle path.
-//
-// The reachable path is a rate move, not a short payment. The screen quotes at
-// the USD_TO_VND in force when it is drawn; the receipt is valued at the rate in
-// force when the watcher settles it, and the deposit window is an hour wide.
-// Drop the rate in between and the customer's EXACT payment is suddenly worth
-// less
-// VND than the total they asked to top up — at which point the tolerance decides
-// whether they get what they asked for or the smaller new-rate value.
-//
-// The receipt is deliberately 30 units UNDER the quote rather than exactly on
-// it. An exact receipt would make |recv - desired| zero, which is inside ANY
-// tolerance including zero, so the tolerance would not be under test at all —
-// only the max() would be. 30 units is inside the shipped 50 and outside 0, so
-// both halves of the rule below actually bite. (Caught by the review pass: the
-// first version of this test asserted a tolerance regression it could not have
-// detected.)
-//
-// Falsification, both halves verified: set DEPOSIT_MATCH_TOL_UNITS to 0, or drop
-// the max() from DepositCredit, and the credit comes back as the smaller
-// new-rate value instead of 150000.
-func TestUSDTDepositRoundsUpWhenTheRateMovedDown(t *testing.T) {
-	ctx := context.Background()
-	b, _, st, _, _ := newUSDTBot(t) // USD_TO_VND=25000
-	const chat = 471
-
-	b.Process(ctx, callbackUpdate(chat, "dep:trx"))
-	b.Process(ctx, textUpdate(chat, "6")) // 6.00 USDT = 150,000 VND at the quote rate
-
-	o := reservedDeposit(t, st, chat)
-	res, ok := b.bands.Get(bands.ProviderTron, o.Des)
-	if !ok || res.Amount != "6.01000" {
-		t.Fatalf("deposit amount = %q (found=%t), want the picked 6.01000", res.Amount, ok)
-	}
-	if o.Total != 150000 {
-		t.Fatalf("order total = %d, want 150000 (the requested top-up at the quote rate)", o.Total)
-	}
-
-	// The rate moves DOWN by 0.4% while the customer is paying. settings.json
-	// wins over the environment, so this is the same override an admin
-	// /setrate would apply mid-window.
-	sett := b.cfg.Settings()
-	sett["usd_to_vnd"] = "24900"
-	if err := b.cfg.SaveSettings(sett); err != nil {
-		t.Fatalf("save settings: %v", err)
-	}
-
-	// They send 6.00970 — 30 units under the quote, well inside the 50-unit
-	// tolerance. At the new rate that is worth ~149,642 VND, under the 150,000
-	// they asked to top up, so the round-up rule is what decides the credit.
-	// Credit through the watcher's per-transfer settle path (no hash paste).
-	prm, _ := b.bands.Params(bands.ProviderTron)
-	b.settleWatchedTransfer(ctx, bands.ProviderTron, prm, watchedIn(t, chainTRX, "6.00970", b))
-
-	bal, _ := st.GetBalance(fmtInt(chat))
-	if bal != 150000 {
-		t.Errorf("credited %d VND, want 150000 — an exact payment inside the tolerance must be "+
-			"rounded up to the top-up the customer asked for, not shaved by a rate move they "+
-			"had no part in; 149649 means the round-up branch did not fire", bal)
 	}
 }
 

@@ -20,7 +20,6 @@ import (
 	"strconv"
 	"strings"
 
-	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/store"
 	"codezdev-bot/internal/tg"
@@ -66,21 +65,14 @@ func (b *Bot) minDepositStr() string {
 	return strconv.FormatFloat(b.minDepositUSDT(), 'g', -1, 64) + " USDT"
 }
 
-// usdtToVND converts a typed USDT amount to the VND stored/charged internally,
-// at the live rate — usdt_to_vnd (telegram_bot.py:18816). 0 when the rate is
-// unset/invalid (the amount then fails the >0 bound and is rejected).
-func (b *Bot) usdtToVND(usdt float64) int64 {
-	rateStr := config.DefaultUSDToVND
-	if b.cfg != nil {
-		rateStr = b.cfg.USDToVND()
-	}
-	rate, err := strconv.ParseFloat(rateStr, 64)
-	if err != nil || rate <= 0 {
-		return 0
-	}
-	// int(round(...)) — usdt_to_vnd (@10569) rounds, not truncates, so the stored
-	// VND matches to the exact đồng.
-	return int64(math.Round(usdt * rate))
+// usdtToMicro converts a typed USDT amount to micro-USDT (1 USDT = 1,000,000
+// micro) — the stored/charged internal unit. No exchange rate, no failure: every
+// representable float maps to an exact rounded micro value, so capDeposit's >0
+// bound can only fail on a genuinely non-positive amount.
+func (b *Bot) usdtToMicro(usdt float64) int64 {
+	// int(round(...)) — round, not truncate, so the stored micro value matches
+	// to the exact micro.
+	return int64(math.Round(usdt * 1_000_000))
 }
 
 // ---- deposit method picker (start_deposit @10592) --------------------------
@@ -178,7 +170,7 @@ func (b *Bot) capDeposit(c *Ctx) bool {
 		usdt = 0
 	}
 	if usdt >= b.minDepositUSDT() && usdt <= b.maxDepositUSDT() {
-		vnd := b.usdtToVND(usdt)
+		micro := b.usdtToMicro(usdt)
 		// Atomically CLAIM the armed method (double-submit guard) then route.
 		c.st.mu.Lock()
 		dc := c.st.Deposit
@@ -194,7 +186,7 @@ func (b *Bot) capDeposit(c *Ctx) bool {
 			// this port.
 			return true
 		}
-		b.startDepositMethod(c.Ctx, c.ChatID, c.Lang, dc.Method, vnd)
+		b.startDepositMethod(c.Ctx, c.ChatID, c.Lang, dc.Method, micro)
 	} else {
 		b.send(c.Ctx, c.ChatID, i18n.F(dc.BadAmount.T(c.Lang), "min", b.minDepositStr()), nil)
 	}
@@ -206,14 +198,14 @@ func (b *Bot) capDeposit(c *Ctx) bool {
 // The two surviving USDT rails are start_bep20_deposit @9478 / start_tron_deposit
 // @9935 (usdt.go). PayPal (formerly "pp") and Binance Pay (formerly "bnb") were
 // removed by the USDT-only migration (S2/S3).
-func (b *Bot) startDepositMethod(ctx context.Context, chatID int64, lang i18n.Lang, method string, vnd int64) {
+func (b *Bot) startDepositMethod(ctx context.Context, chatID int64, lang i18n.Lang, method string, micro int64) {
 	switch method {
 	case "bsc":
-		b.startBep20Deposit(ctx, chatID, lang, vnd)
+		b.startBep20Deposit(ctx, chatID, lang, micro)
 	case "trx":
-		b.startTronDeposit(ctx, chatID, lang, vnd)
+		b.startTronDeposit(ctx, chatID, lang, micro)
 	default:
-		log.Printf("deposit method %q (vnd=%d) — unknown funding rail, ignored", method, vnd)
+		log.Printf("deposit method %q (micro=%d) — unknown funding rail, ignored", method, micro)
 	}
 }
 

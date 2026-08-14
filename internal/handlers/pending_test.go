@@ -23,7 +23,7 @@ var adminClearFields = []string{
 	"Reset", "GetOrd", "Refund", "Discount", "Promo", "ResellerDiscount",
 	"Upstock", "UpstockConfirm", "UpstockAcc", "UpstockPreviewMsg", "UpstockStoreSubs",
 	"Price", "Tier", "Hold", "NewProd", "RenProd", "SetNotice", "SetDelivery",
-	"EditFile", "RmProd", "Entra", "SetRate", "SetBep20", "SetTron",
+	"EditFile", "RmProd", "Entra", "SetBep20", "SetTron",
 	"SetApiPrice", "SetApiMin", "SetApiMax", "SetKiroPrice", "SetKiroMin",
 	"SetKiroMax", "SetApiCap", "SetKiroKey", "SetKiroURL", "SetKiroAcct",
 	"ProvPool", "SetMaxQty", "RefundReject",
@@ -104,7 +104,7 @@ func TestClearListsExact(t *testing.T) {
 	if len(customerClearFields) != 8 {
 		t.Errorf("expected 8 customer clear fields, have %d", len(customerClearFields))
 	}
-	if len(adminClearFields) != 46 {
-		t.Errorf("expected 46 admin clear fields, have %d", len(adminClearFields))
+	if len(adminClearFields) != 45 {
+		t.Errorf("expected 45 admin clear fields, have %d", len(adminClearFields))
 	}
 }

@@ -80,7 +80,6 @@ func TestCaptureChainOrder(t *testing.T) {
 		"upstock",
 		"getord",
 		"custlookup", "addadmin", "addreseller", "addwl", "rmadmin",
-		"setrate",
 		"setapiprice", "setapimin", "setapimax", "setkiroprice", "setkiromin", "setkiromax", "setapicap",
 		"setkirourl", "setkirokey", "setkiroacct", "setbep20", "settron", "setmaxqty",
 		"refundreject",
@@ -103,15 +102,14 @@ func TestCaptureChainOrder(t *testing.T) {
 	if CanonicalCaptureOrder[len(CanonicalCaptureOrder)-1] != "purchase" {
 		t.Errorf("purchase must be the last canonical capture")
 	}
-	// The canonical list itself must stay unique + the pinned length (45 —
-	// adminstock.go's Go-only "provpool" entry, captures.go, brought it from
-	// 49 to 50; M3/M4 fix earlier removed "addbal", which moved to the step-9
-	// adminText chain; AWS IDC provisioning removal took "idcprov" back out,
-	// 50 to 49; AWS-sell removal took "sell"/"setawsprice"/"awsreject" back
-	// out, 49 to 46; the hands-free-deposits work removed the customer
-	// tx-hash capture "txid", 46 to 45).
-	if len(CanonicalCaptureOrder) != 45 {
-		t.Errorf("canonical order length = %d, want 45", len(CanonicalCaptureOrder))
+	// The canonical list itself must stay unique + the pinned length (44 — the
+	// micro-USDT flip removed the USD→VND rate capture "setrate", 45 to 44;
+	// earlier: adminstock.go's Go-only "provpool" entry brought it 49 to 50;
+	// M3/M4 fix removed "addbal", which moved to the step-9 adminText chain;
+	// AWS IDC/sell removals took it back to 46; hands-free-deposits removed the
+	// customer tx-hash capture "txid", 46 to 45).
+	if len(CanonicalCaptureOrder) != 44 {
+		t.Errorf("canonical order length = %d, want 44", len(CanonicalCaptureOrder))
 	}
 	seen := map[string]bool{}
 	for _, n := range CanonicalCaptureOrder {

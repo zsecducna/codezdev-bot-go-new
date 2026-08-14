@@ -47,11 +47,9 @@ import (
 	"math"
 	"math/big"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"time"
 
-	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/pay/bands"
 	"codezdev-bot/internal/store"
@@ -99,88 +97,27 @@ func ledgerPrefix(p bands.Provider) string {
 	return "trx"
 }
 
-// usdtStr is Python's usdt_str(vnd) — the customer-facing 2-decimal USDT string
-// for a VND amount. It must produce the pay screen's base amount and the
-// deposit's desired amount, or a correct payment could miss its band.
+// usdtStr is Python's usdt_str — the customer-facing 2-decimal USDT string for a
+// micro-USDT amount (1 USDT = 1,000,000 micro). It must produce the pay screen's
+// base amount and the deposit's desired amount, or a correct payment could miss
+// its band.
 //
-// Stale-comment fix: this used to say "" on a missing/invalid rate. That is
-// no longer accurate — vndToUSD always has a fallback (config.DefaultUSDToVND,
-// "25000") for a genuinely MISSING rate, so "missing" can no longer produce
-// "". "" is still possible on an actually INVALID configured rate (the
-// resolved string fails to parse as a float, or parses to <=0) — e.g. a
-// broken ambient USD_TO_VND env var, since capSetRate already range-guards
-// the admin-set path. A whitespace-padded-but-otherwise-valid ambient rate
-// (e.g. `USD_TO_VND=" 25000 "`) used to land in this same "" bucket — Go's
-// ParseFloat rejects surrounding whitespace outright — but vndToUSD now
-// TrimSpaces before parsing (task #25), so that specific trigger is closed;
-// this branch still fires for a rate that is invalid on its merits (garbage
-// text, zero, negative).
-//
-// That branch is real, not dead. Its callers split into two kinds by what
-// "" is allowed to do:
-//   - startOnchainDeposit is a customer-facing quote: it tests usdtStr == ""
-//     and ABANDONS rather than quotes a broken price. Quoting wrong is worse
-//     than not quoting — deliberate, and it stays this way.
-//   - the on-chain settle audit line does NOT call usdtStr directly (task #15)
-//     — it goes through auditAmount (money.go), which can never render "+ USDT"
-//     with the amount silently missing; it falls back to the raw VND figure
-//     plus an explicit marker instead. adminusers.go's admin-credit/-debit
-//     audit lines route through the same helper. See auditAmount's doc comment
-//     for the full reasoning, including why that fallback is unreachable at
-//     BOTH of today's call sites (an identical rate check already gates each
-//     one upstream — usdtToVNDFor here, adminUsdtToVnd in adminpricing.go) and
-//     is kept anyway as by-construction protection for the next
-//     audit/description site, which may have no such upstream gate.
-func (b *Bot) usdtStr(vnd int64) string {
-	s, err := b.vndToUSD(vnd)
-	if err != nil {
-		return ""
-	}
-	return s
-}
-
-// vndToUSD is SCAFFOLDING introduced by the SePay/PayPal/Binance removal
-// (USDT migration slices S1-S3, 2026-08-06). usdtStr used to route through
-// paypal.VndToUSD for its VND->USD conversion; paypal.go is gone along with
-// the rest of the PayPal rail. There is no drop-in replacement on the
-// surviving BEP20/TRON rails — their UsdtToVND converters go the opposite
-// direction (USD->VND) and read the rate a different way.
-//
-// Reads the rate through the CONFIG CHAIN (cfg.USDToVND(): settings.json's
-// admin-set usd_to_vnd overriding .env/ambient USD_TO_VND, else the compiled
-// default) — deliberately NOT os.LookupEnv, which is the quote/charge
-// rate-source split rate-source-investigation.md flags as a defect this
-// migration supersedes rather than reproduces.
-//
-// Migration slice S5 deletes this function, its one call site (usdtStr), and
-// the VND rate itself outright when the ledger flips to micro-USDT — do not
-// build new callers on it.
-func (b *Bot) vndToUSD(vnd int64) (string, error) {
-	rateStr := config.DefaultUSDToVND
-	if b.cfg != nil {
-		rateStr = b.cfg.USDToVND()
-	}
-	// TrimSpace: see money.go's usdtDisp for why — cfg.USDToVND() can return an
-	// un-trimmed AMBIENT env value, and ParseFloat rejects surrounding
-	// whitespace, so this must match the trim bep20/tron's UsdtToVND already
-	// apply to the same rate for the two sides (quote vs. credit) to agree.
-	//
-	// config.USDToVND() itself now trims too (internal/config/settings.go) —
-	// this line is REDUNDANT, kept for defence in depth on a money path. Do
-	// not delete the SOURCE trim on the theory that this call site (or
-	// money.go's matching one) covers it: deposit.go, apikey.go and
-	// adminpricing.go each call cfg.USDToVND() directly with no trim of
-	// their own and depend entirely on the source fix.
-	rateStr = strings.TrimSpace(rateStr)
-	rate, err := strconv.ParseFloat(rateStr, 64)
-	if err != nil || rate <= 0 {
-		return "", fmt.Errorf("usdt: no USD_TO_VND rate configured")
-	}
-	usd := float64(vnd) / rate
-	// Python: cents = int(usd*100) + (1 if (usd*100) % 1 else 0) -> ceil to cent
-	// (mirrors the deleted paypal.VndToUSD's own rounding exactly).
+// Rounds UP to the cent (never undercharge) and ALWAYS returns a valid 2dp quote:
+// micro is an exact stored value, so there is no exchange rate to fail and no ""
+// return for a caller to guard. (The ledger used to be VND priced via a
+// USD→VND rate; that rate is gone, and with it the "rate unavailable -> return
+// ”" branch. The two historical call-site kinds — a customer quote and an audit
+// row — no longer need to treat "" specially: a quote always renders now.)
+func (b *Bot) usdtStr(micro int64) string {
+	usd := float64(micro) / 1_000_000
+	// Python: cents = int(usd*100) + (1 if (usd*100) % 1 else 0) -> ceil to cent.
 	cents := math.Ceil(usd*100 - 1e-9)
-	return fmt.Sprintf("%.2f", cents/100), nil
+	// Clear IEEE-754 negative zero so a zero amount renders "0.00", not "-0.00"
+	// (see usdtDisp's matching guard in money.go for the full reasoning).
+	if cents == 0 {
+		cents = 0
+	}
+	return fmt.Sprintf("%.2f", cents/100)
 }
 
 // ---- pending-row registry (the rail-side half) ------------------------------
@@ -326,17 +263,17 @@ func (b *Bot) releaseUnpersisted(p bands.Provider, des string) {
 // round number is never quoted and the amount alone names one order. The
 // customer keeps the difference: an on-chain deposit credits what actually
 // ARRIVED, which is always at least the jitter above what they asked for.
-func (b *Bot) startBep20Deposit(ctx context.Context, chatID int64, lang i18n.Lang, vnd int64) {
-	b.startOnchainDeposit(ctx, chatID, lang, vnd, chainBSC)
+func (b *Bot) startBep20Deposit(ctx context.Context, chatID int64, lang i18n.Lang, micro int64) {
+	b.startOnchainDeposit(ctx, chatID, lang, micro, chainBSC)
 }
 
-func (b *Bot) startTronDeposit(ctx context.Context, chatID int64, lang i18n.Lang, vnd int64) {
-	b.startOnchainDeposit(ctx, chatID, lang, vnd, chainTRX)
+func (b *Bot) startTronDeposit(ctx context.Context, chatID int64, lang i18n.Lang, micro int64) {
+	b.startOnchainDeposit(ctx, chatID, lang, micro, chainTRX)
 }
 
 // startOnchainDeposit is the shared body of the two functions above — the Python
 // twins are line-for-line identical apart from their rail constants.
-func (b *Bot) startOnchainDeposit(ctx context.Context, chatID int64, lang i18n.Lang, vnd int64, chain string) {
+func (b *Bot) startOnchainDeposit(ctx context.Context, chatID int64, lang i18n.Lang, micro int64, chain string) {
 	c := &i18n.C().Pay
 	p, _ := providerForChain(chain)
 	noID, tier := c.BEP20NoID, "USDT BEP20"
@@ -349,17 +286,12 @@ func (b *Bot) startOnchainDeposit(ctx context.Context, chatID int64, lang i18n.L
 		return
 	}
 	des := store.NewDes()
-	if err := b.store.CreateOrder(des, fmtInt(chatID), string(lang), depositProduct, tier, 0, vnd); err != nil {
+	if err := b.store.CreateOrder(des, fmtInt(chatID), string(lang), depositProduct, tier, 0, micro); err != nil {
 		log.Printf("%s deposit create_order failed: %v", chain, err)
 		b.send(ctx, chatID, noID.T(lang), nil)
 		return
 	}
-	amount := b.usdtStr(vnd) // the DESIRED amount, e.g. "120.00"
-	if amount == "" {        // exchange rate unset -> can't price it (@9497)
-		b.abandonUSDTStub(des)
-		b.send(ctx, chatID, noID.T(lang), nil)
-		return
-	}
+	amount := b.usdtStr(micro) // the DESIRED amount, e.g. "120.00" (micro is always valid post-flip — no rate to fail)
 	now := b.now()
 	// depositTimeout, NOT expiryTimeout: a deposit reserves no folder stock, so
 	// it gets the wide customer-facing window instead of the product-order
@@ -371,7 +303,7 @@ func (b *Bot) startOnchainDeposit(ctx context.Context, chatID int64, lang i18n.L
 	// here too would double it up.
 	// allowDownward=false: a deposit must never be quoted below what the
 	// customer asked to send (see reserveUSDTAmount's doc comment).
-	picked, err := b.reserveUSDTAmount(p, amount, fmtInt(chatID), des, vnd, now.UnixMilli(), deadline, false)
+	picked, err := b.reserveUSDTAmount(p, amount, fmtInt(chatID), des, micro, now.UnixMilli(), deadline, false)
 	if err != nil {
 		b.abandonUSDTStub(des)
 		// Band exhaustion is "busy", not "unconfigured" — sendBandError picks
@@ -540,10 +472,10 @@ func (b *Bot) orderTS(o *store.Order) time.Time {
 // paste — and routes every credit through here so dedupe and notify are shared,
 // not duplicated.
 //
-// recvVND/frm/recvStr are passed through rather than recomputed here: they
-// come from the specific on-chain transfer the caller looked up (recvVND via
-// the rail's own USD_TO_VND conversion of the tx's exact `big.Rat` amount,
-// frm/recvStr straight off the tx), and re-deriving them from recvUnits alone
+// recvMicro/frm/recvStr are passed through rather than recomputed here: they
+// come from the specific on-chain transfer the caller looked up (recvMicro via
+// recvToMicro on the tx's exact `big.Rat` amount, frm/recvStr straight off the
+// tx), and re-deriving them from recvUnits alone
 // would lose precision the caller already has in hand — recvStr is rendered
 // via FloatString (rounds) while recvUnits comes straight off the tx lookup
 // (floored), a known deferred mismatch this extraction must not compound by
@@ -556,7 +488,7 @@ func (b *Bot) orderTS(o *store.Order) time.Time {
 // dedupe case, store.Credit's ledgerID PK match); false when nothing could be
 // credited (bad stored amount, or the credit call itself errored). On false the
 // caller holds the band and retries on the next tick.
-func (b *Bot) settleUSDTMatch(ctx context.Context, p bands.Provider, des, ledgerID string, recvUnits, recvVND int64, o *store.Order, lang i18n.Lang, chatID int64, prm bands.Params, expected, frm, recvStr string) bool {
+func (b *Bot) settleUSDTMatch(ctx context.Context, p bands.Provider, des, ledgerID string, recvUnits, recvMicro int64, o *store.Order, lang i18n.Lang, chatID int64, prm bands.Params, expected, frm, recvStr string) bool {
 	pc := i18n.C().Pay
 	chain := ledgerPrefix(p) // "bsc" | "trx" — same string space as ledgerID's own prefix
 	chatStr := fmtInt(chatID)
@@ -582,10 +514,10 @@ func (b *Bot) settleUSDTMatch(ctx context.Context, p bands.Provider, des, ledger
 	// are tuned independently, so a deposit tolerance wider than the band
 	// spacing is a reachable operator mistake — and it would make one
 	// receipt equidistant-and-matching for two live orders' amounts.
-	creditVND, _ := bands.DepositCredit(recvUnits, desiredUnits, o.Total, recvVND,
+	creditMicro, _ := bands.DepositCredit(recvUnits, desiredUnits, o.Total, recvMicro,
 		bands.ClampDepositTol(prm,
 			b.envInt("DEPOSIT_MATCH_TOL_UNITS", bands.DefaultDepositMatchTolUnits)))
-	credited, bal, cerr := b.store.Credit(chatStr, creditVND, ledgerID) // atomic dedupe + credit
+	credited, bal, cerr := b.store.Credit(chatStr, creditMicro, ledgerID) // atomic dedupe + credit
 	if cerr != nil {
 		log.Printf("usdt deposit credit failed [des=%s %s]: %v", des, ledgerID, cerr)
 		return false // nothing moved -> retry
@@ -606,20 +538,15 @@ func (b *Bot) settleUSDTMatch(ctx context.Context, p bands.Provider, des, ledger
 	b.dropUSDTPending(p, des)
 	// The wallet above is already credited correctly (that math never
 	// calls usdtStr) — this line only formats the audit-row description.
-	// auditAmount (money.go) guarantees it can never render "+ USDT"
-	// with the amount silently missing; see its doc comment for why,
-	// and for why this particular call site's invalid-rate branch is
-	// actually unreachable today (the caller's usdtToVNDFor gate already
-	// excludes it before recvVND ever reaches here) but kept anyway as
-	// by-construction protection rather than per-site (task #15 — this
-	// call site used to hand-guard the same gap, now collapsed into the
-	// shared helper).
-	creditDesc := b.auditAmount("+", creditVND)
+	// auditAmount (money.go) builds sign+quote+unit by construction; it can
+	// never render a bare "+ USDT", and with the micro-USDT ledger there is no
+	// rate to fail so it always carries a real number.
+	creditDesc := b.auditAmount("+", creditMicro)
 	b.audit(chatStr, "usdt_"+chain+"_deposit", ledgerID,
 		creditDesc,
 		fmt.Sprintf("from=%s recv=%s balance=%d", frm, recvStr, bal))
 	b.send(ctx, chatID, i18n.F(i18n.C().Deposit.OK.T(lang),
-		"amount", b.usdtDisp(creditVND), "balance", b.usdtDisp(bal)), nil)
+		"amount", b.usdtDisp(creditMicro), "balance", b.usdtDisp(bal)), nil)
 	// notify_admin_deposit (telegram_bot.py:9861-9862) — method falls back
 	// to the chain's own rail label exactly like Python's
 	// `o.get("tier") or ("USDT BEP20" if chain == "bsc" else "USDT TRC20")`.
@@ -630,17 +557,25 @@ func (b *Bot) settleUSDTMatch(ctx context.Context, p bands.Provider, des, ledger
 			method = "USDT BEP20"
 		}
 	}
-	b.notifyAdminDeposit(ctx, chatID, creditVND, bal, method)
+	b.notifyAdminDeposit(ctx, chatID, creditMicro, bal, method)
 	return true
 }
 
-// usdtToVNDFor values a received on-chain amount in VND using the rail's own
-// converter (bep20_pay.usdt_to_vnd / tron_pay.usdt_to_vnd).
-func (b *Bot) usdtToVNDFor(p bands.Provider, recv *big.Rat) (int64, error) {
-	if p == bands.ProviderBEP20 {
-		return b.bep20UsdtToVND(recv)
+// recvToMicro values a received on-chain USDT amount (a big.Rat of the rail's
+// TokenDecimals: wei/10^18 for BEP20, value/10^6 for TRON) as micro-USDT:
+// recv_usdt * 1_000_000 (1 USDT = 1,000,000 micro). Exact big.Rat arithmetic,
+// rounded half-up to int64 — no float, no exchange rate, no error path. A
+// received amount is credited by its exact on-chain value; the rail-credited
+// figure and the customer-quote figure both live in the same micro unit now.
+func (b *Bot) recvToMicro(p bands.Provider, recv *big.Rat) int64 {
+	scaled := new(big.Rat).Mul(recv, big.NewRat(1_000_000, 1))
+	num, den := scaled.Num(), scaled.Denom() // big.Rat guarantees Denom() > 0
+	q, rem := new(big.Int), new(big.Int)
+	q.QuoRem(num, den, rem)                     // truncated division; round half-up next
+	if new(big.Int).Lsh(rem, 1).Cmp(den) >= 0 { // 2*rem >= den -> round up
+		q.Add(q, big.NewInt(1))
 	}
-	return b.tronUsdtToVND(recv)
+	return q.Int64()
 }
 
 // pow10BigInt returns 10^n as a big.Int (TRON base-unit scaling).

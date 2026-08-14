@@ -78,33 +78,33 @@ func TestValidTierCode(t *testing.T) {
 	}
 }
 
-func TestAdminUsdtToVnd(t *testing.T) {
-	b, _ := newTestBot("1", nil) // b.cfg == nil -> compiled default rate 25000
+func TestAdminUsdtToMicro(t *testing.T) {
+	b, _ := newTestBot("1", nil) // b.cfg == nil; adminUsdtToMicro is rate-free (scales by 1e6)
 	cases := []struct {
-		text    string
-		wantVnd int64
-		wantOK  bool
+		text      string
+		wantMicro int64
+		wantOK    bool
 	}{
-		{"5", 125000, true},
-		{"5.5", 137500, true},
-		{"1,234.5", 30862500, true}, // comma stripped as a thousands separator
-		{" 5 ", 125000, true},       // trimmed
-		{"-3", -75000, true},        // sign accepted here; callers reject <=0 themselves
+		{"5", 5_000_000, true},
+		{"5.5", 5_500_000, true},
+		{"1,234.5", 1_234_500_000, true}, // comma stripped as a thousands separator
+		{" 5 ", 5_000_000, true},         // trimmed
+		{"-3", -3_000_000, true},         // sign accepted here; callers reject <=0 themselves
 		{"abc", 0, false},
 		{"", 0, false},
 		{"5,,5", 0, false}, // stripping commas leaves "55" -- NOT this case; see below
 	}
 	for _, tc := range cases {
-		vnd, ok := b.adminUsdtToVnd(tc.text)
+		micro, ok := b.adminUsdtToMicro(tc.text)
 		if tc.text == "5,,5" {
-			// "5,,5" comma-stripped is "55", a VALID digit string -> 55*25000.
-			if !ok || vnd != 1375000 {
-				t.Errorf("adminUsdtToVnd(%q) = (%d,%v), want (1375000,true)", tc.text, vnd, ok)
+			// "5,,5" comma-stripped is "55", a VALID digit string -> 55 * 1e6.
+			if !ok || micro != 55_000_000 {
+				t.Errorf("adminUsdtToMicro(%q) = (%d,%v), want (55000000,true)", tc.text, micro, ok)
 			}
 			continue
 		}
-		if ok != tc.wantOK || (ok && vnd != tc.wantVnd) {
-			t.Errorf("adminUsdtToVnd(%q) = (%d,%v), want (%d,%v)", tc.text, vnd, ok, tc.wantVnd, tc.wantOK)
+		if ok != tc.wantOK || (ok && micro != tc.wantMicro) {
+			t.Errorf("adminUsdtToMicro(%q) = (%d,%v), want (%d,%v)", tc.text, micro, ok, tc.wantMicro, tc.wantOK)
 		}
 	}
 }
@@ -495,8 +495,8 @@ func TestPriceTierLifecycle(t *testing.T) {
 	if last == nil || !strings.Contains(last.Text, "Added tier") {
 		t.Fatalf("expected an Added-tier confirmation, got %+v", last)
 	}
-	if got, ok := stk.ProductPrice("prod1", "BH30D"); !ok || got != 225000 { // 9 USDT * 25000
-		t.Fatalf("ProductPrice(BH30D) = (%d,%v), want (225000,true)", got, ok)
+	if got, ok := stk.ProductPrice("prod1", "BH30D"); !ok || got != 9_000_000 { // 9 USDT * 1e6 micro
+		t.Fatalf("ProductPrice(BH30D) = (%d,%v), want (9000000,true)", got, ok)
 	}
 
 	// pricetier:0:BH30D -> edit its price to 5 USDT.
@@ -510,8 +510,8 @@ func TestPriceTierLifecycle(t *testing.T) {
 	if last == nil || !strings.Contains(last.Text, "set to") {
 		t.Fatalf("expected a set-to confirmation, got %+v", last)
 	}
-	if got, ok := stk.ProductPrice("prod1", "BH30D"); !ok || got != 125000 {
-		t.Fatalf("ProductPrice(BH30D) after edit = (%d,%v), want (125000,true)", got, ok)
+	if got, ok := stk.ProductPrice("prod1", "BH30D"); !ok || got != 5_000_000 {
+		t.Fatalf("ProductPrice(BH30D) after edit = (%d,%v), want (5000000,true)", got, ok)
 	}
 
 	// tierdel:0 -> lists tap-to-delete buttons; tierdo:0:BH30D removes it.
@@ -763,12 +763,12 @@ func TestCapTierAndCapPriceAuditProductPriceChanges(t *testing.T) {
 	if row1.Target != "prod1/BH30D" {
 		t.Errorf("Target = %q, want prod1/BH30D", row1.Target)
 	}
-	if want := "(unset) → " + b.usdtDisp(225000); row1.Outcome != want { // 9 USDT * 25000
+	if want := "(unset) → " + b.usdtDisp(9_000_000); row1.Outcome != want { // 9 USDT * 1e6 micro
 		t.Errorf("Outcome = %q, want %q", row1.Outcome, want)
 	}
 
 	// pricetier:0:BH30D -> "5": editing the tier just created, so old must be
-	// the REAL prior price (225000), not "(unset)" again.
+	// the REAL prior price (9,000,000 micro = 9 USDT), not "(unset)" again.
 	b.Process(ctx, callbackUpdate(1, "pricetier:0:BH30D"))
 	b.Process(ctx, textUpdate(1, "5"))
 	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "set to") {
@@ -778,7 +778,7 @@ func TestCapTierAndCapPriceAuditProductPriceChanges(t *testing.T) {
 	if row2 == nil {
 		t.Fatal("no audit row written for tier edit")
 	}
-	if want := b.usdtDisp(225000) + " → " + b.usdtDisp(125000); row2.Outcome != want {
+	if want := b.usdtDisp(9_000_000) + " → " + b.usdtDisp(5_000_000); row2.Outcome != want {
 		t.Errorf("second Outcome = %q, want %q", row2.Outcome, want)
 	}
 }

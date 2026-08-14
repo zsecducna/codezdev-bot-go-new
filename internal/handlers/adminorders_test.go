@@ -228,7 +228,7 @@ func TestDoRefundDepositRefused(t *testing.T) {
 func TestDoRefundNormalLeavesStockInSold(t *testing.T) {
 	b, _, st, _, _, _, dir := newOrdersTestBot(t, "1")
 	const product = "prodx"
-	seedProduct(t, dir, product, 7000, 1) // writes active/prodx-u0.txt + price_KBH_VND
+	seedProduct(t, dir, product, 7000, 1) // writes active/prodx-u0.txt + price_KBH_USDT
 
 	activeFile := filepath.Join(dir, "accounts", product, "active", product+"-u0.txt")
 	soldDir := filepath.Join(dir, "accounts", product, "sold")

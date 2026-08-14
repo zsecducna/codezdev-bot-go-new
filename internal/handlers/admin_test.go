@@ -659,14 +659,14 @@ func TestAdminDashboardGrossRefundedNetRender(t *testing.T) {
 	ctx := context.Background()
 	b, f, st := newDashboardTestBot(t, "1")
 
-	if err := st.CreateOrder("delivered1", "9", "en", "kiro-pro", "T1", 1, 5000); err != nil {
+	if err := st.CreateOrder("delivered1", "9", "en", "kiro-pro", "T1", 1, 200_000); err != nil {
 		t.Fatalf("CreateOrder(delivered1): %v", err)
 	}
 	if _, err := st.ClaimOrder("delivered1", "reserved", "delivered"); err != nil {
 		t.Fatalf("claim delivered1 -> delivered: %v", err)
 	}
 
-	if err := st.CreateOrder("refcust1", "9", "en", "kiro-pro", "T1", 1, 2000); err != nil {
+	if err := st.CreateOrder("refcust1", "9", "en", "kiro-pro", "T1", 1, 80_000); err != nil {
 		t.Fatalf("CreateOrder(refcust1): %v", err)
 	}
 	if _, err := st.ClaimOrder("refcust1", "reserved", "delivered"); err != nil {
@@ -678,7 +678,7 @@ func TestAdminDashboardGrossRefundedNetRender(t *testing.T) {
 	// The stage-S2 write: only 1250 of the 2000 total was actually credited
 	// back (a pro-rated warranty refund), recorded strictly after the status
 	// flip above, per SetRefundedAmount's own doc comment (orders.go).
-	if err := st.SetRefundedAmount("refcust1", 1250); err != nil {
+	if err := st.SetRefundedAmount("refcust1", 50_000); err != nil {
 		t.Fatalf("SetRefundedAmount(refcust1, 1250): %v", err)
 	}
 
@@ -740,7 +740,7 @@ func TestAdminDashboardRefundedRangeForLegacyUnknownRefunds(t *testing.T) {
 	ctx := context.Background()
 	b, f, st := newDashboardTestBot(t, "1")
 
-	if err := st.CreateOrder("delivered1", "9", "en", "kiro-pro", "T1", 1, 5000); err != nil {
+	if err := st.CreateOrder("delivered1", "9", "en", "kiro-pro", "T1", 1, 200_000); err != nil {
 		t.Fatalf("CreateOrder(delivered1): %v", err)
 	}
 	if _, err := st.ClaimOrder("delivered1", "reserved", "delivered"); err != nil {
@@ -748,7 +748,7 @@ func TestAdminDashboardRefundedRangeForLegacyUnknownRefunds(t *testing.T) {
 	}
 
 	// Known: recorded via SetRefundedAmount, the stage-S2 write path.
-	if err := st.CreateOrder("refcust1", "9", "en", "kiro-pro", "T1", 1, 2000); err != nil {
+	if err := st.CreateOrder("refcust1", "9", "en", "kiro-pro", "T1", 1, 80_000); err != nil {
 		t.Fatalf("CreateOrder(refcust1): %v", err)
 	}
 	if _, err := st.ClaimOrder("refcust1", "reserved", "delivered"); err != nil {
@@ -757,12 +757,12 @@ func TestAdminDashboardRefundedRangeForLegacyUnknownRefunds(t *testing.T) {
 	if _, err := st.ClaimOrderKind("refcust1", "delivered", "refunded", store.RefundKindCustomer); err != nil {
 		t.Fatalf("claim refcust1 -> refunded/customer: %v", err)
 	}
-	if err := st.SetRefundedAmount("refcust1", 1250); err != nil {
+	if err := st.SetRefundedAmount("refcust1", 50_000); err != nil {
 		t.Fatalf("SetRefundedAmount(refcust1, 1250): %v", err)
 	}
 
 	// Unknown: the pre-S2 shape — status flip only, refunded_amount left NULL.
-	if err := st.CreateOrder("reflegacy1", "9", "en", "kiro-pro", "T1", 1, 3000); err != nil {
+	if err := st.CreateOrder("reflegacy1", "9", "en", "kiro-pro", "T1", 1, 120_000); err != nil {
 		t.Fatalf("CreateOrder(reflegacy1): %v", err)
 	}
 	if _, err := st.ClaimOrder("reflegacy1", "reserved", "paid"); err != nil {
@@ -810,7 +810,7 @@ func TestAdminDashboardZeroTotalUnknownRefundOmitsUncertaintyLine(t *testing.T) 
 	ctx := context.Background()
 	b, f, st := newDashboardTestBot(t, "1")
 
-	if err := st.CreateOrder("delivered1", "9", "en", "kiro-pro", "T1", 1, 5000); err != nil {
+	if err := st.CreateOrder("delivered1", "9", "en", "kiro-pro", "T1", 1, 200_000); err != nil {
 		t.Fatalf("CreateOrder(delivered1): %v", err)
 	}
 	if _, err := st.ClaimOrder("delivered1", "reserved", "delivered"); err != nil {
@@ -884,7 +884,7 @@ func TestAdminDashboardZeroTotalUnknownRefundOmitsUncertaintyLine(t *testing.T) 
 func TestAdminDashboardZeroRefundsOmitsNegativeSign(t *testing.T) {
 	ctx := context.Background()
 	b, f, st := newDashboardTestBot(t, "1")
-	if err := st.CreateOrder("delivered1", "9", "en", "kiro-pro", "T1", 1, 5000); err != nil {
+	if err := st.CreateOrder("delivered1", "9", "en", "kiro-pro", "T1", 1, 200_000); err != nil {
 		t.Fatalf("CreateOrder(delivered1): %v", err)
 	}
 	if _, err := st.ClaimOrder("delivered1", "reserved", "delivered"); err != nil {

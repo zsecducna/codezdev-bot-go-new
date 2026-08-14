@@ -468,19 +468,14 @@ func (b *Bot) settleWatchedTransfer(ctx context.Context, p bands.Provider, prm b
 	// Deliberately NO status check. A payment that lands just after its session
 	// expired still credits the customer's wallet, inside the pending grace —
 	// that is what the grace is for.
-	recvVND, verr := b.usdtToVNDFor(p, recv)
-	if verr != nil {
-		// No usable rate means we cannot value the credit. Crediting 0 would
-		// lose the customer's money outright, so hold and retry once the rate
-		// is fixed.
-		log.Printf("usdt watch [%s]: rate error for %s: %v", p, res.Des, verr)
-		b.auditWatch(o.ChatID, p, "no_rate", ledgerID, "held, cannot value the payment",
-			"recv="+recvStr+" from="+wt.frm+" des="+res.Des)
-		return
-	}
+	//
+	// recvToMicro values the received amount as micro-USDT (recv_usdt * 1e6) in
+	// exact big.Rat arithmetic — no exchange rate, so there is no "cannot value
+	// the payment" hold. The old no_rate branch died with the rate itself.
+	recvMicro := b.recvToMicro(p, recv)
 	// res.Amount IS the atomic snapshot MatchIncoming took — a second locked
 	// read here could disagree with the amount that actually matched.
-	if !b.settleUSDTMatch(ctx, p, res.Des, ledgerID, wt.units, recvVND, o, langSafe(o), chatID,
+	if !b.settleUSDTMatch(ctx, p, res.Des, ledgerID, wt.units, recvMicro, o, langSafe(o), chatID,
 		prm, res.Amount, wt.frm, recvStr) {
 		// Nothing moved (bad stored amount, or the credit call errored). The
 		// band and the persisted row are untouched, so the next tick retries.

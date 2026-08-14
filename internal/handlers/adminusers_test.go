@@ -84,7 +84,7 @@ func TestCustLookup(t *testing.T) {
 
 	t.Run("found by numeric chat_id", func(t *testing.T) {
 		b, f, _, st := newUsersTestBot(t, "1")
-		if _, _, err := st.Credit("555", 250000, "TXN-1"); err != nil {
+		if _, _, err := st.Credit("555", 10_000_000, "TXN-1"); err != nil { // 10.00 USDT in micro
 			t.Fatalf("seed credit: %v", err)
 		}
 		b.Process(ctx, callbackUpdate(1, "adm:custlookup"))
@@ -161,8 +161,8 @@ func TestAddBalFlow(t *testing.T) {
 			t.Fatalf("admin confirmation = %+v, want %q", last, want)
 		}
 		bal, err := st.GetBalance("555")
-		if err != nil || bal != 62500 {
-			t.Errorf("GetBalance(555) = %d, %v, want 62500", bal, err)
+		if err != nil || bal != 2_500_000 {
+			t.Errorf("GetBalance(555) = %d, %v, want 2_500_000 (2.50 USDT in micro)", bal, err)
 		}
 		// Customer DM.
 		found := false
@@ -178,7 +178,7 @@ func TestAddBalFlow(t *testing.T) {
 
 	t.Run("debit path succeeds within balance", func(t *testing.T) {
 		b, f, _, st := newUsersTestBot(t, "1")
-		if _, err := st.CreditBalance("555", 100000); err != nil {
+		if _, err := st.CreditBalance("555", 4_000_000); err != nil { // 4.00 USDT
 			t.Fatal(err)
 		}
 		b.Process(ctx, callbackUpdate(1, "adm:addbal"))
@@ -190,14 +190,14 @@ func TestAddBalFlow(t *testing.T) {
 		if last == nil || last.Text != want {
 			t.Fatalf("admin confirmation = %+v, want %q", last, want)
 		}
-		if bal, _ := st.GetBalance("555"); bal != 50000 {
-			t.Errorf("GetBalance(555) = %d, want 50000", bal)
+		if bal, _ := st.GetBalance("555"); bal != 2_000_000 {
+			t.Errorf("GetBalance(555) = %d, want 2_000_000 (2.00 USDT in micro)", bal)
 		}
 	})
 
 	t.Run("debit-overdraw refusal persists nothing", func(t *testing.T) {
 		b, f, _, st := newUsersTestBot(t, "1")
-		if _, err := st.CreditBalance("555", 25000); err != nil { // 1.00 USDT
+		if _, err := st.CreditBalance("555", 1_000_000); err != nil { // 1.00 USDT
 			t.Fatal(err)
 		}
 		b.Process(ctx, callbackUpdate(1, "adm:addbal"))
@@ -209,14 +209,14 @@ func TestAddBalFlow(t *testing.T) {
 		if last == nil || last.Text != want {
 			t.Fatalf("rejection = %+v, want %q", last, want)
 		}
-		if bal, _ := st.GetBalance("555"); bal != 25000 {
-			t.Errorf("balance mutated on refused debit: got %d, want 25000", bal)
+		if bal, _ := st.GetBalance("555"); bal != 1_000_000 {
+			t.Errorf("balance mutated on refused debit: got %d, want 1_000_000 (1.00 USDT in micro)", bal)
 		}
 	})
 
 	t.Run("invalid amount rejects and persists nothing", func(t *testing.T) {
 		b, f, _, st := newUsersTestBot(t, "1")
-		if _, err := st.CreditBalance("555", 25000); err != nil {
+		if _, err := st.CreditBalance("555", 1_000_000); err != nil {
 			t.Fatal(err)
 		}
 		b.Process(ctx, callbackUpdate(1, "adm:addbal"))
@@ -226,8 +226,8 @@ func TestAddBalFlow(t *testing.T) {
 		if last := lastSendMsg(f); last == nil || last.Text != "❌ Amount must be a number, e.g. 2.5 or -1." {
 			t.Fatalf("rejection = %+v", last)
 		}
-		if bal, _ := st.GetBalance("555"); bal != 25000 {
-			t.Errorf("balance mutated on invalid amount: got %d, want 25000", bal)
+		if bal, _ := st.GetBalance("555"); bal != 1_000_000 {
+			t.Errorf("balance mutated on invalid amount: got %d, want 1_000_000", bal)
 		}
 	})
 
@@ -323,7 +323,7 @@ func TestAddBalCreditAuditsRow(t *testing.T) {
 	if want := "+2.50 USDT → new balance 2.50 USDT"; row.Outcome != want {
 		t.Errorf("Outcome = %q, want %q", row.Outcome, want)
 	}
-	if want := "amount_vnd=62500 new_balance_vnd=62500"; row.Detail != want {
+	if want := "amount_micro=2500000 new_balance_micro=2500000"; row.Detail != want {
 		t.Errorf("Detail = %q, want %q", row.Detail, want)
 	}
 }
@@ -337,7 +337,7 @@ func TestAddBalCreditAuditsRow(t *testing.T) {
 func TestAddBalDebitAuditsRowWithCorrectSign(t *testing.T) {
 	ctx := context.Background()
 	b, f, _, st := newUsersTestBot(t, "1")
-	if _, err := st.CreditBalance("555", 100000); err != nil {
+	if _, err := st.CreditBalance("555", 4_000_000); err != nil {
 		t.Fatal(err)
 	}
 
@@ -371,7 +371,7 @@ func TestAddBalDebitAuditsRowWithCorrectSign(t *testing.T) {
 	if want := "-2.00 USDT → new balance 2.00 USDT"; row.Outcome != want {
 		t.Errorf("Outcome = %q, want %q", row.Outcome, want)
 	}
-	if want := "amount_vnd=-50000 new_balance_vnd=50000"; row.Detail != want {
+	if want := "amount_micro=-2000000 new_balance_micro=2000000"; row.Detail != want {
 		t.Errorf("Detail = %q, want %q", row.Detail, want)
 	}
 }

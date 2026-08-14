@@ -29,7 +29,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -185,27 +184,6 @@ func QRURL() string {
 // unset, tron_pay.py:86-88).
 func QRPath() string {
 	return strings.TrimSpace(os.Getenv("TRON_QR_PATH"))
-}
-
-// UsdtToVND converts a received USDT amount to VND (USDT ~ USD) at the
-// VND-per-USD rate the CALLER supplies. Used to record the value ACTUALLY
-// received (tron_pay.py:91-95). Twin of bep20.UsdtToVND — see that function's
-// doc comment for why the rate is a parameter rather than an environment
-// read, and why a non-positive rate is an error instead of a zero credit.
-func UsdtToVND(usdt *big.Rat, rateStr string) (int64, error) {
-	rateStr = strings.TrimSpace(rateStr)
-	if rateStr == "" {
-		return 0, fmt.Errorf("tron: no USD_TO_VND rate supplied")
-	}
-	rate, err := strconv.ParseFloat(rateStr, 64)
-	if err != nil {
-		return 0, fmt.Errorf("tron: invalid USD_TO_VND %q: %w", rateStr, err)
-	}
-	if rate <= 0 {
-		return 0, fmt.Errorf("tron: non-positive USD_TO_VND %q", rateStr)
-	}
-	f, _ := usdt.Float64()
-	return int64(math.Round(f * rate)), nil
 }
 
 // AmountUnits returns the integer amount-unit value of a USDT amount string

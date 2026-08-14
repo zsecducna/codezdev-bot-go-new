@@ -90,7 +90,6 @@ type ChatState struct {
 	AddReseller       bool                  // pending_addreseller @3532
 	AddWL             bool                  // pending_addwl @3535
 	RmAdmin           bool                  // pending_rmadmin @3538
-	SetRate           bool                  // pending_setrate @3542
 	SetBep20          bool                  // pending_setbep20 @3546
 	SetTron           bool                  // pending_settron @3550
 	SetMaxQty         bool                  // pending_setmaxqty @3554
@@ -341,7 +340,6 @@ func (st *ChatState) ClearAdminPending() {
 	st.EditFile = nil
 	st.RmProd = ""
 	st.Entra = nil
-	st.SetRate = false
 	st.SetBep20 = false
 	st.SetTron = false
 	st.SetApiPrice = false

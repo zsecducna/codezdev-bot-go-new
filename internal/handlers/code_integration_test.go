@@ -42,14 +42,16 @@ func newCodeBot(t *testing.T) (*Bot, *fakeTG, *store.Store, string) {
 	return b, f, st, dir
 }
 
-// seedProduct100 creates product "prod-a" priced at 100 VND/unit with tier KBH.
+// seedProduct100 creates product "prod-a" priced at 100 micro-USDT/unit (a
+// token amount; the test asserts arithmetically, not on the real-world price)
+// with tier KBH.
 func seedProduct100(t *testing.T, dir string) {
 	t.Helper()
 	pdir := filepath.Join(dir, "accounts", "prod-a")
 	if err := os.MkdirAll(filepath.Join(pdir, "active"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(pdir, "price_KBH_VND"), []byte("100"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(pdir, "price_KBH_USDT"), []byte("100"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -650,7 +652,6 @@ func TestCaptureChainOrderWithCode(t *testing.T) {
 		"upstock",
 		"getord",
 		"custlookup", "addadmin", "addreseller", "addwl", "rmadmin",
-		"setrate",
 		"setapiprice", "setapimin", "setapimax", "setkiroprice", "setkiromin", "setkiromax", "setapicap",
 		"setkirourl", "setkirokey", "setkiroacct", "setbep20", "settron", "setmaxqty",
 		"refundreject",

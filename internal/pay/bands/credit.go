@@ -84,21 +84,19 @@ func ClampDepositTol(p Params, tolUnits int) int {
 //
 //	desired_units = amount_units(expected)                  # what they were asked to send
 //	if abs(recv_units - desired_units) <= DEPOSIT_MATCH_TOL_UNITS:
-//	    credit_vnd = max(int(o["total"]), recv_vnd)
+//	    credit_micro = max(int(o["total"]), recv_micro)
 //	else:
-//	    credit_vnd = recv_vnd
+//	    credit_micro = recv_micro
 //
 // Two rules ride on that `max`, and both are pinned by the Python
 // tests/test_deposit_credit.py acceptance suite:
 //
 //   - UNDERPAY within tolerance is rounded UP to the desired top-up rather than
-//     short-crediting a confusing amount. At a STABLE exchange rate this branch
+//     short-crediting a confusing amount. At a STABLE unit this branch
 //     does not fire on the deposit path — see DefaultDepositMatchTolUnits: the
 //     picker's jitter puts the quoted amount at least 0.01 USDT above the
 //     requested total, so a receipt within 0.00050 of it is still worth more
-//     than the request and the overpay rule below wins. It fires when the rate
-//     moves DOWN between the quote and the verify, which the hour-long deposit
-//     window makes a real occurrence, not a theoretical one.
+//     than the request and the overpay rule below wins.
 //   - OVERPAY within tolerance credits the ACTUAL received amount: a customer
 //     quoted 120.01000 and credited for a 120 request gets 120.01000's value,
 //     never the smaller desired 120. The customer is never shorted — which is
@@ -108,21 +106,22 @@ func ClampDepositTol(p Params, tolUnits int) int {
 // what actually ARRIVED — money is never lost, and a deposit never rejects.
 //
 // `recvUnits`/`desiredUnits` are amount units (1e-5 USDT at the shipped 5
-// decimals) at the rail's AMOUNT_DECIMALS; `desiredVND`/`recvVND` are the VND
-// values of the requested and the received amounts. `tolUnits` is
-// DepositMatchTolUnits(), and callers MUST pass it through ClampDepositTol so
-// no configuration can widen it past the rail's band half-width.
+// decimals) at the rail's AMOUNT_DECIMALS; `desiredMicro`/`recvMicro` are the
+// micro-USDT values (1 USDT = 1,000,000 micro) of the requested and the received
+// amounts — the stored ledger unit. `tolUnits` is DepositMatchTolUnits(), and
+// callers MUST pass it through ClampDepositTol so no configuration can widen it
+// past the rail's band half-width.
 //
 // withinTol is returned for the caller's audit line; it does NOT mean the credit
-// equals desiredVND (see the overpay rule above).
-func DepositCredit(recvUnits, desiredUnits int64, desiredVND, recvVND int64, tolUnits int) (creditVND int64, withinTol bool) {
+// equals desiredMicro (see the overpay rule above).
+func DepositCredit(recvUnits, desiredUnits int64, desiredMicro, recvMicro int64, tolUnits int) (creditMicro int64, withinTol bool) {
 	if abs64(recvUnits-desiredUnits) <= int64(tolUnits) {
 		// Round a tiny UNDERpay up to the desired top-up but NEVER credit less
 		// than what actually arrived (telegram_bot.py:9758-9761).
-		if recvVND > desiredVND {
-			return recvVND, true
+		if recvMicro > desiredMicro {
+			return recvMicro, true
 		}
-		return desiredVND, true
+		return desiredMicro, true
 	}
-	return recvVND, false // off-amount self-deposit -> credit actual
+	return recvMicro, false // off-amount self-deposit -> credit actual
 }

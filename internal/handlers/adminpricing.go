@@ -32,7 +32,6 @@ import (
 	"strconv"
 	"strings"
 
-	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/store"
 	"codezdev-bot/internal/tg"
@@ -90,14 +89,13 @@ func (b *Bot) registerAdminPricing() {
 // "1,234.5" is accepted the same as "1234.5".
 var adminUsdtRe = regexp.MustCompile(`^-?\d+(\.\d+)?$`)
 
-// adminUsdtToVnd converts an admin-typed USDT amount into stored VND —
-// _admin_usdt_to_vnd (telegram_bot.py:6463-6477): comma-stripped, matched
-// against a plain signed-decimal shape, then rounded at the live USD→VND
-// rate. ok is false on ANY parse failure OR an unset/invalid rate — either
-// way the caller must reject the input rather than persist a bogus price
-// (a price write is money: CLAUDE.md/py_pricing_spec.md §1's "a rejected
-// value must never be persisted").
-func (b *Bot) adminUsdtToVnd(text string) (int64, bool) {
+// adminUsdtToMicro converts an admin-typed USDT amount into stored micro-USDT
+// (1 USDT = 1,000,000 micro): comma-stripped, matched against a plain
+// signed-decimal shape, then scaled by 1e6. ok is false ONLY on a parse failure
+// — the caller must reject rather than persist a bogus price (a price write is
+// money: CLAUDE.md/py_pricing_spec.md §1's "a rejected value must never be
+// persisted").
+func (b *Bot) adminUsdtToMicro(text string) (int64, bool) {
 	s := strings.ReplaceAll(strings.TrimSpace(text), ",", "")
 	if !adminUsdtRe.MatchString(s) {
 		return 0, false
@@ -106,15 +104,7 @@ func (b *Bot) adminUsdtToVnd(text string) (int64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	rateStr := config.DefaultUSDToVND
-	if b.cfg != nil {
-		rateStr = b.cfg.USDToVND()
-	}
-	rate, err := strconv.ParseFloat(rateStr, 64)
-	if err != nil || rate <= 0 {
-		return 0, false
-	}
-	return int64(math.Round(f * rate)), true
+	return int64(math.Round(f * 1_000_000)), true
 }
 
 // fmtRate renders a USDT rate the way Python's :g format spec does: 6
@@ -352,12 +342,12 @@ func (b *Bot) capTier(c *Ctx) bool {
 	if len(bits) > 0 {
 		code = strings.ToUpper(bits[0])
 	}
-	var vnd int64
+	var micro int64
 	var priceOK bool
 	if len(bits) > 1 {
-		vnd, priceOK = b.adminUsdtToVnd(bits[1])
+		micro, priceOK = b.adminUsdtToMicro(bits[1])
 	}
-	if !validTierCode(code) || !priceOK || vnd <= 0 {
+	if !validTierCode(code) || !priceOK || micro <= 0 {
 		b.send(c.Ctx, c.ChatID,
 			"⚠️ Send  CODE PRICE.\n"+
 				"Code must be KBH, BH<N>D (days, e.g. BH30D) or BH<N>H "+
@@ -373,7 +363,7 @@ func (b *Bot) capTier(c *Ctx) bool {
 	// overwritten — "" when the tier never existed, so auditOldNew renders
 	// "(unset) -> <price>" rather than a misleading blank price.
 	oldVnd, hadOld := b.stock.ProductPrice(product, code)
-	existed, err := b.stock.SetProductPrice(product, code, int(vnd))
+	existed, err := b.stock.SetProductPrice(product, code, int(micro))
 	if err != nil {
 		b.send(c.Ctx, c.ChatID, "❌ Failed to write price: "+err.Error(), admNav("admcat:pricing"))
 		return true
@@ -386,13 +376,13 @@ func (b *Bot) capTier(c *Ctx) bool {
 	if hadOld {
 		oldStr = b.usdtDisp(int64(oldVnd))
 	}
-	b.auditConfigSet(fmtInt(c.ChatID), "config_set_product_price", product+"/"+code, oldStr, b.usdtDisp(vnd))
+	b.auditConfigSet(fmtInt(c.ChatID), "config_set_product_price", product+"/"+code, oldStr, b.usdtDisp(micro))
 	verb := "Added"
 	if existed {
 		verb = "Updated"
 	}
 	b.send(c.Ctx, c.ChatID,
-		"✅ "+verb+" tier "+b.tierLabel(code, i18n.EN)+" = "+b.usdtDisp(vnd)+" on "+product,
+		"✅ "+verb+" tier "+b.tierLabel(code, i18n.EN)+" = "+b.usdtDisp(micro)+" on "+product,
 		admNavRetry("admcat:pricing", "🏷️ Prices & tiers", "adm:setprice"))
 	return true
 }
@@ -411,8 +401,8 @@ func (b *Bot) capPrice(c *Ctx) bool {
 	if strings.HasPrefix(c.Text, "/") || labelToCmd(c.Text) != "" {
 		return false
 	}
-	vnd, ok := b.adminUsdtToVnd(c.Text)
-	if !ok || vnd <= 0 {
+	micro, ok := b.adminUsdtToMicro(c.Text)
+	if !ok || micro <= 0 {
 		b.send(c.Ctx, c.ChatID, "⚠️ Invalid price. Enter a positive USDT amount, e.g. 5.", admNav("admcat:pricing"))
 		return true // slot stays ARMED
 	}
@@ -423,7 +413,7 @@ func (b *Bot) capPrice(c *Ctx) bool {
 	// the SAME underlying stock.SetProductPrice mutation, reached via the
 	// edit-existing-tier wizard (pricetier:) instead of add-new (tieradd:).
 	oldVnd, hadOld := b.stock.ProductPrice(armed.Product, armed.Code)
-	if _, err := b.stock.SetProductPrice(armed.Product, armed.Code, int(vnd)); err != nil {
+	if _, err := b.stock.SetProductPrice(armed.Product, armed.Code, int(micro)); err != nil {
 		b.send(c.Ctx, c.ChatID, "❌ Failed to write price: "+err.Error(), admNav("admcat:pricing"))
 		return true
 	}
@@ -431,9 +421,9 @@ func (b *Bot) capPrice(c *Ctx) bool {
 	if hadOld {
 		oldStr = b.usdtDisp(int64(oldVnd))
 	}
-	b.auditConfigSet(fmtInt(c.ChatID), "config_set_product_price", armed.Product+"/"+armed.Code, oldStr, b.usdtDisp(vnd))
+	b.auditConfigSet(fmtInt(c.ChatID), "config_set_product_price", armed.Product+"/"+armed.Code, oldStr, b.usdtDisp(micro))
 	b.send(c.Ctx, c.ChatID,
-		"✅ "+armed.Product+" — "+b.tierLabel(armed.Code, i18n.EN)+" set to "+b.usdtDisp(vnd),
+		"✅ "+armed.Product+" — "+b.tierLabel(armed.Code, i18n.EN)+" set to "+b.usdtDisp(micro),
 		admNavRetry("admcat:pricing", "🏷️ Prices & tiers", "adm:setprice"))
 	return true
 }

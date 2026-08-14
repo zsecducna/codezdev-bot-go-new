@@ -770,8 +770,8 @@ func TestApikeyRateUnsetHidesProduct(t *testing.T) {
 	if got := b.apikeyRateUSDT(saleClassBedrock); got != 4.0 {
 		t.Errorf("legacy per-1k rate migrated to %v per 100, want 4", got)
 	}
-	if got := b.apikeyPriceVND(100, saleClassBedrock); got != 100000 {
-		t.Errorf("100 credits = %d VND, want 100000 (4 USDT @ 25000)", got)
+	if got := b.apikeyPriceMicro(100, saleClassBedrock); got != 4_000_000 {
+		t.Errorf("100 credits = %d micro, want 4_000_000 (4 USDT)", got)
 	}
 }
 
@@ -780,38 +780,35 @@ func TestApikeyRateUnsetHidesProduct(t *testing.T) {
 // TestApikeyOpusTokenEstimate pins apikeyOpusEst's pure arithmetic and its
 // failure paths — port of test_opus_token_estimate. Two numbers a buyer shops
 // on (tokens per 1 USDT, USDT per 1M tokens) both derive from the price of
-// 100 credits; they must move linearly with that price and vanish — never
-// print a bogus zero — when the price or the config USD_TO_VND rate is
-// unusable. The rate comes from usdtStrCfg (b.cfg.USDToVND()), the SAME
-// config-layered source the "Price:" line uses, NOT the raw ambient env —
-// see TestApikeyOpusEstimateUsesConfigRateNotAmbientEnv for the regression
-// this matters for.
+// 100 credits (a micro-USDT amount); they must move linearly with that price
+// and vanish — never print a bogus zero — when the price is unusable. The price
+// feeds usdtStr (rate-free micro->2dp), so the estimate is deterministic from
+// the stored micro total, with no exchange rate to disagree on.
 func TestApikeyOpusTokenEstimate(t *testing.T) {
 	b, _, _, _, _ := newAPIKeyBot(t)
-	t.Setenv("USD_TO_VND", "25000") // 1 USDT = 25,000 VND
 
-	// 4.00 USDT / 100 credits, 80M tokens per 100 credits ->
+	// 4.00 USDT / 100 credits (4,000,000 micro), 80M tokens per 100 credits ->
 	// 80M / 4 = 20.0M tokens per USDT, 4 / 80 = 0.05 USDT per 1M.
-	if got := b.apikeyOpusEst(100000, i18n.EN); !strings.Contains(got, "20.0M") || !strings.Contains(got, "0.05 USDT per 1M") {
+	if got := b.apikeyOpusEst(4_000_000, i18n.EN); !strings.Contains(got, "20.0M") || !strings.Contains(got, "0.05 USDT per 1M") {
 		t.Errorf("apikeyOpusEst(4.00 USDT/100) = %q, want 20.0M tokens and 0.05 USDT per 1M", got)
 	}
 	// Halving the price must double the tokens per USDT (linear, no drift).
-	if got := b.apikeyOpusEst(50000, i18n.EN); !strings.Contains(got, "40.0M") {
+	if got := b.apikeyOpusEst(2_000_000, i18n.EN); !strings.Contains(got, "40.0M") {
 		t.Errorf("half the price -> twice the tokens per USDT, got %q", got)
 	}
 	// A sub-cent per-1M price (0.70 USDT/100 credits -> 0.00875 USDT/1M) keeps
 	// significant digits instead of rounding away to "0.01".
-	if got := b.apikeyOpusEst(17500, i18n.EN); !strings.Contains(got, "0.00875") {
+	if got := b.apikeyOpusEst(700_000, i18n.EN); !strings.Contains(got, "0.00875") {
 		t.Errorf("sub-cent per-1M price rounded away: %q", got)
 	}
 	// Every language renders and none of them crash.
 	for _, lang := range i18n.LANGS {
-		if got := b.apikeyOpusEst(100000, lang); !strings.Contains(got, "20.0M") {
+		if got := b.apikeyOpusEst(4_000_000, lang); !strings.Contains(got, "20.0M") {
 			t.Errorf("estimate did not render for %v: %q", lang, got)
 		}
 	}
 	// Unknown language falls back to English rather than raising/blanking.
-	if got, want := b.apikeyOpusEst(100000, i18n.Lang("xx")), b.apikeyOpusEst(100000, i18n.EN); got != want {
+	if got, want := b.apikeyOpusEst(4_000_000, i18n.Lang("xx")), b.apikeyOpusEst(4_000_000, i18n.EN); got != want {
 		t.Errorf("unknown lang = %q, want English fallback %q", got, want)
 	}
 	// Unusable inputs -> EMPTY block (the screen simply drops the lines).
@@ -823,20 +820,12 @@ func TestApikeyOpusTokenEstimate(t *testing.T) {
 	}
 	// An absurd (fat-fingered) rate — 5000 USDT/100 credits — would floor the
 	// M-rendering to a misleading "0.0M tokens"; the block must vanish instead.
-	if got := b.apikeyOpusEst(125000000, i18n.EN); got != "" {
+	if got := b.apikeyOpusEst(5_000_000_000, i18n.EN); got != "" {
 		t.Errorf("absurd rate -> no estimate, not '0.0M', got %q", got)
 	}
-	// Unsetting the AMBIENT env must NOT blank the estimate: usdtStrCfg reads
-	// through b.cfg.USDToVND(), which falls back to the compiled default
-	// ("25000") when neither settings.json nor the env set a rate — exactly
-	// like usdtDisp/the Price line above it, and UNLIKE the pre-fix code
-	// (usdtStr -> raw os.LookupEnv), which would have gone blank here. No
-	// USD_TO_VND at all is a normal boot state (config.DefaultUSDToVND
-	// exists precisely for it), not an unusable-rate state.
-	os.Unsetenv("USD_TO_VND")
-	if got := b.apikeyOpusEst(100000, i18n.EN); !strings.Contains(got, "20.0M") {
-		t.Errorf("unset ambient USD_TO_VND should still render via the compiled default, got %q", got)
-	}
+	// There is no longer an ambient-rate path to exercise (the micro ledger has
+	// no rate), so the old "unset USD_TO_VND still renders" subtest is gone —
+	// apikeyOpusEst is pure over its micro input and always renders a real price.
 }
 
 // TestApikeyOpusEstimateFollowsResellerRate: a reseller's estimate must use
@@ -896,42 +885,12 @@ func TestApikeyPromptShowsOpusEstimate(t *testing.T) {
 	}
 }
 
-// TestApikeyOpusEstimateUsesConfigRateNotAmbientEnv is a regression pin for a
-// review-caught HIGH bug: apikeyOpusEst originally read USD_TO_VND through
-// usdtStr (paypal.VndToUSD -> raw os.LookupEnv("USD_TO_VND")), while the
-// "Price: X / 100 credits" line directly above it on the SAME screen reads
-// the rate through usdtDisp/apikeyPriceVND (b.cfg.USDToVND() ->
-// settings.json's admin-set "usd_to_vnd" overriding .env, else default).
-// t.Setenv-only tests can't catch that divergence — they set the ONE value
-// both paths would see. This test deliberately makes the two disagree: an
-// admin-set settings.json rate (26000, as adm:setrate would save) against a
-// stale ambient/.env rate (25000) that no longer matches. On the buggy code
-// this reproduces the exact self-contradiction the review flagged — Price:
-// 4.00 USDT, estimate silently computed off 4.16 USDT ("≈19.2M tokens per 1
-// USDT"); on the fix both lines are computed off the SAME 26000 rate
-// ("20.0M").
-func TestApikeyOpusEstimateUsesConfigRateNotAmbientEnv(t *testing.T) {
-	b, _, _, fk, dir := newAPIKeyBot(t)
-	t.Setenv("USD_TO_VND", "25000") // stale ambient/.env rate
-	s := apikeySettings(fk)
-	s["usd_to_vnd"] = 26000 // admin-set rate (adm:setrate), must win over ambient env
-	writeSettings(t, dir, s)
-
-	// apikey_usdt_per_100=4.0 (apikeySettings baseline) priced through the
-	// CONFIG rate is exactly what both apikeyPriceVND and the Price: line use.
-	vndPer100 := b.apikeyPriceVND(100, saleClassBedrock)
-	if vndPer100 != 104000 {
-		t.Fatalf("precondition: apikeyPriceVND = %d, want 104000 (4.00 USDT @ 26000)", vndPer100)
-	}
-
-	got := b.apikeyOpusEst(vndPer100, i18n.EN)
-	if strings.Contains(got, "19.2M") {
-		t.Errorf("apikeyOpusEst used the stale ambient USD_TO_VND (25000) instead of the config rate (26000): %q", got)
-	}
-	if !strings.Contains(got, "20.0M") {
-		t.Errorf("apikeyOpusEst = %q, want 20.0M tokens (same 26000 config rate as the Price line)", got)
-	}
-}
+// TestApikeyOpusEstimateUsesConfigRateNotAmbientEnv and its rate-precedence
+// premise are gone with the USD→VND rate itself: apikeyOpusEst now prices off
+// the stored micro total (usdtStr is rate-free), so there is no config-vs-env
+// rate for the estimate and the Price line to disagree on. The estimate's
+// arithmetic is pinned in TestApikeyOpusTokenEstimate; the reseller-discounted
+// path in TestApikeyOpusEstimateFollowsResellerRate.
 
 // TestApikeyKiroSKUNeedsToggle: the kiro SKU stays hidden until its master
 // toggle flips, even when priced — enabling against a pre-saleClass server would
@@ -1404,7 +1363,7 @@ func TestApikeyPurchaseE2E(t *testing.T) {
 	b, f, st, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	primeKB(b, chat)
-	if _, err := st.CreditBalance(fmtInt(chat), 2000000); err != nil {
+	if _, err := st.CreditBalance(fmtInt(chat), 80_000_000); err != nil { // 80 USDT, enough for the 20 USDT order
 		t.Fatal(err)
 	}
 
@@ -1440,8 +1399,8 @@ func TestApikeyPurchaseE2E(t *testing.T) {
 	if o == nil || o.Product != apikeyProduct || o.Qty != 500 || o.Tier != "API" {
 		t.Fatalf("order = %+v, want a 500-credit __apikey__ order with tier API", o)
 	}
-	if o.Total != 500000 { // 500 credits @ 4 USDT/100 @ 25000 VND/USD
-		t.Errorf("total = %d, want 500000", o.Total)
+	if o.Total != 20_000_000 { // 500 credits @ 4 USDT/100 = 20 USDT = 20,000,000 micro
+		t.Errorf("total = %d, want 20_000_000", o.Total)
 	}
 
 	// Pay by balance -> settle -> mint -> delivery.
@@ -1453,8 +1412,8 @@ func TestApikeyPurchaseE2E(t *testing.T) {
 	if got, _ := st.GetOrder(des); got.Status != "delivered" {
 		t.Errorf("order = %q, want delivered", got.Status)
 	}
-	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 1500000 {
-		t.Errorf("balance = %d, want 1500000 after the 500000 debit", bal)
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 60_000_000 {
+		t.Errorf("balance = %d, want 60_000_000 after the 20_000_000 debit", bal)
 	}
 	if countContains(f, row.APIKey) != 1 {
 		t.Error("the cleartext key must be delivered exactly once")

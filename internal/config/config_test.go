@@ -1,9 +1,7 @@
 package config
 
 import (
-	"bytes"
 	"encoding/json"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -355,175 +353,20 @@ func TestSettingsFileRemovedInvalidatesCache(t *testing.T) {
 // (architecture-go.md §7).
 // ---------------------------------------------------------------------------
 
-func TestUSDToVNDPrecedence(t *testing.T) {
-	t.Run("compiled default when nothing set", func(t *testing.T) {
-		c := mustLoad(t, t.TempDir())
-		if got := c.USDToVND(); got != DefaultUSDToVND {
-			t.Errorf("USDToVND() = %q, want default %q", got, DefaultUSDToVND)
-		}
-	})
-
-	t.Run("env overrides default", func(t *testing.T) {
-		dir := t.TempDir()
-		writeFile(t, filepath.Join(dir, ".env"), "USD_TO_VND=26000\n")
-		c := mustLoad(t, dir)
-		if got := c.USDToVND(); got != "26000" {
-			t.Errorf("USDToVND() = %q, want %q", got, "26000")
-		}
-	})
-
-	t.Run("settings overrides env", func(t *testing.T) {
-		dir := t.TempDir()
-		writeFile(t, filepath.Join(dir, ".env"), "USD_TO_VND=26000\n")
-		// Task #40: 27500 (whole number, in [RateMin, RateMax]) is a shape
-		// capSetRate could actually have written — must still win over env.
-		writeFile(t, filepath.Join(dir, "settings.json"), `{"usd_to_vnd": 27500}`)
-		c := mustLoad(t, dir)
-		if got := c.USDToVND(); got != "27500" {
-			t.Errorf("USDToVND() = %q, want settings value %q", got, "27500")
-		}
-	})
-
-	t.Run("zero settings value falls through to env", func(t *testing.T) {
-		dir := t.TempDir()
-		writeFile(t, filepath.Join(dir, ".env"), "USD_TO_VND=26000\n")
-		writeFile(t, filepath.Join(dir, "settings.json"), `{"usd_to_vnd": 0}`)
-		c := mustLoad(t, dir)
-		if got := c.USDToVND(); got != "26000" {
-			t.Errorf("USDToVND() = %q, want env value %q (falsy settings value ignored)", got, "26000")
-		}
-	})
-
-	// Task #40 note: this used to be "27500.9 truncates to 27500" — that
-	// truncation is exactly the shape-2 poison-value bug (0.5 -> "0"), just
-	// with a less alarming example. 27500.9 is not a whole number, so
-	// capSetRate (internal/handlers/adminsettings.go) could never have
-	// written it; it must now be rejected and fall through, not truncated.
-	t.Run("fractional settings value is rejected, not truncated, falls through to env", func(t *testing.T) {
-		dir := t.TempDir()
-		writeFile(t, filepath.Join(dir, ".env"), "USD_TO_VND=26000\n")
-		writeFile(t, filepath.Join(dir, "settings.json"), `{"usd_to_vnd": 27500.9}`)
-		c := mustLoad(t, dir)
-		if got := c.USDToVND(); got != "26000" {
-			t.Errorf("USDToVND() = %q, want env fallback %q (fractional rate is not admin-settable)", got, "26000")
-		}
-	})
-
-	// TestUSDToVNDPrecedence/whitespace-padded ambient rate is trimmed: the
-	// structural half of task #25's follow-up. Load's env snapshot copies the
-	// AMBIENT process environment verbatim (config.go:42-53) — only .env-FILE
-	// lines go through parseEnvLines's own trim — so an operator-exported
-	// `USD_TO_VND=" 25000 "` used to reach every caller of USDToVND() with its
-	// whitespace intact, and every caller parses the result with
-	// strconv.ParseFloat, which rejects surrounding whitespace outright.
-	// t.Setenv (not a .env-file fixture) is deliberate: the defect lives
-	// specifically in the un-trimmed AMBIENT path.
-	t.Run("whitespace-padded ambient rate is trimmed", func(t *testing.T) {
-		dir := t.TempDir()
-		t.Setenv("USD_TO_VND", " 25000 ")
-		c := mustLoad(t, dir)
-		if got := c.USDToVND(); got != "25000" {
-			t.Errorf("USDToVND() = %q, want trimmed %q", got, "25000")
-		}
-	})
-}
-
-// TestUSDToVNDRejectsHandEditedRate is task #40: a hand-edited settings.json
-// "usd_to_vnd" can carry a value no admin action (capSetRate,
-// internal/handlers/adminsettings.go) could ever have produced. Every case
-// here asserts the RESOLVED rate string USDToVND() hands the rest of the
-// app — not truthyFloat/validAdminRate directly — so the test pins the
-// thing that actually matters: what price the shop uses.
-//
-// Each malicious/malformed subtest pairs a settings.json value with an env
-// fallback that is deliberately DIFFERENT from both the settings value and
-// DefaultUSDToVND, so a pass can only mean "fell through to env", never
-// "coincidentally landed on the right number a different way" — the trap
-// called out in the task: shapes 2 and 3 are the ones where the OLD code
-// does NOT fall through (0.5 truncates to poison "0"; true resolves to a
-// silently-valid "1"), so a test that lets the old code succeed by
-// accident would prove nothing.
-func TestUSDToVNDRejectsHandEditedRate(t *testing.T) {
-	const envFallback = "26000"
-
-	cases := []struct {
-		name string
-		json string // settings.json body
-		want string // resolved USDToVND()
-	}{
-		// ---- healthy control -------------------------------------------
-		{"healthy in-range integer wins over env", `{"usd_to_vnd": 23000}`, "23000"},
-
-		// ---- shape 1: non-numeric string --------------------------------
-		// truthyFloat("abc") = 0 -> already fell through under the old
-		// code too; still asserted so a regression here is caught.
-		{"non-numeric string falls through to env", `{"usd_to_vnd": "abc"}`, envFallback},
-
-		// ---- shape 2: 0 < x < 1 (the poison-value shape) -----------------
-		// OLD code: truthyFloat(0.5)=0.5 (non-zero) -> strconv.Itoa(int(0.5))
-		// = "0" -> every downstream `rate <= 0` gate fires. NEW code must
-		// reject 0.5 outright (not admin-settable: out of [RateMin,RateMax]
-		// AND fractional) and fall through to env — never produce "0".
-		{"0.5 does not truncate to poison zero, falls through to env", `{"usd_to_vnd": 0.5}`, envFallback},
-
-		// ---- shape 3: JSON boolean true (silent mispricing shape) -------
-		// OLD code: truthyFloat(true)=1 -> strconv.Itoa(1) = "1", a
-		// "valid" but catastrophic rate. NEW code must reject it (1 is
-		// outside [RateMin, RateMax]) and fall through to env — never "1".
-		{"boolean true does not resolve to a silent rate of 1, falls through to env", `{"usd_to_vnd": true}`, envFallback},
-		{"boolean false falls through to env", `{"usd_to_vnd": false}`, envFallback},
-
-		// ---- capSetRate boundary — exactly in range is honored -----------
-		{"exactly RateMin is honored", `{"usd_to_vnd": 1000}`, "1000"},
-		{"exactly RateMax is honored", `{"usd_to_vnd": 200000}`, "200000"},
-
-		// ---- capSetRate boundary — just outside is rejected --------------
-		{"one below RateMin falls through to env", `{"usd_to_vnd": 999}`, envFallback},
-		{"one above RateMax falls through to env", `{"usd_to_vnd": 200001}`, envFallback},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			writeFile(t, filepath.Join(dir, ".env"), "USD_TO_VND="+envFallback+"\n")
-			writeFile(t, filepath.Join(dir, "settings.json"), tc.json)
-			c := mustLoad(t, dir)
-			if got := c.USDToVND(); got != tc.want {
-				t.Errorf("USDToVND() with settings.json %s = %q, want %q", tc.json, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestUSDToVNDRejectionIsLoggedOncePerLoad is the "must LOG that it did so,
-// loudly and once per load, naming the key and the offending value" half of
-// task #40 — an admin who never sees this log has no way to know the rate
-// they believe is in effect is not.
-func TestUSDToVNDRejectionIsLoggedOncePerLoad(t *testing.T) {
+// TestUsdToVndKeyToleratedWhenPresent pins the "tolerate the key" half of the
+// micro-USDT flip: the USD→VND rate and its USDToVND() getter are GONE (the
+// ledger is micro-USDT now, no conversion to mis-read), but a settings.json
+// written by an older build may still carry a "usd_to_vnd" key. Such a leftover
+// must round-trip through Settings() without erroring on load — it is simply an
+// unknown key now, ignored by every getter. (A NEW build never writes the key,
+// and adm:setrate no longer exists to set it.)
+func TestUsdToVndKeyToleratedWhenPresent(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "settings.json"), `{"usd_to_vnd": "abc"}`)
+	writeFile(t, filepath.Join(dir, "settings.json"), `{"usd_to_vnd": 25000}`)
 	c := mustLoad(t, dir)
-
-	var buf bytes.Buffer
-	orig := log.Writer()
-	log.SetOutput(&buf)
-	defer log.SetOutput(orig)
-
-	// Two calls, same entry point: the mtime-cache must not re-validate
-	// (and thus not re-log) on the second call, since settings.json never
-	// changed on disk between them.
-	_ = c.USDToVND()
-	_ = c.USDToVND()
-
-	out := buf.String()
-	if !strings.Contains(out, "usd_to_vnd") {
-		t.Errorf("log output = %q, want it to name the offending key %q", out, "usd_to_vnd")
-	}
-	if !strings.Contains(out, "abc") {
-		t.Errorf("log output = %q, want it to name the offending value %q", out, "abc")
-	}
-	if n := strings.Count(out, "usd_to_vnd"); n != 1 {
-		t.Errorf("log fired %d times across two USDToVND() calls with no settings.json change, want exactly 1 (once per load)", n)
+	s := c.Settings()
+	if got, ok := s["usd_to_vnd"]; !ok || got == nil {
+		t.Errorf("Settings()[\"usd_to_vnd\"] = (%v,%t), want the leftover key to round-trip (ignored, not crashed on)", got, ok)
 	}
 }
 

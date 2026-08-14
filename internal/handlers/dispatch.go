@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"maps"
-	"math/big"
 	"strconv"
 	"strings"
 	"sync"
@@ -171,10 +170,8 @@ type Bot struct {
 	// with fakes (or httptest-backed real clients) instead of live chain RPC,
 	// while New binds the real internal/pay/* clients.
 	bep20Configured func() bool
-	bep20UsdtToVND  func(usdt *big.Rat) (int64, error)
 
 	tronConfigured func() bool
-	tronUsdtToVND  func(usdt *big.Rat) (int64, error)
 	// tronTransfersSince lists confirmed incoming USDT transfers to the seller
 	// address since an epoch-ms bound — the hands-free watcher's one chain read
 	// (usdtwatch.go). A seam like its siblings above, and for one extra reason:
@@ -490,29 +487,6 @@ func New(d Deps) *Bot {
 	b.bep20MinConf = b.envInt("BEP20_MIN_CONF", bep20.DefaultMinConfirmations)
 	b.bep20WatchLookback = int64(b.envInt("BEP20_WATCH_LOOKBACK_BLOCKS", 5000))
 	b.bep20BlockTS = bep20.BlockTimestamp
-	// The USD->VND rate is bridged the same way, and for the same reason —
-	// task #22, another instance of this port keeping a config reader while
-	// dropping the config source. These two converters value the amount a
-	// customer is CREDITED for an on-chain payment; the amount that same
-	// customer was QUOTED comes from vndToUSD/usdtDisp/usdtToVND, which all
-	// resolve b.cfg.USDToVND(). Before this binding the converters read
-	// os.LookupEnv("USD_TO_VND") instead, so the two sides could disagree in
-	// two ways: an admin running adm:setrate moved the quote and left
-	// crediting on the environment value, and a process with no USD_TO_VND set
-	// at all quoted at config.DefaultUSDToVND while crediting returned an
-	// error, which the hands-free watcher turns into a hold — a refusal to
-	// credit a payment that had already been made at a correctly quoted amount.
-	//
-	// The rate concept itself is slated to disappear in the USDT migration's
-	// slice S5, when the ledger flips to micro-USDT and there is nothing left
-	// to convert (see vndToUSD in usdt.go, which S5 deletes outright). Until
-	// that lands, the two sides have to agree.
-	b.bep20UsdtToVND = func(usdt *big.Rat) (int64, error) {
-		return bep20.UsdtToVND(usdt, b.usdRateStr())
-	}
-	b.tronUsdtToVND = func(usdt *big.Rat) (int64, error) {
-		return tron.UsdtToVND(usdt, b.usdRateStr())
-	}
 
 	// ---- login-code (OTP) suite (M2.6) --------------------------------------
 	// ONE semaphore for the whole process (telegram_bot.py:680) and the real node

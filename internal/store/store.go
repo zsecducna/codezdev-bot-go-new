@@ -95,6 +95,127 @@ func Open(path string) (*Store, error) {
 // Close releases the underlying handle.
 func (s *Store) Close() error { return s.db.Close() }
 
+// ---- micro-USDT ledger-unit boot guard -------------------------------------
+//
+// The stored money unit flipped from VND to micro-USDT (1 USDT = 1,000,000
+// micro). A store.db written by an older build holds VND amounts; booting this
+// build against it would read those VND figures AS micro and silently
+// mis-price everything by a factor of 40 (at rate 25000). The migrate-usdt
+// tool rewrites the money columns and writes a marker into a `meta` table; this
+// guard reads that marker at boot so an un-migrated DB refuses to start rather
+// than misbehaving. A fresh DB (no money rows yet) marks itself micro and boots.
+
+// metaTableExists reports whether the `meta` key/value table exists at all.
+// A missing table is normal for a DB that predates the migration tool.
+func (s *Store) metaTableExists() (bool, error) {
+	var n int
+	err := s.db.QueryRow(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'").Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// LedgerUnit reads meta.ledger_unit. Returns (value, true) when the meta table
+// exists AND the row is present; ("", false) when either is missing — both are
+// normal for a DB that has never been migrated (or a brand-new DB).
+func (s *Store) LedgerUnit() (string, bool) {
+	hasMeta, err := s.metaTableExists()
+	if err != nil || !hasMeta {
+		return "", false
+	}
+	var v string
+	err = s.db.QueryRow("SELECT value FROM meta WHERE key='ledger_unit'").Scan(&v)
+	if err != nil {
+		return "", false // sql.ErrNoRows or read error -> treat as unset
+	}
+	return v, true
+}
+
+// hasMoneyRows reports whether ANY of the money-bearing tables holds a row
+// (balances / orders / processed). Used by CheckMicroLedger to tell a FRESH
+// empty DB (safe to mark micro) from an UN-MIGRATED VND DB (must refuse).
+func (s *Store) hasMoneyRows() (bool, error) {
+	for _, t := range []string{"balances", "orders", "processed"} {
+		var n int64
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM " + t).Scan(&n); err != nil {
+			return false, fmt.Errorf("count %s: %w", t, err)
+		}
+		if n > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// EnsureMicroLedger creates the `meta` table (if absent) and inserts
+// ledger_unit='micro_usdt' (idempotent — INSERT OR IGNORE, so it never clobbers
+// an existing marker). Used for a FRESH DB that has no money rows and no meta
+// yet; the migrate-usdt tool writes the SAME marker for a migrated DB, so this
+// is the only path the live bot itself writes.
+func (s *Store) EnsureMicroLedger() error {
+	if _, err := s.db.Exec(
+		"CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"); err != nil {
+		return fmt.Errorf("create meta: %w", err)
+	}
+	if _, err := s.db.Exec(
+		"INSERT OR IGNORE INTO meta(key, value) VALUES ('ledger_unit', 'micro_usdt')"); err != nil {
+		return fmt.Errorf("mark ledger_unit: %w", err)
+	}
+	return nil
+}
+
+// ErrUnmigratedVNDLedger is returned by CheckMicroLedger when the DB predates
+// the micro-USDT flip: no meta marker, but money rows are present. The operator
+// must run migrate-usdt before this build can boot against that DB.
+var ErrUnmigratedVNDLedger = errors.New("unmigrated VND ledger — run migrate-usdt first")
+
+// CheckMicroLedger is the boot-time ledger-unit guard:
+//   - fresh DB (no meta, no money rows): marks itself micro_usdt via
+//     EnsureMicroLedger and returns nil;
+//   - un-migrated VND DB (no meta, but money rows present): returns
+//     ErrUnmigratedVNDLedger so the bot refuses to boot;
+//   - DB with a meta marker: returns nil only when ledger_unit == "micro_usdt",
+//     else a unit-mismatch error.
+//
+// Pure decision over the Store (no logging / log.Fatal) so it is directly
+// unit-testable; cmd/bot/main.go calls it and turns an error into a fatal exit.
+func (s *Store) CheckMicroLedger() error {
+	hasMeta, err := s.metaTableExists()
+	if err != nil {
+		return fmt.Errorf("check meta table: %w", err)
+	}
+	if !hasMeta {
+		hasMoney, err := s.hasMoneyRows()
+		if err != nil {
+			return err
+		}
+		if hasMoney {
+			return ErrUnmigratedVNDLedger
+		}
+		return s.EnsureMicroLedger()
+	}
+	if unit, ok := s.LedgerUnit(); ok && unit != "micro_usdt" {
+		return fmt.Errorf("meta.ledger_unit=%q is not micro_usdt — ledger unit mismatch", unit)
+	} else if !ok {
+		// meta table exists but no ledger_unit row. A fresh boot leaves meta
+		// empty (safe to self-mark micro); but a partial restore that kept the
+		// meta table while dropping the ledger_unit row, with VND money rows
+		// still present, must NOT be self-marked — that would silently corrupt.
+		// Same guard as the fresh-DB path: require no money rows first.
+		hasMoney, err := s.hasMoneyRows()
+		if err != nil {
+			return err
+		}
+		if hasMoney {
+			return ErrUnmigratedVNDLedger
+		}
+		return s.EnsureMicroLedger()
+	}
+	return nil
+}
+
 // initSchema is the port of store.py _init() (store.py:56-191): the same
 // idempotent CREATE TABLE IF NOT EXISTS statements plus the same
 // PRAGMA table_info column-add migrations, so the Go binary boots on BOTH an

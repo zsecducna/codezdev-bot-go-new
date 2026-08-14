@@ -18,7 +18,6 @@ var CanonicalCaptureOrder = []string{
 	"addreseller",  // 7  @17606 pop
 	"addwl",        // 8  @17630 pop
 	"rmadmin",      // 9  @17655 pop
-	"setrate",      // 10 @17675 pop
 	"setapiprice",  // 11 @17696 pop
 	"setapimin",    // 12 @17730 pop
 	"setapimax",    // 13 @17770 pop

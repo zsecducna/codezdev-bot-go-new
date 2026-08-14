@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"errors"
 	"math"
 	"math/big"
 	"sync"
@@ -92,8 +91,8 @@ func TestWatcherCreditsMatchingTransfer(t *testing.T) {
 	// DepositCredit never credits LESS than what arrived, so the customer keeps
 	// the jitter; the round-up-to-requested branch only fires when a payment
 	// lands slightly UNDER the quote.
-	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 150250 {
-		t.Errorf("balance after the watcher tick = %d VND, want 150250 — the deposit was not credited hands-free", bal)
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 6_010_000 {
+		t.Errorf("balance after the watcher tick = %d VND, want 6_010_000 — the deposit was not credited hands-free", bal)
 	}
 	// The order is closed for history/revenue, and the band is released so its
 	// amount returns to the picker.
@@ -136,8 +135,8 @@ func TestWatcherDoesNotDoubleCredit(t *testing.T) {
 	w.set(*trxTx(hash64("b"), res.Amount, b.now().UnixMilli()))
 	b.tickOnchain(ctx, bands.ProviderTron)
 	first, _ := st.GetBalance(fmtInt(payer))
-	if first != 150250 {
-		t.Fatalf("first tick credited %d VND, want 150250", first)
+	if first != 6_010_000 {
+		t.Fatalf("first tick credited %d VND, want 6_010_000", first)
 	}
 
 	b.tickOnchain(ctx, bands.ProviderTron)
@@ -223,8 +222,8 @@ func TestWatcherMatchesRehydratedBand(t *testing.T) {
 	if w.calls.Load() != 1 {
 		t.Errorf("fetch called %d times after rehydration, want 1 — a rehydrated deposit must still be watched", w.calls.Load())
 	}
-	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 150250 {
-		t.Errorf("balance after rehydrate+tick = %d VND, want 150250 — a deposit made across a restart was dropped", bal)
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 6_010_000 {
+		t.Errorf("balance after rehydrate+tick = %d VND, want 6_010_000 — a deposit made across a restart was dropped", bal)
 	}
 }
 
@@ -394,8 +393,8 @@ func TestWatcherQuarantineSurvivesTheCompetitionAndARestart(t *testing.T) {
 	// is settled by ITS OWN payment, so only one band is left standing.
 	w.set(ambiguous, *trxTx(hash64("6"), r1.Amount, b.now().UnixMilli()))
 	b.tickOnchain(ctx, bands.ProviderTron)
-	if bal, _ := st.GetBalance(fmtInt(first)); bal != 150250 {
-		t.Fatalf("first depositor balance = %d VND, want 150250 — its own payment should have settled", bal)
+	if bal, _ := st.GetBalance(fmtInt(first)); bal != 6_010_000 {
+		t.Fatalf("first depositor balance = %d VND, want 6_010_000 — its own payment should have settled", bal)
 	}
 	if b.bands.Len(bands.ProviderTron) != 1 {
 		t.Fatalf("expected exactly one surviving band, got %d", b.bands.Len(bands.ProviderTron))
@@ -614,39 +613,6 @@ func TestWatcherAuditsRefusalsOnABrokenOrderRow(t *testing.T) {
 	})
 }
 
-// TestWatcherAuditsAHeldPaymentItCannotValue is the no_rate verdict. Without a
-// usable USDT rate the payment cannot be turned into VND at all, and crediting 0
-// would lose the customer's money outright — so the watcher holds and retries.
-// A HELD payment is the case most likely to be reported as "my deposit never
-// arrived", and the reason it is held has to be answerable from the database.
-func TestWatcherAuditsAHeldPaymentItCannotValue(t *testing.T) {
-	ctx := context.Background()
-	b, _, st, _, _ := newUSDTBot(t)
-	w := installWatchFake(b)
-	const chat = 4722
-
-	b.Process(ctx, callbackUpdate(chat, "dep:trx"))
-	b.Process(ctx, textUpdate(chat, "6"))
-	o := reservedDeposit(t, st, chat)
-	res, _ := b.bands.Get(bands.ProviderTron, o.Des)
-	// The rail's own converter is a seam; break it the way a missing or garbage
-	// admin rate breaks it in production.
-	b.tronUsdtToVND = func(*big.Rat) (int64, error) { return 0, errors.New("no usdt rate configured") }
-
-	got := tickAuditRow(t, b, w, st, "no_rate", hash64("b4"), res.Amount)
-	if got.ActorChat != fmtInt(chat) {
-		t.Errorf("audit chat = %q, want %q", got.ActorChat, fmtInt(chat))
-	}
-	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 0 {
-		t.Errorf("balance = %d VND, want 0 — an unvaluable payment must not be credited at a guessed rate", bal)
-	}
-	// Held, not refused: the band and its order stay put so a later tick with a
-	// working rate still credits the customer.
-	if _, still := b.bands.Get(bands.ProviderTron, o.Des); !still {
-		t.Error("the band was released on a rate failure — its amount can now be re-quoted to someone else")
-	}
-}
-
 // TestWatcherAuditsAnAttributedPaymentThatDidNotCredit is the uncredited verdict:
 // the transfer was attributed to exactly one deposit and the credit itself still
 // failed. Nothing moved, so the next tick retries — which is precisely why it
@@ -725,8 +691,8 @@ func TestWatcherIgnoresATransferOlderThanItsBand(t *testing.T) {
 	// and not a blanket refusal.
 	w.set(*trxTx(hash64("8"), res.Amount, b.now().UnixMilli()))
 	b.tickOnchain(ctx, bands.ProviderTron)
-	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 150250 {
-		t.Errorf("balance after a fresh transfer = %d VND, want 150250 — the freshness gate is refusing valid payments", bal)
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 6_010_000 {
+		t.Errorf("balance after a fresh transfer = %d VND, want 6_010_000 — the freshness gate is refusing valid payments", bal)
 	}
 }
 
@@ -758,8 +724,8 @@ func TestWatcherFetchFailureHoldsEveryBand(t *testing.T) {
 	w.mu.Unlock()
 	w.set(*trxTx(hash64("e"), res.Amount, b.now().UnixMilli()))
 	b.tickOnchain(ctx, bands.ProviderTron)
-	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 150250 {
-		t.Errorf("balance after the retry tick = %d VND, want 150250 — a transient fetch error lost the deposit", bal)
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 6_010_000 {
+		t.Errorf("balance after the retry tick = %d VND, want 6_010_000 — a transient fetch error lost the deposit", bal)
 	}
 }
 
@@ -790,8 +756,8 @@ func TestWatcherSettlesWhatATruncatedWindowReturned(t *testing.T) {
 	w.set(*trxTx(hash64("f"), res.Amount, b.now().UnixMilli()))
 	b.tickOnchain(ctx, bands.ProviderTron)
 
-	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 150250 {
-		t.Errorf("balance after a truncated tick = %d VND, want 150250 — a truncated window was treated as fatal and dropped a settleable transfer", bal)
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 6_010_000 {
+		t.Errorf("balance after a truncated tick = %d VND, want 6_010_000 — a truncated window was treated as fatal and dropped a settleable transfer", bal)
 	}
 }
 

@@ -5,6 +5,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -21,6 +22,96 @@ func newTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+// ---- micro-USDT ledger-unit boot guard -------------------------------------
+
+// TestCheckMicroLedgerFreshDBSelfMarksMicro: a brand-new DB (no meta table, no
+// money rows) is the safe-to-mark case — CheckMicroLedger writes the
+// ledger_unit='micro_usdt' marker itself and boots (returns nil), so the bot
+// never starts against a ledger whose unit it cannot name.
+func TestCheckMicroLedgerFreshDBSelfMarksMicro(t *testing.T) {
+	s := newTestStore(t)
+	// initSchema created the money tables but NOT meta (only migrate-usdt or
+	// EnsureMicroLedger writes meta), so this is a genuinely fresh ledger.
+	if hasMeta, err := s.metaTableExists(); err != nil || hasMeta {
+		t.Fatalf("fresh DB must have no meta table yet, got hasMeta=%v err=%v", hasMeta, err)
+	}
+	if err := s.CheckMicroLedger(); err != nil {
+		t.Fatalf("CheckMicroLedger on a fresh empty DB = %v, want nil (self-mark + boot)", err)
+	}
+	if unit, ok := s.LedgerUnit(); !ok || unit != "micro_usdt" {
+		t.Errorf("LedgerUnit after self-mark = (%q,%t), want (micro_usdt,true)", unit, ok)
+	}
+	// Idempotent: a second check must still pass (the marker is INSERT OR IGNORE).
+	if err := s.CheckMicroLedger(); err != nil {
+		t.Errorf("CheckMicroLedger re-run = %v, want nil (idempotent)", err)
+	}
+}
+
+// TestCheckMicroLedgerRefusesUnmigratedVND: a DB that predates the flip holds
+// money rows but no meta marker — booting against it would read VND figures as
+// micro and mis-price everything ~40x. CheckMicroLedger must refuse with
+// ErrUnmigratedVNDLedger rather than boot.
+func TestCheckMicroLedgerRefusesUnmigratedVND(t *testing.T) {
+	s := newTestStore(t)
+	// Seed a money row the way an old VND build would have left one, with NO
+	// migration marker written.
+	if _, _, err := s.Credit("999", 2_500_000, "TXN-legacy"); err != nil {
+		t.Fatalf("seed credit: %v", err)
+	}
+	if hasMoney, err := s.hasMoneyRows(); err != nil || !hasMoney {
+		t.Fatalf("fixture: expected money rows present, got hasMoney=%v err=%v", hasMoney, err)
+	}
+	err := s.CheckMicroLedger()
+	if !errors.Is(err, ErrUnmigratedVNDLedger) {
+		t.Fatalf("CheckMicroLedger on an un-migrated DB = %v, want ErrUnmigratedVNDLedger (refuse to boot)", err)
+	}
+	// The marker must NOT have been written on the refusal path.
+	if unit, ok := s.LedgerUnit(); ok {
+		t.Errorf("LedgerUnit after refusal = (%q,true), want no marker written (ok=false)", unit)
+	}
+}
+
+// TestCheckMicroLedgerWrongUnitRefuses: a meta marker that names a unit OTHER
+// than micro_usdt must refuse, rather than silently booting against a ledger
+// denominated in something else.
+func TestCheckMicroLedgerWrongUnitRefuses(t *testing.T) {
+	s := newTestStore(t)
+	// Simulate a DB a different build marked with a different unit.
+	if err := s.EnsureMicroLedger(); err != nil {
+		t.Fatalf("EnsureMicroLedger: %v", err)
+	}
+	if _, err := s.db.Exec(
+		"UPDATE meta SET value='vnd' WHERE key='ledger_unit'"); err != nil {
+		t.Fatalf("rewrite ledger_unit: %v", err)
+	}
+	err := s.CheckMicroLedger()
+	if err == nil {
+		t.Fatal("CheckMicroLedger on a vnd-marked DB = nil, want a unit-mismatch error (refuse to boot)")
+	}
+}
+
+// TestEnsureMicroLedgerIsIdempotent: re-running EnsureMicroLedger must not
+// clobber an existing marker (INSERT OR IGNORE), so a bot that boots, then a
+// second boot, never flips the recorded unit.
+func TestEnsureMicroLedgerIsIdempotent(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnsureMicroLedger(); err != nil {
+		t.Fatalf("first EnsureMicroLedger: %v", err)
+	}
+	// Sabotage attempt: pre-write a different value, then EnsureMicroLedger
+	// must NOT overwrite it (the row's PK already exists).
+	if _, err := s.db.Exec(
+		"UPDATE meta SET value='vnd' WHERE key='ledger_unit'"); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	if err := s.EnsureMicroLedger(); err != nil {
+		t.Fatalf("second EnsureMicroLedger: %v", err)
+	}
+	if unit, _ := s.LedgerUnit(); unit != "vnd" {
+		t.Errorf("EnsureMicroLedger overwrote an existing marker to %q; INSERT OR IGNORE must leave 'vnd' in place", unit)
+	}
 }
 
 // TestCreditIdempotent proves the deposit-idempotency invariant: a duplicate

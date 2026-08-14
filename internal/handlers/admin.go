@@ -40,7 +40,6 @@ import (
 	"strings"
 	"time"
 
-	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/tg"
 )
@@ -705,7 +704,6 @@ func (b *Bot) adminCategoryMenuRows(cat string) (title string, rows [][]tg.Inlin
 			btnRow("💳 Payment methods", "admcat:payments"),
 			btnRow("🧑‍⚖️ Standard-admin permissions", "admcat:stdperms"),
 			btnRow("🔢 Max bulk buy: "+bulkLabel(b.maxBulk()), "adm:setmaxqty"),
-			btnRow("💱 USD→VND rate: "+b.rateStr(), "adm:setrate"),
 			btnRow("🌐 Kiro-Go Server URL: "+setUnsetValue(b.kirogoURLStr()), "adm:setkirourl"),
 			btnRow("🔑 Kiro-Go Admin Password: "+setUnsetState(b.kirogoKeySet()), "adm:setkirokey"),
 			btnRow("🆔 Kiro-Go Account ID: "+setUnsetValue(b.kirogoAccountStr()), "adm:setkiroacct"),
@@ -951,31 +949,6 @@ func (b *Bot) pendingRefundCount() int64 {
 	return n
 }
 
-// rateStr is current_rate_str (telegram_bot.py:5291) — the effective USD→VND rate.
-func (b *Bot) rateStr() string {
-	if b.cfg == nil {
-		return "(not set)"
-	}
-	return b.cfg.USDToVND()
-}
-
-// usdRateStr is the same effective USD→VND rate as rateStr, but for
-// ARITHMETIC rather than for a settings label: with no config it answers the
-// compiled default instead of rateStr's human "(not set)", which no converter
-// could parse. The fallback chain is the one every other money converter in
-// this package already uses (usdtDisp in money.go, usdtToVND in deposit.go,
-// vndToUSD in usdt.go): settings.json's admin-set usd_to_vnd, then the
-// .env/ambient USD_TO_VND snapshot frozen at config.Load, then
-// config.DefaultUSDToVND. Matching them matters — a quote priced at the
-// compiled default and a credit priced from somewhere else is exactly the
-// divergence task #22 removed.
-func (b *Bot) usdRateStr() string {
-	if b.cfg == nil {
-		return config.DefaultUSDToVND
-	}
-	return b.cfg.USDToVND()
-}
-
 // kirogoURLStr / kirogoAccountStr / kirogoKeySet expose the Kiro-Go config for
 // the Settings labels. The KEY is reported as a boolean only, never its value.
 func (b *Bot) kirogoURLStr() string {
@@ -1159,8 +1132,6 @@ func (b *Bot) cbAdmAction(cc *cbCtx) {
 		b.cbToggleReferral(cc)
 	case "setmaxqty":
 		b.cbSetMaxQty(cc)
-	case "setrate":
-		b.cbSetRate(cc)
 	case "setkirourl":
 		b.cbSetKiroURL(cc)
 	case "setkirokey":

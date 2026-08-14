@@ -94,12 +94,12 @@ func codedTotalFull(unit, qty int, kind string, percent float64, stack bool, res
 //
 // Deliberate differences from codedTotalFull, both forced by the product
 // (telegram_bot.py:6237-6247):
-//   - base is apikeyPriceVND — a virtual product has no folder price file;
+//   - base is apikeyPriceMicro — a virtual product has no folder price file;
 //   - there is no volume tier (qty is CREDITS, not units), so volumePct is
 //     always 0 and stack is a no-op: a stacking promo adds its percent to a
 //     0% volume discount, which is just the promo percent.
 func (b *Bot) apikeyCodedTotalFull(credits int64, kind string, percent float64, stack bool, resellerPct int, saleClass string) (total int64, effPct, volPct int) {
-	base := b.apikeyPriceVND(credits, saleClass)
+	base := b.apikeyPriceMicro(credits, saleClass)
 	if base <= 0 {
 		return base, 0, 0
 	}

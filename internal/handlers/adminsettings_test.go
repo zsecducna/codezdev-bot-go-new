@@ -91,70 +91,6 @@ func TestKiroAcctUUIDValidator(t *testing.T) {
 	}
 }
 
-// TestRateValidatorRange drives every case through b.Process -> capSetRate
-// (M4 fix). The previous version reimplemented the validator's condition
-// verbatim in the test body, so deleting the real range check from the
-// handler still left this test green — tautological. Driving the table
-// through the actual wizard (the way TestSetRateWizard already does for its
-// two cases) means a regression in capSetRate's validation is the only way
-// to make this fail.
-func TestRateValidatorRange(t *testing.T) {
-	ctx := context.Background()
-	cases := []struct {
-		raw    string
-		wantOK bool
-		wantN  int
-	}{
-		{"23000", true, 23000},
-		{"23,000", true, 23000},
-		{"23.000", true, 23000},
-		{"999", false, 0},
-		{"200001", false, 0},
-		{"1000", true, rateMin},
-		{"200000", true, rateMax},
-		{"abc", false, 0},
-		{"-5", false, 0},
-		{" ", false, 0}, // trims to "" — Process's step-6 gate only drops a
-		// literally-empty msg.Text, so a whitespace-only send still reaches
-		// capSetRate itself (see TestSetKiroKeyWizardNeverEchoesKey).
-	}
-	// sentinelRate primes usd_to_vnd to a value distinct from every wantOK
-	// case above BEFORE each subtest's attempt, so the rejection branch's
-	// "unchanged" assertion is meaningful rather than trivially matching
-	// config's own compiled default (M5-style money-safety guarantee).
-	const sentinelRate = 17000
-	for _, tc := range cases {
-		t.Run(tc.raw, func(t *testing.T) {
-			b, f, cfg := newSettingsTestBot(t, "1")
-			s := cfg.Settings()
-			s["usd_to_vnd"] = sentinelRate
-			if err := cfg.SaveSettings(s); err != nil {
-				t.Fatal(err)
-			}
-			b.Process(ctx, callbackUpdate(1, "adm:setrate"))
-			b.Process(ctx, textUpdate(1, tc.raw))
-			last := lastSendMsg(f)
-			if tc.wantOK {
-				want := "✅ USD→VND rate set to " + commaInt(tc.wantN) + ". New orders and USDT quotes price at this rate."
-				if last == nil || last.Text != want {
-					t.Fatalf("raw=%q reply = %+v, want %q", tc.raw, last, want)
-				}
-				if cfg.USDToVND() != strconv.Itoa(tc.wantN) {
-					t.Errorf("raw=%q USDToVND() = %q, want %d", tc.raw, cfg.USDToVND(), tc.wantN)
-				}
-			} else {
-				wantPrefix := "⚠️ Enter a whole number between "
-				if last == nil || !strings.HasPrefix(last.Text, wantPrefix) {
-					t.Fatalf("raw=%q reply = %+v, want prefix %q", tc.raw, last, wantPrefix)
-				}
-				if cfg.USDToVND() != strconv.Itoa(sentinelRate) {
-					t.Errorf("raw=%q: rejected input must not change the rate, USDToVND() = %q, want unchanged %q", tc.raw, cfg.USDToVND(), strconv.Itoa(sentinelRate))
-				}
-			}
-		})
-	}
-}
-
 // TestMaxQtyValidator drives every case through b.Process -> capSetMaxQty
 // (M4 fix, same rationale as TestRateValidatorRange above).
 func TestMaxQtyValidator(t *testing.T) {
@@ -739,33 +675,6 @@ func TestSetMaxQtyWizard(t *testing.T) {
 	}
 	if cfg.MaxBulk() != 10 {
 		t.Errorf("MaxBulk() = %d, want 10", cfg.MaxBulk())
-	}
-}
-
-func TestSetRateWizard(t *testing.T) {
-	ctx := context.Background()
-	b, f, cfg := newSettingsTestBot(t, "1")
-	before := cfg.USDToVND() // M5: prior value, asserted unchanged below
-
-	b.Process(ctx, callbackUpdate(1, "adm:setrate"))
-	b.Process(ctx, textUpdate(1, "999"))
-	want := "⚠️ Enter a whole number between 1,000 and 200,000 (VND per 1 USD), e.g. 23000."
-	if last := lastSendMsg(f); last == nil || last.Text != want {
-		t.Fatalf("invalid reply = %+v, want %q", last, want)
-	}
-	// M5 fix: the rejected value must persist NOTHING — this is the
-	// money-safety assertion the whole handler exists to guarantee.
-	if cfg.USDToVND() != before {
-		t.Errorf("rejected rate must not change USDToVND(), got %q, want unchanged %q", cfg.USDToVND(), before)
-	}
-	b.Process(ctx, callbackUpdate(1, "adm:setrate"))
-	b.Process(ctx, textUpdate(1, "23,000"))
-	wantOK := "✅ USD→VND rate set to 23,000. New orders and USDT quotes price at this rate."
-	if last := lastSendMsg(f); last == nil || last.Text != wantOK {
-		t.Fatalf("valid reply = %+v, want %q", last, wantOK)
-	}
-	if cfg.USDToVND() != "23000" {
-		t.Errorf("USDToVND() = %q, want 23000", cfg.USDToVND())
 	}
 }
 

@@ -429,7 +429,7 @@ func (b *Bot) execAddBal(ctx context.Context, chatID int64, rawTarget, rawAmount
 			admNavRetry("admcat:customers", "💰 Update balance", "adm:addbal"))
 		return
 	}
-	amount, ok := b.adminUsdtToVnd(rawAmount)
+	amount, ok := b.adminUsdtToMicro(rawAmount)
 	if !ok {
 		b.send(ctx, chatID, "❌ Amount must be a number, e.g. 2.5 or -1.",
 			admNavRetry("admcat:customers", "💰 Update balance", "adm:addbal"))
@@ -468,7 +468,7 @@ func (b *Bot) execAddBal(ctx context.Context, chatID int64, rawTarget, rawAmount
 		// the only signal that it happened twice.
 		b.store.LogAction(fmtInt(chatID), "admin", "admin_credit_balance", target,
 			b.auditAmount("+", amount)+" → new balance "+b.auditAmount("", newBal),
-			fmt.Sprintf("amount_vnd=%d new_balance_vnd=%d", amount, newBal))
+			fmt.Sprintf("amount_micro=%d new_balance_micro=%d", amount, newBal))
 		b.send(ctx, chatID,
 			"✅ Credited "+b.usdtDisp(amount)+" to "+target+". New balance: "+b.usdtDisp(newBal),
 			admNav("admcat:customers"))
@@ -497,7 +497,7 @@ func (b *Bot) execAddBal(ctx context.Context, chatID int64, rawTarget, rawAmount
 		// just passed to store.Debit above), not the raw negative `amount`.
 		b.store.LogAction(fmtInt(chatID), "admin", "admin_debit_balance", target,
 			b.auditAmount("-", -amount)+" → new balance "+b.auditAmount("", newBal),
-			fmt.Sprintf("amount_vnd=%d new_balance_vnd=%d", amount, newBal))
+			fmt.Sprintf("amount_micro=%d new_balance_micro=%d", amount, newBal))
 		b.send(ctx, chatID,
 			"✅ Deducted "+b.usdtDisp(-amount)+" from "+target+". New balance: "+b.usdtDisp(newBal),
 			admNav("admcat:customers"))
@@ -1325,8 +1325,8 @@ func (b *Bot) cbRmReseller(cc *cbCtx) {
 // ============================================================================
 
 // registerAdminUsers wires this file's 6 captures into the ordered dispatch
-// tables. Called LAST from New (dispatch.go), after registerAdminSettings
-// ("setrate") and registerAdminPricing ("promo") have both already landed
+// tables. Called LAST from New (dispatch.go), after registerAdminPricing
+// ("setapiprice") and registerAdminPricing ("promo") have both already landed
 // their own captures — insertCapturesBefore needs those anchors present to
 // splice ahead of them rather than falling back to appending at the very end.
 //
@@ -1343,8 +1343,13 @@ func (b *Bot) cbRmReseller(cc *cbCtx) {
 // admdo:confirm/admdo:cancel routes addbal now shares are already
 // registered by registerAdminSettings for "broadcast" — nothing new needed
 // here either.
+//
+// Anchor note: this used to splice ahead of "setrate" (the now-removed USD→VND
+// rate capture, #10). With the rate gone, the earliest settings-stage capture
+// still ahead of which #5-9 must land is "setapiprice" (#11), registered by
+// registerAdminPricing — so that is the new anchor.
 func (b *Bot) registerAdminUsers() {
-	b.insertCapturesBefore("setrate",
+	b.insertCapturesBefore("setapiprice",
 		stage{name: "custlookup", fn: (*Bot).capCustLookup},
 		stage{name: "addadmin", fn: (*Bot).capAddAdmin},
 		stage{name: "addreseller", fn: (*Bot).capAddReseller},
