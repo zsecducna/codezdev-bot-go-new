@@ -2,7 +2,8 @@
 // store for user balances, processed deposits, orders, api keys, promo codes,
 // referrals, handles, audit trail, bans and the crypto *_pending tables.
 //
-// Balances are real money (bank top-ups, VND), so they persist in a SQLite DB
+// Balances are real money (crypto deposits, micro-USDT — 1 USDT = 1,000,000
+// micro, since the VND->micro-USDT flip), so they persist in a SQLite DB
 // (store.py:2-16). Idempotency is enforced by the DB: processed.txn_id is a
 // PRIMARY KEY, so a duplicate credit hits a constraint error and is rejected —
 // no app-side race window (store.py:12-13).
@@ -231,14 +232,30 @@ func (s *Store) initSchema() error {
 	// Every CREATE below mirrors store.py verbatim (column names, types,
 	// defaults) — table-by-table source line cited inline.
 	creates := []string{
-		// balances(chat_id TEXT PK, amount INTEGER) — current balance, VND
-		// (store.py:59-60).
+		// balances(chat_id TEXT PK, amount INTEGER) — current balance, in
+		// micro-USDT since the VND->micro-USDT flip (column layout mirrors
+		// store.py:59-60 verbatim; only the stored unit changed).
 		"CREATE TABLE IF NOT EXISTS balances (" +
 			"chat_id TEXT PRIMARY KEY, amount INTEGER NOT NULL DEFAULT 0)",
 		// processed(txn_id TEXT PK, ...) — credited SePay txns; the PK is the
 		// deposit-idempotency anchor (store.py:61-62).
 		"CREATE TABLE IF NOT EXISTS processed (" +
 			"txn_id TEXT PRIMARY KEY, chat_id TEXT, amount INTEGER, ts REAL)",
+		// admin_credits(id TEXT PK, ...) — the money-safety-hazard fix for
+		// execAddBal's admin-initiated wallet credits (adminusers.go): id is
+		// minted fresh per confirmed action (store.NewDes()) and is BOTH the
+		// dedupe gate (same PK-first-then-upsert shape as processed/Credit
+		// above) AND the durable ledger row, atomic with the balance mutation
+		// in AdminCreditBalance — no window where the balance moves but
+		// nothing records it. Additional to, not a replacement for, the
+		// existing LogAction "/audit"-facing row every admin action writes.
+		// Deliberately NOT used by CreditBalance's other callers (refunds,
+		// apikey-delivery compensation, referral rewards) — those already
+		// have their own settle-idempotency anchors and are out of scope for
+		// this fix.
+		"CREATE TABLE IF NOT EXISTS admin_credits (" +
+			"id TEXT PRIMARY KEY, actor_chat TEXT, target_chat TEXT, " +
+			"amount INTEGER NOT NULL, resulting_balance INTEGER, ts REAL)",
 		// Persisted orders; status state machine reserved -> paid ->
 		// delivered/refunded, reserved -> expired (store.py:63-71).
 		"CREATE TABLE IF NOT EXISTS orders (" +

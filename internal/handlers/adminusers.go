@@ -392,35 +392,40 @@ func (b *Bot) capAddBalStep(c *Ctx, armed *AdminAction, step string) bool {
 // atomic guarded UPDATE that refuses to overdraw; credit is a plain additive
 // upsert.
 //
-// ⚠️ MONEY-SAFETY HAZARD, ported faithfully from Python, NOT fixed here (task
-// instruction: flag, don't silently change): the CREDIT path
-// (store.CreditBalance) writes NO ledger/txn row and is NOT idempotent.
-// Python has the identical hazard (store.py:838-851's own docstring: "no txn
-// dedupe"). Reported to the user in the final task summary so an idempotency
-// key can be added later if wanted; this port does not invent one
-// unilaterally.
+// MONEY-SAFETY HAZARD — FIXED: this used to call store.CreditBalance, which
+// writes no ledger/txn row and isn't idempotent (Python has the identical gap,
+// store.py:838-851's own docstring: "no txn dedupe" — ported faithfully at
+// first, then fixed here on user decision rather than kept at parity). The
+// credit branch below now calls store.AdminCreditBalance instead: a fresh
+// id (store.NewDes()) is minted per confirmed action and is both a dedupe
+// gate and a durable ledger row (table admin_credits), atomic with the
+// balance mutation — see that method's doc comment. The debit branch is
+// UNCHANGED and was never in scope: store.Debit is already a single atomic
+// guarded UPDATE, not a plain additive upsert, so it doesn't share the
+// credit path's hazard.
 //
 // L10 fix: a PREVIOUS version of this comment claimed "a double-tapped ✅
 // Confirm... credits the customer TWICE" — that is WRONG and has been
 // removed. cbAdminDoConfirm (adminsettings.go) pops cc.st.Admin to nil under
 // st.mu BEFORE this function ever runs, so a second, near-simultaneous
 // admdo:confirm tap finds a nil wizard and returns immediately — it never
-// reaches execAddBal a second time. The real residual hazard is narrower: an
-// admin who manually re-arms adm:addbal and re-enters the SAME chat_id/amount
-// (a genuinely new admin action, not a double-tap of one) gets a second,
-// equally-real credit — exactly as Python would for the same manual repeat.
-// Money-safety hazard flagged just above this function: CreditBalance writes
-// no ledger/txn row, so the audit rows execAddBal writes below (via
-// money.go's auditAmount) are the ONLY place "who moved how much, and to
-// what resulting balance" can ever be reconstructed from — unlike every
-// other admin money mutation in this codebase, there is no second record to
-// fall back on if this one is wrong or missing a digit. This used to build
-// its own "sign + usdtStr(vnd) + \" USDT\"" by hand (the same idiom
-// usdt.go's on-chain settle audit line separately hand-rolled for the
-// identical gap); both collapsed into auditAmount (task #15) so the two
-// audit surfaces can't silently diverge if the rate ever breaks — see that
-// function's doc comment for the full reasoning, including why it doesn't
-// just reuse usdtDisp's "— USDT" fallback.
+// reaches execAddBal a second time. So AdminCreditBalance's id-based dedupe
+// is defense in depth against a FUTURE regression of that UI-level guard (or
+// a retry/redelivery this code doesn't have today), not a fix for a live
+// double-credit path — there wasn't one. The residual case that IS real and
+// intentional: an admin who manually re-arms adm:addbal and re-enters the
+// SAME chat_id/amount gets a fresh id and a second, equally-real credit —
+// that's a genuinely new admin action, not a replay, exactly as Python would
+// do for the same manual repeat.
+//
+// admin_credits is IN ADDITION to, not a replacement for, the LogAction rows
+// written below (via money.go's auditAmount) — LogAction feeds the
+// human-facing /audit view; admin_credits is the structured, dedupe-guarded
+// ledger. Before this fix, the LogAction row was the ONLY record of a credit
+// (unlike every other admin money mutation in this codebase); now there are
+// two, and the ledger one can't silently go missing if a crash lands between
+// the balance mutation and the LogAction call, because they're no longer two
+// separate non-atomic steps for the credit path.
 func (b *Bot) execAddBal(ctx context.Context, chatID int64, rawTarget, rawAmount string) {
 	target := b.resolveCustomerTarget(rawTarget)
 	if target == "" {
@@ -448,24 +453,30 @@ func (b *Bot) execAddBal(ctx context.Context, chatID int64, rawTarget, rawAmount
 	var custMsg string
 	if amount > 0 {
 		// See the money-safety hazard comment above this function: this path
-		// is NOT idempotent by design (ported from Python as-is).
-		newBal, err := b.store.CreditBalance(target, amount)
+		// is now idempotent via a fresh per-action id (store.NewDes) feeding
+		// the admin_credits ledger table (store.AdminCreditBalance).
+		id := store.NewDes()
+		applied, newBal, err := b.store.AdminCreditBalance(id, fmtInt(chatID), target, amount)
 		if err != nil {
 			log.Println("adminusers: credit balance failed:", err)
 			b.send(ctx, chatID, settingsSaveFailed, admNav("admcat:customers"))
 			return
 		}
-		// Written only AFTER CreditBalance succeeds — never on the error path
-		// above, which already reports settingsSaveFailed and stops. This row
-		// (not CreditBalance itself, which the hazard comment above notes
-		// writes no ledger/txn row) is the only durable evidence this credit
-		// ever happened: who authorized it (actorChat), who received it
-		// (target), how much (signed, so a credit can never be mistaken for a
-		// debit by anyone scanning /audit), and the resulting balance — the
-		// one field that makes a manually-repeated credit (the residual
-		// hazard the comment above documents) visible after the fact, since
-		// two identical "+X USDT" rows in a row against a climbing balance is
-		// the only signal that it happened twice.
+		// applied is realistically always true: id is freshly minted this
+		// call, so a PK collision in admin_credits would mean store.NewDes()
+		// (crypto/rand-backed uuid4) collided — astronomically unlikely.
+		// Logged rather than silently ignored so a future bug that reuses an
+		// id isn't invisible; if this ever fires the credit was SKIPPED, not
+		// double-applied, and newBal is already the current balance, which is
+		// still the safe outcome.
+		if !applied {
+			log.Printf("adminusers: admin_credits id collision on %q — credit skipped, not re-applied", id)
+		}
+		// Written in addition to admin_credits (not a replacement — see the
+		// money-safety hazard comment above this function): this row feeds
+		// the human-facing /audit view, duplicating the same facts (who
+		// authorized it, who received it, how much, and the resulting
+		// balance) in the free-text form /audit already expects.
 		b.store.LogAction(fmtInt(chatID), "admin", "admin_credit_balance", target,
 			b.auditAmount("+", amount)+" → new balance "+b.auditAmount("", newBal),
 			fmt.Sprintf("amount_micro=%d new_balance_micro=%d", amount, newBal))

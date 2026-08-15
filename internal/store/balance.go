@@ -144,6 +144,63 @@ func (s *Store) UnmarkTxn(txnID string) error {
 	return err
 }
 
+// AdminCreditBalance is CreditBalance's idempotent sibling for admin-typed
+// actions (execAddBal), which have no natural external id the way a deposit
+// has a blockchain txn hash. id is minted by the caller (store.NewDes(),
+// fresh per confirmed action). Same PK-first-then-upsert shape as Credit
+// above: the INSERT into admin_credits is the dedupe gate AND the durable
+// ledger row, atomic with the balance mutation in ONE transaction — closing
+// the crash window a bare CreditBalance-then-LogAction sequence left open,
+// where the balance could move with nothing durable recording it. Returns
+// (applied, newBalance): applied is false when this id was already recorded
+// (a replay) — newBalance is then the CURRENT balance and nothing is
+// re-credited, exactly Credit's replay semantics.
+func (s *Store) AdminCreditBalance(id, actorChat, targetChat string, amount int64) (bool, int64, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, 0, err
+	}
+	defer tx.Rollback()
+
+	// Dedupe gate, same technique as Credit: a duplicate id hits the PK
+	// constraint (store.py has no equivalent — this is new, not a port).
+	_, err = tx.Exec(
+		"INSERT INTO admin_credits(id, actor_chat, target_chat, amount, resulting_balance, ts) VALUES (?,?,?,?,NULL,?)",
+		id, actorChat, targetChat, amount, now())
+	if isPKConflict(err) {
+		var bal int64
+		berr := tx.QueryRow("SELECT amount FROM balances WHERE chat_id=?", targetChat).Scan(&bal)
+		if berr == sql.ErrNoRows {
+			bal, berr = 0, nil
+		}
+		if berr != nil {
+			return false, 0, berr
+		}
+		return false, bal, tx.Commit()
+	}
+	if err != nil {
+		return false, 0, err
+	}
+
+	if _, err := tx.Exec(
+		"INSERT INTO balances(chat_id, amount) VALUES (?, ?) "+
+			"ON CONFLICT(chat_id) DO UPDATE SET amount = amount + excluded.amount",
+		targetChat, amount); err != nil {
+		return false, 0, err
+	}
+	var newBal int64
+	if err := tx.QueryRow("SELECT amount FROM balances WHERE chat_id=?", targetChat).Scan(&newBal); err != nil {
+		return false, 0, err
+	}
+	// Backfill resulting_balance now that the upsert has computed it — same
+	// row, same still-uncommitted transaction, so this stays atomic with the
+	// balance mutation above.
+	if _, err := tx.Exec("UPDATE admin_credits SET resulting_balance=? WHERE id=?", newBal, id); err != nil {
+		return false, 0, err
+	}
+	return true, newBal, tx.Commit()
+}
+
 // CreditBalance adds `amount` to a chat's balance directly, with NO txn dedupe
 // (store.py:838-851). Used for REFUNDS (paid but undeliverable) — the money
 // becomes spendable wallet credit. Returns the new balance.

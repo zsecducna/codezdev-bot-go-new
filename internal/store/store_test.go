@@ -177,6 +177,117 @@ func TestCreditIdempotent(t *testing.T) {
 	}
 }
 
+// TestAdminCreditBalanceIdempotent mirrors TestCreditIdempotent above, but
+// for the id-based (not txn-hash-based) dedupe gate AdminCreditBalance adds
+// for admin-typed actions (the execAddBal money-safety-hazard fix).
+func TestAdminCreditBalanceIdempotent(t *testing.T) {
+	s := newTestStore(t)
+	applied, bal, err := s.AdminCreditBalance("ADM-1", "1", "555", 2_500_000)
+	if err != nil || !applied || bal != 2_500_000 {
+		t.Fatalf("first admin credit: applied=%v bal=%d err=%v", applied, bal, err)
+	}
+	// Same id replayed — must be rejected, balance unchanged.
+	applied, bal, err = s.AdminCreditBalance("ADM-1", "1", "555", 2_500_000)
+	if err != nil {
+		t.Fatalf("dup admin credit err: %v", err)
+	}
+	if applied {
+		t.Fatal("duplicate admin_credits id was applied — idempotency broken")
+	}
+	if bal != 2_500_000 {
+		t.Fatalf("balance changed on duplicate: %d", bal)
+	}
+	// A genuinely new admin action (a different id) credits again, even for
+	// the SAME target/amount — a manual repeat is a real, intentional action,
+	// not a replay (see execAddBal's doc comment for why that's correct).
+	applied, bal, err = s.AdminCreditBalance("ADM-2", "1", "555", 2_500_000)
+	if err != nil || !applied || bal != 5_000_000 {
+		t.Fatalf("second admin action: applied=%v bal=%d err=%v", applied, bal, err)
+	}
+}
+
+// TestAdminCreditBalanceRecordsLedgerRow proves the admin_credits row lands
+// with the right actor/target/amount, and that resulting_balance gets
+// backfilled correctly (it's written NULL-then-UPDATE within the same
+// transaction, since the balance isn't known until after the upsert).
+func TestAdminCreditBalanceRecordsLedgerRow(t *testing.T) {
+	s := newTestStore(t)
+	if _, _, err := s.AdminCreditBalance("ADM-3", "99", "555", 1_000_000); err != nil {
+		t.Fatalf("AdminCreditBalance: %v", err)
+	}
+	var actor, target string
+	var amount, resultBal int64
+	err := s.db.QueryRow(
+		"SELECT actor_chat, target_chat, amount, resulting_balance FROM admin_credits WHERE id=?",
+		"ADM-3").Scan(&actor, &target, &amount, &resultBal)
+	if err != nil {
+		t.Fatalf("query admin_credits: %v", err)
+	}
+	if actor != "99" || target != "555" || amount != 1_000_000 || resultBal != 1_000_000 {
+		t.Errorf("row = actor=%q target=%q amount=%d resultBal=%d, want 99/555/1000000/1000000",
+			actor, target, amount, resultBal)
+	}
+}
+
+// TestAdminCreditBalanceConcurrent proves the id-based dedupe gate is
+// genuinely atomic across independent connection pools, not just within one
+// — the same two-*Store*-handle pattern as TestDebitConcurrent, because a
+// single-pool test proves nothing here (this repo has been burned by that
+// exact false-confidence shape before). Every attempt races the SAME id:
+// exactly one must apply, no matter which handle wins.
+func TestAdminCreditBalanceConcurrent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	s1, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open s1: %v", err)
+	}
+	t.Cleanup(func() { s1.Close() })
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open s2: %v", err)
+	}
+	t.Cleanup(func() { s2.Close() })
+
+	const attempts = 20
+	var wg sync.WaitGroup
+	appliedCh := make(chan bool, attempts)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		s := s1
+		if i%2 == 1 { // alternate attempts across the two independent pools
+			s = s2
+		}
+		go func(s *Store) {
+			defer wg.Done()
+			applied, _, err := s.AdminCreditBalance("ADM-RACE", "1", "race-target", 1000)
+			if err != nil {
+				t.Errorf("AdminCreditBalance err: %v", err)
+				return
+			}
+			appliedCh <- applied
+		}(s)
+	}
+	wg.Wait()
+	close(appliedCh)
+
+	wins := 0
+	for a := range appliedCh {
+		if a {
+			wins++
+		}
+	}
+	if wins != 1 {
+		t.Errorf("applied count = %d, want exactly 1 (idempotency gate must serialize the race)", wins)
+	}
+	bal, err := s1.GetBalance("race-target")
+	if err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	if bal != 1000 {
+		t.Errorf("final balance = %d, want 1000 (credited exactly once, not %d times)", bal, attempts)
+	}
+}
+
 // TestClaimOrderRace proves the double-delivery gate: two concurrent
 // reserved->paid claims on one order, exactly ONE may win
 // (store.py:255-270, architecture-go.md §5).
