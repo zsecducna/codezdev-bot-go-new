@@ -32,27 +32,6 @@ func TestValidAddress(t *testing.T) {
 
 // TestAmountUnits mirrors tron_pay.py:98-101 — Decimal(str(amount)) *
 // 10^AMOUNT_DECIMALS, exact-decimal (no float drift).
-func TestAmountUnits(t *testing.T) {
-	t.Setenv("TRON_AMOUNT_DECIMALS", "2")
-	cases := []struct {
-		amount string
-		want   int64
-	}{
-		{"5.23", 523},
-		{"0", 0},
-		{"100", 10000},
-		{"5.2", 520},
-	}
-	for _, tc := range cases {
-		got, err := AmountUnits(tc.amount)
-		if err != nil {
-			t.Fatalf("AmountUnits(%q) error: %v", tc.amount, err)
-		}
-		if got != tc.want {
-			t.Errorf("AmountUnits(%q) = %d, want %d", tc.amount, got, tc.want)
-		}
-	}
-}
 
 // TestValToUnits mirrors tron_pay.py:104-108 — floor a 6-decimal base-unit
 // value to AMOUNT_DECIMALS (2) units; floor, not round, so dust never

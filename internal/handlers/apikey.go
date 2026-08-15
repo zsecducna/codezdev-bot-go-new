@@ -455,10 +455,10 @@ func (b *Bot) apikeyCodedTotal(credits int64, resellerPct int, saleClass string)
 	return b.apikeyCodedTotalFull(credits, "", 0, false, resellerPct, saleClass)
 }
 
-// apikeyPriceFor is the API-key micro-USDT total for `credits` WITH this buyer's flat
-// reseller discount — _apikey_price_for (telegram_bot.py:6272-6282). The quoted
-// rate and the charged total both flow through apikeyCodedTotal so they can
-// never drift apart.
+// apikeyPriceFor is the API-key micro-USDT total for `credits` WITH this
+// buyer's flat reseller discount — _apikey_price_for
+// (telegram_bot.py:6272-6282). The quoted rate and the charged total both
+// flow through apikeyCodedTotal so they can never drift apart.
 func (b *Bot) apikeyPriceFor(chatID int64, credits int64, saleClass string) int64 {
 	total, _, _ := b.apikeyCodedTotal(credits, b.resellerPctFor(chatID), saleClass)
 	return total

@@ -186,20 +186,6 @@ func QRPath() string {
 	return strings.TrimSpace(os.Getenv("TRON_QR_PATH"))
 }
 
-// AmountUnits returns the integer amount-unit value of a USDT amount string
-// at AmountDecimals precision (e.g. "5.23" -> 523 at 2 decimals). Uses
-// big.Rat for exact decimal-string parsing, avoiding float drift, mirroring
-// Python's Decimal math (tron_pay.py:98-101).
-func AmountUnits(amountStr string) (int64, error) {
-	r, ok := new(big.Rat).SetString(amountStr)
-	if !ok {
-		return 0, fmt.Errorf("tron: invalid amount %q", amountStr)
-	}
-	scale := new(big.Rat).SetInt(pow10(AmountDecimals()))
-	r.Mul(r, scale)
-	return ratToIntegral(r), nil
-}
-
 // valToUnits floors an on-chain 6-dec `value` (base units) to AmountDecimals
 // units. Floor (not round) so a dust OVERPAY still matches the order and a
 // dust UNDERPAY never credits a higher amount (tron_pay.py:104-108).
@@ -444,15 +430,3 @@ func appendTransfers(out []Transfer, data []any) []Transfer {
 	}
 	return out
 }
-
-// MatchedTransfer is the result of a successful match (tron_pay.py:184):
-// {id, amount}; the caller dedupes by id (prefixed "trx:").
-type MatchedTransfer struct {
-	ID     string
-	Amount *big.Rat
-}
-
-// NOTE: tron's standalone MatchPayment + absInt64 helper (the by-hash fuzzy
-// matcher, tron_pay.py:165-185) were removed here — zero production callers
-// left after the hands-free watcher (usdtwatch.go) took over via
-// bands.MatchIncoming; only their own dedicated tests referenced them.

@@ -57,10 +57,11 @@ var httpClient = &http.Client{Timeout: httpTimeout}
 
 // DefaultAmountDecimals / DefaultMinConfirmations / DefaultAmountMatchTol /
 // DefaultAmountOffsetStep are the compiled-in fallbacks for the four knobs
-// below — named so a caller resolving one of these through config.Config
-// (rather than through this package's own raw env read; see
-// MinConfirmations's doc comment) has the same default to fall back to
-// without hardcoding a second copy of the literal.
+// below — named so a caller resolving one of these through config.Config has
+// the same default to fall back to without hardcoding a second copy of the
+// literal. DefaultMinConfirmations: reorg safety — don't settle until the
+// transfer is this many blocks deep (BSC ~3s/block, so 12 ~ ~36s,
+// bep20_pay.py:41-43).
 const (
 	DefaultAmountDecimals   = 5
 	DefaultMinConfirmations = 12
@@ -77,21 +78,6 @@ const (
 // match tolerance (bep20_pay.py:37-40).
 func AmountDecimals() int {
 	return envInt("BEP20_AMOUNT_DECIMALS", DefaultAmountDecimals)
-}
-
-// MinConfirmations reads the RAW .env/ambient BEP20_MIN_CONF — nothing more.
-// Like Address() (see that function's doc comment for the full reasoning),
-// it does NOT see a value set only via .env under systemd (no
-// EnvironmentFile in production, config.Load's doc comment): a production
-// caller with a *config.Config available must resolve BEP20_MIN_CONF through
-// it and pass the result into MatchPaymentConf instead of letting this package
-// read it. Survives only as the low-level env primitive; do not call it
-// directly for anything customer-facing.
-//
-// reorg safety: don't settle until the transfer is this many blocks deep
-// (BSC ~3s/block, so 12 ~ ~36s, bep20_pay.py:41-43).
-func MinConfirmations() int {
-	return envInt("BEP20_MIN_CONF", DefaultMinConfirmations)
 }
 
 // AmountMatchTol / AmountOffsetStep: a payment within AmountMatchTol units of
@@ -428,9 +414,10 @@ type MatchedTransfer struct {
 // tx is at or after minBlock (the order's own creation block — so a
 // recycled amount's older payment can't settle a newer order), it has >=
 // minConf confirmations (latest - block), and the tx isn't already
-// consumed. minConf is the caller's resolved BEP20_MIN_CONF (see
-// MinConfirmations's doc comment) rather than read from raw env here. The
-// picker keeps live amounts >= 2*tol+1 apart, so a payment is within tol of
+// consumed. minConf is the caller's resolved BEP20_MIN_CONF (config-resolved
+// by the caller, not read from raw env here — see Address's doc comment for
+// why that distinction matters). The picker keeps live amounts >= 2*tol+1
+// apart, so a payment is within tol of
 // at most ONE order (bep20_pay.py:163-186).
 func MatchPaymentConf(transfers []Transfer, expectedAmount string, minBlock, latest int64, minConf int, isUsed func(txnID string) bool) (*MatchedTransfer, error) {
 	want, err := AmountUnits(expectedAmount)

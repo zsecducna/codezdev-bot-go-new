@@ -13,10 +13,13 @@ VND→micro-USDT cutover (`f2960fe`). Consult the Python source for exact
 feature semantics whenever the Go code or tests leave it ambiguous — it
 remains the reference, including for anything not yet ported.
 
-The one confirmed remaining feature gap is the Entra admin-panel integration
-(`internal/entra/` store layer is built and tested; handler wiring is newer
-and may still be in progress) — see `.omc/ADMIN_PORT_HANDOFF.md` for the full
-admin-panel-port audit and current per-slice status.
+The one confirmed remaining feature gap is the Entra admin-panel integration:
+`internal/entra/` (store layer) is built and tested, but all 11 `adm:entra*`
+admin-panel callbacks are unhandled stubs (fall through to the generic
+not-ported notice) — needs handler implementations plus `Deps`/`main.go`
+wiring. Deferred by explicit user decision (~1 month, as of 2026-08-15); see
+`.omc/ADMIN_PORT_HANDOFF.md` for the full admin-panel-port audit and
+per-slice status.
 
 Key reference documents in the Python repo:
 
