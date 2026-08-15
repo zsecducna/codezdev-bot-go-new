@@ -342,7 +342,11 @@ func TestAddBalCreditCollisionDoesNotDoubleCredit(t *testing.T) {
 	ctx := context.Background()
 	b, f, _, st := newUsersTestBot(t, "1")
 
-	before, err := st.RecentAudit(50, "")
+	// Generous limit, not the 50 sibling tests use: this test checks an
+	// exact row COUNT delta, so a fixture that ever grows past a small cap
+	// would silently weaken the assertion instead of failing loud.
+	const auditLimit = 1000
+	before, err := st.RecentAudit(auditLimit, "")
 	if err != nil {
 		t.Fatalf("RecentAudit before: %v", err)
 	}
@@ -370,13 +374,28 @@ func TestAddBalCreditCollisionDoesNotDoubleCredit(t *testing.T) {
 		t.Fatalf("balance after collision = %d, err=%v, want STILL 2500000 (no double-credit)", bal, err)
 	}
 
-	after, err := st.RecentAudit(50, "")
+	// Two NEW rows, not one: the real credit, plus a non-money
+	// "duplicate_blocked" notice for the collision — a blocked replay must
+	// stay visible in /audit, not just on stdout, but must never look like a
+	// second credit.
+	after, err := st.RecentAudit(auditLimit, "")
 	if err != nil {
 		t.Fatalf("RecentAudit after: %v", err)
 	}
-	if len(after) != len(before)+1 {
-		t.Fatalf("audit row count = %d, want exactly %d (before+1 -- a collision must NOT audit a second row)",
-			len(after), len(before)+1)
+	if len(after) != len(before)+2 {
+		t.Fatalf("audit row count = %d, want exactly %d (before+2: one credit, one duplicate-blocked notice)",
+			len(after), len(before)+2)
+	}
+	blocked := after[0] // RecentAudit is newest-first
+	if blocked.Action != "admin_credit_duplicate_blocked" {
+		t.Errorf("newest row Action = %q, want admin_credit_duplicate_blocked", blocked.Action)
+	}
+	if strings.HasPrefix(blocked.Outcome, "+") || strings.HasPrefix(blocked.Outcome, "-") {
+		t.Errorf("duplicate-blocked Outcome = %q, must not carry a sign — nothing moved", blocked.Outcome)
+	}
+	credit := after[1]
+	if credit.Action != "admin_credit_balance" {
+		t.Errorf("second-newest row Action = %q, want admin_credit_balance", credit.Action)
 	}
 }
 

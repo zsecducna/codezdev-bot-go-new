@@ -486,6 +486,14 @@ func (b *Bot) execAddBal(ctx context.Context, chatID int64, id, rawTarget, rawAm
 		// current, correct balance, and nothing further should happen.
 		if !applied {
 			log.Printf("adminusers: admin_credits id %q already recorded — credit not re-applied", id)
+			// Distinct action name (never "admin_credit_balance") and no
+			// sign on the amount — nothing moved, so /audit must not read
+			// this as a second credit. Still worth a row: the FIRST credit's
+			// admin_credits entry proves the money, but without this a
+			// blocked replay attempt is invisible to /audit, only to stdout.
+			b.store.LogAction(fmtInt(chatID), "admin", "admin_credit_duplicate_blocked", target,
+				"duplicate blocked, balance unchanged: "+b.auditAmount("", newBal),
+				fmt.Sprintf("id=%s amount_micro=%d balance_micro=%d", id, amount, newBal))
 			b.send(ctx, chatID,
 				"⚠️ Already applied (duplicate action blocked). "+target+"'s balance: "+b.usdtDisp(newBal),
 				admNav("admcat:customers"))
