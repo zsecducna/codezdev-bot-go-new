@@ -1298,7 +1298,7 @@ func (b *Bot) cbAdminDoConfirm(cc *cbCtx) {
 	case "broadcast":
 		b.execBroadcast(cc.Ctx, cc.ChatID, action)
 	case "addbal":
-		b.execAddBal(cc.Ctx, cc.ChatID, action.Target, action.Amount)
+		b.execAddBal(cc.Ctx, cc.ChatID, action.ID, action.Target, action.Amount)
 	}
 }
 

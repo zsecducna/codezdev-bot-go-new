@@ -328,6 +328,82 @@ func TestAddBalCreditAuditsRow(t *testing.T) {
 	}
 }
 
+// TestAddBalCreditCollisionDoesNotDoubleCredit is a white-box test of
+// execAddBal's OWN behavior on an admin_credits id collision — calls it
+// directly (bypassing the wizard, which by construction never produces two
+// calls with the same id; that's arm-time minting's whole point, see
+// AdminAction.ID's doc comment) to reach the branch a genuine collision
+// would take. Proves the review fix: before it, a collision fell through
+// into the LogAction call and the "✅ Credited" send, telling the admin AND
+// customer a credit happened that didn't — exactly the kind of lie this
+// whole feature exists to prevent. Now it must short-circuit with none of
+// that.
+func TestAddBalCreditCollisionDoesNotDoubleCredit(t *testing.T) {
+	ctx := context.Background()
+	b, f, _, st := newUsersTestBot(t, "1")
+
+	before, err := st.RecentAudit(50, "")
+	if err != nil {
+		t.Fatalf("RecentAudit before: %v", err)
+	}
+
+	id := store.NewDes()
+	b.execAddBal(ctx, 1, id, "555", "2.5")
+	if last := lastSendMsgTo(f, 1); last == nil || !strings.Contains(last.Text, "✅ Credited") {
+		t.Fatalf("first call: expected a credit confirmation, got %+v", last)
+	}
+	if bal, err := st.GetBalance("555"); err != nil || bal != 2_500_000 {
+		t.Fatalf("balance after first call = %d, err=%v, want 2500000", bal, err)
+	}
+
+	// Same id again: must be rejected, not silently re-applied or reported
+	// as a fresh credit.
+	b.execAddBal(ctx, 1, id, "555", "2.5")
+	last := lastSendMsgTo(f, 1)
+	if last == nil || strings.Contains(last.Text, "✅ Credited") {
+		t.Fatalf("second call (collision) must NOT claim a new credit, got %+v", last)
+	}
+	if !strings.Contains(last.Text, "Already applied") {
+		t.Errorf("second call message = %q, want it to say already applied", last.Text)
+	}
+	if bal, err := st.GetBalance("555"); err != nil || bal != 2_500_000 {
+		t.Fatalf("balance after collision = %d, err=%v, want STILL 2500000 (no double-credit)", bal, err)
+	}
+
+	after, err := st.RecentAudit(50, "")
+	if err != nil {
+		t.Fatalf("RecentAudit after: %v", err)
+	}
+	if len(after) != len(before)+1 {
+		t.Fatalf("audit row count = %d, want exactly %d (before+1 -- a collision must NOT audit a second row)",
+			len(after), len(before)+1)
+	}
+}
+
+// TestAddBalRearmMintsFreshID proves the OTHER half of the arm-time-id
+// design: a manual re-arm (adm:addbal run twice, same target/amount) is a
+// genuinely new admin action, not a replay — it must credit BOTH times, not
+// collide. Distinguishing this from a real collision (previous test) is the
+// whole reason ID is minted at arm time instead of e.g. from
+// target+amount.
+func TestAddBalRearmMintsFreshID(t *testing.T) {
+	ctx := context.Background()
+	b, f, _, st := newUsersTestBot(t, "1")
+
+	for i := range 2 {
+		b.Process(ctx, callbackUpdate(1, "adm:addbal"))
+		b.Process(ctx, textUpdate(1, "555"))
+		b.Process(ctx, textUpdate(1, "2.5"))
+		b.Process(ctx, callbackUpdate(1, "admdo:confirm"))
+		if last := lastSendMsgTo(f, 1); last == nil || !strings.Contains(last.Text, "✅ Credited") {
+			t.Fatalf("arm #%d: expected a credit confirmation, got %+v", i+1, last)
+		}
+	}
+	if bal, err := st.GetBalance("555"); err != nil || bal != 5_000_000 {
+		t.Fatalf("balance after two re-arms = %d, err=%v, want 5000000 (both must apply)", bal, err)
+	}
+}
+
 // TestAddBalDebitAuditsRowWithCorrectSign proves the debit branch writes
 // exactly one row, and — the property that actually matters here — the
 // SIGN is "-", not "+". A debit that recorded with a "+" sign would be

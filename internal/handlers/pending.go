@@ -193,6 +193,17 @@ type AdminAction struct {                       // pending_admin @1592
 	// return false only when armed is nil) now matches that.
 	Target string
 	Amount string
+	// ID is addbal's dedupe key for store.AdminCreditBalance (adminusers.go),
+	// minted ONCE at arm time (cbAddBal) rather than at exec time, so it stays
+	// stable across the whole collecting_chatid -> collecting_amount ->
+	// confirm walk and genuinely identifies "this one armed wizard instance" —
+	// an id minted fresh inside execAddBal itself can never collide with
+	// anything, which made the dedupe gate structurally unable to fire
+	// (review finding on the execAddBal idempotency commit). A fresh adm:addbal
+	// arm mints a fresh ID (new AdminAction), matching execAddBal's own
+	// documented stance that a manual re-arm is a genuinely new action, not a
+	// replay. Unused by "broadcast" actions.
+	ID string
 }
 type EntraState struct{ Action, Step string } // pending_entra @1620
 type VerifyCSV struct{ Rows []string }        // _entra_verifycsv_cache @1632
