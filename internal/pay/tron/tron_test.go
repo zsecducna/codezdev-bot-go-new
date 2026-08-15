@@ -78,48 +78,6 @@ func TestValToUnits(t *testing.T) {
 	}
 }
 
-// TestMatchPayment exercises the matcher (tron_pay.py:165-185): fuzzy amount
-// tolerance, at/after min_ts_ms, isUsed dedupe with "trx:" prefix.
-func TestMatchPayment(t *testing.T) {
-	t.Setenv("TRON_AMOUNT_DECIMALS", "2")
-	t.Setenv("TRON_MATCH_TOL", "10")
-	minTS := int64(1_700_000_000_000)
-
-	v1, _ := new(big.Int).SetString("105000000", 10) // 105.00 USDT
-	v2, _ := new(big.Int).SetString("105050000", 10) // 105.05 USDT (5 cents off, within tol 10)
-
-	transfers := []Transfer{
-		{ID: "old", Value: v1, Units: 10500, TS: minTS - 1000},  // too early
-		{ID: "good", Value: v2, Units: 10505, TS: minTS + 1000}, // matches
-	}
-	got, err := MatchPayment(transfers, "105.00", minTS, nil)
-	if err != nil {
-		t.Fatalf("MatchPayment error: %v", err)
-	}
-	if got == nil || got.ID != "good" {
-		t.Fatalf("MatchPayment = %+v, want id=good", got)
-	}
-}
-
-// TestMatchPayment_IsUsedSkips verifies the "trx:" prefixed dedupe hook.
-func TestMatchPayment_IsUsedSkips(t *testing.T) {
-	t.Setenv("TRON_AMOUNT_DECIMALS", "2")
-	minTS := int64(1_700_000_000_000)
-	v, _ := new(big.Int).SetString("105000000", 10)
-
-	transfers := []Transfer{
-		{ID: "first", Value: v, Units: 10500, TS: minTS + 1000},
-		{ID: "second", Value: v, Units: 10500, TS: minTS + 2000},
-	}
-	got, err := MatchPayment(transfers, "105.00", minTS, func(id string) bool { return id == "trx:first" })
-	if err != nil {
-		t.Fatalf("MatchPayment error: %v", err)
-	}
-	if got == nil || got.ID != "second" {
-		t.Fatalf("MatchPayment = %+v, want id=second (first skipped)", got)
-	}
-}
-
 // TestGetIncomingTransfersConf_HonoursInjectedPageLimitAndBase pins the
 // parameter-threading added for task #42 item 5: GetIncomingTransfersConf
 // must hit the injected base URL and send the injected page limit, not the

@@ -5,9 +5,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this repo is
 
 Go rewrite of the **Kiro Telegram shop bot** — the Python original lives at
-`/Users/z/Desktop/Kiro` and is the behavioral reference for this port. As of
-now this repo contains no Go code yet (no `go.mod`); consult the Python source
-for every feature's exact semantics before implementing it here.
+`/Users/z/Desktop/Kiro` and is the behavioral reference for this port. The
+port is substantially complete: stock (folder-state), money/store, refunds,
+the admin panel, and hands-free TRON+BEP20 USDT deposits are all built and
+running in production, on a micro-USDT ledger since the 2026-08-14
+VND→micro-USDT cutover (`f2960fe`). Consult the Python source for exact
+feature semantics whenever the Go code or tests leave it ambiguous — it
+remains the reference, including for anything not yet ported.
+
+The one confirmed remaining feature gap is the Entra admin-panel integration
+(`internal/entra/` store layer is built and tested; handler wiring is newer
+and may still be in progress) — see `.omc/ADMIN_PORT_HANDOFF.md` for the full
+admin-panel-port audit and current per-slice status.
 
 Key reference documents in the Python repo:
 
@@ -16,7 +25,9 @@ Key reference documents in the Python repo:
   and the Kiro-Go proxy (`https://codezdev-shop.uk:8080`). Read this before
   touching any API-key-selling code path.
 - `/Users/z/Desktop/Kiro/.env.example` — every config knob with comments
-  (Telegram token, payment providers, Kiro-Go admin credentials, pricing).
+  (Telegram token, payment providers, Kiro-Go admin credentials, pricing) —
+  note several of these knobs are for providers this Go port has since cut
+  from scope (see Payments below); check current relevance before trusting one.
 
 ## Local testing
 
@@ -26,17 +37,16 @@ user explicitly asks.
 
 ## Commands
 
-No build tooling exists yet. Once the module is initialized, standard Go
-workflow applies:
+Standard Go workflow:
 
 ```bash
 go build ./...          # build
 go vet ./...            # static checks
 go test ./...           # all tests
-go test -run TestName ./pkg/...   # single test
+go test -run TestName ./internal/...   # single test
 ```
 
-## Architecture being ported (from the Python original)
+## Architecture (ported from the Python original)
 
 The Python bot is a single long-polling Telegram bot (stdlib-only, 16-worker
 thread pool, entry point `telegram_bot.py` ~1 MB) with these subsystems:
@@ -47,22 +57,29 @@ thread pool, entry point `telegram_bot.py` ~1 MB) with these subsystems:
   (held; a `.expiry` file holds epoch seconds, past which the whole order is
   swept back to `active/`) → `sold/<user>.txt`. Selling = moving files, so
   stock state is self-describing and survives restarts.
-- **Money — SQLite** (`store.py`): balances are real money (VND). Deposit
+- **Money — SQLite** (`store.py`): balances are real money, in micro-USDT
+  since the VND→micro-USDT flip (1 USDT = 1,000,000 micro). Deposit
   idempotency is enforced by the DB (`txn_id` is PRIMARY KEY → duplicate
   credit hits a constraint error, no app-side race window). Orders, API-key
   records, referral codes live here; refund *requests* are owned by the
   separate `refund_store.py` module (table `refund_requests`, same
   `store.db` file).
-- **Payments**: SePay (bank transfer), PayPal (`paypal.py` + webhook),
-  Binance Pay (`binance_pay.py`), TRON (`tron_pay.py`), BEP20
-  (`bep20_pay.py`).
+- **Payments**: TRON (`tron_pay.py`) and BEP20 (`bep20_pay.py`) only, going
+  forward. Hands-free: a watcher credits deposits by uniquely-quoted amount,
+  no tx-hash paste required. SePay, PayPal, and Binance Pay were explicitly
+  cut from scope (2026-08-13, user decision) and are fully removed from the
+  Go tree — don't port them without a fresh explicit ask.
 - **API-key product (`__apikey__`)**: bot mints metered customer keys via the
   Kiro-Go admin API (`POST /admin/provision_customer`). See invariants below.
-- **Account provisioning**: `kiro_provision.py`, `entra_*.py`, `aws_idc.py`.
-  The Python browser-login scripts (`kiro-*-login.py`) run as subprocesses
-  under a separate Python venv with the browser stack (`KIRO_LOGIN_PYTHON`,
+- **Account provisioning**: `kiro_provision.py`, `entra_*.py`. The Python
+  browser-login scripts (`kiro-*-login.py`) run as subprocesses under a
+  separate Python venv with the browser stack (`KIRO_LOGIN_PYTHON`,
   Playwright + CloakBrowser); the `.mjs` files are Node-run diagnostic/helper
-  scripts using the `cloakbrowser` npm package.
+  scripts using the `cloakbrowser` npm package. AWS IDC provisioning and
+  AWS-sell (`aws_idc.py`, `aws_idc_provision.py`, `aws_sell.py`,
+  `validate_aws_account.py`) were explicitly cut from scope (user decision)
+  and are fully removed from the Go tree — same caveat as the payment cuts
+  above.
 
 ## Domain invariants (must survive the port)
 

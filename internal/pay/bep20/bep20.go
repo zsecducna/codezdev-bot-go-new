@@ -419,15 +419,6 @@ type MatchedTransfer struct {
 	Amount *big.Rat
 }
 
-// MatchPayment is MatchPaymentConf using the raw-env MinConfirmations() —
-// kept for callers with no *config.Config to resolve BEP20_MIN_CONF through
-// (see MinConfirmations's doc comment). Has no production caller today; BEP20
-// deposits are credited hands-free by the watcher (usdtwatch.go), which
-// matches through bands.MatchIncoming, not this helper.
-func MatchPayment(transfers []Transfer, expectedAmount string, minBlock, latest int64, isUsed func(txnID string) bool) (*MatchedTransfer, error) {
-	return MatchPaymentConf(transfers, expectedAmount, minBlock, latest, MinConfirmations(), isUsed)
-}
-
 // MatchPaymentConf returns the first incoming transfer matching
 // expectedAmount (a string like "5.23"), else (nil, nil).
 //

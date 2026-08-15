@@ -127,52 +127,6 @@ func TestGetIncomingTransfers_LogParsing(t *testing.T) {
 	}
 }
 
-// TestMatchPayment exercises the matcher (bep20_pay.py:163-186): fuzzy
-// amount tolerance, min_block floor, MIN_CONFIRMATIONS depth, isUsed dedupe.
-func TestMatchPayment(t *testing.T) {
-	t.Setenv("BEP20_AMOUNT_DECIMALS", "2")
-	t.Setenv("BEP20_MATCH_TOL", "10")
-	t.Setenv("BEP20_MIN_CONF", "12")
-
-	minBlock := int64(1000)
-	latest := int64(1020) // 20 blocks deep
-	dummyWei := big.NewInt(1)
-
-	transfers := []Transfer{
-		{ID: "shallow", Units: 10000, Block: 1015, Wei: dummyWei},  // only 5 confs, not enough
-		{ID: "too-early", Units: 10000, Block: 900, Wei: dummyWei}, // before min_block
-		{ID: "good", Units: 10005, Block: 1005, Wei: dummyWei},     // 5 cents off (within tol), 15 confs
-	}
-	got, err := MatchPayment(transfers, "100.00", minBlock, latest, nil)
-	if err != nil {
-		t.Fatalf("MatchPayment error: %v", err)
-	}
-	if got == nil || got.ID != "good" {
-		t.Fatalf("MatchPayment = %+v, want id=good", got)
-	}
-}
-
-// TestMatchPayment_IsUsedSkips verifies the "bsc:" prefixed dedupe hook.
-func TestMatchPayment_IsUsedSkips(t *testing.T) {
-	t.Setenv("BEP20_AMOUNT_DECIMALS", "2")
-	t.Setenv("BEP20_MIN_CONF", "12")
-	minBlock := int64(1000)
-	latest := int64(1020)
-	dummyWei := big.NewInt(1)
-
-	transfers := []Transfer{
-		{ID: "first", Units: 10000, Block: 1001, Wei: dummyWei},
-		{ID: "second", Units: 10000, Block: 1002, Wei: dummyWei},
-	}
-	got, err := MatchPayment(transfers, "100.00", minBlock, latest, func(id string) bool { return id == "bsc:first" })
-	if err != nil {
-		t.Fatalf("MatchPayment error: %v", err)
-	}
-	if got == nil || got.ID != "second" {
-		t.Fatalf("MatchPayment = %+v, want id=second (first skipped)", got)
-	}
-}
-
 // TestMatchPaymentConf_HonoursInjectedMinConf pins the parameter-threading
 // added for task #42 item 2: MatchPaymentConf must consult the minConf it is
 // PASSED, not the raw-env BEP20_MIN_CONF — because in production

@@ -452,44 +452,7 @@ type MatchedTransfer struct {
 	Amount *big.Rat
 }
 
-// MatchPayment returns the first incoming transfer matching expectedAmount
-// (a string like "5.23"), else (nil, nil).
-//
-// Matches when: amount (floored to AmountDecimals) is within AmountMatchTol
-// of expected — 0.00050 USDT at the shipped geometry, i.e. essentially the
-// exact figure, NOT the "cent or two" of slack this comment claimed while the
-// rail still ran at 2 decimals. A genuinely short payment is handled by
-// bands/match.go's fee-shortfall rule instead. Also requires that the
-// tx is at or after minTSMS (the order's own creation time — so a recycled
-// amount's older payment can't settle a newer order), and the tx isn't
-// already consumed. Rows are already only_confirmed, so finality needs no
-// extra check. The picker keeps live amounts >= 2*tol+1 apart, so a payment
-// is within tol of at most ONE order (tron_pay.py:165-185).
-func MatchPayment(transfers []Transfer, expectedAmount string, minTSMS int64, isUsed func(txnID string) bool) (*MatchedTransfer, error) {
-	want, err := AmountUnits(expectedAmount)
-	if err != nil {
-		return nil, err
-	}
-	tol := int64(AmountMatchTol())
-	for _, t := range transfers {
-		if absInt64(t.Units-want) > tol { // fuzzy: forgot-a-cent still matches
-			continue
-		}
-		if t.TS < minTSMS {
-			continue
-		}
-		if isUsed != nil && isUsed(fmt.Sprintf("trx:%s", t.ID)) {
-			continue
-		}
-		amount := new(big.Rat).SetFrac(t.Value, pow10(TokenDecimals))
-		return &MatchedTransfer{ID: t.ID, Amount: amount}, nil
-	}
-	return nil, nil
-}
-
-func absInt64(n int64) int64 {
-	if n < 0 {
-		return -n
-	}
-	return n
-}
+// NOTE: tron's standalone MatchPayment + absInt64 helper (the by-hash fuzzy
+// matcher, tron_pay.py:165-185) were removed here — zero production callers
+// left after the hands-free watcher (usdtwatch.go) took over via
+// bands.MatchIncoming; only their own dedicated tests referenced them.
