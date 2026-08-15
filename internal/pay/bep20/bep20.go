@@ -85,10 +85,8 @@ func AmountDecimals() int {
 // EnvironmentFile in production, config.Load's doc comment): a production
 // caller with a *config.Config available must resolve BEP20_MIN_CONF through
 // it and pass the result into MatchPaymentConf instead of letting this package
-// read it. This function — and the unparameterized MatchPayment below, which
-// delegates to MatchPaymentConf using this value — survive only as the
-// low-level env primitive and its default-argument callers; do not call
-// them directly for anything customer-facing.
+// read it. Survives only as the low-level env primitive; do not call it
+// directly for anything customer-facing.
 //
 // reorg safety: don't settle until the transfer is this many blocks deep
 // (BSC ~3s/block, so 12 ~ ~36s, bep20_pay.py:41-43).
