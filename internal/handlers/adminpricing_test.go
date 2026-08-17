@@ -1499,6 +1499,30 @@ func TestCapSetApiNameNoAuditOnSaveFailure(t *testing.T) {
 	}
 }
 
+// TestCapSetApiNameNilCfgEchoesTypedName pins the b.cfg == nil case, which
+// TestCapSetApiNameSavesAndAudits above cannot reach — with a real config,
+// the just-applied write and a fresh apikeyProductName read return the same
+// string, so a handler that re-resolved the name instead of echoing what it
+// just applied would still pass that test. Here b.cfg is nil, so the entire
+// save block is skipped and apikeyProductName can only fall back to the
+// built-in default: the ✅ reply must still show the TYPED name, proving the
+// text comes from the local variable, not from re-reading storage.
+func TestCapSetApiNameNilCfgEchoesTypedName(t *testing.T) {
+	ctx := context.Background()
+	b, f := newTestBot("1", nil) // nil cfg (and nil store) — save block never runs
+
+	b.Process(ctx, callbackUpdate(1, "adm:apiname"))
+	b.Process(ctx, textUpdate(1, "Nebula Credits"))
+
+	last := lastSendMsg(f)
+	if last == nil || !strings.Contains(last.Text, "Nebula Credits") {
+		t.Fatalf("reply = %+v, want the typed name even though nothing was saved", last)
+	}
+	if strings.Contains(last.Text, apikeyDefaultNameBedrock) {
+		t.Errorf("reply = %q, want NOT the built-in default — a nil cfg must not make the ✅ text re-resolve through apikeyProductName", last.Text)
+	}
+}
+
 // TestCapSetApikeyNamePeeksEscapes: the two rename captures must NOT swallow a
 // /command or a reply-keyboard label typed while armed — same peek-escape the
 // sibling pricing captures have, so an admin who changes their mind is not

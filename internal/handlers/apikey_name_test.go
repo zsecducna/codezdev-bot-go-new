@@ -354,3 +354,42 @@ func TestApikeyRenameReachesKiroCustomerScreens(t *testing.T) {
 		t.Fatalf("kiro re-reveal message = %v, want the renamed SKU", reveal)
 	}
 }
+
+// TestApikeyOwnerAlertUsesStoredRowClassNotOrderClass pins the owner sale
+// alert to the STORED api_keys row's class (keyCls), not the order-derived
+// saleClass. They normally agree, but a LEGACY row — sale_class "" (see
+// APIKey.SaleClass doc, store/apikeys.go) — can be attached to a kiro-family
+// order (e.g. a row minted before the bedrock/kiro split, or an unclassed
+// echo from Kiro-Go). The delivery message the buyer actually receives is
+// already keyed off the stored row (apikey_deliver.go's keyCls), so the
+// owner alert must read off the SAME variable or the two can silently
+// disagree about what was sold. The row is seeded directly (bypassing the
+// mint call) so deliverApikey takes its "already minted, re-deliver" branch,
+// which is the only path that reads the stored row instead of the order.
+func TestApikeyOwnerAlertUsesStoredRowClassNotOrderClass(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, _ := newAPIKeyBot(t)
+	const chat, des = 100, "0b0b0000b0b00000b0b00000b0b00000"
+
+	// Order is kiro-family (order-derived saleClass == "kiro")...
+	o := seedOrder(t, st, des, chat, kiroApikeyProduct, 500, 500000, "paid")
+	// ...but the stored row is unclassed — the legacy/pre-split state.
+	if _, err := st.AddAPIKey(des, chat, "keyid-1", "sk-legacy-key", 500, ""); err != nil {
+		t.Fatalf("seed api_keys row: %v", err)
+	}
+
+	if !b.deliverApikey(ctx, o, des) {
+		t.Fatal("delivery must succeed on an already-minted row")
+	}
+	delivered := lastSendMsgTo(f, chat)
+	if delivered == nil || !strings.Contains(delivered.Text, "Your Bedrock API Credits are ready") {
+		t.Fatalf("delivery message = %v, want the BEDROCK template (unclassed row collapses to bedrock)", delivered)
+	}
+	alert := lastSendMsgTo(f, 999)
+	if alert == nil || !strings.Contains(alert.Text, apikeyDefaultNameBedrock) {
+		t.Errorf("owner sale alert = %v, want the BEDROCK label %q, matching the delivery template the buyer received", alert, apikeyDefaultNameBedrock)
+	}
+	if alert != nil && strings.Contains(alert.Text, apikeyDefaultNameKiro) {
+		t.Errorf("owner sale alert = %q, must NOT carry the kiro label — that would be the order's saleClass leaking in instead of the stored row's class", alert.Text)
+	}
+}
