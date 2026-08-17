@@ -174,23 +174,30 @@ func (b *Bot) deliverApikey(ctx context.Context, order *store.Order, des string)
 	// SKU-correct delivery wording ("Kiro credits" vs bedrock "credits") — read
 	// off the STORED row, not the order, so a settle replay of a pre-split order
 	// (sale_class '') keeps its original bedrock message.
+	keyCls := apikeyKeyClass(row)
 	tmpl := c.Delivered
-	if apikeyKeyClass(row) == saleClassKiro {
+	if keyCls == saleClassKiro {
 		tmpl = c.KiroDelivered
 	}
 	base := html.EscapeString(b.kiroGoPublicURL())
+	// "name" is admin-typed text landing in a parse_mode=HTML message, so it is
+	// escaped like {key}/{base}: an unescaped `<` or `&` in a renamed SKU would
+	// make Telegram reject the whole delivery message — the one message the
+	// buyer must receive.
 	b.sendHTML(ctx, chatID, i18n.F(tmpl.T(lang),
+		"name", html.EscapeString(b.apikeyProductName(keyCls)),
 		"credits", itoa64(credits),
 		"key", html.EscapeString(row.APIKey),
 		"base", base))
 	// Owner sale alert — notify_admin_sale (telegram_bot.py:7750-7755): the
 	// SKU label mirrors the delivery template split just above (Kiro vs
-	// Bedrock credits), not the raw product string.
-	saleLabel := "Bedrock API Credits"
-	if saleClass == saleClassKiro {
-		saleLabel = "Kiro Credits API"
-	}
-	b.notifyAdminSale(ctx, chatID, saleLabel, "API", credits, total, des)
+	// Bedrock credits) by reusing the SAME keyCls (the STORED row's class),
+	// not the order-derived saleClass — a settle replay of a pre-split order
+	// (stored sale_class '') would otherwise show the buyer the bedrock
+	// template while telling the admin it sold as Kiro. Now the
+	// admin-renameable display name, so the alert matches what the shop
+	// actually sells it as (notifyAdminSale HTML-escapes the label itself).
+	b.notifyAdminSale(ctx, chatID, b.apikeyProductName(keyCls), "API", credits, total, des)
 	return true
 }
 
@@ -434,12 +441,11 @@ func (b *Bot) deliverApikeyRecharge(ctx context.Context, order *store.Order, des
 		"credits", itoa64(credits), "masked", maskAPIKey(krow.APIKey),
 		"remaining", remaining), nil)
 	// Owner sale alert — notify_admin_sale (telegram_bot.py:7897-7902), the
-	// recharge twin of deliverApikey's sale alert above.
-	rcLabel := "Bedrock API Recharge"
-	if apikeyKeyClass(krow) == saleClassKiro {
-		rcLabel = "Kiro Credits API Recharge"
-	}
-	b.notifyAdminSale(ctx, chatID, rcLabel, "API", credits, total, des)
+	// recharge twin of deliverApikey's sale alert above. Built from the
+	// admin-renameable SKU name + the " Recharge" suffix so a rename shows up
+	// on both alert kinds instead of only the sale one.
+	b.notifyAdminSale(ctx, chatID, b.apikeyProductName(apikeyKeyClass(krow))+" Recharge",
+		"API", credits, total, des)
 	return true
 }
 

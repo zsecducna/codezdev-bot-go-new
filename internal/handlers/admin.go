@@ -675,6 +675,11 @@ func (b *Bot) adminCategoryMenuRows(cat string) (title string, rows [][]tg.Inlin
 			btnRow("💰 Update balance (+/−)", "adm:addbal"),
 		}, admBackRoot()), true
 	case "pricing":
+		// Row label/callback text is sourced from apikeyNameRowLabel — the SAME
+		// helper the rename wizard's retry keyboard uses (adminpricing.go) —
+		// rather than re-hardcoded here, so the two can never drift apart.
+		apiNameLabel, apiNameCb := apikeyNameRowLabel(saleClassBedrock)
+		kiroNameLabel, kiroNameCb := apikeyNameRowLabel(saleClassKiro)
 		return "🏷️ PRICING & DISCOUNTS", append([][]tg.InlineKeyboardButton{
 			btnRow("🏷️ Prices & warranty tiers", "adm:setprice"),
 			btnRow("📉 Volume discounts", "adm:setdiscount"),
@@ -683,10 +688,14 @@ func (b *Bot) adminCategoryMenuRows(cat string) (title string, rows [][]tg.Inlin
 			btnRow("🔽 Min credits/key: "+itoa64(b.apikeyMinCredits(saleClassBedrock)), "adm:apimin"),
 			btnRow("🔢 Max credits/key: "+itoa64(b.apikeyMaxCredits(saleClassBedrock)), "adm:apimax"),
 			btnRow(b.apiCapLabel(), "adm:apicap"),
+			// Display-name rename rows sit with their own SKU's rows so the
+			// menu stays grouped by SKU (bedrock block, then kiro block).
+			btnRow(apiNameLabel+": "+b.apikeyProductName(saleClassBedrock), apiNameCb),
 			btnRow(onOffLabel("🟣 Kiro SKU", b.kiroApikeyEnabled()), "adm:kirotoggle"),
 			btnRow(b.apiPricingLabel("🟣 Kiro pricing", saleClassKiro), "adm:kiroprice"),
 			btnRow("🟣 Kiro min credits/key: "+itoa64(b.apikeyMinCredits(saleClassKiro)), "adm:kiromin"),
 			btnRow("🟣 Kiro max credits/key: "+itoa64(b.apikeyMaxCredits(saleClassKiro)), "adm:kiromax"),
+			btnRow(kiroNameLabel+": "+b.apikeyProductName(saleClassKiro), kiroNameCb),
 		}, admBackRoot()), true
 	case "settings":
 		return "⚙️ SETTINGS", append([][]tg.InlineKeyboardButton{
@@ -1158,6 +1167,11 @@ func (b *Bot) cbAdmAction(cc *cbCtx) {
 		b.cbApiMax(cc)
 	case "apicap":
 		b.cbApiCap(cc)
+	// The two Go-only SKU display-rename wizards (adminpricing.go).
+	case "apiname":
+		b.cbApiName(cc)
+	case "kironame":
+		b.cbKiroName(cc)
 	case "kirotoggle":
 		b.cbKiroToggle(cc)
 	case "kiroprice":

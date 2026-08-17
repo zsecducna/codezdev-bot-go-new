@@ -25,6 +25,15 @@ var CanonicalCaptureOrder = []string{
 	"setkiromin",   // 15 @17822 pop
 	"setkiromax",   // 16 @17855 pop
 	"setapicap",    // 17 @17874 (S) pop
+	// setapiname/setkironame (NEW — no Python original): the admin-renameable
+	// SKU DISPLAY name wizards (adm:apiname / adm:kironame, adminpricing.go).
+	// Python has no rename feature at all, so there is no canonical line to
+	// cite — same Go-only precedent as "provpool" below. They sit here, right
+	// after their sibling API-key setters and ahead of "setkirourl", because
+	// order is the contract: the chain must stay an in-order subsequence of
+	// this list.
+	"setapiname",   // (Go-only) pop
+	"setkironame",  // (Go-only) pop
 	"setkirourl",   // 18 @17895 (S) pop
 	"setkirokey",   // 19 @17927 (S) pop
 	"setkiroacct",  // 20 @17953 (S) pop

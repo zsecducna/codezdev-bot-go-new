@@ -1328,3 +1328,267 @@ func TestCbPromoDelNoAuditOnSaveFailure(t *testing.T) {
 		t.Error("promo must still exist after a failed delete — the failure was not actually applied")
 	}
 }
+
+// ---- SKU display rename (adm:apiname / adm:kironame) -----------------------
+//
+// The wizard is a copy of the cbApiMin/capSetApiMin shape (super-admin gate,
+// armed ChatState flag, POP capture, save-then-audit), so these tests target
+// what is genuinely NEW: the settings.json sub-map write, the "-" restore
+// path, the input validation, and the fact that renaming one SKU leaves the
+// other alone.
+
+// apikeyNamesFrom reads the live apikey_names sub-map out of a bot's config,
+// returning nil when the key is absent — the shape assertions below all go
+// through this rather than through apikeyProductName, so they observe what was
+// actually PERSISTED, not what the accessor would have defaulted to.
+func apikeyNamesFrom(t *testing.T, b *Bot) map[string]any {
+	t.Helper()
+	if b.cfg == nil {
+		t.Fatal("bot has no config")
+	}
+	m, _ := b.cfg.Settings()["apikey_names"].(map[string]any)
+	return m
+}
+
+// TestCapSetApiNameSavesAndAudits: a valid name lands in
+// settings.json apikey_names.bedrock, the reply confirms it, the audit row
+// carries old → new, and the kiro SKU is untouched.
+func TestCapSetApiNameSavesAndAudits(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, _ := newBuyBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:apiname"))
+	b.Process(ctx, textUpdate(1, "  My Custom Product Name  "))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "My Custom Product Name") {
+		t.Fatalf("valid reply = %+v, want the rename confirmation", last)
+	}
+	names := apikeyNamesFrom(t, b)
+	if got := names["bedrock"]; got != "My Custom Product Name" {
+		t.Errorf("apikey_names.bedrock = %v, want the trimmed name", got)
+	}
+	if _, present := names["kiro"]; present {
+		t.Errorf("apikey_names.kiro = %v, want the other SKU left absent", names["kiro"])
+	}
+	if got := b.apikeyProductName(saleClassKiro); got != apikeyDefaultNameKiro {
+		t.Errorf("kiro name = %q, want the untouched default", got)
+	}
+	row := latestAuditRow(t, st, "config_set_apikey_name")
+	if row == nil {
+		t.Fatal("no audit row written for the rename")
+	}
+	if row.Target != "apikey_names.bedrock" {
+		t.Errorf("audit target = %q, want apikey_names.bedrock", row.Target)
+	}
+	if want := apikeyDefaultNameBedrock + " → My Custom Product Name"; row.Outcome != want {
+		t.Errorf("audit outcome = %q, want %q", row.Outcome, want)
+	}
+}
+
+// TestCapSetKiroNameSavesUnderItsOwnKey proves the shared body keys the kiro
+// wizard off "kiro" (not "bedrock") — the one boundary the bedrock test above
+// cannot reach.
+func TestCapSetKiroNameSavesUnderItsOwnKey(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, _ := newBuyBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:kironame"))
+	b.Process(ctx, textUpdate(1, "Purple Credits"))
+	names := apikeyNamesFrom(t, b)
+	if got := names["kiro"]; got != "Purple Credits" {
+		t.Errorf("apikey_names.kiro = %v, want the typed name", got)
+	}
+	if _, present := names["bedrock"]; present {
+		t.Errorf("apikey_names.bedrock = %v, want the other SKU left absent", names["bedrock"])
+	}
+	if row := latestAuditRow(t, st, "config_set_apikey_name"); row == nil || row.Target != "apikey_names.kiro" {
+		t.Errorf("audit row = %+v, want target apikey_names.kiro", row)
+	}
+}
+
+// TestCapSetApiNameDashRestoresDefault: "-" DELETES the override rather than
+// storing a literal "-" — the only way back to the built-in name, since an
+// empty message can't be sent to a bot.
+func TestCapSetApiNameDashRestoresDefault(t *testing.T) {
+	ctx := context.Background()
+	b, f, _, _, _ := newBuyBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:apiname"))
+	b.Process(ctx, textUpdate(1, "Temporary Name"))
+	if got := b.apikeyProductName(saleClassBedrock); got != "Temporary Name" {
+		t.Fatalf("name = %q, want the override applied before the restore", got)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:apiname"))
+	b.Process(ctx, textUpdate(1, "-"))
+	if last := lastSendMsg(f); last == nil || !strings.Contains(last.Text, "restored to the default") {
+		t.Fatalf("restore reply = %+v, want the restore confirmation", last)
+	}
+	if _, present := apikeyNamesFrom(t, b)["bedrock"]; present {
+		t.Error("apikey_names.bedrock must be DELETED by \"-\", not set to a literal dash")
+	}
+	// Restoring the LAST override drops the whole sub-map, so settings.json
+	// ends up as it was before anyone renamed anything.
+	if _, present := b.cfg.Settings()["apikey_names"]; present {
+		t.Error("apikey_names must be removed entirely once its last override is restored")
+	}
+	if got := b.apikeyProductName(saleClassBedrock); got != apikeyDefaultNameBedrock {
+		t.Errorf("name after restore = %q, want %q", got, apikeyDefaultNameBedrock)
+	}
+}
+
+// TestCapSetApiNameRejectsBadInput: a newline-bearing or over-long name is
+// refused and NOTHING is persisted — the value ends up inside inline-button
+// labels and an HTML delivery message, so this is a trust boundary, not a
+// cosmetic check.
+func TestCapSetApiNameRejectsBadInput(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct{ name, input string }{
+		{"newline", "Evil\nName"},
+		{"carriage return", "Evil\rName"},
+		{"too long", strings.Repeat("x", apikeyNameMaxRunes+1)},
+		// Whitespace-only collapses to "" after TrimSpace, which apikeyNameOK
+		// rejects (s != ""). Must not be confused with the "-" restore
+		// sentinel, and must not silently persist a blank display name.
+		{"whitespace only", "   "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, f, st, _, _ := newBuyBot(t, "1")
+			b.Process(ctx, callbackUpdate(1, "adm:apiname"))
+			b.Process(ctx, textUpdate(1, tc.input))
+			if last := lastSendMsg(f); last == nil || !strings.HasPrefix(last.Text, "⚠️") {
+				t.Fatalf("reply = %+v, want the rejection notice", last)
+			}
+			if m := apikeyNamesFrom(t, b); len(m) != 0 {
+				t.Errorf("apikey_names = %v, want nothing persisted on a rejected value", m)
+			}
+			if got := b.apikeyProductName(saleClassBedrock); got != apikeyDefaultNameBedrock {
+				t.Errorf("name = %q, want the default still live", got)
+			}
+			if row := latestAuditRow(t, st, "config_set_apikey_name"); row != nil {
+				t.Errorf("audit row written for a rejected value: %+v", *row)
+			}
+		})
+	}
+	// A name of exactly the cap is ACCEPTED — pins the boundary as <=, so a
+	// future off-by-one that rejects a legal name goes red here.
+	b, _, _, _, _ := newBuyBot(t, "1")
+	atCap := strings.Repeat("x", apikeyNameMaxRunes)
+	b.Process(ctx, callbackUpdate(1, "adm:apiname"))
+	b.Process(ctx, textUpdate(1, atCap))
+	if got := b.apikeyProductName(saleClassBedrock); got != atCap {
+		t.Errorf("name at the %d-rune cap = %q, want it accepted", apikeyNameMaxRunes, got)
+	}
+}
+
+// TestCapSetApiNameNoAuditOnSaveFailure is the H1 stop-on-failure pin for the
+// rename capture: on a failed SaveSettings the reply is settingsSaveFailed
+// (never the ✅ rename text), no audit row is written, and the capture still
+// reports the input as CONSUMED.
+func TestCapSetApiNameNoAuditOnSaveFailure(t *testing.T) {
+	b, f, st := newReadOnlyCfgAuditBot(t)
+
+	got := armAndCapture(t, b, 1, "adm:apiname", "Nebula Credits", b.capSetApiName)
+	if !got {
+		t.Errorf("capSetApiName returned %v, want true (input consumed even on save failure)", got)
+	}
+	if last := lastSendMsg(f); last == nil || last.Text != settingsSaveFailed {
+		t.Fatalf("reply on save failure = %+v, want %q", last, settingsSaveFailed)
+	}
+	if row := latestAuditRow(t, st, "config_set_apikey_name"); row != nil {
+		t.Fatalf("audit row written despite failed SaveSettings: %+v", *row)
+	}
+}
+
+// TestCapSetApikeyNamePeeksEscapes: the two rename captures must NOT swallow a
+// /command or a reply-keyboard label typed while armed — same peek-escape the
+// sibling pricing captures have, so an admin who changes their mind is not
+// trapped in the wizard.
+func TestCapSetApikeyNamePeeksEscapes(t *testing.T) {
+	b, _, _, _, _ := newBuyBot(t, "1")
+	for _, tc := range []struct {
+		name string
+		arm  string
+		cap  func(*Ctx) bool
+	}{
+		{"bedrock", "adm:apiname", b.capSetApiName},
+		{"kiro", "adm:kironame", b.capSetKiroName},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := armAndCapture(t, b, 1, tc.arm, "/admin", tc.cap); got {
+				t.Error("a /command typed while armed must fall through, not be eaten as a name")
+			}
+			if m := apikeyNamesFrom(t, b); len(m) != 0 {
+				t.Errorf("apikey_names = %v, want nothing persisted by an escape", m)
+			}
+		})
+	}
+}
+
+// TestCapSetApikeyNameRefusesNonSuperAdmin pins the CAPTURE's own isSuperAdmin
+// check (adminpricing.go capSetApikeyName), not just the arming callback's
+// settingsSuperAdminOnly gate — defense in depth for a case the callback gate
+// alone cannot catch: an admin armed the wizard while still a super admin,
+// then was demoted (RmAdmin / admins.json edit) before typing the name, and
+// the armed flag survives the demotion in ChatState. The flag is set directly
+// here (bypassing the arm callback) to simulate exactly that state, on a chat
+// that is NOT super admin — input must be refused and nothing written.
+func TestCapSetApikeyNameRefusesNonSuperAdmin(t *testing.T) {
+	const chat = 7 // not registered as any kind of admin
+	for _, tc := range []struct {
+		name string
+		arm  func(*ChatState)
+		cap  func(*Bot) func(*Ctx) bool
+	}{
+		{"bedrock", func(st *ChatState) { st.SetApiName = true }, func(b *Bot) func(*Ctx) bool { return b.capSetApiName }},
+		{"kiro", func(st *ChatState) { st.SetKiroName = true }, func(b *Bot) func(*Ctx) bool { return b.capSetKiroName }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, f, _, _, _ := newBuyBot(t, "1") // chat 1 is the only super admin
+			st := b.states.Get(chat)
+			st.mu.Lock()
+			tc.arm(st)
+			st.mu.Unlock()
+
+			c := &Ctx{Ctx: context.Background(), ChatID: chat, Lang: i18n.EN, Text: "Hijacked Name", st: st}
+			if got := tc.cap(b)(c); !got {
+				t.Errorf("capture returned %v, want true (input consumed, not fallen through)", got)
+			}
+			if last := lastSendMsg(f); last != nil {
+				t.Errorf("reply sent to a refused non-super-admin capture: %+v, want none", last)
+			}
+			if m := apikeyNamesFrom(t, b); len(m) != 0 {
+				t.Errorf("apikey_names = %v, want nothing persisted by a non-super-admin", m)
+			}
+		})
+	}
+}
+
+// TestCapSetApikeyNameSecondArmDisarmsFirst is the regression test for the
+// dual-arm bug: the pricing menu carries BOTH rename buttons in one message
+// and old copies stay tappable, so an admin can arm bedrock, scroll up, and
+// arm kiro without the first flag ever clearing. Before the fix, both
+// SetApiName and SetKiroName ended up armed and the FIRST capture stage to
+// run (setapiname, per CanonicalCaptureOrder) silently consumed the typed
+// line — renaming bedrock, then leaving SetKiroName armed to steal the
+// admin's next unrelated plain-text message. After the fix, arming kiro
+// second disarms bedrock, so the one typed line reaches ONLY the kiro
+// capture and the bedrock override stays unset.
+func TestCapSetApikeyNameSecondArmDisarmsFirst(t *testing.T) {
+	ctx := context.Background()
+	b, _, _, _, _ := newBuyBot(t, "1")
+
+	b.Process(ctx, callbackUpdate(1, "adm:apiname"))  // arm bedrock
+	b.Process(ctx, callbackUpdate(1, "adm:kironame")) // arm kiro — must disarm bedrock
+	b.Process(ctx, textUpdate(1, "Aurora Credits"))   // one typed line
+
+	names := apikeyNamesFrom(t, b)
+	if got := names["kiro"]; got != "Aurora Credits" {
+		t.Errorf("apikey_names.kiro = %v, want the typed name (kiro was the live arm)", got)
+	}
+	if _, present := names["bedrock"]; present {
+		t.Errorf("apikey_names.bedrock = %v, want unset — the first arm must have been disarmed by the second", names["bedrock"])
+	}
+	if got := b.apikeyProductName(saleClassBedrock); got != apikeyDefaultNameBedrock {
+		t.Errorf("bedrock name = %q, want the untouched default %q", got, apikeyDefaultNameBedrock)
+	}
+}

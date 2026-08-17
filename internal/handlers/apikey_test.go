@@ -2024,7 +2024,10 @@ func TestApikeySaleNotifiesOwnersOnDeliveryAndRecharge(t *testing.T) {
 	if rcAlert == nil || !strings.Contains(rcAlert.Text, "💸 NEW SALE") {
 		t.Fatalf("owner alert = %v, want a 💸 NEW SALE message", rcAlert)
 	}
-	if !strings.Contains(rcAlert.Text, "Bedrock API Recharge") {
+	// "Bedrock API Credits Recharge", not the old hardcoded "Bedrock API
+	// Recharge": the recharge label is now the SKU's live DISPLAY name plus the
+	// " Recharge" suffix, so an admin rename reaches this alert too.
+	if !strings.Contains(rcAlert.Text, "Bedrock API Credits Recharge") {
 		t.Errorf("recharge sale alert = %q, want the recharge SKU label", rcAlert.Text)
 	}
 }

@@ -39,12 +39,13 @@ import (
 
 // ---- registration -----------------------------------------------------------
 
-// registerAdminPricing wires this file's 11 captures + the 6 standalone
+// registerAdminPricing wires this file's 13 captures + the 6 standalone
 // tier/promo callback prefixes into the ordered dispatch tables. Called from
 // New (dispatch.go) AFTER registerAdminSettings, so insertCapturesBefore
 // finds "setkirourl"/"code"/"deposit" already spliced into the chain:
 //   - setapiprice/setapimin/setapimax/setkiroprice/setkiromin/setkiromax/
-//     setapicap (canonical #11-#17) land ahead of "setkirourl" (#18, already
+//     setapicap (canonical #11-#17) plus the two Go-only rename captures
+//     setapiname/setkironame land ahead of "setkirourl" (#18, already
 //     registered by registerAdminSettings) — setrate (#10) stays first.
 //   - discount/promo (#35/#37) land ahead of "code" (#38, already registered
 //     by registerOTP).
@@ -62,6 +63,10 @@ func (b *Bot) registerAdminPricing() {
 		stage{name: "setkiromin", fn: (*Bot).capSetKiroMin},
 		stage{name: "setkiromax", fn: (*Bot).capSetKiroMax},
 		stage{name: "setapicap", fn: (*Bot).capSetApiCap},
+		// setapiname/setkironame are Go-only (no Python original) and sit right
+		// after setapicap, matching their slot in CanonicalCaptureOrder.
+		stage{name: "setapiname", fn: (*Bot).capSetApiName},
+		stage{name: "setkironame", fn: (*Bot).capSetKiroName},
 	)
 	b.insertCapturesBefore("code",
 		stage{name: "discount", fn: (*Bot).capDiscount},
@@ -1226,6 +1231,198 @@ func (b *Bot) capSetApiCap(c *Ctx) bool {
 	}
 	b.send(c.Ctx, c.ChatID, text, admNav("admcat:pricing"))
 	return true
+}
+
+// ---- 4b. SKU display rename (Go-only) --------------------------------------
+//
+// adm:apiname / adm:kironame let a super-admin rename what the two mint SKUs
+// are CALLED in the shop ("Bedrock API Credits" -> anything). There is no
+// Python original — the feature is new in this port (same Go-only precedent as
+// captures.go's "provpool") — so the wizard shape is copied from the
+// cbApiMin/capSetApiMin sibling above rather than from a cited line: same
+// super-admin gate, same arm-a-ChatState-flag/POP-on-capture semantics, same
+// keyboards, same save-then-audit ordering.
+//
+// DISPLAY ONLY: nothing here touches the product sentinels __apikey__ /
+// __kiroapi__ / __apikeyrc__. Orders, api_keys rows, suspension and
+// private-product gating all key off those strings, so a rename that reached
+// them would break purchase history and product gating; the override lives in
+// its own settings.json map (`apikey_names`) that only apikeyProductName reads.
+
+// apikeyNameRowLabel is the pricing-menu row label for one SKU's rename wizard
+// — shared by the menu (admin.go) contract and the retry keyboards below so a
+// rejected value re-offers a button whose text matches the row the admin came
+// from.
+func apikeyNameRowLabel(saleClass string) (label, cb string) {
+	if saleClass == saleClassKiro {
+		return "🟣 Kiro product name", "adm:kironame"
+	}
+	return "✏️ API product name", "adm:apiname"
+}
+
+// apikeyNameMaxRunes caps a typed display name. Counted in RUNES, not bytes,
+// so a CJK or accented name is not silently cut shorter than a Latin one. The
+// cap exists because this name is concatenated into buy-menu buttons and
+// Telegram truncates over-long button text, which would hide the price the row
+// also carries.
+const apikeyNameMaxRunes = 60
+
+// cbApikeyName is the shared body of both rename wizards — one function taking
+// the sale class instead of two near-identical copies that could drift.
+func (b *Bot) cbApikeyName(cc *cbCtx, saleClass string) {
+	if !b.settingsSuperAdminOnly(cc) {
+		return
+	}
+	cc.st.mu.Lock()
+	// Arming one rename must DISARM the other. Both rename buttons live in the
+	// same pricing menu message, and old copies of that message stay tappable
+	// — so an admin can arm bedrock, scroll up, then arm kiro without ever
+	// clearing the first flag. Unlike the numeric wizards (which reject
+	// non-numeric input and self-correct), a rename capture accepts free
+	// text, so a stale armed flag silently steals the admin's NEXT unrelated
+	// plain-text line and publishes it as that SKU's customer-visible name.
+	cc.st.SetApiName = saleClass != saleClassKiro
+	cc.st.SetKiroName = saleClass == saleClassKiro
+	cc.st.mu.Unlock()
+	// Header names WHICH SKU is being renamed — both wizards land on the same
+	// pricing menu, so a generic header would let an admin rename the wrong one.
+	def, header := apikeyDefaultNameBedrock, "✏️ BEDROCK PRODUCT DISPLAY NAME"
+	if saleClass == saleClassKiro {
+		def, header = apikeyDefaultNameKiro, "🟣 KIRO PRODUCT DISPLAY NAME"
+	}
+	text := header + "\nCurrent: " + b.apikeyProductName(saleClass) +
+		"\n(Display only — the buy menu, purchase screens and delivery message. " +
+		"Order history and the product's internal id never change.)\n\n" +
+		"Send the new display name (or \"-\" to restore the default \"" + def + "\"):"
+	b.send(cc.Ctx, cc.ChatID, text, backKB("admcat:pricing"))
+}
+
+// cbApiName arms the bedrock display-rename wizard — adm:apiname.
+func (b *Bot) cbApiName(cc *cbCtx) { b.cbApikeyName(cc, saleClassBedrock) }
+
+// cbKiroName arms the kiro display-rename wizard — adm:kironame.
+func (b *Bot) cbKiroName(cc *cbCtx) { b.cbApikeyName(cc, saleClassKiro) }
+
+// capSetApikeyName is the shared capture body for both rename wizards (POP
+// semantics, same as capSetApiMin). armed is read+cleared by the caller under
+// the state lock so a single typed line can only ever be consumed once.
+//
+// Validation is a TRUST BOUNDARY, not a nicety: the value is admin-typed free
+// text that ends up inside inline-button labels and a parse_mode=HTML delivery
+// message. A newline would break the one-row-per-button layout, and an
+// unbounded length would push the rate off the end of the button. (HTML
+// metacharacters are allowed — the delivery path escapes them at send time —
+// so a name like "A & B" is accepted and renders literally.)
+func (b *Bot) capSetApikeyName(c *Ctx, saleClass string) bool {
+	if strings.HasPrefix(c.Text, "/") || labelToCmd(c.Text) != "" {
+		return false
+	}
+	if !b.isSuperAdmin(c.ChatID) {
+		return true
+	}
+	label, cb := apikeyNameRowLabel(saleClass)
+	key, def := saleClassBedrock, apikeyDefaultNameBedrock
+	if saleClass == saleClassKiro {
+		key, def = saleClassKiro, apikeyDefaultNameKiro
+	}
+	name := strings.TrimSpace(c.Text)
+	// A lone "-" DELETES the override (restores the built-in default) — the
+	// only way back, since an empty message can't be sent to a bot.
+	restore := name == "-"
+	if !restore {
+		// Same predicate the READ path applies (apikeyNameOK, apikey.go): a
+		// value this rejects would be ignored on read anyway, so accepting it
+		// here would silently store a name the shop never shows.
+		if !apikeyNameOK(name) {
+			b.send(c.Ctx, c.ChatID,
+				"⚠️ Enter a single-line name of at most "+itoa(apikeyNameMaxRunes)+
+					" characters, or \"-\" to restore the default \""+def+"\".",
+				admNavRetry("admcat:pricing", label, cb))
+			return true
+		}
+	}
+	if b.cfg != nil {
+		// Effective pre-change name, captured BEFORE the write (same shape as
+		// the sibling setters: audit records what the shop actually showed,
+		// not the raw map entry, which may have been absent).
+		old := b.apikeyProductName(saleClass)
+		s := b.cfg.Settings()
+		// The sub-map comes back as map[string]any when it round-trips through
+		// JSON, but may be missing entirely or (hand-edited settings.json)
+		// hold a non-object. Both cases are replaced with a fresh map rather
+		// than crashing or silently writing nothing.
+		names, ok := s["apikey_names"].(map[string]any)
+		if !ok {
+			names = map[string]any{}
+		}
+		if restore {
+			delete(names, key)
+		} else {
+			names[key] = name
+		}
+		// Drop the whole sub-map once its last override is gone, so restoring
+		// both defaults leaves settings.json as it was before anyone renamed
+		// anything rather than an orphan "apikey_names": {}.
+		if len(names) == 0 {
+			delete(s, "apikey_names")
+		} else {
+			s["apikey_names"] = names
+		}
+		// H1 stop-on-failure: a SaveSettings error must never be reported as
+		// the ✅ rename-succeeded text — the admin would believe the shop is
+		// selling under the new name while every screen still shows the old
+		// one. Stop here with the shared save-failed reply, exactly like the
+		// pricing setters above.
+		if err := b.cfg.SaveSettings(s); err != nil {
+			log.Println("adminpricing: save failed:", err)
+			b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
+			return true
+		}
+		// Audit AFTER the save succeeds, never before (spec §4.3). A display
+		// rename is customer-visible on every buy/pay/delivery screen, so it
+		// needs the same "who changed this and from what" trail as a price.
+		b.auditConfigSet(fmtInt(c.ChatID), "config_set_apikey_name", "apikey_names."+key,
+			old, b.apikeyProductName(saleClass))
+	}
+	// Echo the value that was JUST applied (the typed/trimmed name, or the
+	// built-in default on a restore) rather than re-resolving it through
+	// apikeyProductName. When b.cfg == nil the save block above is skipped
+	// entirely, so re-resolving would read back the OLD stored name and the
+	// ✅ text would claim success for a write that never happened.
+	shown := name
+	if restore {
+		shown = def
+	}
+	text := "✅ Product display name set to \"" + shown + "\"."
+	if restore {
+		text = "✅ Product display name restored to the default \"" + shown + "\"."
+	}
+	b.send(c.Ctx, c.ChatID, text, admNav("admcat:pricing"))
+	return true
+}
+
+// capSetApiName is the "setapiname" capture (Go-only, POP semantics).
+func (b *Bot) capSetApiName(c *Ctx) bool {
+	c.st.mu.Lock()
+	armed := c.st.SetApiName
+	c.st.SetApiName = false
+	c.st.mu.Unlock()
+	if !armed {
+		return false
+	}
+	return b.capSetApikeyName(c, saleClassBedrock)
+}
+
+// capSetKiroName is the "setkironame" capture (Go-only, POP semantics).
+func (b *Bot) capSetKiroName(c *Ctx) bool {
+	c.st.mu.Lock()
+	armed := c.st.SetKiroName
+	c.st.SetKiroName = false
+	c.st.mu.Unlock()
+	if !armed {
+		return false
+	}
+	return b.capSetApikeyName(c, saleClassKiro)
 }
 
 // ---- 5. Kiro SKU variants: kirotoggle/kiroprice/kiromin/kiromax ------------

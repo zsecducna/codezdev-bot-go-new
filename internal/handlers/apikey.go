@@ -175,6 +175,68 @@ func (b *Bot) envInt64(key string, def int64) int64 {
 	return int64(b.envInt(key, int(def)))
 }
 
+// The built-in DISPLAY names of the two mint SKUs. Declared as constants (not
+// inline literals) because the i18n catalog's default rendering and
+// apikeyProductName's fallback must be the SAME text: with an admin override
+// absent, the rendered button/prompt/delivery text has to stay byte-identical
+// to what shipped before the rename feature existed, and two independent
+// literals would eventually drift apart.
+//
+// These are DISPLAY strings only. They are NEVER the product sentinels
+// (__apikey__ / __kiroapi__ / __apikeyrc__) — orders, api_keys rows, suspension
+// keys and private-product gating all key off those, so a display rename must
+// never reach them.
+const (
+	apikeyDefaultNameBedrock = "Bedrock API Credits"
+	apikeyDefaultNameKiro    = "Kiro Credits API"
+)
+
+// apikeyProductName is the admin-renameable DISPLAY name of one mint SKU —
+// settings.json `apikey_names` = {"bedrock": "...", "kiro": "..."} (Go-only:
+// the Python original has no rename feature, so there is no line to cite).
+// Absent key, absent SKU entry, a wrong-typed value or an empty-after-trim
+// value all fall back to the built-in default above.
+//
+// Legacy (” sale_class) rows resolve to the BEDROCK entry, override included —
+// every render site collapses "not kiro" onto the bedrock template
+// (apikeyKeyClass(row) == saleClassKiro ? kiro : bedrock), so resolving the
+// name any other way would print the old name on a re-reveal of a legacy key
+// while the surrounding template is the renamed bedrock one.
+//
+// Nil-safe exactly like productSuspended (catalog.go): b.settings() returns nil
+// with no config wired (unit tests) and indexing a nil map is legal in Go.
+//
+// The shape guard (single line, ≤ apikeyNameMaxRunes) is enforced HERE, on the
+// read, not only in the admin wizard that writes it: settings.json is also
+// hand-editable, and this name is concatenated into inline-button labels and an
+// all-caps prompt header, where an embedded newline breaks the layout. One
+// guard at the single point every caller routes through beats trusting that
+// every writer validated first; a value that fails it falls back to the
+// built-in default rather than rendering broken.
+func (b *Bot) apikeyProductName(saleClass string) string {
+	def := apikeyDefaultNameBedrock
+	key := saleClassBedrock
+	if saleClass == saleClassKiro {
+		def, key = apikeyDefaultNameKiro, saleClassKiro
+	}
+	names, _ := b.settings()["apikey_names"].(map[string]any)
+	if v, ok := names[key]; ok {
+		if s := strings.TrimSpace(asStr(v)); apikeyNameOK(s) {
+			return s
+		}
+	}
+	return def
+}
+
+// apikeyNameOK is the shared shape check for a SKU display name — non-empty,
+// single-line, at most apikeyNameMaxRunes runes. Used by both the read path
+// above and the admin capture that writes it (capSetApikeyName,
+// adminpricing.go) so the two can never disagree about what is acceptable.
+// Runes, not bytes, so a CJK name is not silently cut shorter than a Latin one.
+func apikeyNameOK(s string) bool {
+	return s != "" && !strings.ContainsAny(s, "\n\r") && len([]rune(s)) <= apikeyNameMaxRunes
+}
+
 // apikeyMinCredits is the per-order credit FLOOR for one SKU — apikey_min_credits
 // (telegram_bot.py:6302-6318). Admin setting wins, else that SKU's env default,
 // never below 1 (a floor of 0 would let a customer order 0 credits, which
@@ -921,7 +983,11 @@ func (b *Bot) cbApikeyStart(cc *cbCtx) {
 	if cls == saleClassBedrock {
 		opus = b.apikeyOpusEstFor(cc.ChatID, lang)
 	}
+	// "name" is the admin-renameable SKU display name. UPPERCASED here because
+	// both prompt templates are all-caps headers ("🔑 BUY {name}") — the
+	// default name renders byte-identically to the pre-rename literal.
 	text := i18n.F(prompt.T(lang),
+		"name", strings.ToUpper(b.apikeyProductName(cls)),
 		"rate", b.apikeyRateDispFor(cc.ChatID, cls),
 		"min", itoa64(mn), "balance", b.usdtDisp(balance), "opus", opus)
 	if markup != nil {
@@ -1227,12 +1293,15 @@ func (b *Bot) apikeyPayScreenText(o *store.Order, lang i18n.Lang, balance int64)
 			"credits", itoa64(o.Qty), "masked", masked, "rate", rateDisp,
 			"total", b.usdtDisp(o.Total), "balance", b.usdtDisp(balance))
 	}
-	// SKU-correct product naming on the pay screen (same shape either way).
-	tmpl := c.PayPrompt
+	// SKU-correct product naming on the pay screen (same shape either way). The
+	// class drives BOTH the template and the display name, so a renamed SKU
+	// can never show one SKU's name above the other SKU's units.
+	cls, tmpl := saleClassBedrock, c.PayPrompt
 	if o.Product == kiroApikeyProduct {
-		tmpl = c.KiroPayPrompt
+		cls, tmpl = saleClassKiro, c.KiroPayPrompt
 	}
 	return i18n.F(tmpl.T(lang),
+		"name", b.apikeyProductName(cls),
 		"credits", itoa64(o.Qty), "rate", rateDisp,
 		"total", b.usdtDisp(o.Total), "balance", b.usdtDisp(balance))
 }
@@ -1248,14 +1317,18 @@ func (b *Bot) apikeyBuyRows(chatID int64, lang i18n.Lang) (rows [][]tg.InlineKey
 	c := &i18n.C().APIKey
 	bedrockOn := b.apikeyForSale(saleClassBedrock)
 	kiroOn := b.apikeyForSale(saleClassKiro)
+	// "name" is the admin-renameable display name (plain, not uppercased: these
+	// are title-case button labels, not headers).
 	if bedrockOn {
 		rows = append(rows, styledBtnRow(
-			i18n.F(c.Btn.T(lang), "rate", b.apikeyRateDisp(saleClassBedrock)),
+			i18n.F(c.Btn.T(lang), "name", b.apikeyProductName(saleClassBedrock),
+				"rate", b.apikeyRateDisp(saleClassBedrock)),
 			"apikey:start", "primary"))
 	}
 	if kiroOn {
 		rows = append(rows, styledBtnRow(
-			i18n.F(c.KiroBtn.T(lang), "rate", b.apikeyRateDisp(saleClassKiro)),
+			i18n.F(c.KiroBtn.T(lang), "name", b.apikeyProductName(saleClassKiro),
+				"rate", b.apikeyRateDisp(saleClassKiro)),
 			"kiroapi:start", "primary"))
 	}
 	if !bedrockOn && !kiroOn {

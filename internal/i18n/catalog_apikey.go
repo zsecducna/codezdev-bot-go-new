@@ -16,10 +16,20 @@ package i18n
 type APIKeyCatalog struct {
 	// ---- bedrock SKU (__apikey__) ----
 
-	// Btn — APIKEY_BTN (telegram_bot.py:3884): buy-menu row; {rate}.
+	// Btn — APIKEY_BTN (telegram_bot.py:3884): buy-menu row; {name} {rate}.
+	//
+	// {name} is a GO-ONLY addition (no Python line to cite, same precedent as
+	// captures.go's "provpool" entry): the SKU's display name is admin-
+	// renameable via settings.json `apikey_names`, so the product name that
+	// used to be baked into this literal is now substituted by the caller
+	// (handlers.apikeyProductName). With no override configured the rendered
+	// text is byte-identical to the Python original. It appears on Prompt,
+	// PayPrompt, Delivered and their Kiro twins below for the same reason.
 	Btn Str
 	// Prompt — APIKEY_PROMPT (telegram_bot.py:3888): credit-amount prompt;
-	// {rate} {min} {balance} {opus}. {opus} is the Opus-5 token-value estimate
+	// {name} {rate} {min} {balance} {opus}. {name} is passed UPPERCASED by the
+	// caller — this template is the all-caps header. {opus} is the Opus-5
+	// token-value estimate
 	// block (see apikeyOpusEstFor, apikey.go) — Kiro commit 3069329. Already
 	// newline-terminated when present and EMPTY when it can't be computed, so
 	// the surrounding layout holds either way. BEDROCK ONLY: the kiro credit is
@@ -27,10 +37,12 @@ type APIKeyCatalog struct {
 	// factor — KiroPrompt below carries no {opus} placeholder at all.
 	Prompt Str
 	// PayPrompt — APIKEY_PAY_PROMPT (telegram_bot.py:3917): pay screen;
-	// {credits} {rate} {total} {balance}.
+	// {name} {credits} {rate} {total} {balance}.
 	PayPrompt Str
 	// Delivered — APIKEY_DELIVERED (telegram_bot.py:3944): delivery/reveal
-	// message (HTML); {credits} {key} {base}.
+	// message (HTML); {name} {credits} {key} {base}. {name} is HTML-escaped by
+	// the sender like {key}/{base} — it is admin-typed text landing inside a
+	// parse_mode=HTML message.
 	Delivered Str
 	// HistLabel — APIKEY_HIST_LABEL (telegram_bot.py:3992); {credits}.
 	HistLabel Str
@@ -46,13 +58,17 @@ type APIKeyCatalog struct {
 
 	// ---- kiro SKU (__kiroapi__) ----
 
-	// KiroBtn — KIROAPI_BTN (telegram_bot.py:4000); {rate}.
+	// KiroBtn — KIROAPI_BTN (telegram_bot.py:4000); {name} {rate}.
 	KiroBtn Str
-	// KiroPrompt — KIROAPI_PROMPT (telegram_bot.py:4006); {rate} {min} {balance}.
+	// KiroPrompt — KIROAPI_PROMPT (telegram_bot.py:4006);
+	// {name} {rate} {min} {balance}. {name} arrives UPPERCASED (all-caps header).
 	KiroPrompt Str
-	// KiroPayPrompt — KIROAPI_PAY_PROMPT (telegram_bot.py:4020).
+	// KiroPayPrompt — KIROAPI_PAY_PROMPT (telegram_bot.py:4020); {name} plus the
+	// bedrock twin's tokens.
 	KiroPayPrompt Str
-	// KiroDelivered — KIROAPI_DELIVERED (telegram_bot.py:4031).
+	// KiroDelivered — KIROAPI_DELIVERED (telegram_bot.py:4031). Carries {name}
+	// TWICE — the "…key is ready" opener and the no-warranty sentence — and
+	// HTML-escaped by the sender, same as Delivered above.
 	KiroDelivered Str
 	// KiroHistLabel — KIROAPI_HIST_LABEL (telegram_bot.py:4078); {credits}.
 	KiroHistLabel Str
@@ -144,30 +160,31 @@ type APIKeyCatalog struct {
 // buildAPIKeyCatalog materializes the API-key strings verbatim from Python.
 func buildAPIKeyCatalog() APIKeyCatalog {
 	return APIKeyCatalog{
-		// APIKEY_BTN (telegram_bot.py:3884).
+		// APIKEY_BTN (telegram_bot.py:3884), product name -> {name}.
 		Btn: Str{
-			EN: "🔑 Bedrock API Credits — {rate}/100 credits",
-			VI: "🔑 Bedrock API Credits — {rate}/100 credits",
-			ZH: "🔑 Bedrock API Credits — {rate}/100 credits",
+			EN: "🔑 {name} — {rate}/100 credits",
+			VI: "🔑 {name} — {rate}/100 credits",
+			ZH: "🔑 {name} — {rate}/100 credits",
 		},
-		// APIKEY_PROMPT (telegram_bot.py:3888, {opus} added by commit 3069329).
+		// APIKEY_PROMPT (telegram_bot.py:3888, {opus} added by commit 3069329),
+		// product name -> {name} (uppercased by the caller).
 		Prompt: Str{
-			EN: "🔑 BUY BEDROCK API CREDITS\nPrice: {rate} / 100 credits\nMinimum: {min} credits\nYour balance: {balance}\n{opus}\nType how many credits you want (e.g. 7500):",
-			VI: "🔑 MUA BEDROCK API CREDITS\nGiá: {rate} / 100 credits\nTối thiểu: {min} credits\nSố dư của bạn: {balance}\n{opus}\nNhập số credits bạn muốn mua (ví dụ 7500):",
-			ZH: "🔑 购买 BEDROCK API CREDITS\n价格：{rate} / 100 credits\n最低：{min} credits\n您的余额：{balance}\n{opus}\n请输入要购买的 credits 数量（例如 7500）：",
+			EN: "🔑 BUY {name}\nPrice: {rate} / 100 credits\nMinimum: {min} credits\nYour balance: {balance}\n{opus}\nType how many credits you want (e.g. 7500):",
+			VI: "🔑 MUA {name}\nGiá: {rate} / 100 credits\nTối thiểu: {min} credits\nSố dư của bạn: {balance}\n{opus}\nNhập số credits bạn muốn mua (ví dụ 7500):",
+			ZH: "🔑 购买 {name}\n价格：{rate} / 100 credits\n最低：{min} credits\n您的余额：{balance}\n{opus}\n请输入要购买的 credits 数量（例如 7500）：",
 		},
-		// APIKEY_PAY_PROMPT (telegram_bot.py:3917).
+		// APIKEY_PAY_PROMPT (telegram_bot.py:3917), product name -> {name}.
 		PayPrompt: Str{
-			EN: "🧾 🔑 Bedrock API Credits — {credits} credits\nPrice: {rate} / 100 credits\nTotal: {total}\n\nYour balance: {balance}\nChoose a payment method:",
-			VI: "🧾 🔑 Bedrock API Credits — {credits} credits\nĐơn giá: {rate} / 100 credits\nThành tiền: {total}\n\nSố dư của bạn: {balance}\nChọn cách thanh toán:",
-			ZH: "🧾 🔑 Bedrock API Credits — {credits} credits\n价格：{rate} / 100 credits\n总计：{total}\n\n您的余额：{balance}\n请选择支付方式：",
+			EN: "🧾 🔑 {name} — {credits} credits\nPrice: {rate} / 100 credits\nTotal: {total}\n\nYour balance: {balance}\nChoose a payment method:",
+			VI: "🧾 🔑 {name} — {credits} credits\nĐơn giá: {rate} / 100 credits\nThành tiền: {total}\n\nSố dư của bạn: {balance}\nChọn cách thanh toán:",
+			ZH: "🧾 🔑 {name} — {credits} credits\n价格：{rate} / 100 credits\n总计：{total}\n\n您的余额：{balance}\n请选择支付方式：",
 		},
-		// APIKEY_DELIVERED (telegram_bot.py:3944) — HTML; {key}/{base} escaped
-		// by the sender.
+		// APIKEY_DELIVERED (telegram_bot.py:3944) — HTML; {name}/{key}/{base}
+		// escaped by the sender. Product name -> {name}.
 		Delivered: Str{
-			EN: "✅ Your Bedrock API Credits are ready — {credits} credits\n\n🔑 Your API key (tap to copy):\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 Send it as header: <code>Authorization: Bearer &lt;your key&gt;</code>\n\n👉 <b>How to use it</b>\n📊 Dashboard — track your quota:\n{base}/\n📖 API docs + client setup (Claude Code, Codex, curl):\n{base}/docs\n🧠 Models &amp; pricing:\n{base}/models\n\n⚠️ Keep this key secret — anyone holding it can spend your credits. You can view it again anytime: Self-Service → 🔑 My API Keys.",
-			VI: "✅ Bedrock API Credits của bạn đã sẵn sàng — {credits} credits\n\n🔑 API key của bạn (chạm để sao chép):\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 Gửi kèm header: <code>Authorization: Bearer &lt;key của bạn&gt;</code>\n\n👉 <b>Hướng dẫn sử dụng</b>\n📊 Bảng điều khiển — theo dõi hạn mức:\n{base}/\n📖 Tài liệu API + cách cài đặt (Claude Code, Codex, curl):\n{base}/docs\n🧠 Danh sách model &amp; bảng giá:\n{base}/models\n\n⚠️ Giữ kín key này — ai có nó là dùng được credits của bạn. Xem lại bất cứ lúc nào: Tự phục vụ → 🔑 API key của tôi.",
-			ZH: "✅ 您的 Bedrock API Credits 已就绪 — {credits} credits\n\n🔑 您的 API key（点击复制）：\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 请求头：<code>Authorization: Bearer &lt;您的 key&gt;</code>\n\n👉 <b>使用指南</b>\n📊 控制台 — 查询余量：\n{base}/\n📖 API 文档 + 客户端配置（Claude Code、Codex、curl）：\n{base}/docs\n🧠 模型与价格：\n{base}/models\n\n⚠️ 请妥善保管此 key — 任何持有者都能消耗您的 credits。随时可再次查看：自助服务 → 🔑 我的 API Key。",
+			EN: "✅ Your {name} are ready — {credits} credits\n\n🔑 Your API key (tap to copy):\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 Send it as header: <code>Authorization: Bearer &lt;your key&gt;</code>\n\n👉 <b>How to use it</b>\n📊 Dashboard — track your quota:\n{base}/\n📖 API docs + client setup (Claude Code, Codex, curl):\n{base}/docs\n🧠 Models &amp; pricing:\n{base}/models\n\n⚠️ Keep this key secret — anyone holding it can spend your credits. You can view it again anytime: Self-Service → 🔑 My API Keys.",
+			VI: "✅ {name} của bạn đã sẵn sàng — {credits} credits\n\n🔑 API key của bạn (chạm để sao chép):\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 Gửi kèm header: <code>Authorization: Bearer &lt;key của bạn&gt;</code>\n\n👉 <b>Hướng dẫn sử dụng</b>\n📊 Bảng điều khiển — theo dõi hạn mức:\n{base}/\n📖 Tài liệu API + cách cài đặt (Claude Code, Codex, curl):\n{base}/docs\n🧠 Danh sách model &amp; bảng giá:\n{base}/models\n\n⚠️ Giữ kín key này — ai có nó là dùng được credits của bạn. Xem lại bất cứ lúc nào: Tự phục vụ → 🔑 API key của tôi.",
+			ZH: "✅ 您的 {name} 已就绪 — {credits} credits\n\n🔑 您的 API key（点击复制）：\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 请求头：<code>Authorization: Bearer &lt;您的 key&gt;</code>\n\n👉 <b>使用指南</b>\n📊 控制台 — 查询余量：\n{base}/\n📖 API 文档 + 客户端配置（Claude Code、Codex、curl）：\n{base}/docs\n🧠 模型与价格：\n{base}/models\n\n⚠️ 请妥善保管此 key — 任何持有者都能消耗您的 credits。随时可再次查看：自助服务 → 🔑 我的 API Key。",
 		},
 		// APIKEY_HIST_LABEL (telegram_bot.py:3992).
 		HistLabel: Str{
@@ -181,29 +198,31 @@ func buildAPIKeyCatalog() APIKeyCatalog {
 			VI: "\n📊 Ước tính Opus 5: ≈ {tokens} token / 1 USDT\n     ≈ {per1m} USDT / 1 triệu token (chỉ là ước tính)\n",
 			ZH: "\n📊 Opus 5 估算：每 1 USDT ≈ {tokens} tokens\n     每 100 万 tokens ≈ {per1m} USDT（仅供参考）\n",
 		},
-		// KIROAPI_BTN (telegram_bot.py:4000).
+		// KIROAPI_BTN (telegram_bot.py:4000), product name -> {name}.
 		KiroBtn: Str{
-			EN: "🟣 Kiro Credits API — {rate}/100 Kiro credits",
-			VI: "🟣 Kiro Credits API — {rate}/100 Kiro credits",
-			ZH: "🟣 Kiro Credits API — {rate}/100 Kiro credits",
+			EN: "🟣 {name} — {rate}/100 Kiro credits",
+			VI: "🟣 {name} — {rate}/100 Kiro credits",
+			ZH: "🟣 {name} — {rate}/100 Kiro credits",
 		},
 		// KIROAPI_PROMPT (telegram_bot.py:4006) — states NO WARRANTY before pay.
+		// Product name -> {name} (uppercased by the caller).
 		KiroPrompt: Str{
-			EN: "🟣 BUY KIRO CREDITS API KEY\nPrice: {rate} / 100 Kiro credits\nMinimum: {min} credits\nYour balance: {balance}\n\nWARRANTY: NO WARRANTY\n\nType how many Kiro credits you want (e.g. 7500):",
-			VI: "🟣 MUA KIRO CREDITS API KEY\nGiá: {rate} / 100 Kiro credits\nTối thiểu: {min} credits\nSố dư của bạn: {balance}\n\nBẢO HÀNH: KHÔNG BẢO HÀNH\n\nNhập số Kiro credits bạn muốn mua (ví dụ 7500):",
-			ZH: "🟣 购买 KIRO CREDITS API KEY\n价格：{rate} / 100 Kiro credits\n最低：{min} credits\n您的余额：{balance}\n\n保修：无保修\n\n请输入要购买的 Kiro credits 数量（例如 7500）：",
+			EN: "🟣 BUY {name} KEY\nPrice: {rate} / 100 Kiro credits\nMinimum: {min} credits\nYour balance: {balance}\n\nWARRANTY: NO WARRANTY\n\nType how many Kiro credits you want (e.g. 7500):",
+			VI: "🟣 MUA {name} KEY\nGiá: {rate} / 100 Kiro credits\nTối thiểu: {min} credits\nSố dư của bạn: {balance}\n\nBẢO HÀNH: KHÔNG BẢO HÀNH\n\nNhập số Kiro credits bạn muốn mua (ví dụ 7500):",
+			ZH: "🟣 购买 {name} KEY\n价格：{rate} / 100 Kiro credits\n最低：{min} credits\n您的余额：{balance}\n\n保修：无保修\n\n请输入要购买的 Kiro credits 数量（例如 7500）：",
 		},
-		// KIROAPI_PAY_PROMPT (telegram_bot.py:4020).
+		// KIROAPI_PAY_PROMPT (telegram_bot.py:4020), product name -> {name}.
 		KiroPayPrompt: Str{
-			EN: "🧾 🟣 Kiro Credits API — {credits} Kiro credits\nPrice: {rate} / 100 credits\nTotal: {total}\n\nYour balance: {balance}\nChoose a payment method:",
-			VI: "🧾 🟣 Kiro Credits API — {credits} Kiro credits\nĐơn giá: {rate} / 100 credits\nThành tiền: {total}\n\nSố dư của bạn: {balance}\nChọn cách thanh toán:",
-			ZH: "🧾 🟣 Kiro Credits API — {credits} Kiro credits\n价格：{rate} / 100 credits\n总计：{total}\n\n您的余额：{balance}\n请选择支付方式：",
+			EN: "🧾 🟣 {name} — {credits} Kiro credits\nPrice: {rate} / 100 credits\nTotal: {total}\n\nYour balance: {balance}\nChoose a payment method:",
+			VI: "🧾 🟣 {name} — {credits} Kiro credits\nĐơn giá: {rate} / 100 credits\nThành tiền: {total}\n\nSố dư của bạn: {balance}\nChọn cách thanh toán:",
+			ZH: "🧾 🟣 {name} — {credits} Kiro credits\n价格：{rate} / 100 credits\n总计：{total}\n\n您的余额：{balance}\n请选择支付方式：",
 		},
-		// KIROAPI_DELIVERED (telegram_bot.py:4031).
+		// KIROAPI_DELIVERED (telegram_bot.py:4031). BOTH product-name
+		// occurrences -> {name}: the opener and the no-warranty sentence.
 		KiroDelivered: Str{
-			EN: "✅ Your Kiro Credits API key is ready — {credits} Kiro credits\nWARRANTY: NO WARRANTY\nPlease be aware that the Kiro Credits API key depends on the Kiro accounts source and it could be not stable and no warranty. In return, you will have good pricing.\n\n🔑 Your API key (tap to copy):\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 Send it as header: <code>Authorization: Bearer &lt;your key&gt;</code>\n\n👉 <b>How to use it</b>\n📊 Dashboard — track your quota:\n{base}/\n📖 API docs + client setup (Claude Code, Codex, curl):\n{base}/docs\n🧠 Models &amp; pricing:\n{base}/models\n\n⚠️ Keep this key secret — anyone holding it can spend your credits. You can view it again anytime: Self-Service → 🔑 My API Keys.",
-			VI: "✅ Kiro Credits API key của bạn đã sẵn sàng — {credits} Kiro credits\nBẢO HÀNH: KHÔNG BẢO HÀNH\nLưu ý: Kiro Credits API key phụ thuộc vào nguồn tài khoản Kiro nên có thể không ổn định và không được bảo hành. Đổi lại, bạn có mức giá tốt.\n\n🔑 API key của bạn (chạm để sao chép):\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 Gửi kèm header: <code>Authorization: Bearer &lt;key của bạn&gt;</code>\n\n👉 <b>Hướng dẫn sử dụng</b>\n📊 Bảng điều khiển — theo dõi hạn mức:\n{base}/\n📖 Tài liệu API + cách cài đặt (Claude Code, Codex, curl):\n{base}/docs\n🧠 Danh sách model &amp; bảng giá:\n{base}/models\n\n⚠️ Giữ kín key này — ai có nó là dùng được credits của bạn. Xem lại bất cứ lúc nào: Tự phục vụ → 🔑 API key của tôi.",
-			ZH: "✅ 您的 Kiro Credits API key 已就绪 — {credits} Kiro credits\n保修：无保修\n请注意：Kiro Credits API key 依赖 Kiro 账号来源，可能不稳定且无保修。作为回报，您将获得优惠的价格。\n\n🔑 您的 API key（点击复制）：\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 请求头：<code>Authorization: Bearer &lt;您的 key&gt;</code>\n\n👉 <b>使用指南</b>\n📊 控制台 — 查询余量：\n{base}/\n📖 API 文档 + 客户端配置（Claude Code、Codex、curl）：\n{base}/docs\n🧠 模型与价格：\n{base}/models\n\n⚠️ 请妥善保管此 key — 任何持有者都能消耗您的 credits。随时可再次查看：自助服务 → 🔑 我的 API Key。",
+			EN: "✅ Your {name} key is ready — {credits} Kiro credits\nWARRANTY: NO WARRANTY\nPlease be aware that the {name} key depends on the Kiro accounts source and it could be not stable and no warranty. In return, you will have good pricing.\n\n🔑 Your API key (tap to copy):\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 Send it as header: <code>Authorization: Bearer &lt;your key&gt;</code>\n\n👉 <b>How to use it</b>\n📊 Dashboard — track your quota:\n{base}/\n📖 API docs + client setup (Claude Code, Codex, curl):\n{base}/docs\n🧠 Models &amp; pricing:\n{base}/models\n\n⚠️ Keep this key secret — anyone holding it can spend your credits. You can view it again anytime: Self-Service → 🔑 My API Keys.",
+			VI: "✅ {name} key của bạn đã sẵn sàng — {credits} Kiro credits\nBẢO HÀNH: KHÔNG BẢO HÀNH\nLưu ý: {name} key phụ thuộc vào nguồn tài khoản Kiro nên có thể không ổn định và không được bảo hành. Đổi lại, bạn có mức giá tốt.\n\n🔑 API key của bạn (chạm để sao chép):\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 Gửi kèm header: <code>Authorization: Bearer &lt;key của bạn&gt;</code>\n\n👉 <b>Hướng dẫn sử dụng</b>\n📊 Bảng điều khiển — theo dõi hạn mức:\n{base}/\n📖 Tài liệu API + cách cài đặt (Claude Code, Codex, curl):\n{base}/docs\n🧠 Danh sách model &amp; bảng giá:\n{base}/models\n\n⚠️ Giữ kín key này — ai có nó là dùng được credits của bạn. Xem lại bất cứ lúc nào: Tự phục vụ → 🔑 API key của tôi.",
+			ZH: "✅ 您的 {name} key 已就绪 — {credits} Kiro credits\n保修：无保修\n请注意：{name} key 依赖 Kiro 账号来源，可能不稳定且无保修。作为回报，您将获得优惠的价格。\n\n🔑 您的 API key（点击复制）：\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 请求头：<code>Authorization: Bearer &lt;您的 key&gt;</code>\n\n👉 <b>使用指南</b>\n📊 控制台 — 查询余量：\n{base}/\n📖 API 文档 + 客户端配置（Claude Code、Codex、curl）：\n{base}/docs\n🧠 模型与价格：\n{base}/models\n\n⚠️ 请妥善保管此 key — 任何持有者都能消耗您的 credits。随时可再次查看：自助服务 → 🔑 我的 API Key。",
 		},
 		// KIROAPI_HIST_LABEL (telegram_bot.py:4078).
 		KiroHistLabel: Str{

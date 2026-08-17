@@ -221,11 +221,17 @@ func (b *Bot) cbApikeyRev(cc *cbCtx) {
 	}
 	// SKU-correct wording/units: a kiro key re-reveals with the kiro delivery
 	// message, everything else (bedrock + legacy '') the bedrock one.
+	keyCls := apikeyKeyClass(row)
 	tmpl := c.Delivered
-	if apikeyKeyClass(row) == saleClassKiro {
+	if keyCls == saleClassKiro {
 		tmpl = c.KiroDelivered
 	}
+	// "name" (admin-renameable display name) must be passed here too, not only
+	// on the first delivery: this re-send uses the SAME template, so omitting
+	// it would leak a literal "{name}" into the customer's message. HTML-escaped
+	// because this goes out with parse_mode=HTML.
 	b.sendHTML(cc.Ctx, cc.ChatID, i18n.F(tmpl.T(lang),
+		"name", html.EscapeString(b.apikeyProductName(keyCls)),
 		"credits", itoa64(roundCredits(row.Credits)),
 		"key", html.EscapeString(row.APIKey),
 		"base", html.EscapeString(b.kiroGoPublicURL())))

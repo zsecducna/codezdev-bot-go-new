@@ -25,7 +25,8 @@ var adminClearFields = []string{
 	"Price", "Tier", "Hold", "NewProd", "RenProd", "SetNotice", "SetDelivery",
 	"EditFile", "RmProd", "Entra", "SetBep20", "SetTron",
 	"SetApiPrice", "SetApiMin", "SetApiMax", "SetKiroPrice", "SetKiroMin",
-	"SetKiroMax", "SetApiCap", "SetKiroKey", "SetKiroURL", "SetKiroAcct",
+	"SetKiroMax", "SetApiCap", "SetApiName", "SetKiroName",
+	"SetKiroKey", "SetKiroURL", "SetKiroAcct",
 	"ProvPool", "SetMaxQty", "RefundReject",
 	"EntraDomains", "EntraVerifyCSV", "RefundDelete",
 }
@@ -104,7 +105,9 @@ func TestClearListsExact(t *testing.T) {
 	if len(customerClearFields) != 8 {
 		t.Errorf("expected 8 customer clear fields, have %d", len(customerClearFields))
 	}
-	if len(adminClearFields) != 45 {
-		t.Errorf("expected 45 admin clear fields, have %d", len(adminClearFields))
+	// 47 = the 45 Python-derived admin pendings + the two Go-only SKU
+	// display-rename flags (SetApiName / SetKiroName).
+	if len(adminClearFields) != 47 {
+		t.Errorf("expected 47 admin clear fields, have %d", len(adminClearFields))
 	}
 }
