@@ -3,6 +3,7 @@ package kirogo
 import (
 	"context"
 	"encoding/json"
+	"strings"
 )
 
 // Remaining models any Kiro-Go "*Remaining" field (creditsRemaining,
@@ -54,9 +55,15 @@ const (
 // saleClass field entirely rather than send an empty string, because a
 // legacy key's own stored sale_class (never recorded for pre-split rows) is
 // the server-side source of truth there — see RechargeKeyRequest.
+// SaleClassFixed is Fixed Pricing: capacity the operator bought as prepaid
+// vendor API keys in bulk, billed to the customer at a flat credit price per
+// REQUEST (set per model on the pool, not here). Like kiro and unlike bedrock it
+// binds no per-customer upstream key: the pool account fronts its own rotating
+// vendor key pool, so there is nothing per-customer to provision.
 const (
 	SaleClassBedrock = "bedrock"
 	SaleClassKiro    = "kiro"
+	SaleClassFixed   = "fixed"
 )
 
 // ── POST /admin/provision_customer (KIRO_GO_API.md:21-46) ───────────────────
@@ -220,6 +227,28 @@ func (c *Client) ProvisionCustomer(ctx context.Context, req ProvisionCustomerReq
 			SaleClass:  SaleClassKiro,
 			// Hardcoded true — a kiro mint always skips upstream binding;
 			// this is not something req.SkipUpstream can override.
+			SkipUpstream: true,
+		}
+
+	case SaleClassFixed:
+		if req.AccountID != "" {
+			return nil, ErrAccountIDForbiddenForFixed
+		}
+		// Same structural guarantee as the kiro case: no AccountID field at
+		// all, so "accountId" cannot appear in the marshaled JSON. Fixed
+		// Pricing capacity is a pooled account that rotates its own vendor
+		// keys, so there is no per-customer upstream key to bind.
+		payload = struct {
+			Name         string `json:"name"`
+			Credits      int64  `json:"credits"`
+			TokenLimit   int    `json:"tokenLimit"`
+			SaleClass    string `json:"saleClass"`
+			SkipUpstream bool   `json:"skipUpstream"`
+		}{
+			Name:         req.Name,
+			Credits:      req.Credits,
+			TokenLimit:   0,
+			SaleClass:    SaleClassFixed,
 			SkipUpstream: true,
 		}
 
@@ -395,7 +424,8 @@ func (c *Client) RechargeKey(ctx context.Context, req RechargeKeyRequest) (*Rech
 	if req.Credits <= 0 {
 		return nil, ErrCreditsMustBePositive
 	}
-	if req.SaleClass != "" && req.SaleClass != SaleClassBedrock && req.SaleClass != SaleClassKiro {
+	if req.SaleClass != "" && req.SaleClass != SaleClassBedrock &&
+		req.SaleClass != SaleClassKiro && req.SaleClass != SaleClassFixed {
 		return nil, ErrUnknownSaleClass
 	}
 
@@ -657,6 +687,76 @@ type CustomerMeResponse struct {
 func (c *Client) CustomerMe(ctx context.Context, apiKey string) (*CustomerMeResponse, error) {
 	var out CustomerMeResponse
 	if err := c.customerGet(ctx, "/api/me", apiKey, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ── POST /admin/set_model_price, GET /admin/model_prices ────────────────────
+// Flat per-request pricing for the "fixed" sale class. The pool's rate card is
+// otherwise editable only from its admin panel, which the bot cannot reach: the
+// panel routes sit behind panel auth while the bot holds the admin key.
+
+// SetModelPriceRequest sets the flat credit charge for one request to one model.
+type SetModelPriceRequest struct {
+	Model string
+	// PerRequest is credits per request. A pointer so an omitted value is
+	// distinguishable from a deliberate 0 — sending nothing would price the
+	// model free, which is the one mistake here that costs money on every
+	// request afterwards rather than failing loudly once.
+	PerRequest *float64
+}
+
+// SetModelPriceResponse is the pool's echo of the stored price.
+type SetModelPriceResponse struct {
+	Success    bool    `json:"success"`
+	Model      string  `json:"model"`
+	PerRequest float64 `json:"perRequest"`
+}
+
+// ModelPrice is one row of the flat-price card.
+type ModelPrice struct {
+	Model      string  `json:"model"`
+	PerRequest float64 `json:"perRequest"`
+}
+
+// ModelPricesResponse lists every model carrying a flat per-request price.
+type ModelPricesResponse struct {
+	Success bool         `json:"success"`
+	Count   int          `json:"count"`
+	Prices  []ModelPrice `json:"prices"`
+}
+
+// SetModelPrice sets a model's flat per-request price on the pool.
+func (c *Client) SetModelPrice(ctx context.Context, req SetModelPriceRequest) (*SetModelPriceResponse, error) {
+	if strings.TrimSpace(req.Model) == "" {
+		return nil, ErrModelRequired
+	}
+	// Validated here rather than left to the server so an admin typo costs a
+	// message, not a round trip and a raw upstream error string in a chat.
+	if req.PerRequest == nil {
+		return nil, ErrPerRequestRequired
+	}
+	if *req.PerRequest < 0 {
+		return nil, ErrPerRequestNegative
+	}
+
+	payload := struct {
+		Model      string  `json:"model"`
+		PerRequest float64 `json:"perRequest"`
+	}{Model: strings.TrimSpace(req.Model), PerRequest: *req.PerRequest}
+
+	var out SetModelPriceResponse
+	if err := c.adminSend(ctx, "POST", "/admin/set_model_price", payload, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ModelPrices lists the models that carry a flat per-request price.
+func (c *Client) ModelPrices(ctx context.Context) (*ModelPricesResponse, error) {
+	var out ModelPricesResponse
+	if err := c.adminSend(ctx, "GET", "/admin/model_prices", nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

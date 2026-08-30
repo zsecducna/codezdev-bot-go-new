@@ -213,7 +213,19 @@ var (
 	// ErrUnknownSaleClass guards the SaleClass field on ProvisionCustomer and
 	// RechargeKey requests — only "" (legacy/omit), SaleClassBedrock and
 	// SaleClassKiro are meaningful.
-	ErrUnknownSaleClass = errors.New("kirogo: unknown sale class (want \"\", \"bedrock\" or \"kiro\")")
+	ErrUnknownSaleClass = errors.New("kirogo: unknown sale class (want \"\", \"bedrock\", \"kiro\" or \"fixed\")")
+
+	// ErrAccountIDForbiddenForFixed mirrors ErrAccountIDForbiddenForKiro: Fixed
+	// Pricing capacity is a pooled account rotating its own vendor keys, so a
+	// caller passing an account id has misunderstood which class they are
+	// selling and would otherwise get a confusing server-side rejection.
+	ErrAccountIDForbiddenForFixed = errors.New("kirogo: accountId must not be set for the fixed sale class")
+
+	// Flat per-request pricing guards. Rejected client-side so an admin typo
+	// costs one message instead of a round trip and a raw upstream error.
+	ErrModelRequired      = errors.New("kirogo: model is required")
+	ErrPerRequestRequired = errors.New("kirogo: perRequest is required")
+	ErrPerRequestNegative = errors.New("kirogo: perRequest must be >= 0")
 )
 
 // APIError wraps a non-2xx JSON error response from Kiro-Go
