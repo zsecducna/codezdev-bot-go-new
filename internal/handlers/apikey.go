@@ -639,6 +639,97 @@ func (b *Bot) apikeyOpusEstFor(chatID int64, lang i18n.Lang) string {
 	return b.apikeyOpusEst(b.apikeyPriceFor(chatID, 100, saleClassBedrock), lang)
 }
 
+// ---- Fixed Pricing rate card (customer side) --------------------------------
+
+// fixedPricesTimeout bounds the live rate-card fetch behind the Fixed Pricing
+// amount prompt. That fetch happens on a CUSTOMER's button tap, and
+// internal/kirogo allows 20s per attempt across up to 3 attempts — so an
+// unbounded call could leave a customer staring at nothing for a minute.
+// Three seconds comfortably covers one healthy round trip to the pool while
+// keeping the worst case inside what a person will wait through; the parent
+// bound covers the WHOLE call, so the client's internal retries cannot push
+// past it.
+//
+// A var rather than a const purely so a test can shrink it and prove the
+// timeout path degrades to an empty block instead of blocking the sale.
+var fixedPricesTimeout = 3 * time.Second
+
+// Caps for the customer copy of the rate card. The prompt already carries a
+// price line, a minimum, a balance and an explanatory paragraph, so the card
+// gets six rows rather than the admin listing's byte-bounded everything.
+//
+// The byte budget is the belt to that suspenders: a model name comes from the
+// pool operator, so a row cap alone is NOT a bound on length, and Telegram
+// hard-rejects a message over 4096 characters (b.send does not chunk, so an
+// oversized prompt would send NOTHING — the customer could not buy at all).
+// The worst case with these caps is comfortably clear of that ceiling: the
+// rendered FixedPrompt templates are 275-306 bytes, {name} is capped at
+// apikeyNameMaxRunes (60) and the rate/min/balance numbers are tens of bytes,
+// so template + fields + 700 lands around 1.3 KB. (Telegram counts UTF-16 code
+// units, which for any string are at most its UTF-8 byte count, so bounding
+// bytes always bounds the real limit — same reasoning as
+// modelPriceListMaxBytes.) That leaves well over the ~40 bytes by which
+// appendModelPriceRows' suffix may exceed the budget, as its doc requires.
+const (
+	fixedPriceCardMaxRows  = 6
+	fixedPriceCardMaxBytes = 700
+)
+
+// apikeyFixedPriceCard renders the live per-request rate card shown on the
+// Fixed Pricing amount prompt, so a customer can see which models cost how
+// many credits per request BEFORE typing an amount. Returns "" when the card
+// cannot be had.
+//
+// Degrades SILENTLY on every failure — Kiro-Go unconfigured, unreachable,
+// slow, answering nil, or carrying no flat prices at all. The card is a
+// nice-to-have on the prompt and must never become a gate in front of the
+// sale: a customer has to be able to buy even when the pool is down. Failures
+// are logged server-side only; no upstream error text ever reaches a chat.
+//
+// ponytail: no caching — each Fixed Pricing tap costs one admin-API round
+// trip. If product taps ever get heavy enough for that to matter, a short TTL
+// cache around ModelPrices is the upgrade path. There is no evidence one is
+// needed today, so none is built.
+func (b *Bot) apikeyFixedPriceCard(ctx context.Context) string {
+	client := b.kirogoClient()
+	if client == nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, fixedPricesTimeout)
+	defer cancel()
+	res, err := client.ModelPrices(ctx)
+	if err != nil {
+		log.Println("apikey: fixed price card unavailable:", err)
+		return ""
+	}
+	// An empty list is a normal state (no model carries a flat price yet), not
+	// an error — same reading as cbModelPrices makes of it. Either way the
+	// prompt simply goes out without the block.
+	if res == nil || len(res.Prices) == 0 {
+		return ""
+	}
+	// The prompt goes out through b.send, which sets no parse_mode at all
+	// (command.go) — PLAIN TEXT, unlike the delivery path's sendHTML. So the
+	// pool operator's model names need no escaping and are written verbatim.
+	// If this prompt is ever switched to HTML, these names must be escaped the
+	// way apikey_deliver.go escapes {name}.
+	//
+	// The leading newline makes the card its own paragraph under the template's
+	// explanatory text (each row then supplies its own "\n"). It is written
+	// into the builder rather than prepended afterwards so it counts against
+	// the byte budget like everything else.
+	var sb strings.Builder
+	sb.WriteString("\n")
+	// Zero rows written means not even the first one fit the budget (one model
+	// name long enough to blow 700 bytes on its own). Rendering the bare
+	// "… and N more (not shown)." that the helper then appends would advertise
+	// a list the customer was never shown — drop the whole block instead.
+	if appendModelPriceRows(&sb, res.Prices, fixedPriceCardMaxRows, fixedPriceCardMaxBytes) == 0 {
+		return ""
+	}
+	return sb.String()
+}
+
 // apikeyQtyRows wraps quick-pick credit buttons into rows of apikeyQtyPerRow —
 // _apikey_qty_rows (telegram_bot.py:6292-6299). Labelled "<n> cr": a bare
 // number sits directly under a rate line reading "4.00 USDT / 100 credits",
@@ -728,12 +819,20 @@ func (b *Bot) orderSaleClass(o *store.Order) string {
 
 // ---- live Kiro-Go stats -----------------------------------------------------
 
-// statsTimeout bounds every customer/admin-facing DISPLAY call to Kiro-Go.
-// Python passed timeout=5, attempts=1 on these paths so a hung proxy degrades
-// the display instead of pinning one of the 16 shared workers
-// (telegram_bot.py:5916-5918, 4509-4511). internal/kirogo's retry budget is
-// fixed at 3 attempts, so the equivalent bound here is a context deadline: it
-// aborts the retry sleep (sleepOrDone) and the in-flight request together.
+// statsTimeout bounds the customer/admin-facing DISPLAY calls that read live
+// key STATS from Kiro-Go. Python passed timeout=5, attempts=1 on these paths so
+// a hung proxy degrades the display instead of pinning one of the 16 shared
+// workers (telegram_bot.py:5916-5918, 4509-4511). internal/kirogo's retry
+// budget is fixed at 3 attempts, so the equivalent bound here is a context
+// deadline: it aborts the retry sleep (sleepOrDone) and the in-flight request
+// together.
+//
+// It is not the only such bound: fixedPricesTimeout applies the same technique,
+// with a tighter 3s, to the rate-card fetch on the Fixed Pricing amount prompt.
+// That one is deliberately shorter because it sits on a plain button tap with
+// nothing yet on screen, whereas a stats read backs a screen the customer has
+// already committed to. Any new display call needs a bound of its own — pick
+// one of these two rather than adding a third number.
 const statsTimeout = 6 * time.Second
 
 // apikeyLiveStats returns the live per-key stats for a minted key, or nil when
@@ -1094,13 +1193,25 @@ func (b *Bot) cbApikeyStart(cc *cbCtx) {
 	if cls == saleClassBedrock {
 		opus = b.apikeyOpusEstFor(cc.ChatID, lang)
 	}
+	// "prices" rides the exact same arrangement as "opus": always passed, but
+	// only FixedPrompt carries a {prices} placeholder, so for the other two
+	// SKUs the kv pair is a silent no-op. It is fetched only for fixed because
+	// a per-request rate card describes how a FIXED key bills and says nothing
+	// about a rate-card-burn SKU — and because a customer tapping bedrock or
+	// kiro must not pay the latency of an admin-API call they gain nothing
+	// from. An unreachable pool yields "" and the prompt sends without it.
+	prices := ""
+	if cls == saleClassFixed {
+		prices = b.apikeyFixedPriceCard(cc.Ctx)
+	}
 	// "name" is the admin-renameable SKU display name. UPPERCASED here because
 	// both prompt templates are all-caps headers ("🔑 BUY {name}") — the
 	// default name renders byte-identically to the pre-rename literal.
 	text := i18n.F(prompt.T(lang),
 		"name", strings.ToUpper(b.apikeyProductName(cls)),
 		"rate", b.apikeyRateDispFor(cc.ChatID, cls),
-		"min", itoa64(mn), "balance", b.usdtDisp(balance), "opus", opus)
+		"min", itoa64(mn), "balance", b.usdtDisp(balance), "opus", opus,
+		"prices", prices)
 	if markup != nil {
 		b.send(cc.Ctx, cc.ChatID, text, markup)
 	} else {

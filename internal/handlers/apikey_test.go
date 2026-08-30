@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
@@ -69,8 +70,9 @@ type fakeKiro struct {
 	// value rather than the number the admin typed.
 	ModelPriceEcho *float64
 
-	keys map[string]*fakeKeyState // by pool key id
-	seq  int
+	keys            map[string]*fakeKeyState // by pool key id
+	seq             int
+	modelPricesHits int
 
 	// Forced non-2xx status per endpoint (0 = respond normally). 4xx only:
 	// internal/kirogo never retries a 4xx, so failure tests stay instant.
@@ -80,6 +82,11 @@ type fakeKiro struct {
 	StatsStatus         int
 	SetModelPriceStatus int
 	ModelPricesStatus   int
+
+	// ModelPricesDelay stalls GET /admin/model_prices, so a test can model a
+	// pool that is reachable but slow — the case the customer-facing rate-card
+	// fetch bounds with its own timeout (fixedPricesTimeout).
+	ModelPricesDelay time.Duration
 
 	// UpstreamStatus / EchoSaleClass shape the mint response. EchoSaleClass
 	// false models a PRE-saleClass server: it echoes no class, so the bot must
@@ -329,14 +336,27 @@ func (fk *fakeKiro) handleSetModelPrice(w http.ResponseWriter, r *http.Request) 
 // handleModelPrices serves the configured flat-price card.
 func (fk *fakeKiro) handleModelPrices(w http.ResponseWriter, _ *http.Request) {
 	fk.mu.Lock()
-	status := fk.ModelPricesStatus
+	fk.modelPricesHits++
+	status, delay := fk.ModelPricesStatus, fk.ModelPricesDelay
 	list := append([]map[string]any{}, fk.ModelPriceList...)
 	fk.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 	if status != 0 {
 		fail(w, status, "model_prices rejected")
 		return
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "count": len(list), "prices": list})
+}
+
+// modelPricesHitCount is how many times GET /admin/model_prices was served.
+// The assertion surface for "this SKU must not pay for a rate-card fetch it
+// cannot use" (want 0 on the bedrock and kiro prompts).
+func (fk *fakeKiro) modelPricesHitCount() int {
+	fk.mu.Lock()
+	defer fk.mu.Unlock()
+	return fk.modelPricesHits
 }
 
 // modelPriceSets returns a snapshot of the recorded set_model_price bodies —

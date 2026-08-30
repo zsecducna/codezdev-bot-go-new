@@ -1724,21 +1724,58 @@ func (b *Bot) cbModelPrices(cc *cbCtx) {
 	}
 	var sb strings.Builder
 	sb.WriteString("📋 FLAT PRICE LIST (" + itoa(len(res.Prices)) + ")")
+	// No row cap for the admin listing: it is bounded by bytes alone, exactly
+	// as it was before the renderer was shared with the customer prompt.
+	appendModelPriceRows(&sb, res.Prices, 0, modelPriceListMaxBytes)
+	b.send(cc.Ctx, cc.ChatID, sb.String(), admNav("admcat:pricing"))
+}
+
+// appendModelPriceRows writes the flat-price card into sb — one
+// "<model> — <n> credits/request" row per priced model — followed by an
+// "… and N more (not shown)." suffix whenever either cap cut the list short,
+// so a reader always knows the list is partial.
+//
+// This is ONE renderer because two call sites now show the same pool's rate
+// card: this file's admin listing (cbModelPrices) and the customer-facing
+// Fixed Pricing amount prompt (apikeyFixedPriceCard, apikey.go). Sharing the
+// row shape means the two views can never drift into quoting the same pool
+// differently — the same reason apikeyDeliveredTemplate and apikeyNameRowLabel
+// were pulled out into single helpers.
+//
+// Both caps stop BEFORE the row that would breach them, never after: the whole
+// point of a budget is that the resulting message stays sendable. maxRows <= 0
+// means "no row cap". The byte budget is measured against sb's CURRENT length,
+// so a caller's already-written header counts against it — that is
+// cbModelPrices' long-standing behaviour, preserved here deliberately rather
+// than quietly loosened by moving the loop.
+//
+// maxBytes bounds the ROWS, not the finished string: the "… and N more"
+// suffix is appended afterwards and can push the result up to ~40 bytes past
+// it. Deliberate — reserving that room inside the loop would drop a row from
+// the admin listing's overflow case and change its output. Both callers leave
+// far more than 40 bytes of slack under Telegram's 4096, so pick a maxBytes
+// with the same slack rather than one sitting exactly on a hard limit.
+//
+// Returns how many rows were actually written, so a caller can tell "the list
+// was trimmed" from "not one row fit" — cbModelPrices ignores it (its header
+// stands on its own), apikeyFixedPriceCard does not.
+func appendModelPriceRows(sb *strings.Builder, prices []kirogo.ModelPrice, maxRows, maxBytes int) int {
 	shown := 0
-	for _, p := range res.Prices {
+	for _, p := range prices {
+		if maxRows > 0 && shown >= maxRows {
+			break
+		}
 		row := "\n" + p.Model + " — " + fmtRate(p.PerRequest) + " credits/request"
-		// Stop BEFORE the row that would blow the budget, rather than after —
-		// the whole point is that the message must stay sendable.
-		if sb.Len()+len(row) > modelPriceListMaxBytes {
+		if sb.Len()+len(row) > maxBytes {
 			break
 		}
 		sb.WriteString(row)
 		shown++
 	}
-	if shown < len(res.Prices) {
-		sb.WriteString("\n\n… and " + itoa(len(res.Prices)-shown) + " more (not shown).")
+	if shown < len(prices) {
+		sb.WriteString("\n\n… and " + itoa(len(prices)-shown) + " more (not shown).")
 	}
-	b.send(cc.Ctx, cc.ChatID, sb.String(), admNav("admcat:pricing"))
+	return shown
 }
 
 // ---- 5. Kiro SKU variants: kirotoggle/kiroprice/kiromin/kiromax ------------

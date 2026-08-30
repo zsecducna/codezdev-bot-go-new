@@ -84,10 +84,17 @@ type APIKeyCatalog struct {
 
 	// FixedBtn — buy-menu row; {name} {rate}.
 	FixedBtn Str
-	// FixedPrompt — credit-amount prompt; {name} {rate} {min} {balance}.
-	// {name} arrives UPPERCASED (all-caps header). No {opus} placeholder: the
-	// Opus estimate is denominated in bedrock rate-card credits and says
-	// nothing about a per-request flat price.
+	// FixedPrompt — credit-amount prompt; {name} {rate} {min} {balance}
+	// {prices}. {name} arrives UPPERCASED (all-caps header). No {opus}
+	// placeholder: the Opus estimate is denominated in bedrock rate-card
+	// credits and says nothing about a per-request flat price.
+	//
+	// {prices} is the live per-request rate card, fetched from the pool at
+	// render time and filled ONLY on this SKU (the other two prompts carry no
+	// such placeholder, so the shared i18n.F call's kv pair is a no-op there —
+	// the {opus} arrangement in reverse). It renders EMPTY whenever the pool is
+	// unconfigured, unreachable, slow, or carries no flat prices, so the prompt
+	// always sends and the sale is never blocked on it.
 	FixedPrompt Str
 	// FixedPayPrompt — pay screen; {name} {credits} {rate} {total} {balance}.
 	FixedPayPrompt Str
@@ -267,11 +274,14 @@ func buildAPIKeyCatalog() APIKeyCatalog {
 		},
 		// Fixed Pricing credit-amount prompt (Go-only) — states the flat
 		// per-request billing model before pay. Name -> {name} (uppercased by
-		// the caller).
+		// the caller). {prices} sits flush against the end of the explanatory
+		// paragraph in all three languages: the rate card supplies its own
+		// leading newlines, so when it is empty the prompt reads exactly as it
+		// did before the card existed — no blank gap, no stray token.
 		FixedPrompt: Str{
-			EN: "⚡ BUY {name} KEY\nPrice: {rate} / 100 credits\nMinimum: {min} credits\nYour balance: {balance}\n\nFLAT PRICING: every request costs the same number of credits for a given model, no matter how long the prompt or the answer is.\n\nType how many credits you want (e.g. 1000):",
-			VI: "⚡ MUA {name} KEY\nGiá: {rate} / 100 credits\nTối thiểu: {min} credits\nSố dư của bạn: {balance}\n\nGIÁ CỐ ĐỊNH: mỗi request tốn cùng một số credits cho cùng một model, dù prompt hay câu trả lời dài bao nhiêu.\n\nNhập số credits bạn muốn mua (ví dụ 1000):",
-			ZH: "⚡ 购买 {name} KEY\n价格：{rate} / 100 credits\n最低：{min} credits\n您的余额：{balance}\n\n固定计价：同一个模型的每次请求消耗相同的 credits，与提示词和回答的长度无关。\n\n请输入要购买的 credits 数量（例如 1000）：",
+			EN: "⚡ BUY {name} KEY\nPrice: {rate} / 100 credits\nMinimum: {min} credits\nYour balance: {balance}\n\nFLAT PRICING: every request costs the same number of credits for a given model, no matter how long the prompt or the answer is.{prices}\n\nType how many credits you want (e.g. 1000):",
+			VI: "⚡ MUA {name} KEY\nGiá: {rate} / 100 credits\nTối thiểu: {min} credits\nSố dư của bạn: {balance}\n\nGIÁ CỐ ĐỊNH: mỗi request tốn cùng một số credits cho cùng một model, dù prompt hay câu trả lời dài bao nhiêu.{prices}\n\nNhập số credits bạn muốn mua (ví dụ 1000):",
+			ZH: "⚡ 购买 {name} KEY\n价格：{rate} / 100 credits\n最低：{min} credits\n您的余额：{balance}\n\n固定计价：同一个模型的每次请求消耗相同的 credits，与提示词和回答的长度无关。{prices}\n\n请输入要购买的 credits 数量（例如 1000）：",
 		},
 		// Fixed Pricing pay screen (Go-only), product name -> {name}.
 		FixedPayPrompt: Str{

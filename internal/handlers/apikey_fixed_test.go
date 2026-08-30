@@ -20,8 +20,10 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"codezdev-bot/internal/i18n"
+	"codezdev-bot/internal/kirogo"
 	"codezdev-bot/internal/store"
 )
 
@@ -532,4 +534,265 @@ func TestMyKeysRendersFixedTag(t *testing.T) {
 	if kiroTag := i18n.C().APIKey.SkuTag[saleClassKiro].T(i18n.EN); !strings.Contains(text, kiroTag) {
 		t.Errorf("My-Keys list = %q, want the sibling %q tag too", text, kiroTag)
 	}
+}
+
+// ---- the live per-request rate card on the amount prompt --------------------
+//
+// The Fixed Pricing amount prompt shows the pool's current per-request price
+// card, so a customer knows which models cost how many credits before they
+// type an amount. The card is fetched live from Kiro-Go on the button tap, so
+// the tests below care as much about what happens when that fetch DOESN'T work
+// as about what it renders when it does: the card is decoration on the prompt
+// and must never become a gate in front of the sale.
+
+// fixedPriceCardBot is newFixedBot with a stocked flat-price card.
+func fixedPriceCardBot(t *testing.T) (*Bot, *fakeTG, *fakeKiro) {
+	t.Helper()
+	b, f, _, fk, _ := newFixedBot(t)
+	fk.ModelPriceList = []map[string]any{
+		{"model": "claude-opus-5", "perRequest": 4.0},
+		{"model": "claude-haiku-4", "perRequest": 0.25},
+	}
+	return b, f, fk
+}
+
+// TestFixedPromptShowsPriceCard: tapping Fixed Pricing renders one
+// "<model> — <n> credits/request" row per priced model, inside the amount
+// prompt, above the "type how many credits" line.
+func TestFixedPromptShowsPriceCard(t *testing.T) {
+	ctx := context.Background()
+	b, f, _ := fixedPriceCardBot(t)
+
+	b.Process(ctx, callbackUpdate(100, "fixedapi:start"))
+
+	got := lastMsg(t, f).Text
+	for _, want := range []string{
+		"claude-opus-5 — 4 credits/request",
+		"claude-haiku-4 — 0.25 credits/request",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("fixed prompt = %q, want a price row %q", got, want)
+		}
+	}
+	// The card must land INSIDE the prompt, not replace it: the amount question
+	// is the whole point of the screen.
+	if !strings.Contains(got, "Type how many credits you want") {
+		t.Errorf("fixed prompt = %q, want the amount question still present", got)
+	}
+	if strings.Contains(got, "{prices}") {
+		t.Errorf("fixed prompt = %q, want no stray placeholder", got)
+	}
+}
+
+// TestFixedPromptSurvivesPriceCardFailure: every way the fetch can fail must
+// still produce a sendable, buyable prompt — and must never put an upstream
+// error string in front of a customer.
+func TestFixedPromptSurvivesPriceCardFailure(t *testing.T) {
+	ctx := context.Background()
+
+	// assertBuyablePrompt is the shared bar for all three failure modes: the
+	// prompt still went out, it still asks for an amount, and it carries
+	// neither a price row nor any leaked upstream/plumbing text.
+	assertBuyablePrompt := func(t *testing.T, got string) {
+		t.Helper()
+		if !strings.Contains(got, "Type how many credits you want") {
+			t.Fatalf("prompt = %q, want the amount question — the sale must not be blocked "+
+				"by an unavailable price card", got)
+		}
+		if strings.Contains(got, "credits/request") {
+			t.Errorf("prompt = %q, want no price rows when the card is unavailable", got)
+		}
+		if strings.Contains(got, "{prices}") {
+			t.Errorf("prompt = %q, want no stray placeholder", got)
+		}
+		// Byte-exact: with no card, the explanatory paragraph must run straight
+		// into the amount question exactly as it did before the card existed.
+		// A dangling header, a stray blank line or a lone newline left behind by
+		// a half-rendered card would all break this.
+		if !strings.Contains(got, "answer is.\n\nType how many credits you want") {
+			t.Errorf("prompt = %q, want the pre-card wording with no leftover artifact "+
+				"where the card would have gone", got)
+		}
+		// The fake's 4xx body is "model_prices rejected" and kirogo wraps its
+		// failures with a "kirogo:" prefix — either surfacing in a customer's
+		// chat is the leak this checks for.
+		for _, leak := range []string{"model_prices rejected", "kirogo", "⚠️"} {
+			if strings.Contains(got, leak) {
+				t.Errorf("prompt = %q, want no upstream error text (%q) shown to a customer", got, leak)
+			}
+		}
+	}
+
+	t.Run("server rejects the call", func(t *testing.T) {
+		b, f, fk := fixedPriceCardBot(t)
+		fk.ModelPricesStatus = 404 // 4xx: kirogo never retries, so this is instant
+
+		b.Process(ctx, callbackUpdate(100, "fixedapi:start"))
+
+		assertBuyablePrompt(t, lastMsg(t, f).Text)
+	})
+
+	t.Run("no model carries a flat price yet", func(t *testing.T) {
+		b, f, fk := fixedPriceCardBot(t)
+		fk.ModelPriceList = nil // a NORMAL state, not an error
+
+		b.Process(ctx, callbackUpdate(100, "fixedapi:start"))
+
+		assertBuyablePrompt(t, lastMsg(t, f).Text)
+	})
+
+	t.Run("no row fits the budget", func(t *testing.T) {
+		b, f, fk := fixedPriceCardBot(t)
+		// One model whose name alone blows the card's byte budget. Nothing can
+		// be shown, so the whole block must be dropped — rendering the helper's
+		// bare "… and N more (not shown)." would advertise a list the customer
+		// never saw.
+		fk.ModelPriceList = []map[string]any{
+			{"model": strings.Repeat("m", fixedPriceCardMaxBytes+1), "perRequest": 4.0},
+		}
+
+		b.Process(ctx, callbackUpdate(100, "fixedapi:start"))
+
+		got := lastMsg(t, f).Text
+		assertBuyablePrompt(t, got)
+		if strings.Contains(got, "more (not shown)") {
+			t.Errorf("prompt = %q, want no partial-list suffix when no row was shown", got)
+		}
+	})
+
+	t.Run("pool is reachable but slow", func(t *testing.T) {
+		b, f, fk := fixedPriceCardBot(t)
+		fk.ModelPricesDelay = 300 * time.Millisecond
+		// Shrink the customer-tap bound so the test can prove the bound is what
+		// ends the wait. Restored immediately: it is a package-level var.
+		restore := fixedPricesTimeout
+		fixedPricesTimeout = 30 * time.Millisecond
+		defer func() { fixedPricesTimeout = restore }()
+
+		start := time.Now()
+		b.Process(ctx, callbackUpdate(100, "fixedapi:start"))
+		elapsed := time.Since(start)
+
+		assertBuyablePrompt(t, lastMsg(t, f).Text)
+		// The fetch must actually have been attempted, or this subtest would
+		// pass vacuously on any future change that skipped the call entirely
+		// (an unconfigured client returns instantly and satisfies everything
+		// else here). The fake counts the hit before it starts stalling.
+		if n := fk.modelPricesHitCount(); n < 1 {
+			t.Fatalf("model_prices fetched %d time(s) — the timeout path was never exercised", n)
+		}
+		// Bounded by fixedPricesTimeout, not by the pool: a generous 10x the
+		// bound still lands far under the fake's stall, so if the prompt had
+		// waited for the slow answer (or for kirogo's own 20s-per-attempt
+		// retries) this would blow past it.
+		if want := 10 * fixedPricesTimeout; elapsed >= want {
+			t.Errorf("prompt took %v against a %v bound (pool stalls %v) — the fetch must be "+
+				"bounded, not left to hang a customer's tap",
+				elapsed, fixedPricesTimeout, fk.ModelPricesDelay)
+		}
+	})
+}
+
+// TestBedrockAndKiroPromptsHaveNoPriceCard: the other two SKUs bill by
+// rate-card burn, so a per-request card would be meaningless on their prompts —
+// and they must not pay an admin-API round trip for it either.
+func TestBedrockAndKiroPromptsHaveNoPriceCard(t *testing.T) {
+	ctx := context.Background()
+	b, f, _, fk, dir := newFixedBot(t)
+	fk.ModelPriceList = []map[string]any{{"model": "claude-opus-5", "perRequest": 4.0}}
+	s := fixedSettings(fk)
+	s["kiro_apikey_enabled"] = true
+	s["kiro_apikey_usdt_per_100"] = 1.0
+	writeSettings(t, dir, s)
+
+	for _, tc := range []struct{ name, data string }{
+		{"bedrock", "apikey:start"},
+		{"kiro", "kiroapi:start"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b.Process(ctx, callbackUpdate(100, tc.data))
+			got := lastMsg(t, f).Text
+			if strings.Contains(got, "credits/request") || strings.Contains(got, "claude-opus-5") {
+				t.Errorf("%s prompt = %q, want no per-request price card", tc.name, got)
+			}
+			if strings.Contains(got, "{prices}") {
+				t.Errorf("%s prompt = %q, want no stray placeholder", tc.name, got)
+			}
+		})
+	}
+	// Nothing above should have cost a fetch: the card is computed for the
+	// fixed SKU alone, so these two taps must not touch Kiro-Go at all.
+	if n := fk.modelPricesHitCount(); n != 0 {
+		t.Errorf("model_prices fetched %d time(s) for the bedrock/kiro prompts, want 0", n)
+	}
+}
+
+// TestAppendModelPriceRowsCaps pins the shared renderer's two bounds at their
+// boundaries. It is a unit test because both call sites depend on the same
+// arithmetic: the admin listing (cbModelPrices) relies on the byte budget
+// counting its already-written header, and the customer prompt relies on the
+// row cap plus the "… and N more" suffix that tells a reader the list is
+// partial.
+func TestAppendModelPriceRowsCaps(t *testing.T) {
+	// prices builds n identical-length rows, so the byte arithmetic below is
+	// exact without hardcoding the width of a row.
+	prices := func(n int) []kirogo.ModelPrice {
+		out := make([]kirogo.ModelPrice, n)
+		for i := range out {
+			out[i] = kirogo.ModelPrice{Model: "model-x", PerRequest: 2}
+		}
+		return out
+	}
+	render := func(seed string, p []kirogo.ModelPrice, maxRows, maxBytes int) string {
+		var sb strings.Builder
+		sb.WriteString(seed)
+		appendModelPriceRows(&sb, p, maxRows, maxBytes)
+		return sb.String()
+	}
+	// One row's byte width, measured rather than assumed.
+	rowLen := len(render("", prices(1), 0, 1<<20))
+	const huge = 1 << 20
+
+	t.Run("row cap trims and says how many are hidden", func(t *testing.T) {
+		got := render("", prices(7), 6, huge)
+		if n := strings.Count(got, "credits/request"); n != 6 {
+			t.Errorf("rendered %d rows, want the cap's 6: %q", n, got)
+		}
+		if !strings.Contains(got, "… and 1 more (not shown).") {
+			t.Errorf("render = %q, want the partial-list suffix", got)
+		}
+	})
+
+	t.Run("exactly at the row cap says nothing is hidden", func(t *testing.T) {
+		got := render("", prices(6), 6, huge)
+		if n := strings.Count(got, "credits/request"); n != 6 {
+			t.Errorf("rendered %d rows, want all 6: %q", n, got)
+		}
+		if strings.Contains(got, "more (not shown)") {
+			t.Errorf("render = %q, want no suffix when the whole list fit", got)
+		}
+	})
+
+	t.Run("byte budget stops before the row that would breach it", func(t *testing.T) {
+		// Room for exactly two rows: the third must not be written.
+		got := render("", prices(3), 0, 2*rowLen)
+		if n := strings.Count(got, "credits/request"); n != 2 {
+			t.Errorf("rendered %d rows under a 2-row budget, want 2: %q", n, got)
+		}
+		// One byte short of two rows: only the first fits.
+		got = render("", prices(3), 0, 2*rowLen-1)
+		if n := strings.Count(got, "credits/request"); n != 1 {
+			t.Errorf("rendered %d rows one byte under a 2-row budget, want 1: %q", n, got)
+		}
+	})
+
+	t.Run("a caller's existing header counts against the budget", func(t *testing.T) {
+		// cbModelPrices writes its "FLAT PRICE LIST (n)" header before calling
+		// in, and that header has always eaten into the same budget. A seed as
+		// long as one row must therefore cost one row.
+		got := render(strings.Repeat("h", rowLen), prices(3), 0, 2*rowLen)
+		if n := strings.Count(got, "credits/request"); n != 1 {
+			t.Errorf("rendered %d rows after a one-row-long header, want 1: %q", n, got)
+		}
+	})
 }
