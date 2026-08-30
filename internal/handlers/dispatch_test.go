@@ -81,7 +81,7 @@ func TestCaptureChainOrder(t *testing.T) {
 		"getord",
 		"custlookup", "addadmin", "addreseller", "addwl", "rmadmin",
 		"setapiprice", "setapimin", "setapimax", "setkiroprice", "setkiromin", "setkiromax", "setapicap",
-		"setapiname", "setkironame",
+		"setapiname", "setkironame", "setmodelprice",
 		"setkirourl", "setkirokey", "setkiroacct", "setbep20", "settron", "setmaxqty",
 		"refundreject",
 		"newprod", "renprod", "provpool",
@@ -109,9 +109,10 @@ func TestCaptureChainOrder(t *testing.T) {
 	// M3/M4 fix removed "addbal", which moved to the step-9 adminText chain;
 	// AWS IDC/sell removals took it back to 46; hands-free-deposits removed the
 	// customer tx-hash capture "txid", 46 to 45; the Go-only SKU display-rename
-	// wizards added "setapiname"/"setkironame", 44 to 46).
-	if len(CanonicalCaptureOrder) != 46 {
-		t.Errorf("canonical order length = %d, want 46", len(CanonicalCaptureOrder))
+	// wizards added "setapiname"/"setkironame", 44 to 46; the Go-only Fixed
+	// Pricing flat-price wizard added "setmodelprice", 46 to 47).
+	if len(CanonicalCaptureOrder) != 47 {
+		t.Errorf("canonical order length = %d, want 47", len(CanonicalCaptureOrder))
 	}
 	seen := map[string]bool{}
 	for _, n := range CanonicalCaptureOrder {

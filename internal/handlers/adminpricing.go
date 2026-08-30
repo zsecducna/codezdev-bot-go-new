@@ -33,20 +33,21 @@ import (
 	"strings"
 
 	"codezdev-bot/internal/i18n"
+	"codezdev-bot/internal/kirogo"
 	"codezdev-bot/internal/store"
 	"codezdev-bot/internal/tg"
 )
 
 // ---- registration -----------------------------------------------------------
 
-// registerAdminPricing wires this file's 13 captures + the 6 standalone
+// registerAdminPricing wires this file's 14 captures + the 6 standalone
 // tier/promo callback prefixes into the ordered dispatch tables. Called from
 // New (dispatch.go) AFTER registerAdminSettings, so insertCapturesBefore
 // finds "setkirourl"/"code"/"deposit" already spliced into the chain:
 //   - setapiprice/setapimin/setapimax/setkiroprice/setkiromin/setkiromax/
-//     setapicap (canonical #11-#17) plus the two Go-only rename captures
-//     setapiname/setkironame land ahead of "setkirourl" (#18, already
-//     registered by registerAdminSettings) — setrate (#10) stays first.
+//     setapicap (canonical #11-#17) plus the three Go-only captures
+//     setapiname/setkironame/setmodelprice land ahead of "setkirourl" (#18,
+//     already registered by registerAdminSettings) — setrate (#10) stays first.
 //   - discount/promo (#35/#37) land ahead of "code" (#38, already registered
 //     by registerOTP).
 //   - tier/price (#42/#43) land ahead of "deposit" (#46, already registered
@@ -63,10 +64,12 @@ func (b *Bot) registerAdminPricing() {
 		stage{name: "setkiromin", fn: (*Bot).capSetKiroMin},
 		stage{name: "setkiromax", fn: (*Bot).capSetKiroMax},
 		stage{name: "setapicap", fn: (*Bot).capSetApiCap},
-		// setapiname/setkironame are Go-only (no Python original) and sit right
-		// after setapicap, matching their slot in CanonicalCaptureOrder.
+		// setapiname/setkironame/setmodelprice are Go-only (no Python original)
+		// and sit right after setapicap, matching their slots in
+		// CanonicalCaptureOrder.
 		stage{name: "setapiname", fn: (*Bot).capSetApiName},
 		stage{name: "setkironame", fn: (*Bot).capSetKiroName},
+		stage{name: "setmodelprice", fn: (*Bot).capSetModelPrice},
 	)
 	b.insertCapturesBefore("code",
 		stage{name: "discount", fn: (*Bot).capDiscount},
@@ -1273,17 +1276,15 @@ func (b *Bot) cbApikeyName(cc *cbCtx, saleClass string) {
 	if !b.settingsSuperAdminOnly(cc) {
 		return
 	}
-	cc.st.mu.Lock()
-	// Arming one rename must DISARM the other. Both rename buttons live in the
-	// same pricing menu message, and old copies of that message stay tappable
-	// — so an admin can arm bedrock, scroll up, then arm kiro without ever
-	// clearing the first flag. Unlike the numeric wizards (which reject
-	// non-numeric input and self-correct), a rename capture accepts free
-	// text, so a stale armed flag silently steals the admin's NEXT unrelated
-	// plain-text line and publishes it as that SKU's customer-visible name.
-	cc.st.SetApiName = saleClass != saleClassKiro
-	cc.st.SetKiroName = saleClass == saleClassKiro
-	cc.st.mu.Unlock()
+	// Arming one free-text wizard must DISARM every other one in this menu —
+	// see armPricingFreeText (section 4c) for why that matters and what breaks
+	// without it. Both rename wizards and the flat-price wizard go through that
+	// one helper so the exclusion is structural, not per-handler bookkeeping.
+	wizard := wizAPIName
+	if saleClass == saleClassKiro {
+		wizard = wizKiroName
+	}
+	armPricingFreeText(cc.st, wizard)
 	// Header names WHICH SKU is being renamed — both wizards land on the same
 	// pricing menu, so a generic header would let an admin rename the wrong one.
 	def, header := apikeyDefaultNameBedrock, "✏️ BEDROCK PRODUCT DISPLAY NAME"
@@ -1423,6 +1424,259 @@ func (b *Bot) capSetKiroName(c *Ctx) bool {
 		return false
 	}
 	return b.capSetApikeyName(c, saleClassKiro)
+}
+
+// ---- 4c. Fixed Pricing: per-model flat prices (Go-only) --------------------
+//
+// adm:setmodelprice / adm:modelprices drive the flat-price rate card of the
+// Kiro-Go pool's THIRD sale class, "fixed" (kirogo.SaleClassFixed). Fixed
+// Pricing capacity is API keys the operator bought from a gateway vendor in
+// bulk, PREPAID — there is no per-request upstream cost to meter, so a request
+// is billed a flat number of pool credits, configured PER MODEL on the pool.
+// There is no Python original (the class postdates telegram_bot.py entirely),
+// so, like the setapiname/setkironame wizards above and captures.go's
+// "provpool", these cite no line number and copy their wizard shape from the
+// cbApiMin/capSetApiMin sibling instead.
+//
+// ADMIN PANEL ONLY: nothing here adds a storefront SKU. There is no third
+// product sentinel, no USDT price, no buy flow — this is the pool's rate card,
+// which its own admin panel is otherwise the only way to edit (those routes sit
+// behind panel auth, while the bot holds the admin key).
+//
+// UNIT WARNING: perRequest is POOL CREDITS (a float), NOT money. It must never
+// be routed through adminUsdtToMicro or compared against the shop's USDT
+// product pricing — they are different quantities in different units that only
+// happen to both be typed by an admin.
+
+// Row label/callback pairs for the two entries, shared by the pricing menu
+// (admin.go) and the retry keyboard below — the same anti-drift discipline
+// apikeyNameRowLabel enforces for the rename rows: a rejected input re-offers a
+// button whose text matches the row the admin came from.
+const (
+	setModelPriceLabel = "🧮 Set model flat price"
+	setModelPriceCB    = "adm:setmodelprice"
+
+	modelPricesLabel = "📋 Flat price list"
+	modelPricesCB    = "adm:modelprices"
+)
+
+// The pricing menu's THREE free-text wizard ids. Named constants rather than
+// bare literals so a typo in an arming call is a compile error instead of a
+// wizard that silently never arms.
+const (
+	wizAPIName       = "apiname"
+	wizKiroName      = "kironame"
+	wizSetModelPrice = "setmodelprice"
+)
+
+// armPricingFreeText arms exactly ONE of the pricing menu's free-text wizards
+// and disarms every other one, under a single state lock.
+//
+// Arming one MUST disarm the rest. All three buttons live in the same pricing
+// menu message and old copies of that message stay tappable, so an admin can
+// arm one, scroll up, and arm another without the first flag ever clearing.
+// Unlike the numeric wizards (which reject non-numeric input and self-correct),
+// these captures accept FREE TEXT, so a stale armed flag silently steals the
+// admin's NEXT unrelated plain-text line — publishing it as a SKU's
+// customer-visible name, or repricing a model. Centralising the exclusion here,
+// rather than making each handler remember to clear the others, is what keeps
+// that true as entries are added.
+func armPricingFreeText(st *ChatState, wizard string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.SetApiName = wizard == wizAPIName
+	st.SetKiroName = wizard == wizKiroName
+	st.SetModelPrice = wizard == wizSetModelPrice
+}
+
+// kirogoNotConfiguredNote is the refusal shown when the Kiro-Go connection
+// settings are incomplete. Both entries in this section are LIVE admin-API
+// calls, so with no client there is nothing to do but say so and change
+// nothing. Distinct from settingsNotConfigured (nil b.cfg): settings may be
+// perfectly configured here and still not name a Kiro-Go server.
+const kirogoNotConfiguredNote = "⚠️ Kiro-Go is not configured (server URL / admin password missing) — nothing was changed. Set them under ⚙️ SETTINGS first."
+
+// modelNameMaxRunes bounds the admin-typed model token. Same trust-boundary
+// discipline as apikeyNameMaxRunes, and load-bearing for the same reason: the
+// value is echoed straight back into the confirmation message and into every
+// later render of the price listing, and nothing else bounds it (the pool
+// accepts any name, and Telegram lets an admin type thousands of characters).
+// Unbounded, a single absurd model name makes both of those messages exceed
+// Telegram's 4096-character limit, and b.send does not chunk — so the reply
+// would silently not arrive at all.
+const modelNameMaxRunes = 128
+
+// cbSetModelPrice arms the flat per-request price wizard — adm:setmodelprice.
+// Super-admin only, like every other entry in this category (the "pricing"
+// category is already absent from catCaps, so command.go denies a standard
+// admin before this runs; the gate here is defence in depth, exactly like the
+// sibling handlers').
+func (b *Bot) cbSetModelPrice(cc *cbCtx) {
+	if !b.settingsSuperAdminOnly(cc) {
+		return
+	}
+	armPricingFreeText(cc.st, wizSetModelPrice)
+	text := "🧮 FLAT PER-REQUEST PRICE\n" +
+		"Sets what ONE request to one model costs a Fixed Pricing key, in POOL CREDITS — " +
+		"the pool's own unit, unrelated to the shop's USDT product prices.\n\n" +
+		"Send: <model> <credits per request>\n\n" +
+		"The price is REQUIRED. An explicit 0 is accepted (that model becomes free), but an " +
+		"OMITTED price is refused rather than defaulted: defaulting it would silently price " +
+		"the model free on every request from then on, instead of failing once, here.\n\n" +
+		"Example: claude-sonnet-4 1.5"
+	b.send(cc.Ctx, cc.ChatID, text, backKB("admcat:pricing"))
+}
+
+// capSetModelPrice is the "setmodelprice" capture (Go-only, POP semantics — the
+// flag is read and cleared under the state lock, so one typed line can only
+// ever reprice once even if two updates race).
+func (b *Bot) capSetModelPrice(c *Ctx) bool {
+	c.st.mu.Lock()
+	armed := c.st.SetModelPrice
+	c.st.SetModelPrice = false
+	c.st.mu.Unlock()
+	if !armed {
+		return false
+	}
+	// Same peek-escape as the sibling captures: an admin who changes their mind
+	// and types a command / taps a reply-keyboard label is not trapped here.
+	if strings.HasPrefix(c.Text, "/") || labelToCmd(c.Text) != "" {
+		return false
+	}
+	// Defence in depth against a demotion between the arming tap and this line
+	// — the armed flag survives it in ChatState. Same recheck capSetApikeyName
+	// carries, for the same reason.
+	if !b.isSuperAdmin(c.ChatID) {
+		return true
+	}
+	retry := admNavRetry("admcat:pricing", setModelPriceLabel, setModelPriceCB)
+	// EXACTLY two tokens: "<model> <perRequest>". One token means the price was
+	// omitted — the single most expensive mistake available here — so it is
+	// rejected BY NAME rather than defaulted (see the arming prompt).
+	fields := strings.Fields(c.Text)
+	if len(fields) != 2 {
+		b.send(c.Ctx, c.ChatID,
+			"⚠️ A price is REQUIRED — nothing was changed.\nSend: <model> <credits per request>\n\n"+
+				"An explicit 0 is allowed; an omitted price is refused, because defaulting it would "+
+				"price the model free on every later request instead of failing once, now.",
+			retry)
+		return true
+	}
+	if len([]rune(fields[0])) > modelNameMaxRunes {
+		b.send(c.Ctx, c.ChatID,
+			"⚠️ The model name must be at most "+itoa(modelNameMaxRunes)+
+				" characters — nothing was changed.",
+			retry)
+		return true
+	}
+	// Validate BEFORE the call, never after: a rejected value must never reach
+	// the pool (CLAUDE.md / py_pricing_spec.md §1's "a rejected value must never
+	// be persisted"). ParseFloat accepts "NaN", "Inf" and "-Inf" with a NIL
+	// error, so those are rejected explicitly HERE.
+	//
+	// Two backstops downstream would also refuse them — kirogo's own
+	// ErrPerRequestNegative, and json.Marshal, which cannot encode a non-finite
+	// float at all — so this guard is not what keeps a bad price off the pool.
+	// What it buys is the refusal happening at the input boundary with a
+	// message that names the actual rule, instead of surfacing a raw internal
+	// error string ("json: unsupported value: NaN") to an admin who mistyped.
+	v, err := strconv.ParseFloat(fields[1], 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		b.send(c.Ctx, c.ChatID,
+			"⚠️ The price must be a finite number of credits, 0 or greater — nothing was changed.",
+			retry)
+		return true
+	}
+	client := b.kirogoClient()
+	if client == nil {
+		b.send(c.Ctx, c.ChatID, kirogoNotConfiguredNote, retry)
+		return true
+	}
+	// &v, never a bare value: PerRequest is a POINTER precisely so an omitted
+	// price stays distinguishable from a deliberate 0 (kirogo/types.go). A nil
+	// here is already impossible — the two-token check above guarantees a price
+	// was typed and the parse above guarantees it is finite and non-negative.
+	res, err := client.SetModelPrice(c.Ctx, kirogo.SetModelPriceRequest{
+		Model:      fields[0],
+		PerRequest: &v,
+	})
+	if err != nil {
+		// err carries only the server's error text — internal/kirogo never puts
+		// credentials in an error.
+		log.Printf("adminpricing: set_model_price failed [chat=%d model=%q]: %v", c.ChatID, fields[0], err)
+		b.send(c.Ctx, c.ChatID, "⚠️ Could not set the price — nothing was changed.\n"+err.Error(), retry)
+		return true
+	}
+	// The PRICE comes from the pool's echo (it is the authority on what it
+	// actually stored); the model name is the one we sent, so an empty echo
+	// can't render a nameless confirmation. Nothing is audited: unlike every
+	// other setter in this file the value does not live in settings.json at
+	// all — it lives on the pool, whose own records are the trail.
+	b.send(c.Ctx, c.ChatID,
+		"✅ "+fields[0]+" — "+fmtRate(res.PerRequest)+" credits/request.",
+		admNav("admcat:pricing"))
+	return true
+}
+
+// modelPriceListMaxBytes is the render budget for the flat-price listing.
+// Telegram hard-rejects a message over 4096 characters and b.send does not
+// chunk, so an oversized rate card would otherwise send NOTHING at all — a dead
+// button. A truncated list plus a count beats silence.
+//
+// Counted in BYTES against a deliberately conservative budget, NOT in rows: a
+// row-count cap does not bound the message, because a model name is admin-typed
+// and each row's length varies with it. (Telegram measures in UTF-16 code
+// units, which for any string are at most its UTF-8 byte count, so staying
+// under this budget is always safe.)
+const modelPriceListMaxBytes = 3500
+
+// cbModelPrices lists every model that carries a flat per-request price —
+// adm:modelprices. Read-only: no wizard, no capture, nothing to arm (so it
+// deliberately does NOT disarm the free-text wizards either — tapping it is not
+// an admin abandoning a half-typed one).
+func (b *Bot) cbModelPrices(cc *cbCtx) {
+	if !b.settingsSuperAdminOnly(cc) {
+		return
+	}
+	client := b.kirogoClient()
+	if client == nil {
+		b.send(cc.Ctx, cc.ChatID, kirogoNotConfiguredNote, admNav("admcat:pricing"))
+		return
+	}
+	res, err := client.ModelPrices(cc.Ctx)
+	if err != nil {
+		log.Println("adminpricing: model_prices failed:", err)
+		b.send(cc.Ctx, cc.ChatID,
+			"⚠️ Could not read the flat price list from Kiro-Go.\n"+err.Error(),
+			admNav("admcat:pricing"))
+		return
+	}
+	if res == nil || len(res.Prices) == 0 {
+		// An empty list is a NORMAL state, not an error: no model carries a flat
+		// price until an admin sets one.
+		b.send(cc.Ctx, cc.ChatID,
+			"📋 FLAT PRICE LIST\n\nNo models carry a flat price yet. Set one with \""+
+				setModelPriceLabel+"\".",
+			admNav("admcat:pricing"))
+		return
+	}
+	var sb strings.Builder
+	sb.WriteString("📋 FLAT PRICE LIST (" + itoa(len(res.Prices)) + ")")
+	shown := 0
+	for _, p := range res.Prices {
+		row := "\n" + p.Model + " — " + fmtRate(p.PerRequest) + " credits/request"
+		// Stop BEFORE the row that would blow the budget, rather than after —
+		// the whole point is that the message must stay sendable.
+		if sb.Len()+len(row) > modelPriceListMaxBytes {
+			break
+		}
+		sb.WriteString(row)
+		shown++
+	}
+	if shown < len(res.Prices) {
+		sb.WriteString("\n\n… and " + itoa(len(res.Prices)-shown) + " more (not shown).")
+	}
+	b.send(cc.Ctx, cc.ChatID, sb.String(), admNav("admcat:pricing"))
 }
 
 // ---- 5. Kiro SKU variants: kirotoggle/kiroprice/kiromin/kiromax ------------

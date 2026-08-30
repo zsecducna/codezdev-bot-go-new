@@ -620,6 +620,10 @@ func TestPricingCategorySuperAdminOnly(t *testing.T) {
 		"adm:setprice", "adm:setdiscount", "adm:promocodes", "adm:promonew",
 		"adm:apiprice", "adm:apimin", "adm:apimax", "adm:apicap",
 		"adm:kirotoggle", "adm:kiroprice", "adm:kiromin", "adm:kiromax",
+		// The Go-only Fixed Pricing rate-card entries (adminpricing.go §4c) —
+		// adm:modelprices in particular is the only READ-ONLY action in this
+		// category, so its gate is easy to forget.
+		"adm:setmodelprice", "adm:modelprices",
 		// The 6 standalone tier/promo callback prefixes (cbRoutes, not
 		// captures) each start with their own settingsSuperAdminOnly check —
 		// prove the gate fires there too, not just on the 11 capture-armed
@@ -1615,4 +1619,369 @@ func TestCapSetApikeyNameSecondArmDisarmsFirst(t *testing.T) {
 	if got := b.apikeyProductName(saleClassBedrock); got != apikeyDefaultNameBedrock {
 		t.Errorf("bedrock name = %q, want the untouched default %q", got, apikeyDefaultNameBedrock)
 	}
+}
+
+// ---- 4c. Fixed Pricing flat prices (Go-only) -------------------------------
+//
+// adm:setmodelprice / adm:modelprices talk to the POOL over HTTP rather than to
+// settings.json, so these tests run against the httptest Kiro-Go double from
+// apikey_test.go and assert on the recorded request bodies. The money-critical
+// pins are the ones proving a rejected price never leaves the process at all:
+// perRequest is a POINTER precisely so an omitted price fails loudly once
+// instead of pricing a model free on every request from then on.
+
+// newModelPriceBot wires a Bot to a temp store/config plus the fake Kiro-Go,
+// with chat 1 as the super admin (newAPIKeyBot's 999 would fail every
+// super-admin gate these handlers run first).
+func newModelPriceBot(t *testing.T) (*Bot, *fakeTG, *fakeKiro) {
+	t.Helper()
+	dir := t.TempDir()
+	fk := newFakeKiro(t)
+	writeSettings(t, dir, apikeySettings(fk))
+	st, err := store.Open(filepath.Join(dir, "store.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	f := &fakeTG{}
+	b := New(Deps{TG: f, Store: st, Config: cfg, AdminID: "1"})
+	t.Cleanup(func() { b.Shutdown(); st.Close() })
+	return b, f, fk
+}
+
+// TestCapSetModelPriceMissingPriceRejectedNoCall is THE money-critical pin: a
+// model name with no price must be refused outright, and — the half a
+// reply-text assertion alone cannot prove — must never reach the pool. Sending
+// a bare model would leave perRequest nil, which the client rejects, but a
+// future edit that "helpfully" defaulted it to 0 would price that model FREE on
+// every request afterwards instead of failing once, here.
+func TestCapSetModelPriceMissingPriceRejectedNoCall(t *testing.T) {
+	ctx := context.Background()
+	b, f, fk := newModelPriceBot(t)
+
+	b.Process(ctx, callbackUpdate(1, "adm:setmodelprice"))
+	b.Process(ctx, textUpdate(1, "claude-sonnet-4"))
+
+	last := lastSendMsg(f)
+	if last == nil || !strings.HasPrefix(last.Text, "⚠️") || !strings.Contains(last.Text, "REQUIRED") {
+		t.Fatalf("reply = %+v, want the explicit price-is-required refusal", last)
+	}
+	if n := len(fk.modelPriceSets()); n != 0 {
+		t.Errorf("set_model_price called %d time(s) for a missing price, want 0 — a rejected value must never reach the pool", n)
+	}
+}
+
+// TestCapSetModelPriceZeroIsAccepted pins the OTHER half of the pointer
+// contract: an explicit 0 is a legitimate price (that model becomes free) and
+// must pass through as a non-nil *float64. The proof is that the HTTP call
+// happened at all — a nil pointer would have been rejected client-side by
+// kirogo.ErrPerRequestRequired with no request sent — plus perRequest being
+// PRESENT in the body with value 0.
+func TestCapSetModelPriceZeroIsAccepted(t *testing.T) {
+	ctx := context.Background()
+	b, f, fk := newModelPriceBot(t)
+
+	b.Process(ctx, callbackUpdate(1, "adm:setmodelprice"))
+	b.Process(ctx, textUpdate(1, "claude-haiku-4 0"))
+
+	sets := fk.modelPriceSets()
+	if len(sets) != 1 {
+		t.Fatalf("set_model_price called %d time(s), want exactly 1 — an explicit 0 is a legal price", len(sets))
+	}
+	got, present := sets[0]["perRequest"]
+	if !present {
+		t.Fatal("perRequest absent from the body — an explicit 0 must be sent, not omitted")
+	}
+	if got != float64(0) {
+		t.Errorf("perRequest = %v, want 0", got)
+	}
+	if sets[0]["model"] != "claude-haiku-4" {
+		t.Errorf("model = %v, want claude-haiku-4", sets[0]["model"])
+	}
+	if last := lastSendMsg(f); last == nil || !strings.HasPrefix(last.Text, "✅") {
+		t.Fatalf("reply = %+v, want the success confirmation", last)
+	}
+}
+
+// TestCapSetModelPriceRejectsBadInputBeforeCall: every malformed price is
+// refused BEFORE the call, never after (py_pricing_spec.md §1 — a rejected
+// value must never be persisted).
+//
+// Each case asserts the GUARD-SPECIFIC message, not merely a ⚠️ prefix plus
+// zero HTTP calls. That distinction is the whole test: two backstops downstream
+// (kirogo's ErrPerRequestNegative, and json.Marshal refusing a non-finite
+// float) also reject these inputs before any request goes out and also produce
+// a ⚠️ reply with zero recorded calls — so a prefix-only assertion passes
+// identically with the handler's own pre-call guard DELETED, which a mutation
+// run confirmed. Matching the guard's own wording is what makes these cases
+// falsify a regression that removes it.
+func TestCapSetModelPriceRejectsBadInputBeforeCall(t *testing.T) {
+	ctx := context.Background()
+	const (
+		wantFinite   = "must be a finite number of credits" // the parse/finite/non-negative guard
+		wantRequired = "A price is REQUIRED"                // the exactly-two-tokens guard
+		wantModelCap = "model name must be at most"         // the model-token length guard
+	)
+	for _, tc := range []struct{ name, input, want string }{
+		{"negative", "gpt-5 -1", wantFinite},
+		{"negative fraction", "gpt-5 -0.5", wantFinite},
+		{"unparseable", "gpt-5 cheap", wantFinite},
+		{"NaN", "gpt-5 NaN", wantFinite},
+		{"positive infinity", "gpt-5 Inf", wantFinite},
+		{"negative infinity", "gpt-5 -Inf", wantFinite},
+		// Three tokens is not "<model> <perRequest>": which of the two trailing
+		// tokens is the price is a guess, and guessing about a price is exactly
+		// what this wizard must never do.
+		{"extra token", "gpt-5 1.5 please", wantRequired},
+		{"empty line", "   ", wantRequired},
+		// An unbounded model name would blow Telegram's 4096-char limit in the
+		// confirmation and in every later listing render, and b.send does not
+		// chunk — so the reply would silently not arrive.
+		{"model name too long", strings.Repeat("m", modelNameMaxRunes+1) + " 1", wantModelCap},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, f, fk := newModelPriceBot(t)
+			b.Process(ctx, callbackUpdate(1, "adm:setmodelprice"))
+			b.Process(ctx, textUpdate(1, tc.input))
+
+			last := lastSendMsg(f)
+			if last == nil || !strings.HasPrefix(last.Text, "⚠️") {
+				t.Fatalf("reply = %+v, want the rejection notice", last)
+			}
+			if !strings.Contains(last.Text, tc.want) {
+				t.Errorf("reply = %q, want the handler's own guard message containing %q — a downstream rejection is NOT the same as a pre-call one", last.Text, tc.want)
+			}
+			if n := len(fk.modelPriceSets()); n != 0 {
+				t.Errorf("set_model_price called %d time(s) for %q, want 0 — validation must run BEFORE the call", n, tc.input)
+			}
+		})
+	}
+	// A model name of exactly the cap is ACCEPTED — pins the bound as <=, so a
+	// future off-by-one that rejects a legal name goes red here.
+	b, _, fk := newModelPriceBot(t)
+	atCap := strings.Repeat("m", modelNameMaxRunes)
+	b.Process(ctx, callbackUpdate(1, "adm:setmodelprice"))
+	b.Process(ctx, textUpdate(1, atCap+" 1"))
+	if sets := fk.modelPriceSets(); len(sets) != 1 || sets[0]["model"] != atCap {
+		t.Errorf("bodies = %v, want a model name at the %d-rune cap accepted", sets, modelNameMaxRunes)
+	}
+}
+
+// TestCapSetModelPriceEchoesPoolValue proves the confirmation reports what the
+// POOL stored, not what the admin typed — the two differ whenever the pool
+// clamps or rounds, and showing the typed number would tell the operator a
+// price is live that never was.
+func TestCapSetModelPriceEchoesPoolValue(t *testing.T) {
+	ctx := context.Background()
+	b, f, fk := newModelPriceBot(t)
+	stored := 2.5
+	fk.ModelPriceEcho = &stored
+
+	b.Process(ctx, callbackUpdate(1, "adm:setmodelprice"))
+	b.Process(ctx, textUpdate(1, "claude-opus-5 1.5"))
+
+	last := lastSendMsg(f)
+	if last == nil || !strings.Contains(last.Text, "2.5 credits/request") {
+		t.Fatalf("reply = %+v, want the pool's echoed 2.5, not the typed 1.5", last)
+	}
+	if strings.Contains(last.Text, "1.5") {
+		t.Errorf("reply = %q, want the typed value NOT reported as stored", last.Text)
+	}
+	if sets := fk.modelPriceSets(); len(sets) != 1 || sets[0]["perRequest"] != 1.5 {
+		t.Errorf("body = %v, want the typed 1.5 actually sent", sets)
+	}
+}
+
+// TestCapSetModelPriceServerErrorReported: a non-2xx from the pool must say
+// nothing changed rather than showing a ✅ the write never earned — the same
+// H1 stop-on-failure rule the settings.json setters follow.
+func TestCapSetModelPriceServerErrorReported(t *testing.T) {
+	ctx := context.Background()
+	b, f, fk := newModelPriceBot(t)
+	fk.SetModelPriceStatus = 400
+
+	b.Process(ctx, callbackUpdate(1, "adm:setmodelprice"))
+	b.Process(ctx, textUpdate(1, "gpt-5 1"))
+
+	last := lastSendMsg(f)
+	if last == nil || !strings.HasPrefix(last.Text, "⚠️") || !strings.Contains(last.Text, "nothing was changed") {
+		t.Fatalf("reply = %+v, want the failure notice", last)
+	}
+}
+
+// TestCapSetModelPriceUnconfigured: with no Kiro-Go server there is nothing to
+// call, so the wizard says so and changes nothing (b.cfg is nil here, which is
+// a strictly harsher case than a configured-but-blank URL).
+func TestCapSetModelPriceUnconfigured(t *testing.T) {
+	ctx := context.Background()
+	b, f := newTestBot("1", nil) // nil cfg -> kirogoClient() is nil
+
+	b.Process(ctx, callbackUpdate(1, "adm:setmodelprice"))
+	b.Process(ctx, textUpdate(1, "gpt-5 1"))
+
+	if last := lastSendMsg(f); last == nil || last.Text != kirogoNotConfiguredNote {
+		t.Fatalf("reply = %+v, want %q", last, kirogoNotConfiguredNote)
+	}
+}
+
+// TestCapSetModelPricePeeksEscapes: a /command typed while armed must fall
+// through to the command router, not be eaten as a model name — same escape
+// the sibling pricing captures give an admin who changes their mind.
+func TestCapSetModelPricePeeksEscapes(t *testing.T) {
+	b, _, fk := newModelPriceBot(t)
+	if got := armAndCapture(t, b, 1, "adm:setmodelprice", "/admin", b.capSetModelPrice); got {
+		t.Error("a /command typed while armed must fall through, not be consumed")
+	}
+	if n := len(fk.modelPriceSets()); n != 0 {
+		t.Errorf("set_model_price called %d time(s) by an escape, want 0", n)
+	}
+}
+
+// TestCapSetModelPriceRefusesNonSuperAdmin pins the CAPTURE's own isSuperAdmin
+// recheck, not just the arming callback's gate — the case the callback gate
+// cannot catch is an admin who armed the wizard while still super, then was
+// demoted before typing, since the armed flag survives the demotion in
+// ChatState. The flag is set directly here to simulate exactly that.
+func TestCapSetModelPriceRefusesNonSuperAdmin(t *testing.T) {
+	const chat = 7 // not registered as any kind of admin
+	b, f, fk := newModelPriceBot(t)
+	st := b.states.Get(chat)
+	st.mu.Lock()
+	st.SetModelPrice = true
+	st.mu.Unlock()
+
+	c := &Ctx{Ctx: context.Background(), ChatID: chat, Lang: i18n.EN, Text: "gpt-5 1", st: st}
+	if got := b.capSetModelPrice(c); !got {
+		t.Errorf("capture returned %v, want true (input consumed, not fallen through)", got)
+	}
+	if last := lastSendMsg(f); last != nil {
+		t.Errorf("reply sent to a refused non-super-admin capture: %+v, want none", last)
+	}
+	if n := len(fk.modelPriceSets()); n != 0 {
+		t.Errorf("set_model_price called %d time(s) by a non-super-admin, want 0", n)
+	}
+}
+
+// TestPricingFreeTextWizardsAreMutuallyExclusive is the regression test for the
+// stale-arm bug armPricingFreeText exists to prevent: the pricing menu carries
+// all three free-text buttons in ONE message and old copies stay tappable, so
+// an admin can arm one and then another without the first flag clearing. A
+// stale armed flag would silently eat the admin's next unrelated line —
+// repricing a model, or publishing it as a SKU's customer-visible name. Both
+// directions are pinned, because a helper that only cleared one way would still
+// pass a single-direction test.
+func TestPricingFreeTextWizardsAreMutuallyExclusive(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("rename arm disarms the price wizard", func(t *testing.T) {
+		b, _, fk := newModelPriceBot(t)
+		b.Process(ctx, callbackUpdate(1, "adm:setmodelprice"))
+		b.Process(ctx, callbackUpdate(1, "adm:apiname")) // must disarm setmodelprice
+		b.Process(ctx, textUpdate(1, "Nebula Credits"))
+
+		if got := b.apikeyProductName(saleClassBedrock); got != "Nebula Credits" {
+			t.Errorf("bedrock name = %q, want the typed line consumed by the LIVE arm", got)
+		}
+		// A SECOND, unrelated line is what actually exposes a stale flag in THIS
+		// direction, and the first line cannot: "setapiname" sits ahead of
+		// "setmodelprice" in the capture chain, so capSetApiName consumes the
+		// rename and first-match dispatch stops before capSetModelPrice is ever
+		// reached — the two assertions above hold with or without the disarm. By
+		// now no rename is armed, so this line falls through to whatever else
+		// still is. (Mutation-verified: a one-way armPricingFreeText that only
+		// ever SETS its own flag reprices model "hello" here, and passes the
+		// subtest without this second line.)
+		b.Process(ctx, textUpdate(1, "hello 5"))
+		if n := len(fk.modelPriceSets()); n != 0 {
+			t.Errorf("set_model_price called %d time(s) by a later unrelated line, want 0 — arming the rename must have disarmed the price wizard", n)
+		}
+	})
+
+	t.Run("price arm disarms the rename wizards", func(t *testing.T) {
+		b, _, fk := newModelPriceBot(t)
+		b.Process(ctx, callbackUpdate(1, "adm:apiname"))
+		b.Process(ctx, callbackUpdate(1, "adm:kironame"))
+		b.Process(ctx, callbackUpdate(1, "adm:setmodelprice")) // must disarm both renames
+		b.Process(ctx, textUpdate(1, "gpt-5 3"))
+
+		if sets := fk.modelPriceSets(); len(sets) != 1 || sets[0]["model"] != "gpt-5" {
+			t.Fatalf("set_model_price bodies = %v, want exactly the one live arm's", sets)
+		}
+		if m := apikeyNamesFrom(t, b); len(m) != 0 {
+			t.Errorf("apikey_names = %v, want nothing renamed — both rename arms must have been cleared", m)
+		}
+	})
+}
+
+// TestCbModelPricesRendersRows: the listing renders one "model — N
+// credits/request" row per priced model.
+func TestCbModelPricesRendersRows(t *testing.T) {
+	ctx := context.Background()
+	b, f, fk := newModelPriceBot(t)
+	fk.ModelPriceList = []map[string]any{
+		{"model": "claude-opus-5", "perRequest": 4.0},
+		{"model": "claude-haiku-4", "perRequest": 0.25},
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:modelprices"))
+
+	last := lastSendMsg(f)
+	if last == nil {
+		t.Fatal("no reply")
+	}
+	for _, want := range []string{
+		"claude-opus-5 — 4 credits/request",
+		"claude-haiku-4 — 0.25 credits/request",
+	} {
+		if !strings.Contains(last.Text, want) {
+			t.Errorf("listing = %q, want a row %q", last.Text, want)
+		}
+	}
+}
+
+// TestCbModelPricesEmptyList: no priced models is a NORMAL state (nobody has
+// set one yet), so it gets a plain explanatory message, not an error.
+func TestCbModelPricesEmptyList(t *testing.T) {
+	ctx := context.Background()
+	b, f, _ := newModelPriceBot(t)
+
+	b.Process(ctx, callbackUpdate(1, "adm:modelprices"))
+
+	last := lastSendMsg(f)
+	if last == nil || !strings.Contains(last.Text, "No models carry a flat price yet") {
+		t.Fatalf("reply = %+v, want the empty-list explanation", last)
+	}
+	if strings.HasPrefix(last.Text, "⚠️") {
+		t.Errorf("reply = %q, want an empty list treated as normal, not as an error", last.Text)
+	}
+}
+
+// TestCbModelPricesServerError / unconfigured: both must produce a reply (a
+// silent handler is a dead button) and neither may claim a price list it does
+// not have.
+func TestCbModelPricesFailurePaths(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("server error", func(t *testing.T) {
+		b, f, fk := newModelPriceBot(t)
+		// 4xx, not 5xx: internal/kirogo retries a 5xx, which would make this
+		// test sleep through the backoff for no extra coverage (the same reason
+		// fakeKiro's status knobs are documented as 4xx-only).
+		fk.ModelPricesStatus = 400
+		b.Process(ctx, callbackUpdate(1, "adm:modelprices"))
+		if last := lastSendMsg(f); last == nil || !strings.HasPrefix(last.Text, "⚠️") {
+			t.Fatalf("reply = %+v, want the read-failure notice", last)
+		}
+	})
+
+	t.Run("kiro-go unconfigured", func(t *testing.T) {
+		b, f := newTestBot("1", nil) // nil cfg -> kirogoClient() is nil
+		b.Process(ctx, callbackUpdate(1, "adm:modelprices"))
+		if last := lastSendMsg(f); last == nil || last.Text != kirogoNotConfiguredNote {
+			t.Fatalf("reply = %+v, want %q", last, kirogoNotConfiguredNote)
+		}
+	})
 }

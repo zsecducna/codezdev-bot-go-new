@@ -108,16 +108,21 @@ type ChatState struct {
 	// (adm:apiname / adm:kironame, adminpricing.go). No Python line to cite —
 	// the original has no rename feature (same Go-only precedent as
 	// captures.go's "provpool").
-	SetApiName   bool
-	SetKiroName  bool
-	SetKiroPrice bool             // pending_setkiroprice @3857
-	SetKiroMin   bool             // pending_setkiromin @3858
-	SetKiroMax   bool             // pending_setkiromax @3859
-	SetKiroKey   bool             // pending_setkirokey @3860
-	SetKiroURL   bool             // pending_setkirourl @3861
-	SetKiroAcct  bool             // pending_setkiroacct @3865
-	ProvPool     bool             // pending_provpool @3869
-	RefundDelete *RefundDeleteCtx // pending_entra{"action":"refund_delete"|"refund_delete_single",...} @2929/@12830 — the admrefdel bulk sweep / refdelone: per-order Entra-deprovisioning confirm gate (adminorders.go). Its own slot, not the generic Entra field above: pending_entra in Python is a free-form dict shared by many unrelated Entra flows (login, genusers, cleanup, …), none of which have landed in Go yet — reusing the thin {Action,Step string} EntraState here would either collide with those future flows' shapes or force this one to squeeze emails/orders into two string fields it can't hold.
+	SetApiName  bool
+	SetKiroName bool
+	// SetModelPrice arms the Go-only Fixed Pricing per-model flat-price wizard
+	// (adm:setmodelprice, adminpricing.go). No Python line to cite — the
+	// "fixed" sale class postdates the original entirely (same Go-only
+	// precedent as the two rename flags above and captures.go's "provpool").
+	SetModelPrice bool
+	SetKiroPrice  bool             // pending_setkiroprice @3857
+	SetKiroMin    bool             // pending_setkiromin @3858
+	SetKiroMax    bool             // pending_setkiromax @3859
+	SetKiroKey    bool             // pending_setkirokey @3860
+	SetKiroURL    bool             // pending_setkirourl @3861
+	SetKiroAcct   bool             // pending_setkiroacct @3865
+	ProvPool      bool             // pending_provpool @3869
+	RefundDelete  *RefundDeleteCtx // pending_entra{"action":"refund_delete"|"refund_delete_single",...} @2929/@12830 — the admrefdel bulk sweep / refdelone: per-order Entra-deprovisioning confirm gate (adminorders.go). Its own slot, not the generic Entra field above: pending_entra in Python is a free-form dict shared by many unrelated Entra flows (login, genusers, cleanup, …), none of which have landed in Go yet — reusing the thin {Action,Step string} EntraState here would either collide with those future flows' shapes or force this one to squeeze emails/orders into two string fields it can't hold.
 
 	// ---- ad-hoc runtime flags (handlers-go.md §8; NOT in any clear list) ----
 	KBVersionSent    string // _kb_version_sent @6942 (in-memory; restart re-pushes once)
@@ -327,8 +332,9 @@ func (st *ChatState) ClearCustomerPending() {
 // (e.g. an abandoned "add admin" prompt) can't consume their next plain text.
 // The Python loop's slots (handlers-go.md §3) PLUS the Go-only additions that
 // have no Python counterpart (SetApiName / SetKiroName, the SKU
-// display-rename wizards); a unit test asserts this cleared set matches that
-// list by reflection.
+// display-rename wizards, and SetModelPrice, the Fixed Pricing flat-price
+// wizard); a unit test asserts this cleared set matches that list by
+// reflection.
 func (st *ChatState) ClearAdminPending() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -370,6 +376,7 @@ func (st *ChatState) ClearAdminPending() {
 	st.SetApiCap = false
 	st.SetApiName = false
 	st.SetKiroName = false
+	st.SetModelPrice = false
 	st.SetKiroKey = false
 	st.SetKiroURL = false
 	st.SetKiroAcct = false

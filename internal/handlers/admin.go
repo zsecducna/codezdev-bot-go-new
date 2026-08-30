@@ -696,6 +696,14 @@ func (b *Bot) adminCategoryMenuRows(cat string) (title string, rows [][]tg.Inlin
 			btnRow("🟣 Kiro min credits/key: "+itoa64(b.apikeyMinCredits(saleClassKiro)), "adm:kiromin"),
 			btnRow("🟣 Kiro max credits/key: "+itoa64(b.apikeyMaxCredits(saleClassKiro)), "adm:kiromax"),
 			btnRow(kiroNameLabel+": "+b.apikeyProductName(saleClassKiro), kiroNameCb),
+			// Fixed Pricing block (adminpricing.go §4c). These price the POOL's
+			// prepaid "fixed" sale class in POOL CREDITS PER REQUEST — a
+			// different quantity in a different unit from every USDT row above,
+			// which is why they sit in their own block rather than beside them.
+			// Labels come from the same constants the wizard's retry keyboard
+			// uses, so the two can never drift apart.
+			btnRow(setModelPriceLabel, setModelPriceCB),
+			btnRow(modelPricesLabel, modelPricesCB),
 		}, admBackRoot()), true
 	case "settings":
 		return "⚙️ SETTINGS", append([][]tg.InlineKeyboardButton{
@@ -1172,6 +1180,11 @@ func (b *Bot) cbAdmAction(cc *cbCtx) {
 		b.cbApiName(cc)
 	case "kironame":
 		b.cbKiroName(cc)
+	// The two Go-only Fixed Pricing rate-card entries (adminpricing.go §4c).
+	case "setmodelprice":
+		b.cbSetModelPrice(cc)
+	case "modelprices":
+		b.cbModelPrices(cc)
 	case "kirotoggle":
 		b.cbKiroToggle(cc)
 	case "kiroprice":

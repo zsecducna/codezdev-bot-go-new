@@ -32,17 +32,25 @@ var CanonicalCaptureOrder = []string{
 	// after their sibling API-key setters and ahead of "setkirourl", because
 	// order is the contract: the chain must stay an in-order subsequence of
 	// this list.
-	"setapiname",   // (Go-only) pop
-	"setkironame",  // (Go-only) pop
-	"setkirourl",   // 18 @17895 (S) pop
-	"setkirokey",   // 19 @17927 (S) pop
-	"setkiroacct",  // 20 @17953 (S) pop
-	"setbep20",     // 21 @17979 pop
-	"settron",      // 22 @17997 pop
-	"setmaxqty",    // 23 @18015 pop
-	"refundreject", // 26 @18086 pop (py_orders_spec.md: any typed line commits, no re-arm on "invalid")
-	"newprod",      // 27 @18108 pop
-	"renprod",      // 28 @18146 pop
+	"setapiname",  // (Go-only) pop
+	"setkironame", // (Go-only) pop
+	// setmodelprice (NEW — no Python original): the Fixed Pricing per-model
+	// flat-price wizard (adm:setmodelprice, adminpricing.go). The "fixed" sale
+	// class did not exist when telegram_bot.py was written, so there is no
+	// canonical line to cite — same Go-only precedent as "setapiname"/
+	// "setkironame" just above and "provpool" below. It sits here, with its
+	// sibling API-key/pricing wizards and ahead of "setkirourl", because order
+	// is the contract: the chain must stay an in-order subsequence of this list.
+	"setmodelprice", // (Go-only) pop
+	"setkirourl",    // 18 @17895 (S) pop
+	"setkirokey",    // 19 @17927 (S) pop
+	"setkiroacct",   // 20 @17953 (S) pop
+	"setbep20",      // 21 @17979 pop
+	"settron",       // 22 @17997 pop
+	"setmaxqty",     // 23 @18015 pop
+	"refundreject",  // 26 @18086 pop (py_orders_spec.md: any typed line commits, no re-arm on "invalid")
+	"newprod",       // 27 @18108 pop
+	"renprod",       // 28 @18146 pop
 	// provpool (NEW — no Python original, py_stock_spec.md §6.2): Python wires
 	// pending_provpool a FILE handler only (@17607) and never a matching
 	// paste/text handler despite its own prompt inviting one — a confirmed

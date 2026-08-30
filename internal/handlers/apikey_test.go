@@ -57,15 +57,29 @@ type fakeKiro struct {
 	Recharge  []map[string]any
 	Delete    []map[string]any
 
+	// ModelPriceSets records every POST /admin/set_model_price body verbatim,
+	// so the flat-price tests (adminpricing_test.go) can pin the exact JSON —
+	// above all whether "perRequest" is PRESENT, which is the whole point of
+	// the pointer in kirogo.SetModelPriceRequest. ModelPriceList is what
+	// GET /admin/model_prices returns.
+	ModelPriceSets []map[string]any
+	ModelPriceList []map[string]any
+	// ModelPriceEcho overrides the perRequest value echoed back by
+	// set_model_price, so a test can prove the reply shows the POOL's stored
+	// value rather than the number the admin typed.
+	ModelPriceEcho *float64
+
 	keys map[string]*fakeKeyState // by pool key id
 	seq  int
 
 	// Forced non-2xx status per endpoint (0 = respond normally). 4xx only:
 	// internal/kirogo never retries a 4xx, so failure tests stay instant.
-	ProvisionStatus int
-	RechargeStatus  int
-	DeleteStatus    int
-	StatsStatus     int
+	ProvisionStatus     int
+	RechargeStatus      int
+	DeleteStatus        int
+	StatsStatus         int
+	SetModelPriceStatus int
+	ModelPricesStatus   int
 
 	// UpstreamStatus / EchoSaleClass shape the mint response. EchoSaleClass
 	// false models a PRE-saleClass server: it echoes no class, so the bot must
@@ -103,6 +117,8 @@ func newFakeKiro(t *testing.T) *fakeKiro {
 	mux.HandleFunc("/admin/recharge_api_key", fk.handleRecharge)
 	mux.HandleFunc("/admin/delete_api_key", fk.handleDelete)
 	mux.HandleFunc("/admin/stats", fk.handleStats)
+	mux.HandleFunc("/admin/set_model_price", fk.handleSetModelPrice)
+	mux.HandleFunc("/admin/model_prices", fk.handleModelPrices)
 	fk.srv = httptest.NewServer(mux)
 	t.Cleanup(fk.srv.Close)
 	return fk
@@ -288,6 +304,48 @@ func (fk *fakeKiro) rechargeCount() int {
 	fk.mu.Lock()
 	defer fk.mu.Unlock()
 	return len(fk.Recharge)
+}
+
+// handleSetModelPrice records the body and echoes the stored price back, the
+// way the real POST /admin/set_model_price does.
+func (fk *fakeKiro) handleSetModelPrice(w http.ResponseWriter, r *http.Request) {
+	body := fk.decode(r)
+	fk.mu.Lock()
+	fk.ModelPriceSets = append(fk.ModelPriceSets, body)
+	status, echo := fk.SetModelPriceStatus, fk.ModelPriceEcho
+	fk.mu.Unlock()
+	if status != 0 {
+		fail(w, status, "set_model_price rejected")
+		return
+	}
+	per, _ := body["perRequest"].(float64)
+	if echo != nil {
+		per = *echo
+	}
+	model, _ := body["model"].(string)
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "model": model, "perRequest": per})
+}
+
+// handleModelPrices serves the configured flat-price card.
+func (fk *fakeKiro) handleModelPrices(w http.ResponseWriter, _ *http.Request) {
+	fk.mu.Lock()
+	status := fk.ModelPricesStatus
+	list := append([]map[string]any{}, fk.ModelPriceList...)
+	fk.mu.Unlock()
+	if status != 0 {
+		fail(w, status, "model_prices rejected")
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "count": len(list), "prices": list})
+}
+
+// modelPriceSets returns a snapshot of the recorded set_model_price bodies —
+// the assertion surface for "no HTTP call happened" (len == 0) as well as for
+// the exact payload.
+func (fk *fakeKiro) modelPriceSets() []map[string]any {
+	fk.mu.Lock()
+	defer fk.mu.Unlock()
+	return append([]map[string]any{}, fk.ModelPriceSets...)
 }
 
 func (fk *fakeKiro) lastProvision() map[string]any {
