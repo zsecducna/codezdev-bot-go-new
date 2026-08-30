@@ -73,6 +73,31 @@ type APIKeyCatalog struct {
 	// KiroHistLabel — KIROAPI_HIST_LABEL (telegram_bot.py:4078); {credits}.
 	KiroHistLabel Str
 
+	// ---- fixed SKU (__fixedapi__) ----
+	//
+	// GO-ONLY: the "fixed" sale class postdates telegram_bot.py entirely, so
+	// none of these five has a Python constant to cite (same precedent as
+	// captures.go's "provpool" entry). They are exact structural twins of the
+	// Kiro block above — a Fixed key is minted the same way (no accountId, no
+	// per-customer upstream binding), it is just billed a FLAT credit price
+	// per request instead of by rate-card burn.
+
+	// FixedBtn — buy-menu row; {name} {rate}.
+	FixedBtn Str
+	// FixedPrompt — credit-amount prompt; {name} {rate} {min} {balance}.
+	// {name} arrives UPPERCASED (all-caps header). No {opus} placeholder: the
+	// Opus estimate is denominated in bedrock rate-card credits and says
+	// nothing about a per-request flat price.
+	FixedPrompt Str
+	// FixedPayPrompt — pay screen; {name} {credits} {rate} {total} {balance}.
+	FixedPayPrompt Str
+	// FixedDelivered — delivery/reveal message (HTML); {name} {credits} {key}
+	// {base}. Carries {name} TWICE, like KiroDelivered. HTML-escaped by the
+	// sender, same as Delivered above.
+	FixedDelivered Str
+	// FixedHistLabel — history row; {credits}.
+	FixedHistLabel Str
+
 	// ---- shared gates / errors ----
 
 	// BadAmount — APIKEY_BAD_AMOUNT (telegram_bot.py:3899); {min} {max}.
@@ -83,7 +108,11 @@ type APIKeyCatalog struct {
 	Off Str
 	// MintFail — APIKEY_MINT_FAIL (telegram_bot.py:3981); {amount} {balance}.
 	MintFail Str
-	// SkuTag — APIKEY_SKU_TAG (telegram_bot.py:4085), keyed "bedrock"/"kiro".
+	// SkuTag — APIKEY_SKU_TAG (telegram_bot.py:4085), keyed
+	// "bedrock"/"kiro"/"fixed" (the last Go-only). EVERY sale class
+	// apikeyKeyClass can return must have an entry: a missing key yields the
+	// zero Str, which renders as an EMPTY tag in the My-Keys list and the
+	// recharge picker.
 	SkuTag map[string]Str
 	// Status — APIKEY_STATUS (telegram_bot.py:4213), keyed by the Kiro-Go
 	// /admin/stats "status" value (active|exhausted|disabled).
@@ -230,6 +259,39 @@ func buildAPIKeyCatalog() APIKeyCatalog {
 			VI: "🟣 Kiro API key — {credits} Kiro credits",
 			ZH: "🟣 Kiro API key — {credits} Kiro credits",
 		},
+		// Fixed Pricing buy-menu row (Go-only), product name -> {name}.
+		FixedBtn: Str{
+			EN: "⚡ {name} — {rate}/100 credits",
+			VI: "⚡ {name} — {rate}/100 credits",
+			ZH: "⚡ {name} — {rate}/100 credits",
+		},
+		// Fixed Pricing credit-amount prompt (Go-only) — states the flat
+		// per-request billing model before pay. Name -> {name} (uppercased by
+		// the caller).
+		FixedPrompt: Str{
+			EN: "⚡ BUY {name} KEY\nPrice: {rate} / 100 credits\nMinimum: {min} credits\nYour balance: {balance}\n\nFLAT PRICING: every request costs the same number of credits for a given model, no matter how long the prompt or the answer is.\n\nType how many credits you want (e.g. 1000):",
+			VI: "⚡ MUA {name} KEY\nGiá: {rate} / 100 credits\nTối thiểu: {min} credits\nSố dư của bạn: {balance}\n\nGIÁ CỐ ĐỊNH: mỗi request tốn cùng một số credits cho cùng một model, dù prompt hay câu trả lời dài bao nhiêu.\n\nNhập số credits bạn muốn mua (ví dụ 1000):",
+			ZH: "⚡ 购买 {name} KEY\n价格：{rate} / 100 credits\n最低：{min} credits\n您的余额：{balance}\n\n固定计价：同一个模型的每次请求消耗相同的 credits，与提示词和回答的长度无关。\n\n请输入要购买的 credits 数量（例如 1000）：",
+		},
+		// Fixed Pricing pay screen (Go-only), product name -> {name}.
+		FixedPayPrompt: Str{
+			EN: "🧾 ⚡ {name} — {credits} credits\nPrice: {rate} / 100 credits\nTotal: {total}\n\nYour balance: {balance}\nChoose a payment method:",
+			VI: "🧾 ⚡ {name} — {credits} credits\nĐơn giá: {rate} / 100 credits\nThành tiền: {total}\n\nSố dư của bạn: {balance}\nChọn cách thanh toán:",
+			ZH: "🧾 ⚡ {name} — {credits} credits\n价格：{rate} / 100 credits\n总计：{total}\n\n您的余额：{balance}\n请选择支付方式：",
+		},
+		// Fixed Pricing delivery/reveal (Go-only). BOTH product-name
+		// occurrences -> {name}: the opener and the pricing-model sentence.
+		FixedDelivered: Str{
+			EN: "✅ Your {name} key is ready — {credits} credits\nFLAT PRICING: with a {name} key every request to a given model costs the same number of credits, whatever the prompt and answer length. Per-model prices are on the models page below.\n\n🔑 Your API key (tap to copy):\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 Send it as header: <code>Authorization: Bearer &lt;your key&gt;</code>\n\n👉 <b>How to use it</b>\n📊 Dashboard — track your quota:\n{base}/\n📖 API docs + client setup (Claude Code, Codex, curl):\n{base}/docs\n🧠 Models &amp; pricing:\n{base}/models\n\n⚠️ Keep this key secret — anyone holding it can spend your credits. You can view it again anytime: Self-Service → 🔑 My API Keys.",
+			VI: "✅ {name} key của bạn đã sẵn sàng — {credits} credits\nGIÁ CỐ ĐỊNH: với {name} key, mỗi request tới cùng một model tốn cùng một số credits, bất kể prompt và câu trả lời dài bao nhiêu. Giá từng model xem ở trang models bên dưới.\n\n🔑 API key của bạn (chạm để sao chép):\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 Gửi kèm header: <code>Authorization: Bearer &lt;key của bạn&gt;</code>\n\n👉 <b>Hướng dẫn sử dụng</b>\n📊 Bảng điều khiển — theo dõi hạn mức:\n{base}/\n📖 Tài liệu API + cách cài đặt (Claude Code, Codex, curl):\n{base}/docs\n🧠 Danh sách model &amp; bảng giá:\n{base}/models\n\n⚠️ Giữ kín key này — ai có nó là dùng được credits của bạn. Xem lại bất cứ lúc nào: Tự phục vụ → 🔑 API key của tôi.",
+			ZH: "✅ 您的 {name} key 已就绪 — {credits} credits\n固定计价：使用 {name} key 时，同一个模型的每次请求消耗相同的 credits，与提示词和回答的长度无关。各模型价格见下方 models 页面。\n\n🔑 您的 API key（点击复制）：\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 请求头：<code>Authorization: Bearer &lt;您的 key&gt;</code>\n\n👉 <b>使用指南</b>\n📊 控制台 — 查询余量：\n{base}/\n📖 API 文档 + 客户端配置（Claude Code、Codex、curl）：\n{base}/docs\n🧠 模型与价格：\n{base}/models\n\n⚠️ 请妥善保管此 key — 任何持有者都能消耗您的 credits。随时可再次查看：自助服务 → 🔑 我的 API Key。",
+		},
+		// Fixed Pricing history row (Go-only).
+		FixedHistLabel: Str{
+			EN: "⚡ Fixed Pricing API key — {credits} credits",
+			VI: "⚡ Fixed Pricing API key — {credits} credits",
+			ZH: "⚡ Fixed Pricing API key — {credits} credits",
+		},
 		// APIKEY_BAD_AMOUNT (telegram_bot.py:3899).
 		BadAmount: Str{
 			EN: "⚠️ Invalid credit amount. Enter a whole number between {min} and {max}:",
@@ -258,6 +320,8 @@ func buildAPIKeyCatalog() APIKeyCatalog {
 		SkuTag: map[string]Str{
 			"bedrock": {EN: "🔷 Bedrock", VI: "🔷 Bedrock", ZH: "🔷 Bedrock"},
 			"kiro":    {EN: "🟣 Kiro", VI: "🟣 Kiro", ZH: "🟣 Kiro"},
+			// Go-only, keyed by kirogo.SaleClassFixed's wire value.
+			"fixed": {EN: "⚡ Fixed", VI: "⚡ Fixed", ZH: "⚡ Fixed"},
 		},
 		// APIKEY_STATUS (telegram_bot.py:4213).
 		Status: map[string]Str{

@@ -680,6 +680,7 @@ func (b *Bot) adminCategoryMenuRows(cat string) (title string, rows [][]tg.Inlin
 		// rather than re-hardcoded here, so the two can never drift apart.
 		apiNameLabel, apiNameCb := apikeyNameRowLabel(saleClassBedrock)
 		kiroNameLabel, kiroNameCb := apikeyNameRowLabel(saleClassKiro)
+		fixedNameLabel, fixedNameCb := apikeyNameRowLabel(saleClassFixed)
 		return "🏷️ PRICING & DISCOUNTS", append([][]tg.InlineKeyboardButton{
 			btnRow("🏷️ Prices & warranty tiers", "adm:setprice"),
 			btnRow("📉 Volume discounts", "adm:setdiscount"),
@@ -696,7 +697,16 @@ func (b *Bot) adminCategoryMenuRows(cat string) (title string, rows [][]tg.Inlin
 			btnRow("🟣 Kiro min credits/key: "+itoa64(b.apikeyMinCredits(saleClassKiro)), "adm:kiromin"),
 			btnRow("🟣 Kiro max credits/key: "+itoa64(b.apikeyMaxCredits(saleClassKiro)), "adm:kiromax"),
 			btnRow(kiroNameLabel+": "+b.apikeyProductName(saleClassKiro), kiroNameCb),
-			// Fixed Pricing block (adminpricing.go §4c). These price the POOL's
+			// Fixed Pricing SKU block (adminpricing.go §6) — the storefront
+			// half: what the SHOP charges, in USDT per 100 credits, plus the
+			// SKU's own bounds and display name. Same five-row shape as the
+			// Kiro block above.
+			btnRow(onOffLabel("⚡ Fixed SKU", b.fixedApikeyEnabled()), "adm:fixedtoggle"),
+			btnRow(b.apiPricingLabel("⚡ Fixed pricing", saleClassFixed), "adm:fixedprice"),
+			btnRow("⚡ Fixed min credits/key: "+itoa64(b.apikeyMinCredits(saleClassFixed)), "adm:fixedmin"),
+			btnRow("⚡ Fixed max credits/key: "+itoa64(b.apikeyMaxCredits(saleClassFixed)), "adm:fixedmax"),
+			btnRow(fixedNameLabel+": "+b.apikeyProductName(saleClassFixed), fixedNameCb),
+			// Fixed Pricing RATE-CARD block (adminpricing.go §4c). These price the POOL's
 			// prepaid "fixed" sale class in POOL CREDITS PER REQUEST — a
 			// different quantity in a different unit from every USDT row above,
 			// which is why they sit in their own block rather than beside them.
@@ -1180,6 +1190,8 @@ func (b *Bot) cbAdmAction(cc *cbCtx) {
 		b.cbApiName(cc)
 	case "kironame":
 		b.cbKiroName(cc)
+	case "fixedname":
+		b.cbFixedName(cc)
 	// The two Go-only Fixed Pricing rate-card entries (adminpricing.go §4c).
 	case "setmodelprice":
 		b.cbSetModelPrice(cc)
@@ -1193,6 +1205,15 @@ func (b *Bot) cbAdmAction(cc *cbCtx) {
 		b.cbKiroMin(cc)
 	case "kiromax":
 		b.cbKiroMax(cc)
+	// The Go-only Fixed Pricing SKU rows (adminpricing.go §6).
+	case "fixedtoggle":
+		b.cbFixedToggle(cc)
+	case "fixedprice":
+		b.cbFixedPrice(cc)
+	case "fixedmin":
+		b.cbFixedMin(cc)
+	case "fixedmax":
+		b.cbFixedMax(cc)
 	// 👥 CUSTOMERS (adminusers.go). custlookup is customers_view-capability
 	// (grantable, hence no fullAdminOnly gate here); addbal is full-admin-only.
 	case "custlookup":

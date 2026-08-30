@@ -1592,12 +1592,15 @@ func (b *Bot) cbRevenueRange(cc *cbCtx) {
 }
 
 // revenuePickableProducts is _revenue_pickable_products (py_orders_spec.md):
-// the folder catalogue plus the two virtual API-pool sale SKUs, fixed order
-// so an index stays stable across ranges, capped to 90 rows.
+// the folder catalogue plus the three virtual API-pool sale SKUs, fixed order
+// so an index stays stable across ranges, capped to 90 rows. APPEND-ONLY: the
+// admrevp: callbacks address a product by its INDEX in this slice, so a new
+// SKU must go on the END or every previously-rendered menu resolves to the
+// wrong product.
 func (b *Bot) revenuePickableProducts() []string {
 	const maxPick = 90
 	products := append([]string(nil), b.listProducts()...)
-	products = append(products, apikeyProduct, kiroApikeyProduct)
+	products = append(products, apikeyProduct, kiroApikeyProduct, fixedApikeyProduct)
 	if len(products) > maxPick {
 		products = products[:maxPick]
 	}
@@ -1757,7 +1760,7 @@ func (b *Bot) revenueByProductText(m *store.RevenueMatrix, label string) string 
 	var active []activeProd
 	var activeTotal, activeCount int64
 	for _, p := range m.Products {
-		isVirtual := p == apikeyProduct || p == kiroApikeyProduct
+		isVirtual := isApikeyBuyProduct(p)
 		isActive := isVirtual || (b.stock != nil && b.stock.ProductExists(p) && !b.productSuspended(p))
 		if !isActive {
 			continue
@@ -1828,7 +1831,7 @@ func (b *Bot) revenueByProductText(m *store.RevenueMatrix, label string) string 
 // get a tag.
 func (b *Bot) revenueSingleProductText(m *store.RevenueMatrix, product, label string) string {
 	tag := ""
-	if product != apikeyProduct && product != kiroApikeyProduct {
+	if !isApikeyBuyProduct(product) {
 		switch {
 		case b.stock == nil || !b.stock.ProductExists(product):
 			tag = " (removed)"

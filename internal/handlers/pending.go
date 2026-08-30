@@ -115,9 +115,18 @@ type ChatState struct {
 	// "fixed" sale class postdates the original entirely (same Go-only
 	// precedent as the two rename flags above and captures.go's "provpool").
 	SetModelPrice bool
-	SetKiroPrice  bool             // pending_setkiroprice @3857
-	SetKiroMin    bool             // pending_setkiromin @3858
-	SetKiroMax    bool             // pending_setkiromax @3859
+	SetKiroPrice  bool // pending_setkiroprice @3857
+	SetKiroMin    bool // pending_setkiromin @3858
+	SetKiroMax    bool // pending_setkiromax @3859
+	// SetFixedPrice / SetFixedMin / SetFixedMax / SetFixedName arm the
+	// Go-only Fixed Pricing SKU wizards (adm:fixedprice / adm:fixedmin /
+	// adm:fixedmax / adm:fixedname, adminpricing.go) — structural twins of
+	// the SetKiro* trio plus the rename flag above. No Python line to cite:
+	// the "fixed" sale class postdates the original entirely.
+	SetFixedPrice bool
+	SetFixedMin   bool
+	SetFixedMax   bool
+	SetFixedName  bool
 	SetKiroKey    bool             // pending_setkirokey @3860
 	SetKiroURL    bool             // pending_setkirourl @3861
 	SetKiroAcct   bool             // pending_setkiroacct @3865
@@ -332,9 +341,10 @@ func (st *ChatState) ClearCustomerPending() {
 // (e.g. an abandoned "add admin" prompt) can't consume their next plain text.
 // The Python loop's slots (handlers-go.md §3) PLUS the Go-only additions that
 // have no Python counterpart (SetApiName / SetKiroName, the SKU
-// display-rename wizards, and SetModelPrice, the Fixed Pricing flat-price
-// wizard); a unit test asserts this cleared set matches that list by
-// reflection.
+// display-rename wizards; SetModelPrice, the Fixed Pricing per-model
+// flat-price wizard; and SetFixedPrice / SetFixedMin / SetFixedMax /
+// SetFixedName, the Fixed Pricing SKU's own price/bounds/name wizards); a
+// unit test asserts this cleared set matches that list by reflection.
 func (st *ChatState) ClearAdminPending() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -373,6 +383,10 @@ func (st *ChatState) ClearAdminPending() {
 	st.SetKiroPrice = false
 	st.SetKiroMin = false
 	st.SetKiroMax = false
+	st.SetFixedPrice = false
+	st.SetFixedMin = false
+	st.SetFixedMax = false
+	st.SetFixedName = false
 	st.SetApiCap = false
 	st.SetApiName = false
 	st.SetKiroName = false

@@ -98,8 +98,11 @@ func (b *Bot) sendHistory(ctx context.Context, chatID int64, lang i18n.Lang, key
 		// a friendly label, not the raw "__apikey__" sentinel) — @16793-16799.
 		if isApikeyBuyProduct(o.Product) {
 			icon := "🔑"
-			if o.Product == kiroApikeyProduct {
+			switch o.Product {
+			case kiroApikeyProduct:
 				icon = "🟣"
+			case fixedApikeyProduct:
+				icon = "⚡"
 			}
 			rows = append(rows, btnRow(icon+" API key "+when, cbData("apikeyrev", o.Des)))
 			continue
@@ -170,14 +173,16 @@ func (b *Bot) historySummaryText(chatID int64, lang i18n.Lang) (string, bool) {
 			break
 		}
 		// API-key rows render with the credits label instead of the raw
-		// "__apikey__"/"__kiroapi__"/"__apikeyrc__" sentinel and the "accounts"
-		// wording (telegram_bot.py:16733-16746).
+		// "__apikey__"/"__kiroapi__"/"__fixedapi__"/"__apikeyrc__" sentinel and
+		// the "accounts" wording (telegram_bot.py:16733-16746).
 		var label i18n.Str
 		switch r.Product {
 		case apikeyProduct:
 			label = ak.HistLabel
 		case kiroApikeyProduct:
 			label = ak.KiroHistLabel
+		case fixedApikeyProduct:
+			label = ak.FixedHistLabel
 		case apikeyRechargeProduct:
 			label = ak.RCHistLabel
 		}
@@ -251,6 +256,9 @@ func (b *Bot) historyText(chatID int64, lang i18n.Lang, key string) (string, str
 		case kiroApikeyProduct:
 			// Kiro-SKU key order: same shape, Kiro-credit wording (@16477).
 			head = status + " · " + i18n.F(ak.KiroHistLabel.T(lang), "credits", itoa64(o.Qty))
+		case fixedApikeyProduct:
+			// Fixed-Pricing key order: same shape, its own label (Go-only).
+			head = status + " · " + i18n.F(ak.FixedHistLabel.T(lang), "credits", itoa64(o.Qty))
 		case apikeyRechargeProduct:
 			// Recharge order: qty is the topped-up credits; own 🔁 label (@16480).
 			head = status + " · " + i18n.F(ak.RCHistLabel.T(lang), "credits", itoa64(o.Qty))
@@ -333,7 +341,7 @@ func (b *Bot) hasAnyOrder(chatID int64) bool {
 // CREDITS, so the summary excludes them from the "accounts bought" total.
 func isApikeyFamily(product string) bool {
 	switch product {
-	case apikeyProduct, kiroApikeyProduct, apikeyRechargeProduct:
+	case apikeyProduct, kiroApikeyProduct, fixedApikeyProduct, apikeyRechargeProduct:
 		return true
 	}
 	return false

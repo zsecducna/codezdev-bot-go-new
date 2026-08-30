@@ -620,6 +620,9 @@ func TestPricingCategorySuperAdminOnly(t *testing.T) {
 		"adm:setprice", "adm:setdiscount", "adm:promocodes", "adm:promonew",
 		"adm:apiprice", "adm:apimin", "adm:apimax", "adm:apicap",
 		"adm:kirotoggle", "adm:kiroprice", "adm:kiromin", "adm:kiromax",
+		// The Go-only Fixed Pricing SKU rows (adminpricing.go §6).
+		"adm:fixedtoggle", "adm:fixedprice", "adm:fixedmin", "adm:fixedmax",
+		"adm:fixedname",
 		// The Go-only Fixed Pricing rate-card entries (adminpricing.go §4c) —
 		// adm:modelprices in particular is the only READ-ONLY action in this
 		// category, so its gate is easy to forget.
@@ -1540,6 +1543,7 @@ func TestCapSetApikeyNamePeeksEscapes(t *testing.T) {
 	}{
 		{"bedrock", "adm:apiname", b.capSetApiName},
 		{"kiro", "adm:kironame", b.capSetKiroName},
+		{"fixed", "adm:fixedname", b.capSetFixedName},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := armAndCapture(t, b, 1, tc.arm, "/admin", tc.cap); got {
@@ -1569,6 +1573,7 @@ func TestCapSetApikeyNameRefusesNonSuperAdmin(t *testing.T) {
 	}{
 		{"bedrock", func(st *ChatState) { st.SetApiName = true }, func(b *Bot) func(*Ctx) bool { return b.capSetApiName }},
 		{"kiro", func(st *ChatState) { st.SetKiroName = true }, func(b *Bot) func(*Ctx) bool { return b.capSetKiroName }},
+		{"fixed", func(st *ChatState) { st.SetFixedName = true }, func(b *Bot) func(*Ctx) bool { return b.capSetFixedName }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b, f, _, _, _ := newBuyBot(t, "1") // chat 1 is the only super admin
@@ -1867,7 +1872,7 @@ func TestCapSetModelPriceRefusesNonSuperAdmin(t *testing.T) {
 
 // TestPricingFreeTextWizardsAreMutuallyExclusive is the regression test for the
 // stale-arm bug armPricingFreeText exists to prevent: the pricing menu carries
-// all three free-text buttons in ONE message and old copies stay tappable, so
+// all four free-text buttons in ONE message and old copies stay tappable, so
 // an admin can arm one and then another without the first flag clearing. A
 // stale armed flag would silently eat the admin's next unrelated line —
 // repricing a model, or publishing it as a SKU's customer-visible name. Both
@@ -1904,14 +1909,15 @@ func TestPricingFreeTextWizardsAreMutuallyExclusive(t *testing.T) {
 		b, _, fk := newModelPriceBot(t)
 		b.Process(ctx, callbackUpdate(1, "adm:apiname"))
 		b.Process(ctx, callbackUpdate(1, "adm:kironame"))
-		b.Process(ctx, callbackUpdate(1, "adm:setmodelprice")) // must disarm both renames
+		b.Process(ctx, callbackUpdate(1, "adm:fixedname"))
+		b.Process(ctx, callbackUpdate(1, "adm:setmodelprice")) // must disarm all three renames
 		b.Process(ctx, textUpdate(1, "gpt-5 3"))
 
 		if sets := fk.modelPriceSets(); len(sets) != 1 || sets[0]["model"] != "gpt-5" {
 			t.Fatalf("set_model_price bodies = %v, want exactly the one live arm's", sets)
 		}
 		if m := apikeyNamesFrom(t, b); len(m) != 0 {
-			t.Errorf("apikey_names = %v, want nothing renamed — both rename arms must have been cleared", m)
+			t.Errorf("apikey_names = %v, want nothing renamed — every rename arm must have been cleared", m)
 		}
 	})
 }
@@ -1984,4 +1990,243 @@ func TestCbModelPricesFailurePaths(t *testing.T) {
 			t.Fatalf("reply = %+v, want %q", last, kirogoNotConfiguredNote)
 		}
 	})
+}
+
+// ---- §6: the Fixed Pricing SKU's five admin wizards -----------------------
+
+// TestFixedPricingWizardsPersistValidValues walks the four value-setting
+// wizards end to end through the real dispatch chain: arm the callback, type a
+// value, assert the LIVE accessor moved. Reading through the accessors (not the
+// raw settings map) is deliberate — it proves the wizard writes the key the
+// read path actually consults, which a raw-map assertion would not.
+func TestFixedPricingWizardsPersistValidValues(t *testing.T) {
+	ctx := context.Background()
+	b, f, _, _, _ := newBuyBot(t, "1") // chat 1 is the super admin
+
+	b.Process(ctx, callbackUpdate(1, "adm:fixedprice"))
+	b.Process(ctx, textUpdate(1, "1.5"))
+	if got := b.apikeyRateUSDT(saleClassFixed); got != 1.5 {
+		t.Errorf("fixed rate = %v, want 1.5", got)
+	}
+	// The bedrock rate must not have moved — the SKUs own separate keys.
+	if got := b.apikeyRateUSDT(saleClassBedrock); got != 0 {
+		t.Errorf("bedrock rate = %v, want 0 (untouched)", got)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:fixedmax"))
+	b.Process(ctx, textUpdate(1, "5000"))
+	if got := b.apikeyMaxCredits(saleClassFixed); got != 5000 {
+		t.Errorf("fixed max = %d, want 5000", got)
+	}
+	b.Process(ctx, callbackUpdate(1, "adm:fixedmin"))
+	b.Process(ctx, textUpdate(1, "250"))
+	if got := b.apikeyMinCredits(saleClassFixed); got != 250 {
+		t.Errorf("fixed min = %d, want 250", got)
+	}
+
+	b.Process(ctx, callbackUpdate(1, "adm:fixedname"))
+	b.Process(ctx, textUpdate(1, "  Flat Rate Credits  "))
+	if got := b.apikeyProductName(saleClassFixed); got != "Flat Rate Credits" {
+		t.Errorf("fixed name = %q, want the trimmed typed name", got)
+	}
+	// A lone "-" restores the built-in default.
+	b.Process(ctx, callbackUpdate(1, "adm:fixedname"))
+	b.Process(ctx, textUpdate(1, "-"))
+	if got := b.apikeyProductName(saleClassFixed); got != apikeyDefaultNameFixed {
+		t.Errorf("fixed name after restore = %q, want %q", got, apikeyDefaultNameFixed)
+	}
+	if last := lastSendMsg(f); last == nil {
+		t.Fatal("the wizards must always answer")
+	}
+}
+
+// TestFixedPricingWizardsRejectWithoutPersisting: a rejected value must never
+// be written. Asserting the LIVE value is unchanged (not merely that the reply
+// says "⚠️") is the point — a handler that saved first and validated after
+// would pass a message-only assertion.
+func TestFixedPricingWizardsRejectWithoutPersisting(t *testing.T) {
+	ctx := context.Background()
+	b, f, _, _, _ := newBuyBot(t, "1")
+
+	// Baseline: a valid range to reject against.
+	b.Process(ctx, callbackUpdate(1, "adm:fixedprice"))
+	b.Process(ctx, textUpdate(1, "1.5"))
+	b.Process(ctx, callbackUpdate(1, "adm:fixedmax"))
+	b.Process(ctx, textUpdate(1, "5000"))
+	b.Process(ctx, callbackUpdate(1, "adm:fixedmin"))
+	b.Process(ctx, textUpdate(1, "250"))
+
+	for _, tc := range []struct {
+		name, arm, text, wantMsg string
+		read                     func() string
+	}{
+		// NaN must not slip past the range check — it compares false against
+		// every bound, so a bare `rate < 0 || rate > 10000` would accept it.
+		{"price NaN", "adm:fixedprice", "NaN", "USDT per 100 credits",
+			func() string { return fmtRate(b.apikeyRateUSDT(saleClassFixed)) }},
+		{"price negative", "adm:fixedprice", "-1", "USDT per 100 credits",
+			func() string { return fmtRate(b.apikeyRateUSDT(saleClassFixed)) }},
+		{"price out of range", "adm:fixedprice", "10001", "USDT per 100 credits",
+			func() string { return fmtRate(b.apikeyRateUSDT(saleClassFixed)) }},
+		{"price not a number", "adm:fixedprice", "cheap", "USDT per 100 credits",
+			func() string { return fmtRate(b.apikeyRateUSDT(saleClassFixed)) }},
+		{"min zero", "adm:fixedmin", "0", "whole number ≥ 1",
+			func() string { return itoa64(b.apikeyMinCredits(saleClassFixed)) }},
+		{"min above max", "adm:fixedmin", "5001", "above the current maximum",
+			func() string { return itoa64(b.apikeyMinCredits(saleClassFixed)) }},
+		{"max below min", "adm:fixedmax", "10", "the per-order minimum",
+			func() string { return itoa64(b.apikeyMaxCredits(saleClassFixed)) }},
+		{"name multi-line", "adm:fixedname", "Evil\nName", "single-line name",
+			func() string { return b.apikeyProductName(saleClassFixed) }},
+		{"name over-long", "adm:fixedname", strings.Repeat("x", apikeyNameMaxRunes+1), "single-line name",
+			func() string { return b.apikeyProductName(saleClassFixed) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := tc.read()
+			f.Sends = nil
+			b.Process(ctx, callbackUpdate(1, tc.arm))
+			b.Process(ctx, textUpdate(1, tc.text))
+			last := lastSendMsg(f)
+			if last == nil || !strings.Contains(last.Text, tc.wantMsg) {
+				t.Fatalf("reply = %+v, want the rejection mentioning %q", last, tc.wantMsg)
+			}
+			if got := tc.read(); got != before {
+				t.Errorf("a rejected value was persisted: now %q, want unchanged %q", got, before)
+			}
+		})
+	}
+}
+
+// TestFixedToggleFlipsAndWarns: the master toggle flips both ways, audits the
+// change, and warns (advisory only, never blocking) while the SKU still cannot
+// actually sell.
+func TestFixedToggleFlipsAndWarns(t *testing.T) {
+	ctx := context.Background()
+	b, f, _, _, _ := newBuyBot(t, "1")
+
+	if b.fixedApikeyEnabled() {
+		t.Fatal("the Fixed SKU must default OFF")
+	}
+	b.Process(ctx, callbackUpdate(1, "adm:fixedtoggle"))
+	if !b.fixedApikeyEnabled() {
+		t.Fatal("the toggle must flip ON")
+	}
+	// Nothing else is configured here, so both advisories must fire — the
+	// toggle is a rollout gate, not a validator, so it flips regardless.
+	var warned string
+	for _, m := range f.Sends {
+		if strings.Contains(m.Text, "Fixed Pricing SKU: ON") {
+			warned = m.Text
+		}
+	}
+	if warned == "" {
+		t.Fatal("no ON confirmation was sent")
+	}
+	for _, want := range []string{"URL/admin key not set", "Fixed pricing is 0"} {
+		if !strings.Contains(warned, want) {
+			t.Errorf("ON notice = %q, want the advisory %q", warned, want)
+		}
+	}
+	// The advisory must NOT name the account id: a fixed mint sends none, so
+	// pointing the admin at it would send them to configure the wrong thing.
+	if strings.Contains(warned, "account id") || strings.Contains(warned, "Account") {
+		t.Errorf("ON notice = %q, must not mention an account id for the fixed SKU", warned)
+	}
+	b.Process(ctx, callbackUpdate(1, "adm:fixedtoggle"))
+	if b.fixedApikeyEnabled() {
+		t.Fatal("the toggle must flip back OFF")
+	}
+}
+
+// TestPricingMenuCarriesFixedRows: every fixed wizard must be reachable from
+// the pricing submenu. A handler wired in the adm: switch but missing from the
+// menu is a dead feature no other test would catch.
+func TestPricingMenuCarriesFixedRows(t *testing.T) {
+	b, _, _, _, _ := newBuyBot(t, "1")
+	_, rows, ok := b.adminCategoryMenu(1, "pricing")
+	if !ok {
+		t.Fatal("no pricing menu")
+	}
+	var data []string
+	for _, row := range rows {
+		for _, btn := range row {
+			data = append(data, btn.CallbackData)
+		}
+	}
+	for _, want := range []string{
+		"adm:fixedtoggle", "adm:fixedprice", "adm:fixedmin", "adm:fixedmax", "adm:fixedname",
+	} {
+		if !containsStr(data, want) {
+			t.Errorf("pricing menu is missing %q, buttons=%v", want, data)
+		}
+	}
+}
+
+// TestNumericPricingWizardsDisarmFreeText is the regression test for the
+// asymmetric-arming hole: only the free-text wizards routed through
+// armPricingFreeText, so arming a NUMERIC one left any standing rename /
+// model-price arm untouched.
+//
+// That is not benign. All of these buttons live in one pricing-menu message and
+// old copies stay tappable, so an admin can tap "⚡ Rename" (arming SetFixedName),
+// scroll up, tap "Min credits" (arming SetFixedMin), and type a number. The
+// capture chain is ORDERED (captures.go CanonicalCaptureOrder puts setfixedmin
+// ahead of setfixedname) and the first stage that consumes the line ENDS the
+// chain — so the number is eaten by capSetFixedMin and SetFixedName is still
+// armed, ready to publish the admin's next unrelated plain-text line as a
+// customer-visible SKU name on the buy button, pay screen and delivery message.
+//
+// PRE-EXISTING and symmetric across all ten numeric wizards, which is why the
+// disarm lives in armPricingFreeText and every one of them is asserted here:
+// dropping the armPricingFreeText call from ANY single row fails this test.
+//
+// (Go-only; no Python original — Python has no rename or model-price wizard.)
+func TestNumericPricingWizardsDisarmFreeText(t *testing.T) {
+	for _, tc := range []struct {
+		data  string                // the adm: callback that arms it
+		armed func(*ChatState) bool // its own numeric flag, which must end up set
+	}{
+		{"adm:apiprice", func(st *ChatState) bool { return st.SetApiPrice }},
+		{"adm:apimin", func(st *ChatState) bool { return st.SetApiMin }},
+		{"adm:apimax", func(st *ChatState) bool { return st.SetApiMax }},
+		{"adm:apicap", func(st *ChatState) bool { return st.SetApiCap }},
+		{"adm:kiroprice", func(st *ChatState) bool { return st.SetKiroPrice }},
+		{"adm:kiromin", func(st *ChatState) bool { return st.SetKiroMin }},
+		{"adm:kiromax", func(st *ChatState) bool { return st.SetKiroMax }},
+		{"adm:fixedprice", func(st *ChatState) bool { return st.SetFixedPrice }},
+		{"adm:fixedmin", func(st *ChatState) bool { return st.SetFixedMin }},
+		{"adm:fixedmax", func(st *ChatState) bool { return st.SetFixedMax }},
+	} {
+		t.Run(tc.data, func(t *testing.T) {
+			b, _, _, _, _ := newBuyBot(t, "1") // chat 1 is the only super admin
+			st := b.states.Get(1)
+			// Every free-text wizard armed at once — the worst case an admin can
+			// reach by tapping stale copies of the pricing menu.
+			st.mu.Lock()
+			st.SetApiName, st.SetKiroName, st.SetFixedName, st.SetModelPrice = true, true, true, true
+			st.mu.Unlock()
+
+			b.Process(context.Background(), callbackUpdate(1, tc.data))
+
+			st.mu.Lock()
+			defer st.mu.Unlock()
+			for _, ft := range []struct {
+				name  string
+				armed bool
+			}{
+				{"SetApiName", st.SetApiName},
+				{"SetKiroName", st.SetKiroName},
+				{"SetFixedName", st.SetFixedName},
+				{"SetModelPrice", st.SetModelPrice},
+			} {
+				if ft.armed {
+					t.Errorf("%s still armed after %s — it will steal the admin's next "+
+						"plain-text line once this numeric capture ends the chain", ft.name, tc.data)
+				}
+			}
+			if !tc.armed(st) {
+				t.Errorf("%s did not arm its own wizard flag", tc.data)
+			}
+		})
+	}
 }

@@ -50,10 +50,15 @@ func (b *Bot) registerAPIKey() {
 		stage{name: "apikeyrc", fn: (*Bot).capAPIKeyRC}, // #46 @19084 peek
 	)
 	b.cbRoutes = append(b.cbRoutes,
-		cbRoute{key: "apikey:start", exact: true, fn: (*Bot).cbApikeyStart},     // @15405
-		cbRoute{key: "kiroapi:start", exact: true, fn: (*Bot).cbApikeyStart},    // @15405
+		cbRoute{key: "apikey:start", exact: true, fn: (*Bot).cbApikeyStart},  // @15405
+		cbRoute{key: "kiroapi:start", exact: true, fn: (*Bot).cbApikeyStart}, // @15405
+		// The Fixed Pricing SKU's twins. Go-only (the "fixed" sale class
+		// postdates telegram_bot.py), so there is no @line to cite — same
+		// precedent as captures.go's "provpool".
+		cbRoute{key: "fixedapi:start", exact: true, fn: (*Bot).cbApikeyStart},
 		cbRoute{key: "apikeyqty:", fn: (*Bot).cbApikeyQty},                      // @15448
 		cbRoute{key: "kiroapiqty:", fn: (*Bot).cbApikeyQty},                     // @15448
+		cbRoute{key: "fixedapiqty:", fn: (*Bot).cbApikeyQty},                    // (Go-only)
 		cbRoute{key: "apikeyrc:start", exact: true, fn: (*Bot).cbApikeyRCStart}, // @15467
 		cbRoute{key: "apikeyrcpick:", fn: (*Bot).cbApikeyRCPick},                // @15502
 		cbRoute{key: "apikeyrcqty:", fn: (*Bot).cbApikeyRCQty},                  // @15549
@@ -94,21 +99,46 @@ func (b *Bot) insertCapturesBefore(anchor string, stages ...stage) {
 
 // ---- SKU model -------------------------------------------------------------
 
-// The two Kiro-Go sale classes. Re-exported from internal/kirogo so this file
+// The three Kiro-Go sale classes. Re-exported from internal/kirogo so this file
 // reads like the Python source ("bedrock" / "kiro") while the wire values stay
-// owned by the client package (telegram_bot.py:3801 _APIKEY_CLASS).
+// owned by the client package (telegram_bot.py:3801 _APIKEY_CLASS). "fixed" is
+// Go-only — the class postdates telegram_bot.py, so it has no _APIKEY_CLASS
+// entry to cite.
 const (
 	saleClassBedrock = kirogo.SaleClassBedrock
 	saleClassKiro    = kirogo.SaleClassKiro
+	saleClassFixed   = kirogo.SaleClassFixed
 )
+
+// apikeyBindsUpstream reports whether a sale class binds a PER-CUSTOMER
+// upstream (llmgate) key at mint time. True only for bedrock and the legacy
+// "" of pre-split rows, which billed as bedrock and bound the same way.
+//
+// Kiro and Fixed both mint against a pooled account that fronts its own
+// credentials, so ProvisionCustomer sends skipUpstream:true for them and the
+// server answers upstreamStatus:"skipped" — the NORMAL terminal state for
+// those classes, not an anomaly.
+//
+// This exists as ONE predicate because the three sites that need it
+// (accountId on the mint payload, the not-bound log line, the owner alert)
+// were each written as their own `!= saleClassKiro` literal. That shape is
+// how the Fixed SKU shipped broken twice over: every mint failed with
+// ErrAccountIDForbiddenForFixed, and every sale that did go through paged the
+// owners. Route new classes through here instead of adding a fourth literal.
+func apikeyBindsUpstream(saleClass string) bool {
+	return saleClass == saleClassBedrock || saleClass == ""
+}
 
 // apikeyClassForProduct maps a BUY product sentinel to its Kiro-Go saleClass —
 // _APIKEY_CLASS (telegram_bot.py:3801). The recharge sentinel is deliberately
 // absent: a top-up's class comes from the TARGET key's stored sale_class, never
 // from its own product (see orderSaleClass).
 func apikeyClassForProduct(product string) string {
-	if product == kiroApikeyProduct {
+	switch product {
+	case kiroApikeyProduct:
 		return saleClassKiro
+	case fixedApikeyProduct:
+		return saleClassFixed
 	}
 	return saleClassBedrock
 }
@@ -116,7 +146,8 @@ func apikeyClassForProduct(product string) string {
 // isApikeyBuyProduct reports a NEW-KEY (mint) order — _APIKEY_BUY_PRODUCTS
 // membership (telegram_bot.py:3798). Recharges are excluded.
 func isApikeyBuyProduct(product string) bool {
-	return product == apikeyProduct || product == kiroApikeyProduct
+	return product == apikeyProduct || product == kiroApikeyProduct ||
+		product == fixedApikeyProduct
 }
 
 // ---- env/settings bounds (telegram_bot.py:3814-3842) -----------------------
@@ -128,6 +159,12 @@ func isApikeyBuyProduct(product string) bool {
 var (
 	apikeyQtyChoices     = []int64{100, 200, 500, 1000, 2000, 5000, 10000}
 	kiroApikeyQtyChoices = []int64{500, 1000, 2000, 5000, 10000, 20000, 50000}
+	// Fixed Pricing bills a flat credit price PER REQUEST rather than by
+	// rate-card burn, so its credit unit is closest to bedrock's — it reuses
+	// the same quick picks rather than kiro's ~5.7x-smaller ladder. Its own
+	// slice (not a shared reference) so retuning one SKU can never move the
+	// other's buttons.
+	fixedApikeyQtyChoices = []int64{100, 200, 500, 1000, 2000, 5000, 10000}
 )
 
 // apikeyQtyPerRow is APIKEY_QTY_PER_ROW (telegram_bot.py:3831): seven quick
@@ -189,6 +226,7 @@ func (b *Bot) envInt64(key string, def int64) int64 {
 const (
 	apikeyDefaultNameBedrock = "Bedrock API Credits"
 	apikeyDefaultNameKiro    = "Kiro Credits API"
+	apikeyDefaultNameFixed   = "Fixed Pricing API Credits"
 )
 
 // apikeyProductName is the admin-renameable DISPLAY name of one mint SKU —
@@ -198,8 +236,8 @@ const (
 // value all fall back to the built-in default above.
 //
 // Legacy (” sale_class) rows resolve to the BEDROCK entry, override included —
-// every render site collapses "not kiro" onto the bedrock template
-// (apikeyKeyClass(row) == saleClassKiro ? kiro : bedrock), so resolving the
+// every render site collapses an unrecognised class onto the bedrock template
+// (apikeyKeyClass maps only "kiro"/"fixed" to themselves), so resolving the
 // name any other way would print the old name on a re-reveal of a legacy key
 // while the surrounding template is the renamed bedrock one.
 //
@@ -216,8 +254,11 @@ const (
 func (b *Bot) apikeyProductName(saleClass string) string {
 	def := apikeyDefaultNameBedrock
 	key := saleClassBedrock
-	if saleClass == saleClassKiro {
+	switch saleClass {
+	case saleClassKiro:
 		def, key = apikeyDefaultNameKiro, saleClassKiro
+	case saleClassFixed:
+		def, key = apikeyDefaultNameFixed, saleClassFixed
 	}
 	names, _ := b.settings()["apikey_names"].(map[string]any)
 	if v, ok := names[key]; ok {
@@ -226,6 +267,22 @@ func (b *Bot) apikeyProductName(saleClass string) string {
 		}
 	}
 	return def
+}
+
+// apikeyDeliveredTemplate picks the SKU-correct delivery/reveal template for a
+// key's effective class. Shared by the first delivery (deliverApikey) and the
+// 👁 re-reveal (cbApikeyRev) so the two can never show a buyer one SKU's
+// wording on delivery and another's on a re-read of the same key. Anything not
+// recognised (bedrock, or the legacy "" of pre-split rows) keeps the bedrock
+// template, matching apikeyKeyClass's own collapse.
+func apikeyDeliveredTemplate(c *i18n.APIKeyCatalog, keyClass string) i18n.Str {
+	switch keyClass {
+	case saleClassKiro:
+		return c.KiroDelivered
+	case saleClassFixed:
+		return c.FixedDelivered
+	}
+	return c.Delivered
 }
 
 // apikeyNameOK is the shared shape check for a SKU display name — non-empty,
@@ -246,8 +303,11 @@ func apikeyNameOK(s string) bool {
 // or an admin change would apply to some checks and not others.
 func (b *Bot) apikeyMinCredits(saleClass string) int64 {
 	key, envKey, envDef := "apikey_min_credits", "APIKEY_MIN_CREDITS", int64(100)
-	if saleClass == saleClassKiro {
+	switch saleClass {
+	case saleClassKiro:
 		key, envKey, envDef = "kiro_apikey_min_credits", "KIRO_APIKEY_MIN_CREDITS", 500
+	case saleClassFixed:
+		key, envKey, envDef = "fixed_apikey_min_credits", "FIXED_APIKEY_MIN_CREDITS", 100
 	}
 	v := int64(0)
 	if f, ok := settingsNumber(b.settings(), key); ok {
@@ -264,8 +324,11 @@ func (b *Bot) apikeyMinCredits(saleClass string) int64 {
 // a max under the min can never make the sellable range empty.
 func (b *Bot) apikeyMaxCredits(saleClass string) int64 {
 	key, envKey := "apikey_max_credits", "APIKEY_MAX_CREDITS"
-	if saleClass == saleClassKiro {
+	switch saleClass {
+	case saleClassKiro:
 		key, envKey = "kiro_apikey_max_credits", "KIRO_APIKEY_MAX_CREDITS"
+	case saleClassFixed:
+		key, envKey = "fixed_apikey_max_credits", "FIXED_APIKEY_MAX_CREDITS"
 	}
 	v := int64(0)
 	if f, ok := settingsNumber(b.settings(), key); ok {
@@ -449,8 +512,17 @@ func (b *Bot) kiroGoPublicURL() string {
 // kiro SKU postdates the per-100 change and has no legacy fallback.
 func (b *Bot) apikeyRateUSDT(saleClass string) float64 {
 	s := b.settings()
-	if saleClass == saleClassKiro {
+	switch saleClass {
+	case saleClassKiro:
 		f, _ := settingsNumber(s, "kiro_apikey_usdt_per_100")
+		return math.Max(0, f)
+	case saleClassFixed:
+		// Like kiro, this SKU postdates the per-1k -> per-100 migration, so
+		// there is no legacy key to fall back to. NOT to be confused with the
+		// pool's per-model flat price card (adm:setmodelprice): that is what a
+		// REQUEST costs the key in pool credits; this is what the shop charges
+		// in USDT for 100 of those credits.
+		f, _ := settingsNumber(s, "fixed_apikey_usdt_per_100")
 		return math.Max(0, f)
 	}
 	// Python parity (telegram_bot.py:6180-6188): the legacy per-1k fallback
@@ -484,13 +556,31 @@ func (b *Bot) kiroApikeyEnabled() bool {
 	return v
 }
 
+// fixedApikeyEnabled is the FIXED-SKU master toggle, default OFF — the twin of
+// kiroApikeyEnabled (Go-only: the class postdates telegram_bot.py, so there is
+// no line to cite). Separate from the price for the same rollout reason: the
+// shop can be priced up while the toggle stays OFF until the pool actually has
+// enabled fixed-class capacity and a per-model flat price card, and enabling
+// it before that would sell keys every request of which the pool refuses.
+func (b *Bot) fixedApikeyEnabled() bool {
+	v, _ := b.settings()["fixed_apikey_enabled"].(bool)
+	return v
+}
+
 // apikeyForSale reports whether a SKU is actually sellable — apikey_for_sale
 // (telegram_bot.py:6207-6215): a positive admin rate AND a reachable-in-
 // principle Kiro-Go config. The product HIDES rather than selling and
 // auto-refunding (repo CLAUDE.md domain invariant).
 func (b *Bot) apikeyForSale(saleClass string) bool {
-	if saleClass == saleClassKiro {
+	switch saleClass {
+	case saleClassKiro:
 		return b.kiroApikeyEnabled() && b.apikeyRateUSDT(saleClassKiro) > 0 && b.kiroGoConfiguredBase()
+	case saleClassFixed:
+		// BASE config (URL + admin key), never kiroGoConfigured(): a fixed mint
+		// sends NO accountId at all (the client REJECTS one —
+		// kirogo.ErrAccountIDForbiddenForFixed), so requiring a configured
+		// account id here would hide a perfectly sellable product.
+		return b.fixedApikeyEnabled() && b.apikeyRateUSDT(saleClassFixed) > 0 && b.kiroGoConfiguredBase()
 	}
 	return b.apikeyRateUSDT(saleClassBedrock) > 0 && b.kiroGoConfigured()
 }
@@ -572,8 +662,11 @@ func apikeyQtyRows(choices []int64, cbPrefix string) [][]tg.InlineKeyboardButton
 // qtyChoicesFor returns the SKU's quick-pick list filtered to [lo, hi].
 func qtyChoicesFor(saleClass string, lo, hi int64) []int64 {
 	src := apikeyQtyChoices
-	if saleClass == saleClassKiro {
+	switch saleClass {
+	case saleClassKiro:
 		src = kiroApikeyQtyChoices
+	case saleClassFixed:
+		src = fixedApikeyQtyChoices
 	}
 	var out []int64
 	for _, n := range src {
@@ -587,23 +680,29 @@ func qtyChoicesFor(saleClass string, lo, hi int64) []int64 {
 // ---- key-class resolution ---------------------------------------------------
 
 // apikeyKeyClass is the effective SKU of a stored api_keys row for pricing/
-// labels/bounds — _apikey_key_class (telegram_bot.py:6347-6354). "kiro" only
-// when the row was minted as kiro; anything else (bedrock, or the legacy ""
-// of pre-split rows) prices and labels as bedrock, because legacy keys WERE
-// sold at the bedrock rate card.
+// labels/bounds — _apikey_key_class (telegram_bot.py:6347-6354). "kiro" or
+// "fixed" only when the row was minted as that class; anything else (bedrock,
+// or the legacy "" of pre-split rows) prices and labels as bedrock, because
+// legacy keys WERE sold at the bedrock rate card.
 //
 // Recharge PAYLOADS must NOT use this: they read the RAW stored value so a
 // legacy "" row omits saleClass entirely (see deliverApikeyRecharge).
 func apikeyKeyClass(row *store.APIKey) string {
-	if row != nil && row.SaleClass == saleClassKiro {
-		return saleClassKiro
+	if row != nil {
+		switch row.SaleClass {
+		case saleClassKiro:
+			return saleClassKiro
+		case saleClassFixed:
+			return saleClassFixed
+		}
 	}
 	return saleClassBedrock
 }
 
 // orderSaleClass is the SKU of any API-key-family order, for pricing/labels —
 // _order_sale_class (telegram_bot.py:6357-6370). A buy order carries it in its
-// product sentinel; a RECHARGE order inherits the TARGET key's class via the
+// product sentinel (all three mint SKUs, via apikeyClassForProduct); a
+// RECHARGE order inherits the TARGET key's class via the
 // order→key binding. Unknown/broken bindings fall back to bedrock, matching
 // every legacy row's real billing.
 func (b *Bot) orderSaleClass(o *store.Order) string {
@@ -844,9 +943,15 @@ func (b *Bot) startApikeyPurchase(ctx context.Context, chatID int64, lang i18n.L
 		}
 	}
 	des := store.NewDes()
+	// The order's product sentinel IS its SKU record — deliverApikey reads the
+	// mint class straight back off it. Picking the wrong one here would settle
+	// a paid fixed order as a bedrock mint.
 	product := apikeyProduct
-	if saleClass == saleClassKiro {
+	switch saleClass {
+	case saleClassKiro:
 		product = kiroApikeyProduct
+	case saleClassFixed:
+		product = fixedApikeyProduct
 	}
 	if err := b.store.CreateOrder(des, fmtInt(chatID), string(lang), product, "API",
 		credits, total); err != nil {
@@ -926,8 +1031,11 @@ func (b *Bot) startApikeyRecharge(ctx context.Context, chatID int64, lang i18n.L
 func (b *Bot) cbApikeyStart(cc *cbCtx) {
 	c := &i18n.C().APIKey
 	cls := saleClassBedrock
-	if cc.Data == "kiroapi:start" {
+	switch cc.Data {
+	case "kiroapi:start":
 		cls = saleClassKiro
+	case "fixedapi:start":
+		cls = saleClassFixed
 	}
 	lang := b.langFor(cc.ChatID, "en")
 	if b.salesBlocked(cc.Ctx, cc.ChatID, lang, nil) {
@@ -964,8 +1072,11 @@ func (b *Bot) cbApikeyStart(cc *cbCtx) {
 
 	mn, mx := b.apikeyMinCredits(cls), b.apikeyMaxCredits(cls)
 	qtyPrefix, prompt := "apikeyqty", c.Prompt
-	if cls == saleClassKiro {
+	switch cls {
+	case saleClassKiro:
 		qtyPrefix, prompt = "kiroapiqty", c.KiroPrompt
+	case saleClassFixed:
+		qtyPrefix, prompt = "fixedapiqty", c.FixedPrompt
 	}
 	var markup *tg.InlineKeyboardMarkup
 	if choices := qtyChoicesFor(cls, mn, mx); len(choices) > 0 {
@@ -1005,8 +1116,11 @@ func (b *Bot) cbApikeyStart(cc *cbCtx) {
 // product at the wrong rate.
 func (b *Bot) cbApikeyQty(cc *cbCtx) {
 	cls := saleClassBedrock
-	if strings.HasPrefix(cc.Data, "kiroapiqty:") {
+	switch {
+	case strings.HasPrefix(cc.Data, "kiroapiqty:"):
 		cls = saleClassKiro
+	case strings.HasPrefix(cc.Data, "fixedapiqty:"):
+		cls = saleClassFixed
 	}
 	lang := b.langFor(cc.ChatID, "en")
 	_, raw, _ := strings.Cut(cc.Data, ":")
@@ -1041,10 +1155,11 @@ func (b *Bot) cbApikeyRCStart(cc *cbCtx) {
 	if b.pendingGuard(cc.Ctx, cc.ChatID, lang, "buy") {
 		return
 	}
-	// EITHER SKU sellable keeps the picker open; the picked key's own SKU is
+	// ANY mint SKU sellable keeps the picker open; the picked key's own SKU is
 	// re-gated at pick/order time (a bedrock key can't be topped up while only
 	// the kiro SKU is on sale, and vice versa).
-	if !b.apikeyForSale(saleClassBedrock) && !b.apikeyForSale(saleClassKiro) {
+	if !b.apikeyForSale(saleClassBedrock) && !b.apikeyForSale(saleClassKiro) &&
+		!b.apikeyForSale(saleClassFixed) {
 		b.send(cc.Ctx, cc.ChatID, c.Off.T(lang), nil)
 		return
 	}
@@ -1297,8 +1412,11 @@ func (b *Bot) apikeyPayScreenText(o *store.Order, lang i18n.Lang, balance int64)
 	// class drives BOTH the template and the display name, so a renamed SKU
 	// can never show one SKU's name above the other SKU's units.
 	cls, tmpl := saleClassBedrock, c.PayPrompt
-	if o.Product == kiroApikeyProduct {
+	switch o.Product {
+	case kiroApikeyProduct:
 		cls, tmpl = saleClassKiro, c.KiroPayPrompt
+	case fixedApikeyProduct:
+		cls, tmpl = saleClassFixed, c.FixedPayPrompt
 	}
 	return i18n.F(tmpl.T(lang),
 		"name", b.apikeyProductName(cls),
@@ -1317,6 +1435,7 @@ func (b *Bot) apikeyBuyRows(chatID int64, lang i18n.Lang) (rows [][]tg.InlineKey
 	c := &i18n.C().APIKey
 	bedrockOn := b.apikeyForSale(saleClassBedrock)
 	kiroOn := b.apikeyForSale(saleClassKiro)
+	fixedOn := b.apikeyForSale(saleClassFixed)
 	// "name" is the admin-renameable display name (plain, not uppercased: these
 	// are title-case button labels, not headers).
 	if bedrockOn {
@@ -1331,7 +1450,13 @@ func (b *Bot) apikeyBuyRows(chatID int64, lang i18n.Lang) (rows [][]tg.InlineKey
 				"rate", b.apikeyRateDisp(saleClassKiro)),
 			"kiroapi:start", "primary"))
 	}
-	if !bedrockOn && !kiroOn {
+	if fixedOn {
+		rows = append(rows, styledBtnRow(
+			i18n.F(c.FixedBtn.T(lang), "name", b.apikeyProductName(saleClassFixed),
+				"rate", b.apikeyRateDisp(saleClassFixed)),
+			"fixedapi:start", "primary"))
+	}
+	if !bedrockOn && !kiroOn && !fixedOn {
 		return nil, false
 	}
 	// Recharge row: only for customers who already hold a live (non-refunded)

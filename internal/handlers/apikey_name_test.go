@@ -137,6 +137,9 @@ func TestApikeyProductNameFallbacks(t *testing.T) {
 	if got := nilCfg.apikeyProductName(saleClassKiro); got != apikeyDefaultNameKiro {
 		t.Errorf("nil-config kiro name = %q, want %q", got, apikeyDefaultNameKiro)
 	}
+	if got := nilCfg.apikeyProductName(saleClassFixed); got != apikeyDefaultNameFixed {
+		t.Errorf("nil-config fixed name = %q, want %q", got, apikeyDefaultNameFixed)
+	}
 
 	b, _, _, _, dir := newAPIKeyBot(t)
 	fkSettings := func(names any) {
@@ -147,24 +150,25 @@ func TestApikeyProductNameFallbacks(t *testing.T) {
 		writeSettings(t, dir, s)
 	}
 	cases := []struct {
-		name              string
-		names             any
-		wantBed, wantKiro string
+		name                         string
+		names                        any
+		wantBed, wantKiro, wantFixed string
 	}{
-		{"absent map", nil, apikeyDefaultNameBedrock, apikeyDefaultNameKiro},
-		{"wrong type", "not-a-map", apikeyDefaultNameBedrock, apikeyDefaultNameKiro},
-		{"empty map", map[string]any{}, apikeyDefaultNameBedrock, apikeyDefaultNameKiro},
-		{"blank value", map[string]any{"bedrock": "   ", "kiro": ""}, apikeyDefaultNameBedrock, apikeyDefaultNameKiro},
+		{"absent map", nil, apikeyDefaultNameBedrock, apikeyDefaultNameKiro, apikeyDefaultNameFixed},
+		{"wrong type", "not-a-map", apikeyDefaultNameBedrock, apikeyDefaultNameKiro, apikeyDefaultNameFixed},
+		{"empty map", map[string]any{}, apikeyDefaultNameBedrock, apikeyDefaultNameKiro, apikeyDefaultNameFixed},
+		{"blank value", map[string]any{"bedrock": "   ", "kiro": "", "fixed": " "}, apikeyDefaultNameBedrock, apikeyDefaultNameKiro, apikeyDefaultNameFixed},
 		// Hand-edited settings.json bypasses the admin wizard's validation, so
 		// the READ path has to reject the same shapes the wizard does:
 		// a newline would break the inline-button layout, an unbounded length
 		// would push the price off the end of the buy-menu row.
-		{"embedded newline", map[string]any{"bedrock": "Evil\nName", "kiro": "Bad\rName"}, apikeyDefaultNameBedrock, apikeyDefaultNameKiro},
-		{"over-long", map[string]any{"bedrock": strings.Repeat("x", apikeyNameMaxRunes+1)}, apikeyDefaultNameBedrock, apikeyDefaultNameKiro},
-		{"exactly at cap", map[string]any{"bedrock": strings.Repeat("x", apikeyNameMaxRunes)}, strings.Repeat("x", apikeyNameMaxRunes), apikeyDefaultNameKiro},
-		{"bedrock only", map[string]any{"bedrock": "Shiny Credits"}, "Shiny Credits", apikeyDefaultNameKiro},
-		{"kiro only", map[string]any{"kiro": "Purple Keys"}, apikeyDefaultNameBedrock, "Purple Keys"},
-		{"trimmed", map[string]any{"bedrock": "  Padded Name  "}, "Padded Name", apikeyDefaultNameKiro},
+		{"embedded newline", map[string]any{"bedrock": "Evil\nName", "kiro": "Bad\rName", "fixed": "Also\nBad"}, apikeyDefaultNameBedrock, apikeyDefaultNameKiro, apikeyDefaultNameFixed},
+		{"over-long", map[string]any{"bedrock": strings.Repeat("x", apikeyNameMaxRunes+1)}, apikeyDefaultNameBedrock, apikeyDefaultNameKiro, apikeyDefaultNameFixed},
+		{"exactly at cap", map[string]any{"bedrock": strings.Repeat("x", apikeyNameMaxRunes)}, strings.Repeat("x", apikeyNameMaxRunes), apikeyDefaultNameKiro, apikeyDefaultNameFixed},
+		{"bedrock only", map[string]any{"bedrock": "Shiny Credits"}, "Shiny Credits", apikeyDefaultNameKiro, apikeyDefaultNameFixed},
+		{"kiro only", map[string]any{"kiro": "Purple Keys"}, apikeyDefaultNameBedrock, "Purple Keys", apikeyDefaultNameFixed},
+		{"fixed only", map[string]any{"fixed": "Flat Rate Keys"}, apikeyDefaultNameBedrock, apikeyDefaultNameKiro, "Flat Rate Keys"},
+		{"trimmed", map[string]any{"bedrock": "  Padded Name  "}, "Padded Name", apikeyDefaultNameKiro, apikeyDefaultNameFixed},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -178,6 +182,9 @@ func TestApikeyProductNameFallbacks(t *testing.T) {
 			}
 			if got := b.apikeyProductName(saleClassKiro); got != tc.wantKiro {
 				t.Errorf("kiro name = %q, want %q", got, tc.wantKiro)
+			}
+			if got := b.apikeyProductName(saleClassFixed); got != tc.wantFixed {
+				t.Errorf("fixed name = %q, want %q", got, tc.wantFixed)
 			}
 		})
 	}
@@ -199,9 +206,12 @@ func TestApikeyRenameReachesCustomerScreens(t *testing.T) {
 	const chat = 100
 
 	// (1) Buy-menu rows: the renamed bedrock row, the untouched kiro row.
+	// Only bedrock and kiro are priced here (the fixed SKU stays OFF), so the
+	// row order below is bedrock, kiro — index-addressed on purpose so a SKU
+	// rendering under another SKU's row would fail.
 	rows, sellable := b.apikeyBuyRows(chat, i18n.EN)
 	if !sellable || len(rows) < 2 {
-		t.Fatalf("buy rows = %v (sellable=%v), want both SKU rows", rows, sellable)
+		t.Fatalf("buy rows = %v (sellable=%v), want both priced SKU rows", rows, sellable)
 	}
 	if got := rows[0][0].Text; !strings.Contains(got, "Nebula Credits") || strings.Contains(got, "Bedrock API Credits") {
 		t.Errorf("bedrock buy row = %q, want the renamed SKU", got)

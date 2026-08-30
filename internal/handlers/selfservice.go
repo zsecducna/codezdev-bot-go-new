@@ -207,6 +207,9 @@ func (b *Bot) showRefundOrderPicker(ctx context.Context, chatID int64, lang i18n
 		case kiroApikeyProduct:
 			// Kiro API key sale.
 			label = fmt.Sprintf("🟣 %d Kiro credits · %s · %s", o.Qty, b.usdtDisp(o.Total), when)
+		case fixedApikeyProduct:
+			// Fixed Pricing API key sale.
+			label = fmt.Sprintf("⚡ %d credits · %s · %s", o.Qty, b.usdtDisp(o.Total), when)
 		default:
 			// Standard account order — show warranty tier label.
 			label = fmt.Sprintf("🛡️ %s · %s · %s", b.tierLabel(o.Tier, lang), b.usdtDisp(o.Total), when)
@@ -558,9 +561,20 @@ func (b *Bot) cbRemoveCode(cc *cbCtx) {
 	resellerPct := b.resellerPctFor(cc.ChatID)
 	var volTotal int64
 	if isAPIKeyProduct(o.Product) {
-		// API-key orders price off credits (@16083-16085). saleClass must be
-		// derived from the product sentinel — NOT passed as the raw product string.
-		total, _, _ := b.apikeyCodedTotal(o.Qty, resellerPct, apikeyClassForProduct(o.Product))
+		// API-key orders price off credits (@16083-16085), at the SAME sale class
+		// the order was reserved with — so removing a code reverts to that class's
+		// baseline instead of silently re-quoting the order at another rate card.
+		//
+		// The class must come from orderSaleClass, never from the product sentinel:
+		// isAPIKeyProduct above admits the RECHARGE sentinel (__apikeyrc__), whose
+		// class lives on the TARGET key's stored sale_class, not on its own product.
+		// apikeyClassForProduct maps only the three MINT sentinels and falls through
+		// to bedrock, so a kiro or fixed recharge came back re-priced at the bedrock
+		// rate card and UpdateOrderCode wrote that total — the buyer then paid it.
+		// PRE-EXISTING: kiro recharges have hit this since the kiro SKU shipped; the
+		// fixed SKU only widened it. applyCodeToOrder (code.go:200-205) already
+		// resolves the class this way, and this is the other half of that invariant.
+		total, _, _ := b.apikeyCodedTotal(o.Qty, resellerPct, b.orderSaleClass(o))
 		volTotal = total
 	} else {
 		// Standard account orders (@16086-16089).
@@ -585,7 +599,7 @@ func (b *Bot) cbRemoveCode(cc *cbCtx) {
 // ---- isAPIKeyProduct helper (for this file) ---------------------------------
 
 // isAPIKeyProduct reports whether product is any api-key-family product
-// (__apikey__, __kiroapi__, __apikeyrc__) — _APIKEY_PRODUCTS membership check
+// (__apikey__, __kiroapi__, __fixedapi__, __apikeyrc__) — _APIKEY_PRODUCTS check
 // (telegram_bot.py:3805). Kept package-private; the canonical one lives in
 // apikey.go but is not exported; this mirrors it here to avoid a cross-file
 // call from a non-method function.
@@ -595,5 +609,6 @@ func (b *Bot) cbRemoveCode(cc *cbCtx) {
 func isAPIKeyProduct(product string) bool {
 	return product == apikeyProduct ||
 		product == kiroApikeyProduct ||
+		product == fixedApikeyProduct ||
 		product == apikeyRechargeProduct
 }

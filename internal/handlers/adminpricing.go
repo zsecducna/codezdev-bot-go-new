@@ -40,14 +40,15 @@ import (
 
 // ---- registration -----------------------------------------------------------
 
-// registerAdminPricing wires this file's 14 captures + the 6 standalone
+// registerAdminPricing wires this file's 18 captures + the 6 standalone
 // tier/promo callback prefixes into the ordered dispatch tables. Called from
 // New (dispatch.go) AFTER registerAdminSettings, so insertCapturesBefore
 // finds "setkirourl"/"code"/"deposit" already spliced into the chain:
 //   - setapiprice/setapimin/setapimax/setkiroprice/setkiromin/setkiromax/
-//     setapicap (canonical #11-#17) plus the three Go-only captures
-//     setapiname/setkironame/setmodelprice land ahead of "setkirourl" (#18,
-//     already registered by registerAdminSettings) — setrate (#10) stays first.
+//     setapicap (canonical #11-#17) plus the seven Go-only captures
+//     setapiname/setkironame/setmodelprice/setfixedprice/setfixedmin/
+//     setfixedmax/setfixedname land ahead of "setkirourl" (#18, already
+//     registered by registerAdminSettings) — setrate (#10) stays first.
 //   - discount/promo (#35/#37) land ahead of "code" (#38, already registered
 //     by registerOTP).
 //   - tier/price (#42/#43) land ahead of "deposit" (#46, already registered
@@ -70,6 +71,12 @@ func (b *Bot) registerAdminPricing() {
 		stage{name: "setapiname", fn: (*Bot).capSetApiName},
 		stage{name: "setkironame", fn: (*Bot).capSetKiroName},
 		stage{name: "setmodelprice", fn: (*Bot).capSetModelPrice},
+		// The Fixed Pricing SKU's four wizards — also Go-only, in their
+		// CanonicalCaptureOrder slots right after setmodelprice.
+		stage{name: "setfixedprice", fn: (*Bot).capSetFixedPrice},
+		stage{name: "setfixedmin", fn: (*Bot).capSetFixedMin},
+		stage{name: "setfixedmax", fn: (*Bot).capSetFixedMax},
+		stage{name: "setfixedname", fn: (*Bot).capSetFixedName},
 	)
 	b.insertCapturesBefore("code",
 		stage{name: "discount", fn: (*Bot).capDiscount},
@@ -143,8 +150,11 @@ func validTierCode(code string) bool {
 // stored max", telegram_bot.py:18404).
 func (b *Bot) rawApikeyMaxCredits(saleClass string) int64 {
 	key, envKey, envDef := "apikey_max_credits", "APIKEY_MAX_CREDITS", int64(1000000)
-	if saleClass == saleClassKiro {
+	switch saleClass {
+	case saleClassKiro:
 		key, envKey = "kiro_apikey_max_credits", "KIRO_APIKEY_MAX_CREDITS"
+	case saleClassFixed:
+		key, envKey = "fixed_apikey_max_credits", "FIXED_APIKEY_MAX_CREDITS"
 	}
 	v := int64(0)
 	if f, ok := settingsNumber(b.settings(), key); ok {
@@ -919,6 +929,11 @@ func (b *Bot) cbApiPrice(cc *cbCtx) {
 	if !b.settingsSuperAdminOnly(cc) {
 		return
 	}
+	// Disarm every free-text pricing wizard before arming this one. A numeric
+	// capture pops EARLIER in the capture chain than the rename/model-price ones
+	// and ends the chain when it consumes the line, so a still-armed free-text
+	// wizard would survive to steal the admin's next message (armPricingFreeText).
+	armPricingFreeText(cc.st, wizNone)
 	cc.st.mu.Lock()
 	cc.st.SetApiPrice = true
 	cc.st.mu.Unlock()
@@ -1016,6 +1031,11 @@ func (b *Bot) cbApiMin(cc *cbCtx) {
 	if !b.settingsSuperAdminOnly(cc) {
 		return
 	}
+	// Disarm every free-text pricing wizard before arming this one. A numeric
+	// capture pops EARLIER in the capture chain than the rename/model-price ones
+	// and ends the chain when it consumes the line, so a still-armed free-text
+	// wizard would survive to steal the admin's next message (armPricingFreeText).
+	armPricingFreeText(cc.st, wizNone)
 	cc.st.mu.Lock()
 	cc.st.SetApiMin = true
 	cc.st.mu.Unlock()
@@ -1096,6 +1116,11 @@ func (b *Bot) cbApiMax(cc *cbCtx) {
 	if !b.settingsSuperAdminOnly(cc) {
 		return
 	}
+	// Disarm every free-text pricing wizard before arming this one. A numeric
+	// capture pops EARLIER in the capture chain than the rename/model-price ones
+	// and ends the chain when it consumes the line, so a still-armed free-text
+	// wizard would survive to steal the admin's next message (armPricingFreeText).
+	armPricingFreeText(cc.st, wizNone)
 	cc.st.mu.Lock()
 	cc.st.SetApiMax = true
 	cc.st.mu.Unlock()
@@ -1167,6 +1192,11 @@ func (b *Bot) cbApiCap(cc *cbCtx) {
 	if !b.settingsSuperAdminOnly(cc) {
 		return
 	}
+	// Disarm every free-text pricing wizard before arming this one. A numeric
+	// capture pops EARLIER in the capture chain than the rename/model-price ones
+	// and ends the chain when it consumes the line, so a still-armed free-text
+	// wizard would survive to steal the admin's next message (armPricingFreeText).
+	armPricingFreeText(cc.st, wizNone)
 	cc.st.mu.Lock()
 	cc.st.SetApiCap = true
 	cc.st.mu.Unlock()
@@ -1257,8 +1287,11 @@ func (b *Bot) capSetApiCap(c *Ctx) bool {
 // rejected value re-offers a button whose text matches the row the admin came
 // from.
 func apikeyNameRowLabel(saleClass string) (label, cb string) {
-	if saleClass == saleClassKiro {
+	switch saleClass {
+	case saleClassKiro:
 		return "🟣 Kiro product name", "adm:kironame"
+	case saleClassFixed:
+		return "⚡ Fixed product name", "adm:fixedname"
 	}
 	return "✏️ API product name", "adm:apiname"
 }
@@ -1281,15 +1314,21 @@ func (b *Bot) cbApikeyName(cc *cbCtx, saleClass string) {
 	// without it. Both rename wizards and the flat-price wizard go through that
 	// one helper so the exclusion is structural, not per-handler bookkeeping.
 	wizard := wizAPIName
-	if saleClass == saleClassKiro {
+	switch saleClass {
+	case saleClassKiro:
 		wizard = wizKiroName
+	case saleClassFixed:
+		wizard = wizFixedName
 	}
 	armPricingFreeText(cc.st, wizard)
 	// Header names WHICH SKU is being renamed — both wizards land on the same
 	// pricing menu, so a generic header would let an admin rename the wrong one.
 	def, header := apikeyDefaultNameBedrock, "✏️ BEDROCK PRODUCT DISPLAY NAME"
-	if saleClass == saleClassKiro {
+	switch saleClass {
+	case saleClassKiro:
 		def, header = apikeyDefaultNameKiro, "🟣 KIRO PRODUCT DISPLAY NAME"
+	case saleClassFixed:
+		def, header = apikeyDefaultNameFixed, "⚡ FIXED PRICING PRODUCT DISPLAY NAME"
 	}
 	text := header + "\nCurrent: " + b.apikeyProductName(saleClass) +
 		"\n(Display only — the buy menu, purchase screens and delivery message. " +
@@ -1303,6 +1342,9 @@ func (b *Bot) cbApiName(cc *cbCtx) { b.cbApikeyName(cc, saleClassBedrock) }
 
 // cbKiroName arms the kiro display-rename wizard — adm:kironame.
 func (b *Bot) cbKiroName(cc *cbCtx) { b.cbApikeyName(cc, saleClassKiro) }
+
+// cbFixedName arms the Fixed Pricing display-rename wizard — adm:fixedname.
+func (b *Bot) cbFixedName(cc *cbCtx) { b.cbApikeyName(cc, saleClassFixed) }
 
 // capSetApikeyName is the shared capture body for both rename wizards (POP
 // semantics, same as capSetApiMin). armed is read+cleared by the caller under
@@ -1323,8 +1365,11 @@ func (b *Bot) capSetApikeyName(c *Ctx, saleClass string) bool {
 	}
 	label, cb := apikeyNameRowLabel(saleClass)
 	key, def := saleClassBedrock, apikeyDefaultNameBedrock
-	if saleClass == saleClassKiro {
+	switch saleClass {
+	case saleClassKiro:
 		key, def = saleClassKiro, apikeyDefaultNameKiro
+	case saleClassFixed:
+		key, def = saleClassFixed, apikeyDefaultNameFixed
 	}
 	name := strings.TrimSpace(c.Text)
 	// A lone "-" DELETES the override (restores the built-in default) — the
@@ -1460,32 +1505,49 @@ const (
 	modelPricesCB    = "adm:modelprices"
 )
 
-// The pricing menu's THREE free-text wizard ids. Named constants rather than
+// The pricing menu's FOUR free-text wizard ids. Named constants rather than
 // bare literals so a typo in an arming call is a compile error instead of a
 // wizard that silently never arms.
 const (
 	wizAPIName       = "apiname"
 	wizKiroName      = "kironame"
+	wizFixedName     = "fixedname"
 	wizSetModelPrice = "setmodelprice"
+	// wizNone is the "arm none of them" sentinel, used by the NUMERIC pricing
+	// wizards to disarm every free-text arm before arming their own flag. It is
+	// deliberately a value no wizard id can equal, so every assignment below
+	// evaluates to false.
+	wizNone = ""
 )
 
-// armPricingFreeText arms exactly ONE of the pricing menu's free-text wizards
-// and disarms every other one, under a single state lock.
+// armPricingFreeText arms at most ONE of the pricing menu's free-text wizards
+// and disarms every other one, under a single state lock. Pass wizNone to
+// disarm all of them and arm none.
 //
-// Arming one MUST disarm the rest. All three buttons live in the same pricing
-// menu message and old copies of that message stay tappable, so an admin can
-// arm one, scroll up, and arm another without the first flag ever clearing.
-// Unlike the numeric wizards (which reject non-numeric input and self-correct),
-// these captures accept FREE TEXT, so a stale armed flag silently steals the
-// admin's NEXT unrelated plain-text line — publishing it as a SKU's
-// customer-visible name, or repricing a model. Centralising the exclusion here,
-// rather than making each handler remember to clear the others, is what keeps
-// that true as entries are added.
+// Arming ANY pricing wizard must disarm every free-text one. All of these
+// buttons live in the same pricing menu message and old copies of that message
+// stay tappable, so an admin can arm one, scroll up, and arm another without
+// the first flag ever clearing. The free-text captures accept ARBITRARY text,
+// so a stale free-text arm silently steals the admin's NEXT unrelated plain-text
+// line — publishing it as a SKU's customer-visible name, or repricing a model.
+//
+// A numeric wizard does NOT save the free-text arm from that. The capture chain
+// is an ordered list (captures.go CanonicalCaptureOrder) and the first stage
+// that consumes the line ENDS the chain: with, say, SetFixedName and SetFixedMin
+// both armed, capSetFixedMin pops first, eats the typed number, and returns —
+// leaving SetFixedName standing to steal the admin's next message. So the
+// numeric wizards route through here too (with wizNone) before setting their
+// own flag. Centralising the exclusion here, rather than making each handler
+// remember to clear the others, is what keeps that true as entries are added.
+//
+// (Go-only; no Python original — Python has no rename or per-model-price
+// wizard, so there is no canonical line to cite.)
 func armPricingFreeText(st *ChatState, wizard string) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.SetApiName = wizard == wizAPIName
 	st.SetKiroName = wizard == wizKiroName
+	st.SetFixedName = wizard == wizFixedName
 	st.SetModelPrice = wizard == wizSetModelPrice
 }
 
@@ -1732,9 +1794,10 @@ func (b *Bot) cbKiroToggle(cc *cbCtx) {
 			"Kiro-credit accounts are tagged, or keys will misroute/misbill."
 	}
 	b.send(cc.Ctx, cc.ChatID, note, nil)
-	// RE-RENDERS the pricing submenu in place — the ONLY handler in this
-	// whole category that does so (py_pricing_spec.md §5); every other
-	// action here sends a plain confirmation with a Back button instead.
+	// RE-RENDERS the pricing submenu in place — this and its Fixed Pricing
+	// twin cbFixedToggle (§6) are the only handlers in this whole category
+	// that do so (py_pricing_spec.md §5); every other action here sends a
+	// plain confirmation with a Back button instead.
 	title, rows, ok := b.adminCategoryMenu(cc.ChatID, "pricing")
 	if ok {
 		b.sendMenu(cc.Ctx, cc.ChatID, "🔑 "+title, rows)
@@ -1747,6 +1810,11 @@ func (b *Bot) cbKiroPrice(cc *cbCtx) {
 	if !b.settingsSuperAdminOnly(cc) {
 		return
 	}
+	// Disarm every free-text pricing wizard before arming this one. A numeric
+	// capture pops EARLIER in the capture chain than the rename/model-price ones
+	// and ends the chain when it consumes the line, so a still-armed free-text
+	// wizard would survive to steal the admin's next message (armPricingFreeText).
+	armPricingFreeText(cc.st, wizNone)
 	cc.st.mu.Lock()
 	cc.st.SetKiroPrice = true
 	cc.st.mu.Unlock()
@@ -1839,6 +1907,11 @@ func (b *Bot) cbKiroMin(cc *cbCtx) {
 	if !b.settingsSuperAdminOnly(cc) {
 		return
 	}
+	// Disarm every free-text pricing wizard before arming this one. A numeric
+	// capture pops EARLIER in the capture chain than the rename/model-price ones
+	// and ends the chain when it consumes the line, so a still-armed free-text
+	// wizard would survive to steal the admin's next message (armPricingFreeText).
+	armPricingFreeText(cc.st, wizNone)
 	cc.st.mu.Lock()
 	cc.st.SetKiroMin = true
 	cc.st.mu.Unlock()
@@ -1917,6 +1990,11 @@ func (b *Bot) cbKiroMax(cc *cbCtx) {
 	if !b.settingsSuperAdminOnly(cc) {
 		return
 	}
+	// Disarm every free-text pricing wizard before arming this one. A numeric
+	// capture pops EARLIER in the capture chain than the rename/model-price ones
+	// and ends the chain when it consumes the line, so a still-armed free-text
+	// wizard would survive to steal the admin's next message (armPricingFreeText).
+	armPricingFreeText(cc.st, wizNone)
 	cc.st.mu.Lock()
 	cc.st.SetKiroMax = true
 	cc.st.mu.Unlock()
@@ -1977,4 +2055,334 @@ func (b *Bot) capSetKiroMax(c *Ctx) bool {
 	}
 	b.send(c.Ctx, c.ChatID, "✅ Max KIRO credits per order set to "+commaInt(n)+".", admNav("admcat:pricing"))
 	return true
+}
+
+// ---- 6. Fixed Pricing SKU: fixedtoggle/fixedprice/fixedmin/fixedmax/fixedname
+//
+// The storefront half of the "fixed" sale class (kirogo.SaleClassFixed) — the
+// third mint SKU, product sentinel __fixedapi__. GO-ONLY: the class postdates
+// telegram_bot.py entirely, so there is no line to cite for any handler below
+// (same precedent as captures.go's "provpool"); every one is a structural copy
+// of its §5 Kiro twin — same super-admin gate, same arm-a-ChatState-flag /
+// POP-on-capture semantics, same validate-BEFORE-save ordering, same
+// save-then-audit ordering.
+//
+// UNIT WARNING: these five price the SKU in USDT PER 100 POOL CREDITS. They are
+// NOT the pool's per-model flat price card (§4c, adm:setmodelprice), which is
+// what one REQUEST costs a Fixed key in pool credits. Conflating them would
+// either give the shop away or price it into nonsense; they are different
+// quantities in different units that only happen to both be typed by an admin.
+
+// cbFixedToggle flips the Fixed Pricing SKU master switch — adm:fixedtoggle,
+// the twin of cbKiroToggle. The warnings are ADVISORY only (never block the
+// toggle): a Fixed key whose pool has no enabled fixed-class account, or no
+// flat price card for the models the customer calls, mints fine and then
+// refuses every request — so the warning fires whenever the toggle flips ON
+// while a prerequisite looks unmet.
+func (b *Bot) cbFixedToggle(cc *cbCtx) {
+	if !b.settingsSuperAdminOnly(cc) {
+		return
+	}
+	if b.cfg == nil {
+		b.send(cc.Ctx, cc.ChatID, settingsNotConfigured, admNav("admcat:pricing"))
+		return
+	}
+	s := b.cfg.Settings()
+	turningOn := !settingBool(s, "fixed_apikey_enabled", false)
+	s["fixed_apikey_enabled"] = turningOn
+	if err := b.cfg.SaveSettings(s); err != nil {
+		log.Println("adminpricing: save failed:", err)
+		// settingsSaveFailed, never settingsNotConfigured: b.cfg is non-nil
+		// (checked above) and settings ARE configured — only the disk write
+		// failed. See cbKiroToggle for the full reasoning.
+		b.send(cc.Ctx, cc.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
+		return
+	}
+	// Audit AFTER the save succeeds, never before (spec §4.3). This toggle
+	// opens/closes a real sale channel, so it gets a row like every other
+	// Tier 4 toggle.
+	b.auditConfigSet(fmtInt(cc.ChatID), "config_toggle_fixed_apikey_enabled", "fixed_apikey_enabled",
+		strconv.FormatBool(!turningOn), strconv.FormatBool(turningOn))
+	state := "OFF"
+	if turningOn {
+		state = "ON"
+	}
+	note := "⚡ Fixed Pricing SKU: " + state
+	if turningOn {
+		// BASE config only (URL + admin key). A fixed mint sends NO accountId
+		// — the client rejects one — so an unset account id is irrelevant here
+		// and naming it would send the admin off configuring the wrong thing.
+		if !b.kiroGoConfiguredBase() {
+			note += "\n⚠️ Kiro-Go URL/admin key not set — the product stays hidden until they are."
+		}
+		if b.apikeyRateUSDT(saleClassFixed) <= 0 {
+			note += "\n⚠️ Fixed pricing is 0 — set ⚡ Fixed pricing or the product stays hidden."
+		}
+		note += "\nℹ️ The pool needs at least one ENABLED fixed-class account and a per-model flat " +
+			"price (🧮 Set model flat price) for every model you sell, or the keys mint fine and " +
+			"then refuse every request."
+	}
+	b.send(cc.Ctx, cc.ChatID, note, nil)
+	// RE-RENDERS the pricing submenu in place, exactly like cbKiroToggle: the
+	// row this button sits on shows the live ON/OFF state, so leaving the old
+	// message up would show the state the admin just changed away from. These
+	// two toggles are the only handlers in this category that re-render
+	// (py_pricing_spec.md §5); every other action sends a plain confirmation
+	// with a Back button.
+	title, rows, ok := b.adminCategoryMenu(cc.ChatID, "pricing")
+	if ok {
+		b.sendMenu(cc.Ctx, cc.ChatID, "🔑 "+title, rows)
+	}
+}
+
+// cbFixedPrice arms the Fixed Pricing rate wizard — adm:fixedprice, the twin
+// of cbKiroPrice.
+func (b *Bot) cbFixedPrice(cc *cbCtx) {
+	if !b.settingsSuperAdminOnly(cc) {
+		return
+	}
+	// Disarm every free-text pricing wizard before arming this one. A numeric
+	// capture pops EARLIER in the capture chain than the rename/model-price ones
+	// and ends the chain when it consumes the line, so a still-armed free-text
+	// wizard would survive to steal the admin's next message (armPricingFreeText).
+	armPricingFreeText(cc.st, wizNone)
+	cc.st.mu.Lock()
+	cc.st.SetFixedPrice = true
+	cc.st.mu.Unlock()
+	priceLine := "OFF (not for sale)"
+	if cur := b.apikeyRateUSDT(saleClassFixed); cur > 0 {
+		priceLine = fmtRate(cur) + " USDT per 100 credits"
+	}
+	skuState := "OFF"
+	if b.fixedApikeyEnabled() {
+		skuState = "ON"
+	}
+	text := "⚡ FIXED PRICING — SHOP PRICE\nCurrent: " + priceLine + "\nSKU toggle: " + skuState +
+		"\n(This is what the SHOP charges for 100 credits. It is NOT the pool's per-model flat " +
+		"price — that is set in POOL CREDITS PER REQUEST under 🧮 Set model flat price.)\n\n" +
+		"Send the new USDT price per 100 credits (e.g. 1.5), or 0 to stop selling the Fixed SKU:"
+	b.send(cc.Ctx, cc.ChatID, text, backKB("admcat:pricing"))
+}
+
+// capSetFixedPrice is the "setfixedprice" capture (Go-only, POP semantics) —
+// the twin of capSetKiroPrice. No legacy per-1k mirror: this SKU postdates the
+// per-1k -> per-100 migration entirely.
+func (b *Bot) capSetFixedPrice(c *Ctx) bool {
+	c.st.mu.Lock()
+	armed := c.st.SetFixedPrice
+	c.st.SetFixedPrice = false
+	c.st.mu.Unlock()
+	if !armed {
+		return false
+	}
+	if strings.HasPrefix(c.Text, "/") || labelToCmd(c.Text) != "" {
+		return false
+	}
+	if !b.isSuperAdmin(c.ChatID) {
+		return true
+	}
+	raw := strings.ReplaceAll(strings.TrimSpace(c.Text), ",", ".")
+	rate, err := strconv.ParseFloat(raw, 64)
+	// Same NaN/Inf guard as the sibling price setters — a bare range check
+	// lets "NaN" slip through, since NaN compares false against every bound.
+	if err != nil || math.IsNaN(rate) || math.IsInf(rate, 0) {
+		rate = -1.0
+	}
+	if rate < 0 || rate > 10000 {
+		b.send(c.Ctx, c.ChatID,
+			"⚠️ Enter a price in USDT per 100 credits (e.g. 1.5), or 0 to disable.",
+			admNavRetry("admcat:pricing", "⚡ Fixed pricing", "adm:fixedprice"))
+		return true
+	}
+	if b.cfg != nil {
+		// Effective pre-change rate, captured BEFORE the write.
+		old := b.apikeyRateUSDT(saleClassFixed)
+		s := b.cfg.Settings()
+		s["fixed_apikey_usdt_per_100"] = rate
+		// A SaveSettings error must never be reported as the ✅ success text:
+		// that would tell the admin the SKU's literal sale price changed while
+		// the old rate stayed live.
+		if err := b.cfg.SaveSettings(s); err != nil {
+			log.Println("adminpricing: save failed:", err)
+			b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
+			return true
+		}
+		// Audit AFTER the save succeeds, never before (spec §4.3).
+		b.auditConfigSet(fmtInt(c.ChatID), "config_set_fixed_apikey_usdt_per_100", "fixed_apikey_usdt_per_100",
+			fmtRate(old), fmtRate(rate))
+	}
+	text := "✅ Fixed Pricing price set to " + fmtRate(rate) + " USDT per 100 credits."
+	if rate == 0 {
+		text = "✅ Fixed Pricing price turned OFF (price 0)."
+	}
+	if rate > 0 && !b.fixedApikeyEnabled() {
+		text += "\nℹ️ The ⚡ Fixed SKU toggle is still OFF — flip ⚡ Fixed SKU when ready."
+	}
+	if rate > 0 && !b.kiroGoConfiguredBase() {
+		text += "\n⚠️ Kiro-Go is not configured — set the URL and admin key too."
+	}
+	b.send(c.Ctx, c.ChatID, text, admNav("admcat:pricing"))
+	return true
+}
+
+// cbFixedMin arms the Fixed Pricing per-order floor wizard — adm:fixedmin.
+func (b *Bot) cbFixedMin(cc *cbCtx) {
+	if !b.settingsSuperAdminOnly(cc) {
+		return
+	}
+	// Disarm every free-text pricing wizard before arming this one. A numeric
+	// capture pops EARLIER in the capture chain than the rename/model-price ones
+	// and ends the chain when it consumes the line, so a still-armed free-text
+	// wizard would survive to steal the admin's next message (armPricingFreeText).
+	armPricingFreeText(cc.st, wizNone)
+	cc.st.mu.Lock()
+	cc.st.SetFixedMin = true
+	cc.st.mu.Unlock()
+	text := "⚡ FIXED PRICING — MIN CREDITS PER API KEY\nCurrent: " +
+		commaInt(int(b.apikeyMinCredits(saleClassFixed))) +
+		"\n(The smallest Fixed Pricing key a customer may buy. Must stay below the maximum, currently " +
+		commaInt(int(b.apikeyMaxCredits(saleClassFixed))) + ".)\n\n" +
+		"Send the new minimum (a whole number of credits), e.g. 100:"
+	b.send(cc.Ctx, cc.ChatID, text, backKB("admcat:pricing"))
+}
+
+// capSetFixedMin is the "setfixedmin" capture (Go-only, POP semantics) —
+// the twin of capSetKiroMin, floored against the RAW Fixed max
+// (rawApikeyMaxCredits) for the same reason: apikeyMaxCredits' own
+// max(min, v) floor would make this validator unable to ever reject.
+func (b *Bot) capSetFixedMin(c *Ctx) bool {
+	c.st.mu.Lock()
+	armed := c.st.SetFixedMin
+	c.st.SetFixedMin = false
+	c.st.mu.Unlock()
+	if !armed {
+		return false
+	}
+	if strings.HasPrefix(c.Text, "/") || labelToCmd(c.Text) != "" {
+		return false
+	}
+	if !b.isSuperAdmin(c.ChatID) {
+		return true
+	}
+	raw := stripThousandsSeps(c.Text)
+	n, err := strconv.Atoi(raw)
+	if !isAllDigits(raw) || err != nil || n < 1 {
+		b.send(c.Ctx, c.ChatID, "⚠️ Enter a whole number ≥ 1, e.g. 100.",
+			admNavRetry("admcat:pricing", "⚡ Fixed min credits", "adm:fixedmin"))
+		return true
+	}
+	mx := b.rawApikeyMaxCredits(saleClassFixed)
+	if int64(n) > mx {
+		b.send(c.Ctx, c.ChatID,
+			"⚠️ Minimum "+commaInt(n)+" is above the current maximum "+commaInt(int(mx))+
+				" — nothing would be buyable. Raise the maximum first, or pick a smaller minimum.",
+			admNavRetry("admcat:pricing", "⚡ Fixed max credits", "adm:fixedmax"))
+		return true
+	}
+	if b.cfg != nil {
+		// Effective pre-change floor, captured BEFORE it is overwritten.
+		old := b.apikeyMinCredits(saleClassFixed)
+		s := b.cfg.Settings()
+		s["fixed_apikey_min_credits"] = n
+		// A SaveSettings error must never be reported as success: the floor is
+		// the minimum a customer must spend to buy this SKU, so a silent
+		// failure would leave the old floor live while the admin believes they
+		// changed it.
+		if err := b.cfg.SaveSettings(s); err != nil {
+			log.Println("adminpricing: save failed:", err)
+			b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
+			return true
+		}
+		// Audit AFTER the save succeeds, never before (spec §4.3).
+		b.auditConfigSet(fmtInt(c.ChatID), "config_set_fixed_apikey_min_credits", "fixed_apikey_min_credits",
+			itoa64(old), itoa(n))
+	}
+	b.send(c.Ctx, c.ChatID,
+		"✅ Min Fixed Pricing credits per order set to "+commaInt(n)+".\nBuyable range is now "+
+			commaInt(n)+" – "+commaInt(int(mx))+" credits.",
+		admNav("admcat:pricing"))
+	return true
+}
+
+// cbFixedMax arms the Fixed Pricing per-order ceiling wizard — adm:fixedmax.
+func (b *Bot) cbFixedMax(cc *cbCtx) {
+	if !b.settingsSuperAdminOnly(cc) {
+		return
+	}
+	// Disarm every free-text pricing wizard before arming this one. A numeric
+	// capture pops EARLIER in the capture chain than the rename/model-price ones
+	// and ends the chain when it consumes the line, so a still-armed free-text
+	// wizard would survive to steal the admin's next message (armPricingFreeText).
+	armPricingFreeText(cc.st, wizNone)
+	cc.st.mu.Lock()
+	cc.st.SetFixedMax = true
+	cc.st.mu.Unlock()
+	text := "⚡ FIXED PRICING — MAX CREDITS PER API KEY\nCurrent: " +
+		commaInt(int(b.apikeyMaxCredits(saleClassFixed))) +
+		"\n(The biggest Fixed Pricing key a customer can buy. Minimum is " +
+		itoa64(b.apikeyMinCredits(saleClassFixed)) + ".)\n\n" +
+		"Send the new maximum (a whole number of credits), e.g. 100000:"
+	b.send(cc.Ctx, cc.ChatID, text, backKB("admcat:pricing"))
+}
+
+// capSetFixedMax is the "setfixedmax" capture (Go-only, POP semantics) — the
+// twin of capSetKiroMax, floored against the LIVE (already-floored)
+// apikeyMinCredits(saleClassFixed).
+func (b *Bot) capSetFixedMax(c *Ctx) bool {
+	c.st.mu.Lock()
+	armed := c.st.SetFixedMax
+	c.st.SetFixedMax = false
+	c.st.mu.Unlock()
+	if !armed {
+		return false
+	}
+	if strings.HasPrefix(c.Text, "/") || labelToCmd(c.Text) != "" {
+		return false
+	}
+	if !b.isSuperAdmin(c.ChatID) {
+		return true
+	}
+	raw := stripThousandsSeps(c.Text)
+	n, err := strconv.Atoi(raw)
+	minC := b.apikeyMinCredits(saleClassFixed)
+	if !isAllDigits(raw) || err != nil || int64(n) < minC {
+		b.send(c.Ctx, c.ChatID,
+			"⚠️ Enter a whole number ≥ "+itoa64(minC)+" (the per-order minimum).",
+			admNavRetry("admcat:pricing", "⚡ Fixed max credits", "adm:fixedmax"))
+		return true
+	}
+	if b.cfg != nil {
+		// Effective pre-change ceiling, captured BEFORE it is overwritten.
+		old := b.apikeyMaxCredits(saleClassFixed)
+		s := b.cfg.Settings()
+		s["fixed_apikey_max_credits"] = n
+		// A SaveSettings error must never be reported as success: raising the
+		// ceiling raises the loss ceiling of any other pricing error, so a
+		// silent failure would leave the admin believing the old (lower) cap is
+		// gone while it still holds.
+		if err := b.cfg.SaveSettings(s); err != nil {
+			log.Println("adminpricing: save failed:", err)
+			b.send(c.Ctx, c.ChatID, settingsSaveFailed, admNav("admcat:pricing"))
+			return true
+		}
+		// Audit AFTER the save succeeds, never before (spec §4.3).
+		b.auditConfigSet(fmtInt(c.ChatID), "config_set_fixed_apikey_max_credits", "fixed_apikey_max_credits",
+			itoa64(old), itoa(n))
+	}
+	b.send(c.Ctx, c.ChatID, "✅ Max Fixed Pricing credits per order set to "+commaInt(n)+".",
+		admNav("admcat:pricing"))
+	return true
+}
+
+// capSetFixedName is the "setfixedname" capture (Go-only, POP semantics) — the
+// third arm of the shared rename wizard, alongside capSetApiName/capSetKiroName.
+func (b *Bot) capSetFixedName(c *Ctx) bool {
+	c.st.mu.Lock()
+	armed := c.st.SetFixedName
+	c.st.SetFixedName = false
+	c.st.mu.Unlock()
+	if !armed {
+		return false
+	}
+	return b.capSetApikeyName(c, saleClassFixed)
 }

@@ -85,7 +85,8 @@ func (b *Bot) deliverApikey(ctx context.Context, order *store.Order, des string)
 		//               shared account credential until a background retry binds
 		//               it.
 		//   "skipped" — binding deliberately not attempted (ALWAYS the case for
-		//               a kiro mint, which sends skipUpstream:true).
+		//               a kiro or fixed mint, both of which send
+		//               skipUpstream:true — see apikeyBindsUpstream).
 		// In ALL THREE cases the customer-facing outcome is identical: deliver
 		// the key and complete the sale. Only a non-2xx (which surfaced as
 		// mintErr above) means the sale actually failed. Retrying on "pending"
@@ -97,10 +98,11 @@ func (b *Bot) deliverApikey(ctx context.Context, order *store.Order, des string)
 		// receive, store, log or forward one — any llmgate key can read the
 		// whole account's quota and spend.
 		if minted.UpstreamStatusAnomalous(saleClass) || minted.UpstreamStatus != kirogo.UpstreamStatusBound {
-			// Log only ANOMALOUS non-bound states: a kiro mint's "skipped" is its
-			// normal terminal status, and logging it would put one warning-shaped
-			// line on EVERY kiro sale (telegram_bot.py:7578-7584).
-			if !(saleClass == saleClassKiro && minted.UpstreamStatus == kirogo.UpstreamStatusSkipped) {
+			// Log only ANOMALOUS non-bound states: for a class that binds no
+			// upstream key, "skipped" is its normal terminal status and logging
+			// it would put one warning-shaped line on EVERY sale of that SKU
+			// (telegram_bot.py:7578-7584).
+			if apikeyBindsUpstream(saleClass) || minted.UpstreamStatus != kirogo.UpstreamStatusSkipped {
 				log.Printf("apikey mint upstream not bound [des=%s class=%s status=%s upstreamKeyId=%d] — pool key is live, delivering as normal",
 					des, saleClass, minted.UpstreamStatus, minted.UpstreamKeyID)
 			}
@@ -138,14 +140,18 @@ func (b *Bot) deliverApikey(ctx context.Context, order *store.Order, des string)
 			row = &store.APIKey{OrderID: des, ChatID: chatID, KeyID: minted.ID,
 				APIKey: minted.Key, Credits: float64(credits), SaleClass: minted.SaleClass}
 		}
-		// A BEDROCK sale that completed with NO upstream binding has no
+		// A sale of an UPSTREAM-BINDING class (bedrock/legacy — see
+		// apikeyBindsUpstream) that completed with NO upstream binding has no
 		// per-customer attribution and no independent kill switch — usually the
-		// configured account holds no llmgate credential. Alert, never block:
+		// configured account holds no llmgate credential. Kiro and fixed are
+		// excluded by that predicate, not by a local class literal: they skip
+		// binding by construction, so alerting on them would page the owners on
+		// every normal sale. Alert, never block:
 		// the customer's key is live and paid for. Fires AFTER the persist above
 		// on purpose — anything slow between a committed mint and the api_keys
 		// row reopens the double-mint window that row exists to close.
 		// _notify_owners — telegram_bot.py:7701-7711.
-		if saleClass != saleClassKiro &&
+		if apikeyBindsUpstream(saleClass) &&
 			minted.UpstreamStatus != kirogo.UpstreamStatusBound &&
 			minted.UpstreamStatus != kirogo.UpstreamStatusPending {
 			log.Printf("OWNER ALERT: API-KEY SOLD WITHOUT UPSTREAM BINDING [des=%s upstreamStatus=%s] — the key works and the sale is complete, but it has no per-customer llmgate binding; check the configured provisioning account holds the llmgate credential",
@@ -175,10 +181,7 @@ func (b *Bot) deliverApikey(ctx context.Context, order *store.Order, des string)
 	// off the STORED row, not the order, so a settle replay of a pre-split order
 	// (sale_class '') keeps its original bedrock message.
 	keyCls := apikeyKeyClass(row)
-	tmpl := c.Delivered
-	if keyCls == saleClassKiro {
-		tmpl = c.KiroDelivered
-	}
+	tmpl := apikeyDeliveredTemplate(c, keyCls)
 	base := html.EscapeString(b.kiroGoPublicURL())
 	// "name" is admin-typed text landing in a parse_mode=HTML message, so it is
 	// escaped like {key}/{base}: an unescaped `<` or `&` in a renamed SKU would
@@ -219,12 +222,20 @@ func (b *Bot) mintAPIKey(ctx context.Context, chatID int64, des string, credits 
 		Credits:   credits,
 		SaleClass: saleClass,
 	}
-	if saleClass != saleClassKiro {
-		// BEDROCK mint: accountId is PINNED (never omitted). The server resolves
-		// a missing one only while a single account holds upstream credentials
-		// and starts 400-ing "specify accountId" the moment a second one does.
-		// kiroGoConfigured() already hides the product when it is unset, so this
-		// is a defence-in-depth backstop, not the primary gate.
+	if apikeyBindsUpstream(saleClass) {
+		// BEDROCK/legacy mint: accountId is PINNED (never omitted). The server
+		// resolves a missing one only while a single account holds upstream
+		// credentials and starts 400-ing "specify accountId" the moment a
+		// second one does. kiroGoConfigured() already hides the product when it
+		// is unset, so this is a defence-in-depth backstop, not the primary
+		// gate.
+		//
+		// The gate is apikeyBindsUpstream, NOT `!= saleClassKiro`: the kirogo
+		// client REJECTS an accountId for both non-binding classes
+		// (ErrAccountIDForbiddenForKiro / ErrAccountIDForbiddenForFixed), so a
+		// "not kiro" test sends one on every FIXED mint and fails the sale
+		// client-side before the request is even made — auto-refunding the
+		// buyer on a product that was never broken.
 		acct := b.kiroGoConfig().AccountID
 		if acct == "" {
 			return nil, errKiroGoUnconfigured
@@ -232,9 +243,9 @@ func (b *Bot) mintAPIKey(ctx context.Context, chatID int64, des string, credits 
 		req.AccountID = acct
 		req.SkipUpstream = false
 	}
-	// KIRO mint needs no accountId and forces skipUpstream server-side — the
-	// kirogo client hardcodes both for that class (invariant 3b), so nothing
-	// extra is set here.
+	// A KIRO or FIXED mint needs no accountId and forces skipUpstream
+	// server-side — the kirogo client hardcodes both for those classes
+	// (invariant 3b), so nothing extra is set here.
 	res, err := client.ProvisionCustomer(ctx, req)
 	if err != nil {
 		return nil, err

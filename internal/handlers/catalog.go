@@ -23,9 +23,13 @@ import (
 // here so pending_guard + the expiry/cancel workers behave correctly when a
 // later slice's deposit/API-key order is the chat's pending order.
 const (
-	depositProduct        = store.DepositProduct // "__deposit__"
-	apikeyProduct         = "__apikey__"
-	kiroApikeyProduct     = "__kiroapi__"
+	depositProduct    = store.DepositProduct // "__deposit__"
+	apikeyProduct     = "__apikey__"
+	kiroApikeyProduct = "__kiroapi__"
+	// fixedApikeyProduct is the third mint SKU, "fixed" sale class (Go-only:
+	// the class postdates telegram_bot.py entirely, so there is no Python
+	// sentinel to cite — same precedent as captures.go's "provpool").
+	fixedApikeyProduct    = "__fixedapi__"
 	apikeyRechargeProduct = "__apikeyrc__"
 )
 
@@ -33,7 +37,7 @@ const (
 // twin of _NO_STOCK_PRODUCTS (telegram_bot.py:3803).
 func isNoStockProduct(product string) bool {
 	switch product {
-	case depositProduct, apikeyProduct, kiroApikeyProduct, apikeyRechargeProduct:
+	case depositProduct, apikeyProduct, kiroApikeyProduct, fixedApikeyProduct, apikeyRechargeProduct:
 		return true
 	}
 	return false

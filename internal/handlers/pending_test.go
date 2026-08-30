@@ -9,7 +9,7 @@ import (
 
 // customerClearFields / adminClearFields are the EXACT field sets
 // ClearCustomerPending / ClearAdminPending must touch (handlers-go.md §3: 8
-// customer slots, 46 admin slots). TestClearListsExact asserts the code clears
+// customer slots, 52 admin slots). TestClearListsExact asserts the code clears
 // precisely these — a new slot added to one clear method but not the expected
 // list (or vice versa) fails the test, mirroring the Python "sibling captures
 // never collide" invariant.
@@ -26,6 +26,7 @@ var adminClearFields = []string{
 	"EditFile", "RmProd", "Entra", "SetBep20", "SetTron",
 	"SetApiPrice", "SetApiMin", "SetApiMax", "SetKiroPrice", "SetKiroMin",
 	"SetKiroMax", "SetApiCap", "SetApiName", "SetKiroName", "SetModelPrice",
+	"SetFixedPrice", "SetFixedMin", "SetFixedMax", "SetFixedName",
 	"SetKiroKey", "SetKiroURL", "SetKiroAcct",
 	"ProvPool", "SetMaxQty", "RefundReject",
 	"EntraDomains", "EntraVerifyCSV", "RefundDelete",
@@ -105,10 +106,12 @@ func TestClearListsExact(t *testing.T) {
 	if len(customerClearFields) != 8 {
 		t.Errorf("expected 8 customer clear fields, have %d", len(customerClearFields))
 	}
-	// 48 = the 45 Python-derived admin pendings + the three Go-only flags: the
-	// two SKU display-rename wizards (SetApiName / SetKiroName) and the Fixed
-	// Pricing flat-price wizard (SetModelPrice).
-	if len(adminClearFields) != 48 {
-		t.Errorf("expected 48 admin clear fields, have %d", len(adminClearFields))
+	// 52 = the 45 Python-derived admin pendings + the seven Go-only flags: the
+	// two SKU display-rename wizards (SetApiName / SetKiroName), the Fixed
+	// Pricing per-model flat-price wizard (SetModelPrice), and the Fixed
+	// Pricing SKU's own four (SetFixedPrice / SetFixedMin / SetFixedMax /
+	// SetFixedName).
+	if len(adminClearFields) != 52 {
+		t.Errorf("expected 52 admin clear fields, have %d", len(adminClearFields))
 	}
 }

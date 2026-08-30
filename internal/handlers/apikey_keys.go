@@ -110,14 +110,17 @@ func (b *Bot) showMyAPIKeys(ctx context.Context, chatID int64, lang i18n.Lang) {
 		}
 		// SKU tag: the STORED class wins; a legacy '' row falls back to the LIVE
 		// stats row's class, and only then to the bedrock default — so an
-		// operator who classed a legacy key kiro server-side still sees it
+		// operator who classed a legacy key kiro/fixed server-side still sees it
 		// labelled (and unit-labelled) correctly here (telegram_bot.py:4340-4342).
 		// DISPLAY ONLY: the recharge guard must keep reading the raw stored value.
 		rowCls := k.SaleClass
 		if rowCls == "" && stat != nil {
 			rowCls = stat.SaleClass
 		}
-		if rowCls != saleClassKiro {
+		// Collapse anything unrecognised onto bedrock, exactly as
+		// apikeyKeyClass does — an unknown class would otherwise index SkuTag
+		// with a missing key and render an EMPTY tag.
+		if rowCls != saleClassKiro && rowCls != saleClassFixed {
 			rowCls = saleClassBedrock
 		}
 		tag := c.SkuTag[rowCls].T(lang)
@@ -219,13 +222,12 @@ func (b *Bot) cbApikeyRev(cc *cbCtx) {
 	if row.RefundedTS != nil {
 		return
 	}
-	// SKU-correct wording/units: a kiro key re-reveals with the kiro delivery
-	// message, everything else (bedrock + legacy '') the bedrock one.
+	// SKU-correct wording/units: a kiro/fixed key re-reveals with its own
+	// delivery message, everything else (bedrock + legacy '') the bedrock one.
+	// Shared with the first delivery via apikeyDeliveredTemplate so the two
+	// renders of one key can never disagree.
 	keyCls := apikeyKeyClass(row)
-	tmpl := c.Delivered
-	if keyCls == saleClassKiro {
-		tmpl = c.KiroDelivered
-	}
+	tmpl := apikeyDeliveredTemplate(c, keyCls)
 	// "name" (admin-renameable display name) must be passed here too, not only
 	// on the first delivery: this re-send uses the SAME template, so omitting
 	// it would leak a literal "{name}" into the customer's message. HTML-escaped

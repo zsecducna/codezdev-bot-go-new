@@ -42,6 +42,19 @@ var CanonicalCaptureOrder = []string{
 	// sibling API-key/pricing wizards and ahead of "setkirourl", because order
 	// is the contract: the chain must stay an in-order subsequence of this list.
 	"setmodelprice", // (Go-only) pop
+	// setfixedprice/setfixedmin/setfixedmax/setfixedname (NEW — no Python
+	// original): the Fixed Pricing SKU's own price / per-order bounds /
+	// display-name wizards (adm:fixedprice / adm:fixedmin / adm:fixedmax /
+	// adm:fixedname, adminpricing.go). Structural twins of the setkiro* trio
+	// plus setkironame above; the "fixed" sale class postdates
+	// telegram_bot.py, so there is no canonical line to cite. They sit here
+	// with their sibling API-key pricing wizards and ahead of "setkirourl",
+	// because order is the contract: the chain must stay an in-order
+	// subsequence of this list.
+	"setfixedprice", // (Go-only) pop
+	"setfixedmin",   // (Go-only) pop
+	"setfixedmax",   // (Go-only) pop
+	"setfixedname",  // (Go-only) pop
 	"setkirourl",    // 18 @17895 (S) pop
 	"setkirokey",    // 19 @17927 (S) pop
 	"setkiroacct",   // 20 @17953 (S) pop

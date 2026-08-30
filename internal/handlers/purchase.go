@@ -32,6 +32,8 @@ func pendingProductDisplay(product string) string {
 		return "🔑 API credits"
 	case kiroApikeyProduct:
 		return "🟣 Kiro API credits"
+	case fixedApikeyProduct:
+		return "⚡ Fixed Pricing API credits"
 	case apikeyRechargeProduct:
 		return "🔁 API credits top-up"
 	}

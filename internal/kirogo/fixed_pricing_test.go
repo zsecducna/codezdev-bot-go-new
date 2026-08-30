@@ -104,3 +104,33 @@ func TestSetModelPriceSendsExplicitZero(t *testing.T) {
 		t.Fatal("response not decoded")
 	}
 }
+
+// A fixed mint always answers upstreamStatus "skipped" (the client hardcodes
+// skipUpstream:true for the class), so "skipped" is its NORMAL terminal state
+// and must not read as anomalous — an anomalous verdict pages the bot's owners
+// on every single fixed sale. Anything else IS anomalous for the class,
+// exactly as for kiro.
+func TestUpstreamStatusAnomalousFixed(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		want   bool
+	}{
+		{UpstreamStatusSkipped, false},
+		{UpstreamStatusBound, true},
+		{UpstreamStatusPending, true},
+		{"", true},
+	} {
+		r := ProvisionCustomerResponse{UpstreamStatus: tc.status}
+		if got := r.UpstreamStatusAnomalous(SaleClassFixed); got != tc.want {
+			t.Errorf("UpstreamStatusAnomalous(fixed) for %q = %v, want %v", tc.status, got, tc.want)
+		}
+		// The sibling classes must keep their existing verdicts — the fixed
+		// arm was added to the skip-EXPECTED branch, not swapped for one.
+		if got := r.UpstreamStatusAnomalous(SaleClassKiro); got != tc.want {
+			t.Errorf("UpstreamStatusAnomalous(kiro) for %q = %v, want %v", tc.status, got, tc.want)
+		}
+		if got := r.UpstreamStatusAnomalous(SaleClassBedrock); got != (tc.status == UpstreamStatusSkipped) {
+			t.Errorf("UpstreamStatusAnomalous(bedrock) for %q = %v", tc.status, got)
+		}
+	}
+}

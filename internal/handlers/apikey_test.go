@@ -539,8 +539,9 @@ func TestApikeyMintKiroPayload(t *testing.T) {
 }
 
 // TestApikeyMintPendingIsSuccess: upstreamStatus "pending" (bedrock) and
-// "skipped" (kiro) are BOTH terminal successes — the key is delivered, the
-// order closes, and nothing is retried or refunded.
+// "skipped" (kiro/fixed, which bind no upstream key at all) are ALL terminal
+// successes — the key is delivered, the order closes, and nothing is retried
+// or refunded.
 func TestApikeyMintPendingIsSuccess(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
@@ -548,12 +549,15 @@ func TestApikeyMintPendingIsSuccess(t *testing.T) {
 	}{
 		{"bedrock/pending", apikeyProduct, "pending"},
 		{"kiro/skipped", kiroApikeyProduct, "skipped"},
+		{"fixed/skipped", fixedApikeyProduct, "skipped"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b, f, st, fk, dir := newAPIKeyBot(t)
 			s := apikeySettings(fk)
 			s["kiro_apikey_enabled"] = true
 			s["kiro_apikey_usdt_per_100"] = 1.0
+			s["fixed_apikey_enabled"] = true
+			s["fixed_apikey_usdt_per_100"] = 1.5
 			writeSettings(t, dir, s)
 			fk.UpstreamStatus = tc.upstream
 			const chat, des = 100, "dddd0000dddd0000dddd0000dddd0000"

@@ -170,15 +170,33 @@ func (r ProvisionCustomerResponse) IsUpstreamSkipped() bool {
 
 // UpstreamStatusAnomalous reports whether UpstreamStatus is unexpected for
 // the given sale class — an operator-alert signal only, NEVER a failure
-// signal (Deliverable() already covers that). For SaleClassKiro, anything
-// other than "skipped" is anomalous (a kiro mint should always skip upstream
-// binding by construction). For bedrock/legacy ("" or SaleClassBedrock),
-// "skipped" is anomalous — a bedrock mint should bind or defer-bind, never
-// skip; a caller seeing this should alert the owners the same way the
-// Python bot does (telegram_bot.py:7572-7587) even though the sale itself
-// still completes normally.
+// signal (Deliverable() already covers that).
+//
+// For the two classes that bind NO per-customer upstream key —
+// SaleClassKiro and SaleClassFixed, both of which ProvisionCustomer sends
+// with skipUpstream:true — anything other than "skipped" is anomalous: they
+// skip upstream binding by construction, so a "bound"/"pending" answer means
+// the server routed the mint somewhere the bot did not expect. For
+// bedrock/legacy ("" or SaleClassBedrock), the reverse holds: "skipped" is
+// anomalous — a bedrock mint should bind or defer-bind, never skip; a caller
+// seeing this should alert the owners the same way the Python bot does
+// (telegram_bot.py:7572-7587) even though the sale itself still completes
+// normally.
+//
+// This method is the class-aware contract for "is this upstream status the
+// expected one for this sale class", and nothing more. Fixed was previously
+// missing from the skip-expected arm, so a fixed mint's perfectly normal
+// "skipped" was reported here as an anomaly.
+//
+// It is worth being precise about what that did and did not cause, because the
+// two defects shipped together and are easy to conflate: the OWNER-PAGING bug
+// was a SEPARATE, bot-side defect, fixed by gating the alert on
+// apikeyBindsUpstream(saleClass) (internal/handlers/apikey_deliver.go). This
+// method's result never drove that alert. The class check belongs here, in the
+// one class-aware method, rather than in each caller's own literal — that is
+// what let the omission slip through in the first place.
 func (r ProvisionCustomerResponse) UpstreamStatusAnomalous(saleClass string) bool {
-	if saleClass == SaleClassKiro {
+	if saleClass == SaleClassKiro || saleClass == SaleClassFixed {
 		return r.UpstreamStatus != UpstreamStatusSkipped
 	}
 	return r.UpstreamStatus == UpstreamStatusSkipped
@@ -195,8 +213,13 @@ func (r ProvisionCustomerResponse) UpstreamStatusAnomalous(saleClass string) boo
 //     hardcoded true on the wire regardless of req.SkipUpstream, exactly like
 //     tokenLimit is hardcoded 0 — these are invariants of the class, not
 //     caller-tunable knobs.
+//   - SaleClassFixed: same shape as kiro. accountId must NOT be set
+//     (ErrAccountIDForbiddenForFixed if req.AccountID is non-empty) and is
+//     never sent — Fixed Pricing capacity is a pooled account that rotates its
+//     own vendor keys, so there is no per-customer upstream key to bind;
+//     skipUpstream is likewise hardcoded true on the wire.
 //
-// tokenLimit is hardcoded 0 in BOTH branches (invariant 3).
+// tokenLimit is hardcoded 0 in EVERY branch (invariant 3).
 func (c *Client) ProvisionCustomer(ctx context.Context, req ProvisionCustomerRequest) (*ProvisionCustomerResponse, error) {
 	// Client-side validation BEFORE any HTTP call (invariant 3): a credits<=0
 	// or misconfigured-account-id request must fail cheaply and locally, not
