@@ -72,7 +72,7 @@ func TestNotifyAdminSaleGatedByToggle(t *testing.T) {
 	b, f, _, _, _ := newBuyBot(t, "999")
 	const buyer = 4242
 
-	b.notifyAdminSale(ctx, buyer, "Bedrock API Credits", "API", 500, 500000, "des-on")
+	b.notifyAdminSale(ctx, buyer, "API Credits", "API", 500, 500000, "des-on")
 	if n := countContains(f, "NEW SALE"); n != 1 {
 		t.Fatalf("default (unset) admin_sale_notify: got %d NEW SALE alert(s), want 1", n)
 	}
@@ -83,7 +83,7 @@ func TestNotifyAdminSaleGatedByToggle(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Sends = nil
-	b.notifyAdminSale(ctx, buyer, "Bedrock API Credits", "API", 500, 500000, "des-off")
+	b.notifyAdminSale(ctx, buyer, "API Credits", "API", 500, 500000, "des-off")
 	if n := countContains(f, "NEW SALE"); n != 0 {
 		t.Fatalf("admin_sale_notify=false: got %d NEW SALE alert(s), want 0 (toggle OFF must be silent)", n)
 	}
@@ -96,7 +96,7 @@ func TestNotifyAdminSaleGatedByToggle(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Sends = nil
-	b.notifyAdminSale(ctx, buyer, "Bedrock API Credits", "API", 500, 500000, "des-absent")
+	b.notifyAdminSale(ctx, buyer, "API Credits", "API", 500, 500000, "des-absent")
 	if n := countContains(f, "NEW SALE"); n != 1 {
 		t.Fatalf("absent admin_sale_notify key: got %d NEW SALE alert(s), want 1 (an absent key must default to ON, not silently OFF)", n)
 	}

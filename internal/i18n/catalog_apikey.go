@@ -371,7 +371,10 @@ func buildAPIKeyCatalog() APIKeyCatalog {
 		},
 		// APIKEY_SKU_TAG (telegram_bot.py:4085).
 		SkuTag: map[string]Str{
-			"bedrock": {EN: "🔷 Bedrock", VI: "🔷 Bedrock", ZH: "🔷 Bedrock"},
+			// "🔷 Bedrock" → "🔷 API" (operator 2026-10-10): no customer-facing
+			// screen may print "Bedrock" anymore. The map KEY stays the internal
+			// sale-class wire value.
+			"bedrock": {EN: "🔷 API", VI: "🔷 API", ZH: "🔷 API"},
 			"kiro":    {EN: "🟣 Kiro", VI: "🟣 Kiro", ZH: "🟣 Kiro"},
 			// Go-only, keyed by kirogo.SaleClassFixed's wire value.
 			"fixed": {EN: "⚡ Fixed", VI: "⚡ Fixed", ZH: "⚡ Fixed"},

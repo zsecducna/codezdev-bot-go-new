@@ -35,27 +35,30 @@ var nameRenderArgs = []string{
 // preChangeBtn … preChangeKiroDelivered are the catalog values EXACTLY as they
 // were before {name} was introduced, product name literal included. They must
 // never be "refreshed" from the catalog — the moment they are, this file stops
-// guarding anything.
+// guarding anything. ONE sanctioned exception: the bedrock literals below were
+// re-pinned once, on the 2026-10-10 operator decision that renamed the default
+// display name "Bedrock API Credits" → "API Credits" (no screen may print
+// "Bedrock"); the pinned baseline is the NEW shipped text, byte-for-byte.
 var (
 	preChangeBtn = i18n.Str{
-		EN: "🔑 Bedrock API Credits — {rate}/100 credits",
-		VI: "🔑 Bedrock API Credits — {rate}/100 credits",
-		ZH: "🔑 Bedrock API Credits — {rate}/100 credits",
+		EN: "🔑 API Credits — {rate}/100 credits",
+		VI: "🔑 API Credits — {rate}/100 credits",
+		ZH: "🔑 API Credits — {rate}/100 credits",
 	}
 	preChangePrompt = i18n.Str{
-		EN: "🔑 BUY BEDROCK API CREDITS\nPrice: {rate} / 100 credits\nMinimum: {min} credits\nYour balance: {balance}\n{opus}\nType how many credits you want (e.g. 7500):",
-		VI: "🔑 MUA BEDROCK API CREDITS\nGiá: {rate} / 100 credits\nTối thiểu: {min} credits\nSố dư của bạn: {balance}\n{opus}\nNhập số credits bạn muốn mua (ví dụ 7500):",
-		ZH: "🔑 购买 BEDROCK API CREDITS\n价格：{rate} / 100 credits\n最低：{min} credits\n您的余额：{balance}\n{opus}\n请输入要购买的 credits 数量（例如 7500）：",
+		EN: "🔑 BUY API CREDITS\nPrice: {rate} / 100 credits\nMinimum: {min} credits\nYour balance: {balance}\n{opus}\nType how many credits you want (e.g. 7500):",
+		VI: "🔑 MUA API CREDITS\nGiá: {rate} / 100 credits\nTối thiểu: {min} credits\nSố dư của bạn: {balance}\n{opus}\nNhập số credits bạn muốn mua (ví dụ 7500):",
+		ZH: "🔑 购买 API CREDITS\n价格：{rate} / 100 credits\n最低：{min} credits\n您的余额：{balance}\n{opus}\n请输入要购买的 credits 数量（例如 7500）：",
 	}
 	preChangePayPrompt = i18n.Str{
-		EN: "🧾 🔑 Bedrock API Credits — {credits} credits\nPrice: {rate} / 100 credits\nTotal: {total}\n\nYour balance: {balance}\nChoose a payment method:",
-		VI: "🧾 🔑 Bedrock API Credits — {credits} credits\nĐơn giá: {rate} / 100 credits\nThành tiền: {total}\n\nSố dư của bạn: {balance}\nChọn cách thanh toán:",
-		ZH: "🧾 🔑 Bedrock API Credits — {credits} credits\n价格：{rate} / 100 credits\n总计：{total}\n\n您的余额：{balance}\n请选择支付方式：",
+		EN: "🧾 🔑 API Credits — {credits} credits\nPrice: {rate} / 100 credits\nTotal: {total}\n\nYour balance: {balance}\nChoose a payment method:",
+		VI: "🧾 🔑 API Credits — {credits} credits\nĐơn giá: {rate} / 100 credits\nThành tiền: {total}\n\nSố dư của bạn: {balance}\nChọn cách thanh toán:",
+		ZH: "🧾 🔑 API Credits — {credits} credits\n价格：{rate} / 100 credits\n总计：{total}\n\n您的余额：{balance}\n请选择支付方式：",
 	}
 	preChangeDelivered = i18n.Str{
-		EN: "✅ Your Bedrock API Credits are ready — {credits} credits\n\n🔑 Your API key (tap to copy):\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 Send it as header: <code>Authorization: Bearer &lt;your key&gt;</code>\n\n👉 <b>How to use it</b>\n📊 Dashboard — track your quota:\n{base}/\n📖 API docs + client setup (Claude Code, Codex, curl):\n{base}/docs\n🧠 Models &amp; pricing:\n{base}/models\n\n⚠️ Keep this key secret — anyone holding it can spend your credits. You can view it again anytime: Self-Service → 🔑 My API Keys.",
-		VI: "✅ Bedrock API Credits của bạn đã sẵn sàng — {credits} credits\n\n🔑 API key của bạn (chạm để sao chép):\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 Gửi kèm header: <code>Authorization: Bearer &lt;key của bạn&gt;</code>\n\n👉 <b>Hướng dẫn sử dụng</b>\n📊 Bảng điều khiển — theo dõi hạn mức:\n{base}/\n📖 Tài liệu API + cách cài đặt (Claude Code, Codex, curl):\n{base}/docs\n🧠 Danh sách model &amp; bảng giá:\n{base}/models\n\n⚠️ Giữ kín key này — ai có nó là dùng được credits của bạn. Xem lại bất cứ lúc nào: Tự phục vụ → 🔑 API key của tôi.",
-		ZH: "✅ 您的 Bedrock API Credits 已就绪 — {credits} credits\n\n🔑 您的 API key（点击复制）：\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 请求头：<code>Authorization: Bearer &lt;您的 key&gt;</code>\n\n👉 <b>使用指南</b>\n📊 控制台 — 查询余量：\n{base}/\n📖 API 文档 + 客户端配置（Claude Code、Codex、curl）：\n{base}/docs\n🧠 模型与价格：\n{base}/models\n\n⚠️ 请妥善保管此 key — 任何持有者都能消耗您的 credits。随时可再次查看：自助服务 → 🔑 我的 API Key。",
+		EN: "✅ Your API Credits are ready — {credits} credits\n\n🔑 Your API key (tap to copy):\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 Send it as header: <code>Authorization: Bearer &lt;your key&gt;</code>\n\n👉 <b>How to use it</b>\n📊 Dashboard — track your quota:\n{base}/\n📖 API docs + client setup (Claude Code, Codex, curl):\n{base}/docs\n🧠 Models &amp; pricing:\n{base}/models\n\n⚠️ Keep this key secret — anyone holding it can spend your credits. You can view it again anytime: Self-Service → 🔑 My API Keys.",
+		VI: "✅ API Credits của bạn đã sẵn sàng — {credits} credits\n\n🔑 API key của bạn (chạm để sao chép):\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 Gửi kèm header: <code>Authorization: Bearer &lt;key của bạn&gt;</code>\n\n👉 <b>Hướng dẫn sử dụng</b>\n📊 Bảng điều khiển — theo dõi hạn mức:\n{base}/\n📖 Tài liệu API + cách cài đặt (Claude Code, Codex, curl):\n{base}/docs\n🧠 Danh sách model &amp; bảng giá:\n{base}/models\n\n⚠️ Giữ kín key này — ai có nó là dùng được credits của bạn. Xem lại bất cứ lúc nào: Tự phục vụ → 🔑 API key của tôi.",
+		ZH: "✅ 您的 API Credits 已就绪 — {credits} credits\n\n🔑 您的 API key（点击复制）：\n<code>{key}</code>\n\n📍 Base URL: <code>{base}</code>\n🔐 请求头：<code>Authorization: Bearer &lt;您的 key&gt;</code>\n\n👉 <b>使用指南</b>\n📊 控制台 — 查询余量：\n{base}/\n📖 API 文档 + 客户端配置（Claude Code、Codex、curl）：\n{base}/docs\n🧠 模型与价格：\n{base}/models\n\n⚠️ 请妥善保管此 key — 任何持有者都能消耗您的 credits。随时可再次查看：自助服务 → 🔑 我的 API Key。",
 	}
 	preChangeKiroBtn = i18n.Str{
 		EN: "🟣 Kiro Credits API — {rate}/100 Kiro credits",
@@ -213,7 +216,7 @@ func TestApikeyRenameReachesCustomerScreens(t *testing.T) {
 	if !sellable || len(rows) < 2 {
 		t.Fatalf("buy rows = %v (sellable=%v), want both priced SKU rows", rows, sellable)
 	}
-	if got := rows[0][0].Text; !strings.Contains(got, "Nebula Credits") || strings.Contains(got, "Bedrock API Credits") {
+	if got := rows[0][0].Text; !strings.Contains(got, "Nebula Credits") || strings.Contains(got, "API Credits") {
 		t.Errorf("bedrock buy row = %q, want the renamed SKU", got)
 	}
 	if got := rows[1][0].Text; !strings.Contains(got, apikeyDefaultNameKiro) {
@@ -392,7 +395,7 @@ func TestApikeyOwnerAlertUsesStoredRowClassNotOrderClass(t *testing.T) {
 		t.Fatal("delivery must succeed on an already-minted row")
 	}
 	delivered := lastSendMsgTo(f, chat)
-	if delivered == nil || !strings.Contains(delivered.Text, "Your Bedrock API Credits are ready") {
+	if delivered == nil || !strings.Contains(delivered.Text, "Your API Credits are ready") {
 		t.Fatalf("delivery message = %v, want the BEDROCK template (unclassed row collapses to bedrock)", delivered)
 	}
 	alert := lastSendMsgTo(f, 999)

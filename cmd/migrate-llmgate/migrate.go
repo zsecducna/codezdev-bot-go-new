@@ -4,21 +4,26 @@
 // Kiro-Go, mint an llmgate.app key carrying exactly those credits, verify
 // the mint against llmgate, and commit the row's migration through
 // store.MigrateAPIKeyToLlmgate — the store's idempotent, race-safe commit
-// point.
+// point. Rows the plan classifies as EXHAUSTED (remaining <= 0) are a
+// separate act-phase branch (business rule 2026-10-10): no mint, and under
+// -apply their pool key is DELETED instead (deleteExhaustedPoolKey below).
 //
 // The run is two-phase on purpose: a PLAN phase (reads only — pool stats +
 // classification + a printed plan) followed, in -apply mode only, by an ACT
-// phase (mint → verify → commit, per row). Sharing the plan phase between
-// dry run and apply means a dry run prints exactly what an apply would do,
-// from the same stats read, with zero second implementation to drift.
+// phase (mint → verify → commit, per row; delete for exhausted rows).
+// Sharing the plan phase between dry run and apply means a dry run prints
+// exactly what an apply would do, from the same stats read, with zero
+// second implementation to drift.
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -39,7 +44,9 @@ type Migrator struct {
 	// are called on it.
 	Store *store.Store
 	// Pool is the Kiro-Go admin client used for the live remaining-credit
-	// read (Stats). Pool keys are NEVER revoked by this tool.
+	// read (Stats) and — for exhausted rows only, under -apply — the
+	// best-effort key deletion (DeleteAPIKey). Healthy pool keys are NEVER
+	// revoked by this tool.
 	Pool *kirogo.Client
 	// Gate is the llmgate.app client used to mint (CreateKey) and verify
 	// (KeyStats) the replacement keys.
@@ -87,7 +94,8 @@ type Counts struct {
 	// non-finite value) — fail-closed, row left untouched.
 	SkippedStats int
 	// SkippedExhausted: remaining <= 0, or so small it rounds below the
-	// 0.01 mint floor — nothing worth carrying to llmgate.
+	// 0.01 mint floor — nothing worth carrying to llmgate. Under -apply
+	// these rows' pool keys are DELETED (deleteExhaustedPoolKey).
 	SkippedExhausted int
 	// SkippedUnlimited: remaining == -1 — unlimited keys must be
 	// hand-migrated; never mint an unlimited llmgate key by tool.
@@ -102,14 +110,20 @@ type Counts struct {
 	// row is migrated by someone else; the just-minted key is ORPHANED and
 	// CRITICAL-logged with its id.
 	SkippedRace int
+	// FailedExhaustedDelete: an exhausted row's pool key deletion failed
+	// with anything other than 404 (business rule 2026-10-10). The row is
+	// still counted SkippedExhausted above; this bucket only says a pool
+	// key the rule wants GONE is still live. Never aborts the run.
+	FailedExhaustedDelete int
 }
 
-// FailureCount is the exit-code input: the three buckets that leave either
-// an unmigrated row or an orphaned/unrecorded llmgate key behind. Zero
-// means every row ended migrated, deliberately skipped, or fail-closed
-// BEFORE anything was minted.
+// FailureCount is the exit-code input: the four buckets that leave either
+// an unmigrated row, an orphaned/unrecorded llmgate key, or an exhausted
+// pool key that should have been deleted behind. Zero means every row ended
+// migrated, deliberately skipped, or fail-closed BEFORE anything was minted
+// (and every exhausted pool key is verifiably gone).
 func (c Counts) FailureCount() int {
-	return c.FailedMint + c.FailedVerify + c.SkippedRace
+	return c.FailedMint + c.FailedVerify + c.SkippedRace + c.FailedExhaustedDelete
 }
 
 // skipReason buckets a plan-phase skip; the empty string means "plannable".
@@ -250,7 +264,17 @@ func (m *Migrator) Run(ctx context.Context, apply bool, limit int, chatID int64)
 	// ---- end journal open ---------------------------------------------------
 
 	// ---- ACT PHASE: mint → verify → commit, per plannable row ------------
+	// (plus, first, the exhausted-row deletes the 2026-10-10 rule adds.)
 	for _, pr := range plans {
+		// EXHAUSTED rows do not migrate — but under -apply their pool key
+		// must be DELETED (business rule 2026-10-10). This is act-phase
+		// work on purpose: the plan phase stays read-only so a dry run
+		// deletes nothing, and the deletes land only after the operator's
+		// Ctrl-C window. Best-effort: failures count, never abort.
+		if pr.Skip == skipExhausted {
+			m.deleteExhaustedPoolKey(ctx, pr, &c)
+			continue
+		}
 		if pr.Skip != skipNone {
 			continue // already bucketed + printed by the plan phase
 		}
@@ -298,11 +322,13 @@ func (m *Migrator) planRow(ctx context.Context, row *store.APIKey) planRow {
 	}
 
 	// STEP 3 — exhausted (or negative, which the pool never sends but the
-	// maths below should never silently honor): nothing to carry.
+	// maths below should never silently honor): nothing to carry. Under
+	// -apply the row's pool key is DELETED too (2026-10-10 rule), so the
+	// plan line announces the DELETE rather than a plain skip.
 	remaining := float64(stat.CreditsRemaining)
 	if remaining <= 0 {
 		why := fmt.Sprintf("exhausted (remaining=%.2f)", remaining)
-		m.planSkipLine(row, skipExhausted, why)
+		m.planDeleteExhaustedLine(row, why)
 		return planRow{Row: row, Skip: skipExhausted, Detail: why}
 	}
 
@@ -330,7 +356,7 @@ func (m *Migrator) planRow(ctx context.Context, row *store.APIKey) planRow {
 	remaining = roundUp2(remaining)
 	if remaining < 0.01 {
 		why := fmt.Sprintf("remaining %.4f rounds below the 0.01 mint floor", float64(stat.CreditsRemaining))
-		m.planSkipLine(row, skipExhausted, why)
+		m.planDeleteExhaustedLine(row, why)
 		return planRow{Row: row, Skip: skipExhausted, Detail: why}
 	}
 
@@ -544,13 +570,63 @@ func (m *Migrator) planSkipLine(row *store.APIKey, why skipReason, detail string
 		row.OrderID, row.ChatID, row.KeyID, why, detail)
 }
 
+// planDeleteExhaustedLine is the exhausted row's plan line (2026-10-10
+// rule): instead of a bare SKIP it announces what an apply will actually do
+// — DELETE the pool key — in the act phase's own vocabulary, so the dry-run
+// plan stays the exact preview of the apply transcript.
+func (m *Migrator) planDeleteExhaustedLine(row *store.APIKey, detail string) {
+	fmt.Fprintf(m.Out, "  plan des=%s chat=%d DELETE-EXHAUSTED pool=%s (%s)\n",
+		row.OrderID, row.ChatID, row.KeyID, detail)
+}
+
+// deleteExhaustedPoolKey is the ACT-phase half of the exhausted-row rule
+// (business rule 2026-10-10): a row the plan classified skipExhausted
+// carries nothing worth minting, and its pool key must not linger either —
+// under -apply the key is DELETED from the pool, best-effort. A 404 counts
+// as success (the key is already gone — exactly the end state the rule
+// wants); every OTHER failure bumps FailedExhaustedDelete, is logged, and
+// does NOT abort the run. NO journal line: the journal exists to trace
+// possibly-orphaned MINTS and no mint happens here — the durable record of
+// a deletion is this run's stdout line plus the pool itself.
+func (m *Migrator) deleteExhaustedPoolKey(ctx context.Context, pr planRow, c *Counts) {
+	row := pr.Row
+	// Same identifier discipline as the stats read (readPoolStats): pool
+	// uuid primary, the cleartext key only when the row stored no uuid.
+	// The cleartext key rides the REQUEST only — transcript and log lines
+	// always name the row by its uuid (pool=), never by the secret itself,
+	// same hygiene as every other line this tool prints.
+	req := kirogo.DeleteAPIKeyRequest{ID: row.KeyID}
+	if req.ID == "" {
+		req.APIKey = row.APIKey
+	}
+	if _, err := m.Pool.DeleteAPIKey(ctx, req); err != nil {
+		// 404 = already gone = the desired end state; still one stdout
+		// line, marked as such, so the transcript accounts for the row.
+		var apiErr *kirogo.APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			fmt.Fprintf(m.Out, "deleted-exhausted des=%s chat=%d pool=%s (already gone, 404)\n",
+				row.OrderID, row.ChatID, row.KeyID)
+			return
+		}
+		c.FailedExhaustedDelete++
+		fmt.Fprintf(m.Out, "failed-exhausted-delete des=%s chat=%d pool=%s error=%v\n",
+			row.OrderID, row.ChatID, row.KeyID, err)
+		m.Log.Error("migrate-llmgate: deleting exhausted pool key failed",
+			"des", row.OrderID, "chat", row.ChatID, "pool", row.KeyID, "error", err)
+		return
+	}
+	// One line per deletion, in the run's house vocabulary.
+	fmt.Fprintf(m.Out, "deleted-exhausted des=%s chat=%d pool=%s\n",
+		row.OrderID, row.ChatID, row.KeyID)
+}
+
 // printSummary emits the end-of-run tally — every bucket, always, in both
 // modes: the operator's receipt of what the run did (apply) or would have
 // done (dry run).
 func (m *Migrator) printSummary(c Counts) {
-	fmt.Fprintf(m.Out, "summary: migrated=%d skipped-stats=%d skipped-exhausted=%d skipped-unlimited=%d failed-mint=%d failed-verify=%d skipped-race=%d\n",
+	fmt.Fprintf(m.Out, "summary: migrated=%d skipped-stats=%d skipped-exhausted=%d skipped-unlimited=%d failed-mint=%d failed-verify=%d skipped-race=%d failed-exhausted-delete=%d\n",
 		c.Migrated, c.SkippedStats, c.SkippedExhausted, c.SkippedUnlimited,
-		c.FailedMint, c.FailedVerify, c.SkippedRace)
+		c.FailedMint, c.FailedVerify, c.SkippedRace, c.FailedExhaustedDelete)
 }
 
 // sleepCtx waits d, returning early with ctx's error if the context is

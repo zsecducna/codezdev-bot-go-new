@@ -46,17 +46,24 @@ type poolKeyState struct {
 	remaining float64 // -1 = unlimited sentinel, exactly as the pool sends it
 }
 
-// fakePool is a kirogo-shaped /admin/stats server. Every response is a 2xx
-// {success, keys:[...]} body; unknown ids match ZERO keys (the fail-closed
-// input for the migrator), and failAll 404s every request (the transport-
-// error input). 4xx only — the real client never retries a 4xx, so the
-// tests stay fast.
+// fakePool is a kirogo-shaped /admin/stats + /admin/delete_api_key server.
+// Every stats response is a 2xx {success, keys:[...]} body; unknown ids match
+// ZERO keys (the fail-closed input for the migrator), and failAll 404s every
+// stats request (the transport-error input). 4xx only on the delete path
+// unless failDeleteStatus says otherwise — the real client never retries a
+// 4xx, so the tests stay fast.
 type fakePool struct {
 	mu      sync.Mutex
 	calls   int
 	byID    map[string]poolKeyState
 	byKey   map[string]poolKeyState
 	failAll bool
+	// deleteCalls / deletedIDs record what the exhausted-delete rule
+	// (2026-10-10) actually sent to the pool; failDeleteStatus (0 = succeed)
+	// is the pool's answer for the failure/404 legs.
+	deleteCalls      int
+	deletedIDs       []string
+	failDeleteStatus int
 }
 
 // newFakePool builds an empty pool.
@@ -64,19 +71,53 @@ func newFakePool() *fakePool {
 	return &fakePool{byID: map[string]poolKeyState{}, byKey: map[string]poolKeyState{}}
 }
 
-// ServeHTTP implements POST /admin/stats: Bearer auth check, id/apiKey
-// filter lookup, and the {success, keys, totals} answer.
+// ServeHTTP implements the two admin endpoints: POST /admin/stats (Bearer
+// auth check, id/apiKey filter lookup, the {success, keys, totals} answer)
+// and POST /admin/delete_api_key (the exhausted-key delete of the 2026-10-10
+// rule — same Bearer check, records the identifier it was asked to kill).
 func (f *fakePool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 
-	if r.Method != http.MethodPost || r.URL.Path != "/admin/stats" {
+	if r.Method != http.MethodPost {
 		http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
 		return
 	}
 	if got := r.Header.Get("Authorization"); got != "Bearer pool-admin-key" {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+
+	// The delete endpoint: uuid (id) primary, cleartext apiKey fallback —
+	// exactly the identifier discipline deleteExhaustedPoolKey implements.
+	// failDeleteStatus simulates the pool's answer (409 = a "real" failure,
+	// 404 = already gone); anything else records a successful delete.
+	if r.URL.Path == "/admin/delete_api_key" {
+		var req struct {
+			ID     string `json:"id"`
+			APIKey string `json:"apiKey"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		f.deleteCalls++
+		if f.failDeleteStatus != 0 {
+			writeJSON(w, f.failDeleteStatus, map[string]any{"error": "delete failed for test"})
+			return
+		}
+		id := req.ID
+		if id == "" {
+			id = req.APIKey
+		}
+		f.deletedIDs = append(f.deletedIDs, id)
+		writeJSON(w, http.StatusOK, map[string]any{"success": true, "id": id, "upstreamRevoked": true})
+		return
+	}
+
+	if r.URL.Path != "/admin/stats" {
+		http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
 		return
 	}
 	var req struct {
@@ -525,8 +566,9 @@ func TestApplyMints30DayExpiry(t *testing.T) {
 	}
 }
 
-// TestExhaustedRowSkipped: remaining <= 0 carries nothing — skipped, no
-// mint, row untouched.
+// TestExhaustedRowSkipped: remaining <= 0 carries nothing — skipped from
+// migration, no mint, row untouched — and, per the 2026-10-10 business
+// rule, its pool key IS deleted under -apply.
 func TestExhaustedRowSkipped(t *testing.T) {
 	e := newEnv(t)
 	e.seedRow(t, "ord1", 111, "pool-uuid-1", "sk-pool-1", 100, "", 0)
@@ -535,8 +577,8 @@ func TestExhaustedRowSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if counts.SkippedExhausted != 1 || counts.Migrated != 0 {
-		t.Errorf("counts: %+v, want skipped-exhausted=1 migrated=0", counts)
+	if counts.SkippedExhausted != 1 || counts.Migrated != 0 || counts.FailedExhaustedDelete != 0 {
+		t.Errorf("counts: %+v, want skipped-exhausted=1 migrated=0 failed-exhausted-delete=0", counts)
 	}
 	e.gate.mu.Lock()
 	creates := e.gate.creates
@@ -546,6 +588,120 @@ func TestExhaustedRowSkipped(t *testing.T) {
 	}
 	if k := e.row(t, "ord1"); k.Backend != store.BackendPool || k.KeyID != "pool-uuid-1" {
 		t.Errorf("exhausted row changed: %+v", k)
+	}
+	// The delete: exactly one, for the row's pool uuid, with one transcript
+	// line — the stdout record the rule asks for.
+	e.pool.mu.Lock()
+	deletes, ids := e.pool.deleteCalls, append([]string(nil), e.pool.deletedIDs...)
+	e.pool.mu.Unlock()
+	if deletes != 1 || len(ids) != 1 || ids[0] != "pool-uuid-1" {
+		t.Errorf("pool deletes = %d %v, want exactly [pool-uuid-1]", deletes, ids)
+	}
+	if out := e.out.String(); !strings.Contains(out, "deleted-exhausted des=ord1 chat=111 pool=pool-uuid-1\n") {
+		t.Errorf("transcript missing the deleted-exhausted line:\n%s", out)
+	}
+}
+
+// TestExhaustedDeleteDryRunDeletesNothing: the DELETE-EXHAUSTED plan line is
+// a PREVIEW only — a dry run reaches none of the act-phase deletes (and, as
+// ever, mints and writes nothing).
+func TestExhaustedDeleteDryRunDeletesNothing(t *testing.T) {
+	e := newEnv(t)
+	e.seedRow(t, "ord1", 111, "pool-uuid-1", "sk-pool-1", 100, "", 0)
+
+	counts, err := e.run(t, false)
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if counts.SkippedExhausted != 1 || counts.Migrated != 0 {
+		t.Errorf("counts: %+v, want skipped-exhausted=1 migrated=0", counts)
+	}
+	if out := e.out.String(); !strings.Contains(out, "DELETE-EXHAUSTED pool=pool-uuid-1") {
+		t.Errorf("dry-run plan missing the DELETE-EXHAUSTED line:\n%s", out)
+	}
+	e.pool.mu.Lock()
+	deletes := e.pool.deleteCalls
+	e.pool.mu.Unlock()
+	if deletes != 0 {
+		t.Errorf("pool delete calls = %d, want 0 (a dry run deletes nothing)", deletes)
+	}
+}
+
+// TestExhaustedDeleteFailureCountedNotFatal: a delete failing with anything
+// but 404 bumps failed-exhausted-delete — and the run CONTINUES: the healthy
+// row after the failing one still migrates. (409, not 5xx, so the kirogo
+// client's 5xx retry discipline does not slow the test; the bucket logic
+// only cares that it is not a 404.)
+func TestExhaustedDeleteFailureCountedNotFatal(t *testing.T) {
+	e := newEnv(t)
+	e.seedRow(t, "ordx", 111, "pool-uuid-x", "sk-pool-x", 100, "", 0)
+	e.seedRow(t, "ordok", 222, "pool-uuid-ok", "sk-pool-ok", 100, "", 42)
+	e.pool.mu.Lock()
+	e.pool.failDeleteStatus = http.StatusConflict
+	e.pool.mu.Unlock()
+
+	counts, err := e.run(t, true)
+	if err != nil {
+		t.Fatalf("apply: %v (a failed delete must not abort the run)", err)
+	}
+	if counts.FailedExhaustedDelete != 1 || counts.Migrated != 1 || counts.SkippedExhausted != 1 {
+		t.Errorf("counts: %+v, want failed-exhausted-delete=1 migrated=1 skipped-exhausted=1", counts)
+	}
+	if out := e.out.String(); !strings.Contains(out, "failed-exhausted-delete des=ordx") ||
+		!strings.Contains(out, "failed-exhausted-delete=1") {
+		t.Errorf("transcript missing the failure line and/or the summary bucket:\n%s", out)
+	}
+}
+
+// TestExhaustedDelete404IsFine: 404 means the key is already gone — the
+// rule's desired end state — so it is NOT a failure bucket, and the
+// transcript still carries one accounting line for the row.
+func TestExhaustedDelete404IsFine(t *testing.T) {
+	e := newEnv(t)
+	e.seedRow(t, "ord1", 111, "pool-uuid-1", "sk-pool-1", 100, "", 0)
+	e.pool.mu.Lock()
+	e.pool.failDeleteStatus = http.StatusNotFound
+	e.pool.mu.Unlock()
+
+	counts, err := e.run(t, true)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if counts.FailedExhaustedDelete != 0 || counts.SkippedExhausted != 1 || counts.Migrated != 0 {
+		t.Errorf("counts: %+v, want failed-exhausted-delete=0 skipped-exhausted=1 migrated=0", counts)
+	}
+	if out := e.out.String(); !strings.Contains(out, "deleted-exhausted des=ord1 chat=111 pool=pool-uuid-1 (already gone, 404)") {
+		t.Errorf("transcript missing the 404 deleted-exhausted line:\n%s", out)
+	}
+}
+
+// TestExhaustedDeleteNoUuidRowUsesCleartextSilently: a legacy row with NO
+// stored uuid is deleted by its cleartext pool key (the request-side
+// fallback), but the transcript must never print that key — pool= stays the
+// uuid slot (empty here), same secret hygiene as every other line.
+func TestExhaustedDeleteNoUuidRowUsesCleartextSilently(t *testing.T) {
+	e := newEnv(t)
+	e.seedRow(t, "ordnv", 111, "", "sk-pool-nv", 100, "", 0)
+
+	counts, err := e.run(t, true)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if counts.SkippedExhausted != 1 || counts.FailedExhaustedDelete != 0 {
+		t.Errorf("counts: %+v, want skipped-exhausted=1 failed-exhausted-delete=0", counts)
+	}
+	e.pool.mu.Lock()
+	ids := append([]string(nil), e.pool.deletedIDs...)
+	e.pool.mu.Unlock()
+	if len(ids) != 1 || ids[0] != "sk-pool-nv" {
+		t.Errorf("pool deletes = %v, want the cleartext fallback [sk-pool-nv]", ids)
+	}
+	out := e.out.String()
+	if strings.Contains(out, "sk-pool-nv") {
+		t.Errorf("transcript leaked the cleartext pool key:\n%s", out)
+	}
+	if !strings.Contains(out, "deleted-exhausted des=ordnv chat=111 pool=\n") {
+		t.Errorf("transcript missing the deleted-exhausted line (empty uuid slot):\n%s", out)
 	}
 }
 

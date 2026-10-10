@@ -3,9 +3,14 @@
 // mints a direct llmgate.app key carrying the row's REMAINING pool credits,
 // verifies the mint, and commits the row's migration (pool values preserved
 // in pool_key_id/pool_api_key, key_id/api_key repointed at the llmgate key,
-// backend='llmgate'). Old pool keys are NEVER revoked here — customers keep
-// them working until the pool is retired; revocation is a later, separate
-// decision needing the preserved pool_key_id/pool_api_key columns.
+// backend='llmgate'). Old pool keys are NOT revoked here — customers keep
+// them working until the pool is retired; revocation of a healthy key is a
+// later, separate decision needing the preserved pool_key_id/pool_api_key
+// columns. ONE exception (business rule 2026-10-10): EXHAUSTED keys
+// (remaining <= 0) are DELETED from the pool under -apply — there is no
+// customer value left to protect, and the pool must not accumulate dead
+// keys. Those deletes are best-effort: a 404 is fine, any other failure is
+// counted (failed-exhausted-delete) and the run continues.
 //
 // Run OFFLINE, with the bot process stopped (same posture as migrate-usdt):
 // this tool does not gate against a live writer beyond SQLite's own file
@@ -16,8 +21,8 @@
 //
 // Usage:
 //
-//	migrate-llmgate -db store.db                        # dry run: reads pool stats, prints the plan, writes/mints nothing
-//	migrate-llmgate -db store.db -apply                 # the real migration, after a 3s Ctrl-C-to-abort window
+//	migrate-llmgate -db store.db                        # dry run: reads pool stats, prints the plan (incl. DELETE-EXHAUSTED lines), writes/mints/deletes nothing
+//	migrate-llmgate -db store.db -apply                 # the real migration, after a 3s Ctrl-C-to-abort window; exhausted pool keys are also deleted
 //	migrate-llmgate -db store.db -chat 12345 -apply     # REHEARSAL: same flow, scoped to ONE telegram chat only
 //
 // Both upstream credentials come from flags or their env fallbacks:
@@ -55,11 +60,12 @@ const abortDelay = 3 * time.Second
 
 // main wires flags → env fallbacks → store + both upstream clients → Run,
 // and owns process exit codes: 0 only when the run finished with zero
-// failed-mint/failed-verify/skipped-race rows, 1 on any error or failure
-// count, 2 when an upstream client is not fully configured.
+// failed-mint/failed-verify/skipped-race/failed-exhausted-delete rows,
+// 1 on any error or failure count, 2 when an upstream client is not fully
+// configured.
 func main() {
 	dbPath := flag.String("db", "", "path to store.db — REQUIRED")
-	apply := flag.Bool("apply", false, "actually mint llmgate keys and migrate rows. Without this flag: dry run — reads and a plan printout only, nothing is written and no llmgate key is created")
+	apply := flag.Bool("apply", false, "actually mint llmgate keys and migrate rows, and DELETE exhausted pool keys (remaining <= 0, best-effort). Without this flag: dry run — reads and a plan printout only, nothing is written, minted, or deleted")
 	limit := flag.Int("limit", 0, "migrate at most N rows this run (oldest first); 0 = all eligible rows")
 	// REHEARSAL SCOPE: -chat restricts BOTH the eligible count and the listed
 	// rows to one telegram chat_id, so the operator can run the ENTIRE
@@ -160,9 +166,10 @@ func main() {
 		os.Exit(1)
 	}
 	// Exit 0 only when nothing needs an operator's follow-up: a failed mint,
-	// a failed verify, or a lost race each leave either a row unmigrated or
-	// an orphaned llmgate key behind, and must read as a failed run even
-	// though the tool did its best per-row.
+	// a failed verify, a lost race, or a failed exhausted-key delete each
+	// leave either a row unmigrated, an orphaned llmgate key, or an
+	// exhausted pool key that should be gone behind them, and must read as
+	// a failed run even though the tool did its best per-row.
 	if counts.FailureCount() > 0 {
 		os.Exit(1)
 	}

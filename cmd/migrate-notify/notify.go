@@ -355,6 +355,12 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 // must not become an HTML-injection vector into a parse_mode=HTML message).
 // The literal &lt;/&amp; entities inside the bodies are INTENTIONAL template
 // text (they must reach Telegram pre-escaped).
+//
+// Text change 2026-10-10 (both halves of the cutover story): the old "your
+// OLD key still works for now" line was REMOVED and replaced by a standalone
+// closing note — "🗑️ All exhausted API keys have been deleted." — because
+// migrate-llmgate now deletes exhausted pool keys under -apply; telling
+// customers their old key still works would be a lie for exactly those keys.
 var messageTemplates = map[string]string{
 	"en": `🔄 Your API key was upgraded — codezdev shop
 
@@ -370,7 +376,7 @@ The shop now serves API traffic through a faster gateway. Your remaining credits
 📊 Check quota &amp; usage anytime: {pubbase}/customer
 📖 Client setup: {pubbase}/docs
 
-Your OLD key still works for now — switch when convenient. View the new key anytime: Self-Service → 🔑 My API Keys.`,
+🗑️ All exhausted API keys have been deleted.`,
 	"vi": `🔄 API key của bạn đã được nâng cấp — codezdev shop
 
 Shop hiện phục vụ lưu lượng API qua một cổng nhanh hơn. Số tín dụng còn lại của bạn đã được chuyển sang key MỚI này:
@@ -385,7 +391,7 @@ Shop hiện phục vụ lưu lượng API qua một cổng nhanh hơn. Số tín
 📊 Kiểm tra hạn mức &amp; mức dùng bất cứ lúc nào: {pubbase}/customer
 📖 Hướng dẫn kết nối: {pubbase}/docs
 
-Key CŨ của bạn vẫn còn dùng được tạm thời — hãy chuyển khi tiện. Xem key mới bất cứ lúc nào: Tự phục vụ → 🔑 My API Keys.`,
+🗑️ Tất cả các API key đã hết hạn mức đã bị xóa.`,
 	"zh": `🔄 您的 API key 已升级 — codezdev shop
 
 本店现在通过更快的网关提供 API 服务。您剩余的额度已转入这把新 key：
@@ -400,7 +406,7 @@ Key CŨ của bạn vẫn còn dùng được tạm thời — hãy chuyển khi
 📊 随时查询额度与用量：{pubbase}/customer
 📖 客户端配置：{pubbase}/docs
 
-您的旧 key 目前仍可使用 — 方便时再切换即可。随时可在 自助服务 → 🔑 My API Keys 查看新 key。`,
+🗑️ 所有已耗尽的 API key 均已删除。`,
 }
 
 // messageFor renders one CUSTOMER's DM: pick the template by order lang

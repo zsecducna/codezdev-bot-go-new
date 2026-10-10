@@ -502,7 +502,7 @@ func TestRemoveCodeRepricesRechargeAtTargetKeyClass(t *testing.T) {
 // not recognise onto bedrock before indexing SkuTag (so an unknown class can
 // never render an EMPTY tag), and "fixed" had to be added to that recognised
 // set by hand — dropping it from the condition makes every fixed key silently
-// display as "🔷 Bedrock" with no test failing.
+// display as "🔷 API" (the bedrock tag) with no test failing.
 //
 // This must drive showMyAPIKeys specifically: the recharge picker (apikey.go)
 // resolves its tag through apikeyKeyClass, a different code path that the

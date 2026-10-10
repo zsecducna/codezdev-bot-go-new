@@ -225,8 +225,12 @@ func (b *Bot) envInt64(key string, def int64) int64 {
 // (__apikey__ / __kiroapi__ / __apikeyrc__) — orders, api_keys rows, suspension
 // keys and private-product gating all key off those, so a display rename must
 // never reach them.
+// The bedrock default was renamed "Bedrock API Credits" → "API Credits" by
+// operator decision 2026-10-10: no customer/admin screen may print the word
+// "Bedrock" anymore. Only the DISPLAY text moved — the internal sale-class
+// identifier stays `bedrock` (wire value, DB value, settings key).
 const (
-	apikeyDefaultNameBedrock = "Bedrock API Credits"
+	apikeyDefaultNameBedrock = "API Credits"
 	apikeyDefaultNameKiro    = "Kiro Credits API"
 	apikeyDefaultNameFixed   = "Fixed Pricing API Credits"
 )

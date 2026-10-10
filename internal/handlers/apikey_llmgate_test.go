@@ -931,7 +931,7 @@ func TestApikeyLlmgateMyKeysAndReveal(t *testing.T) {
 	if !strings.Contains(msg.Text, "∞ left") {
 		t.Errorf("an unlimited llmgate key must render ∞, got %q", msg.Text)
 	}
-	if !strings.Contains(msg.Text, "🔷 Bedrock") {
+	if !strings.Contains(msg.Text, "🔷 API") {
 		t.Errorf("llmgate rows carry the bedrock SKU tag, got %q", msg.Text)
 	}
 	if _, ok := findCB(inlineRows(msg), "apikeyrev:"+limDes); !ok {

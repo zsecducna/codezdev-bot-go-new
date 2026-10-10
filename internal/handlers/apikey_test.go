@@ -1472,7 +1472,7 @@ func TestApikeyPurchaseE2E(t *testing.T) {
 	// Tap it -> amount prompt with quick-pick buttons in the SKU's bounds.
 	b.Process(ctx, callbackUpdate(chat, "apikey:start"))
 	prompt := lastMsg(t, f)
-	if !strings.Contains(prompt.Text, "BUY BEDROCK API CREDITS") {
+	if !strings.Contains(prompt.Text, "BUY API CREDITS") {
 		t.Fatalf("amount prompt = %q", prompt.Text)
 	}
 	if _, ok := findCB(inlineRows(prompt), "apikeyqty:500"); !ok {
@@ -2077,13 +2077,13 @@ func TestApikeySaleNotifiesOwnersOnDeliveryAndRecharge(t *testing.T) {
 	}
 	// admin chat "999" is newAPIKeyBot's fixed ADMIN_ID, always != the buyer
 	// (chat 100), so this is unambiguously the owner alert, not the buyer's
-	// own delivery DM (which ALSO contains "Bedrock API Credits" in its own
+	// own delivery DM (which ALSO contains "API Credits" in its own
 	// customer-facing template — countContains alone would double-count it).
 	alert := lastSendMsgTo(f, 999)
 	if alert == nil || !strings.Contains(alert.Text, "💸 NEW SALE") {
 		t.Fatalf("owner alert = %v, want a 💸 NEW SALE message", alert)
 	}
-	if !strings.Contains(alert.Text, "Bedrock API Credits") {
+	if !strings.Contains(alert.Text, "API Credits") {
 		t.Errorf("mint sale alert = %q, want the bedrock SKU label", alert.Text)
 	}
 
@@ -2109,10 +2109,10 @@ func TestApikeySaleNotifiesOwnersOnDeliveryAndRecharge(t *testing.T) {
 	if rcAlert == nil || !strings.Contains(rcAlert.Text, "💸 NEW SALE") {
 		t.Fatalf("owner alert = %v, want a 💸 NEW SALE message", rcAlert)
 	}
-	// "Bedrock API Credits Recharge", not the old hardcoded "Bedrock API
+	// "API Credits Recharge", not the old hardcoded "Bedrock API
 	// Recharge": the recharge label is now the SKU's live DISPLAY name plus the
 	// " Recharge" suffix, so an admin rename reaches this alert too.
-	if !strings.Contains(rcAlert.Text, "Bedrock API Credits Recharge") {
+	if !strings.Contains(rcAlert.Text, "API Credits Recharge") {
 		t.Errorf("recharge sale alert = %q, want the recharge SKU label", rcAlert.Text)
 	}
 }

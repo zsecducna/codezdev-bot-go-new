@@ -277,15 +277,24 @@ func TestApplySendsHTMLWithKeyAndStampsRows(t *testing.T) {
 		"https://pub.test-shop.uk/docs",
 		"Authorization: Bearer &lt;your key&gt;",
 		"Valid 30 days",
+		// 2026-10-10 text change: the old-key line is GONE, the exhausted-
+		// keys-deleted note is the closing line.
+		"🗑️ All exhausted API keys have been deleted.",
 	} {
 		if !strings.Contains(en.Text, want) {
 			t.Errorf("en message missing %q:\n%s", want, en.Text)
 		}
 	}
+	if strings.Contains(en.Text, "OLD key still works") {
+		t.Errorf("en message still carries the removed old-key line:\n%s", en.Text)
+	}
 	zh := bodies[1]
 	if zh.ChatID != 33 || !strings.Contains(zh.Text, "<code>sk-lg-ord-zh</code>") ||
 		!strings.Contains(zh.Text, "有效期 30 天") {
 		t.Errorf("zh message wrong (must be the zh template with the key):\n%s", zh.Text)
+	}
+	if !strings.Contains(zh.Text, "🗑️ 所有已耗尽的 API key 均已删除。") {
+		t.Errorf("zh message missing the exhausted-keys-deleted note:\n%s", zh.Text)
 	}
 
 	// The stamp is the delivery record: a re-run finds an empty queue, sends
@@ -314,9 +323,12 @@ func TestMessageForLanguagesAndEscaping(t *testing.T) {
 	mk := func(key string, credits float64) store.MigratedKey {
 		return store.MigratedKey{OrderID: "o", ChatID: 1, APIKey: key, Credits: credits, Lang: "en"}
 	}
-	// vi template identifiable, en fallback for junk langs.
+	// vi template identifiable, en fallback for junk langs. Both also pin
+	// the 2026-10-10 closing note and the REMOVED old-key line (vi + en).
 	if m := messageFor("vi", []store.MigratedKey{mk("k", 1)}, "https://a", "https://p"); !strings.Contains(m, "API key của bạn") {
 		t.Errorf("vi message did not use the vi template:\n%s", m)
+	} else if !strings.Contains(m, "🗑️ Tất cả các API key đã hết hạn mức đã bị xóa.") || strings.Contains(m, "Key CŨ") {
+		t.Errorf("vi message must close with the exhausted-keys-deleted note and no old-key line:\n%s", m)
 	}
 	if m := messageFor("fr", []store.MigratedKey{mk("k", 1)}, "https://a", "https://p"); !strings.Contains(m, "Your API key was upgraded") {
 		t.Errorf("unknown lang must fall back to English:\n%s", m)

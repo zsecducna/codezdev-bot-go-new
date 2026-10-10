@@ -1323,7 +1323,9 @@ func (b *Bot) cbApikeyName(cc *cbCtx, saleClass string) {
 	armPricingFreeText(cc.st, wizard)
 	// Header names WHICH SKU is being renamed — both wizards land on the same
 	// pricing menu, so a generic header would let an admin rename the wrong one.
-	def, header := apikeyDefaultNameBedrock, "✏️ BEDROCK PRODUCT DISPLAY NAME"
+	// "BEDROCK PRODUCT" → "API PRODUCT" (operator 2026-10-10): the admin screen
+	// must not print "Bedrock"; the wizard still renames the bedrock SKU.
+	def, header := apikeyDefaultNameBedrock, "✏️ API PRODUCT DISPLAY NAME"
 	switch saleClass {
 	case saleClassKiro:
 		def, header = apikeyDefaultNameKiro, "🟣 KIRO PRODUCT DISPLAY NAME"
