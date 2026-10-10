@@ -29,6 +29,7 @@ import (
 	"log"
 	"math"
 	"strconv"
+	"time"
 
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/kirogo"
@@ -256,7 +257,7 @@ func (b *Bot) deliverApikey(ctx context.Context, order *store.Order, des string)
 	// SKU-correct delivery wording ("Kiro credits" vs bedrock "credits") — read
 	// off the STORED row, not the order, so a settle replay of a pre-split order
 	// (sale_class '') keeps its original bedrock message. Backend-aware since
-	// the cutover: a BackendLlmgate row (whatever its class) gets the two-URL
+	// the cutover: a BackendLlmgate row (whatever its class) gets the
 	// llmgate wording via apikeyDeliveredTemplate.
 	keyCls := apikeyKeyClass(row)
 	tmpl := apikeyDeliveredTemplate(c, keyCls, row.Backend)
@@ -264,15 +265,19 @@ func (b *Bot) deliverApikey(ctx context.Context, order *store.Order, des string)
 	// "name" is admin-typed text landing in a parse_mode=HTML message, so it is
 	// escaped like {key}/{base}: an unescaped `<` or `&` in a renamed SKU would
 	// make Telegram reject the whole delivery message — the one message the
-	// buyer must receive. "apibase" is only a placeholder on the llmgate
-	// template; for the pool templates the kv pair is a silent no-op (the same
-	// arrangement the prompts use for {opus}/{prices}).
+	// buyer must receive. "apibase"/"pubbase" are only placeholders on the
+	// llmgate template; for the pool templates the kv pairs are silent no-ops
+	// (the same arrangement the prompts use for {opus}/{prices}). {base} is no
+	// longer on the llmgate template (the legacy-endpoint line was removed
+	// 2026-10-10) but stays passed for the POOL templates, which still carry
+	// it.
 	b.sendHTML(ctx, chatID, i18n.F(tmpl.T(lang),
 		"name", html.EscapeString(b.apikeyProductName(keyCls)),
 		"credits", itoa64(credits),
 		"key", html.EscapeString(row.APIKey),
 		"base", base,
-		"apibase", b.llmgateAPIBaseDisp()))
+		"apibase", b.llmgateAPIBaseDisp(),
+		"pubbase", b.llmgatePublicURLDisp()))
 	// Owner sale alert — notify_admin_sale (telegram_bot.py:7750-7755): the
 	// SKU label mirrors the delivery template split just above (Kiro vs
 	// Bedrock credits) by reusing the SAME keyCls (the STORED row's class),
@@ -342,10 +347,12 @@ func (b *Bot) mintAPIKey(ctx context.Context, chatID int64, des string, credits 
 // mint. Returns the created key (cleartext APIKey + numeric ID), or an error
 // the caller turns into a refund.
 //
-// WIRE FACTS this path leans on (both verified live, encoded in
-// internal/llmgate): CreateKey structurally omits expires_at, so the key
-// NEVER expires — the only safe default for a sold key; and credit_limit is
-// in credits where 1 credit = $1, so the order's credits map 1:1.
+// WIRE FACTS this path leans on (verified live, encoded in
+// internal/llmgate): CreateKey sends expires_at as RFC3339 when given a
+// time — this path always gives it now+llmgate.DefaultValidity, the 30
+// DAYS every sold key lives (business rule 2026-10-10); a zero time would
+// omit the field (never expires), the legacy shape no caller here uses. credit_limit is in credits where
+// 1 credit = $1, so the order's credits map 1:1.
 //
 // AMBIGUOUS-CREATE RECONCILIATION (the no-double-mint recovery): CreateKey
 // sends a SINGLE attempt (internal/llmgate sendOnce — a create retried
@@ -373,7 +380,16 @@ func (b *Bot) mintLlmgateKey(ctx context.Context, chatID int64, des string, cred
 	// what an operator greps in the llmgate console to find a sale's key, and
 	// what the reconciliation below matches on (unique per order).
 	name := "tg-" + fmtInt(chatID) + "-order-" + des
-	res, err := client.CreateKey(ctx, name, float64(credits))
+	// 30-DAY DEFAULT VALIDITY (business rule 2026-10-10, rule 1, revised
+	// same day to a flat 30 days — NOT a calendar month, which would hand
+	// buyers 28-to-31-day "months"): every freshly minted key expires
+	// exactly 30 days out; a later recharge of the still-ACTIVE key renews
+	// this window (rule 2). The old never-expire mint is gone — only an
+	// explicit zero time can still ask llmgate for it, and no caller here
+	// passes one. The constant is shared with the recharge renewal and the
+	// migration tool so all three agree by construction.
+	expires := time.Now().Add(llmgate.DefaultValidity)
+	res, err := client.CreateKey(ctx, name, float64(credits), expires)
 	if err != nil {
 		// Ambiguity only: a 4xx is a definitive rejection (nothing was
 		// minted, reconciliation would be wasted work) and fails straight
@@ -547,17 +563,33 @@ func (b *Bot) deliverApikeyRecharge(ctx context.Context, order *store.Order, des
 
 	remaining := "—" // fresh creditsRemaining for the receipt ("—" when unknown)
 	if rec.AppliedTS == nil {
-		// A recharge RE-ENABLES a key disabled for ANY reason server-side, so a
-		// key the admin manually disabled for abuse during the payment window
-		// must be refused here too (the gate only ran at order time). Refuse ONLY
-		// on an explicit "disabled" status: a stats hiccup fails OPEN — payment is
-		// secured and blocking good orders on a read outage is worse (exhausted
-		// keys legitimately recharge). Backend-agnostic since the cutover:
-		// apikeyLiveStats routes llmgate rows through KeyStats and pool rows
-		// through /admin/stats, and both map to the same tri-state.
-		if st := b.apikeyLiveStats(ctx, krow); st != nil && st.Status == "disabled" {
-			return b.apikeyRCFailRefund(ctx, order, des, chatID, lang, credits, total,
-				errors.New("target key is disabled (recharge would re-enable it)"))
+		// Delivery-time refusal re-checks, all on ONE stats read (fail OPEN on
+		// an unreadable read — payment is secured and blocking good orders on a
+		// read outage is worse; the in-lock re-read in applyLlmgateRecharge is
+		// the fail-CLOSED backstop for llmgate rows). The RC gate ran these at
+		// order time; the world may have moved since.
+		//
+		// (a) A recharge RE-ENABLES a key disabled for ANY reason server-side,
+		// so a key the admin manually disabled for abuse during the payment
+		// window must be refused too. Refuse ONLY on an explicit "disabled"
+		// status — "exhausted" keys legitimately recharge. Backend-agnostic
+		// since the cutover: apikeyLiveStats routes llmgate rows through
+		// KeyStats and pool rows through /admin/stats, same tri-state.
+		//
+		// (b) EXPIRED keys cannot be recharged (business rule 2026-10-10,
+		// rule 3): the top-up below RENEWS the validity of an ACTIVE key —
+		// applying it to one already past its expires_at would resurrect a
+		// key llmgate has killed, which the rule exists to forbid. Only
+		// llmgate rows can ever be expired — pool keys never expire.
+		if st := b.apikeyLiveStats(ctx, krow); st != nil {
+			if st.Status == "disabled" {
+				return b.apikeyRCFailRefund(ctx, order, des, chatID, lang, credits, total,
+					errors.New("target key is disabled (recharge would re-enable it)"))
+			}
+			if st.Expired {
+				return b.apikeyRCFailRefund(ctx, order, des, chatID, lang, credits, total,
+					errors.New("target key is expired (recharge cannot renew an expired key)"))
+			}
 		}
 		if krow.Backend == store.BackendLlmgate {
 			// LLMGATE top-up: UpdateKey SETS credit_limit ABSOLUTELY, so the
@@ -693,9 +725,10 @@ func (b *Bot) deliverApikeyRecharge(ctx context.Context, order *store.Order, des
 // per-ORDER and already idempotent.
 //
 // The stats read inside the lock is FRESH (not the pre-check's read): the
-// pre-check only screened for "disabled" and failed OPEN on error, but the
-// arithmetic MUST have a real limit or the write would set a garbage cap —
-// so an unreadable stats read HERE fails closed into the refund path.
+// pre-check only screened for "disabled"/"expired" and failed OPEN on error,
+// but the arithmetic MUST have a real limit or the write would set a garbage
+// cap — so an unreadable stats read HERE fails closed into the refund path
+// (as does an expiry the open pre-check could not see).
 func (b *Bot) applyLlmgateRecharge(ctx context.Context, krow *store.APIKey, targetOrderID string, credits int64) (float64, error) {
 	client := b.llmgateClient()
 	if client == nil {
@@ -716,6 +749,23 @@ func (b *Bot) applyLlmgateRecharge(ctx context.Context, krow *store.APIKey, targ
 	if st.Info.CreditLimit <= 0 {
 		return 0, errors.New("unlimited llmgate key cannot take a credit top-up")
 	}
+	// DISABLED re-check on the same FRESH in-lock read: the update below pins
+	// is_active:true, so a key the admin disabled between the pre-check and
+	// this lock would otherwise be silently RE-ENABLED, credited and renewed
+	// by this very write — the exact outcome the gate refuses. Mirrors the
+	// unlimited/expired guards' fail-CLOSED layering.
+	if !st.Info.IsActive {
+		return 0, errors.New("llmgate key is disabled (recharge would re-enable it)")
+	}
+	// EXPIRED re-check on the FRESH in-lock read (business rule 2026-10-10,
+	// rule 3): the pre-check above fails OPEN on unreadable stats, so the key
+	// may have expired (or died) since — and the renewal write below is
+	// exactly what the rule forbids on a dead key. Same fail-CLOSED layering
+	// as the unlimited guard: this read is the one the arithmetic AND the
+	// renewal write are computed from.
+	if exp, has := st.Info.Expiry(); has && exp.Before(time.Now()) {
+		return 0, errors.New("llmgate key is expired (recharge cannot renew an expired key)")
+	}
 	// The stored key id is llmgate's NUMERIC id as a decimal string (minted by
 	// mintLlmgateKey); anything else is a corrupt row for an operator, never a
 	// condition to guess a top-up around.
@@ -724,13 +774,21 @@ func (b *Bot) applyLlmgateRecharge(ctx context.Context, krow *store.APIKey, targ
 		return 0, fmt.Errorf("llmgate key id %q is not a decimal id: %w", krow.KeyID, perr)
 	}
 	newLimit := st.Info.CreditLimit + float64(credits)
+	// RECHARGE RENEWS VALIDITY (business rule 2026-10-10, rule 2): the top-up
+	// also pushes expires_at to now+30 days, so an ACTIVE key's window
+	// resets on every recharge — the delivery message's "recharging before
+	// expiry extends validity" promise is this write.
+	// expires is ALWAYS concrete here (never the zero time): update-side
+	// omission semantics are unverified (internal/llmgate invariant 4), and
+	// the expired guards above prove this key is alive to renew.
+	expires := time.Now().Add(llmgate.DefaultValidity)
 	// MUST resend the CURRENT name: UpdateKey CLEARS the stored name when the
 	// field is omitted (verified live — internal/llmgate invariant 4), and the
 	// name is the operator's only grep handle tying a key to its sale.
 	// is_active is pinned true: the disabled pre-check already refused a
 	// disabled key, and re-asserting it is the verified normal state for a
 	// live key.
-	if _, uerr := client.UpdateKey(ctx, id, st.Info.Name, true, newLimit); uerr != nil {
+	if _, uerr := client.UpdateKey(ctx, id, st.Info.Name, true, newLimit, expires); uerr != nil {
 		return 0, uerr
 	}
 	return newLimit - st.Used(), nil

@@ -417,9 +417,14 @@ func (m *Migrator) migrateRow(ctx context.Context, pr planRow, c *Counts, j *jou
 	}
 
 	// STEP 5 — mint the llmgate key carrying exactly the row's remaining
-	// pool credits. An error means NO llmgate key exists (nothing to clean
-	// up): count failed-mint, log, move on.
-	created, err := m.Gate.CreateKey(ctx, llmKeyName(row), pr.Remaining)
+	// pool credits, expiring 30 DAYS out (user rule 2026-10-10): migrated
+	// keys adopt the same 30-day validity as fresh mints so their owners
+	// recharge-to-renew exactly like everyone else — a never-expiring
+	// migrated key would be a privileged class the shop no longer sells.
+	// llmgate.DefaultValidity is THE one constant so the tool can never
+	// drift from the shop's mint/renew paths. An error means NO llmgate key
+	// exists (nothing to clean up): count failed-mint, log, move on.
+	created, err := m.Gate.CreateKey(ctx, llmKeyName(row), pr.Remaining, time.Now().Add(llmgate.DefaultValidity))
 	if err != nil {
 		c.FailedMint++
 		if j != nil {

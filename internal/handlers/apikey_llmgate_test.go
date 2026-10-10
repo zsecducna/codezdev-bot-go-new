@@ -7,11 +7,13 @@ package handlers
 // the exact JSON that goes out:
 //
 //   - bedrock mints CreateKey with the deterministic name + credit_limit and
-//     NO expires_at on the wire (omitted = never expires);
+//     a 30-day expires_at on the wire (business rule 2026-10-10);
 //   - the row is stored backend=llmgate with the DECIMAL key id, and the pool
 //     fake receives NOTHING for a bedrock sale;
 //   - recharge is a read-modify-write: update carries the CURRENT name and
-//     is_active true, sets the ABSOLUTE new limit (10 + 50 = 60);
+//     is_active true, sets the ABSOLUTE new limit (10 + 50 = 60) and RENEWS
+//     expires_at by ≈30 more days; an EXPIRED key is refused at the gate and
+//     refunded at delivery, never renewed;
 //   - unlimited keys refuse top-ups; unreadable stats fail CLOSED at the gate;
 //   - revoke treats 404 as "already gone";
 //   - My-Keys renders llmgate rows with live stats (∞ when unlimited) and the
@@ -30,19 +32,24 @@ import (
 	"time"
 
 	"codezdev-bot/internal/i18n"
+	"codezdev-bot/internal/llmgate"
 	"codezdev-bot/internal/store"
 )
 
 // fakeLlmgateKey is one llmgate key as the fake server sees it. Used is the
-// SUM of the four cost buckets the /stats endpoint reports.
+// SUM of the four cost buckets the /stats endpoint reports. ExpiresAt is the
+// RAW ISO string ("" = never expires, the pre-2026-10-10 mint shape) so the
+// fake mirrors the verified wire fact that stats includes expires_at ONLY
+// when the key has one.
 type fakeLlmgateKey struct {
-	ID    int64
-	Name  string
-	Key   string // full cleartext, "sk-llmgate-…" (59 chars)
-	Limit float64
-	Used  float64
-	Alive bool // is_active
-	Gone  bool // deleted
+	ID        int64
+	Name      string
+	Key       string // full cleartext, "sk-llmgate-…" (59 chars)
+	Limit     float64
+	Used      float64
+	Alive     bool // is_active
+	Gone      bool // deleted
+	ExpiresAt string
 }
 
 // fakeLlmgate is an httptest stand-in for the llmgate API behind
@@ -158,17 +165,22 @@ func (fl *fakeLlmgate) handleCreate(w http.ResponseWriter, r *http.Request) {
 		id := int64(fl.seq)
 		name, _ := body["name"].(string)
 		limit, _ := body["credit_limit"].(float64)
+		expires, _ := body["expires_at"].(string)
 		key := fmt.Sprintf("sk-llmgate-%048d", id)
-		fl.keys[id] = &fakeLlmgateKey{ID: id, Name: name, Key: key, Limit: limit, Alive: true}
+		fl.keys[id] = &fakeLlmgateKey{ID: id, Name: name, Key: key, Limit: limit, Alive: true, ExpiresAt: expires}
 		fl.mu.Unlock()
 		if ambiguous {
 			reject(w, 500, "create committed but the answer was lost")
 			return
 		}
-		wrap(w, 200, map[string]any{
+		created := map[string]any{
 			"id": id, "api_key": key, "name": name,
 			"is_active": true, "credit_limit": limit,
-		})
+		}
+		if expires != "" {
+			created["expires_at"] = expires
+		}
+		wrap(w, 200, created)
 		return
 	}
 	fl.mu.Unlock()
@@ -195,11 +207,22 @@ func (fl *fakeLlmgate) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		if lim, ok := body["credit_limit"].(float64); ok {
 			k.Limit = lim
 		}
-		fl.mu.Unlock()
-		wrap(w, 200, map[string]any{
+		// expires_at: the bot always sends a concrete renewal time on this
+		// path, so apply it when present; an ABSENT field leaves the stored
+		// expiry alone (the omission semantics of the real update endpoint
+		// are unverified, and no test exercises that shape).
+		if exp, ok := body["expires_at"].(string); ok {
+			k.ExpiresAt = exp
+		}
+		updated := map[string]any{
 			"id": k.ID, "name": k.Name, "is_active": k.Alive,
 			"credit_limit": k.Limit, "api_key_length": 59,
-		})
+		}
+		if k.ExpiresAt != "" {
+			updated["expires_at"] = k.ExpiresAt
+		}
+		fl.mu.Unlock()
+		wrap(w, 200, updated)
 		return
 	}
 	fl.mu.Unlock()
@@ -230,10 +253,10 @@ func (fl *fakeLlmgate) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	var limit, used float64
 	var alive bool
-	var name string
+	var name, expires string
 	var id int64
 	if k != nil {
-		limit, used, alive, name, id = k.Limit, k.Used, k.Alive, k.Name, k.ID
+		limit, used, alive, name, id, expires = k.Limit, k.Used, k.Alive, k.Name, k.ID, k.ExpiresAt
 	}
 	fl.mu.Unlock()
 	if status != 0 {
@@ -244,10 +267,16 @@ func (fl *fakeLlmgate) handleStats(w http.ResponseWriter, r *http.Request) {
 		reject(w, 401, "invalid api key")
 		return
 	}
+	info := map[string]any{
+		"id": id, "name": name, "is_active": alive, "credit_limit": limit,
+	}
+	// Verified wire fact: expires_at rides the stats info ONLY when the key
+	// has one — never-expiring keys omit the field entirely.
+	if expires != "" {
+		info["expires_at"] = expires
+	}
 	wrap(w, 200, map[string]any{
-		"info": map[string]any{
-			"id": id, "name": name, "is_active": alive, "credit_limit": limit,
-		},
+		"info": info,
 		"stats": map[string]any{
 			"input_cost": used, "output_cost": 0.0, "cache_cost": 0.0,
 			"cache_write_cost": 0.0, "input_token": 0, "output_token": 0,
@@ -328,10 +357,14 @@ func (fl *fakeLlmgate) handleReveal(w http.ResponseWriter, r *http.Request) {
 		reject(w, 404, "key not found")
 		return
 	}
-	wrap(w, 200, map[string]any{
+	revealed := map[string]any{
 		"id": snap.ID, "api_key": snap.Key, "name": snap.Name,
 		"is_active": snap.Alive, "credit_limit": snap.Limit,
-	})
+	}
+	if snap.ExpiresAt != "" {
+		revealed["expires_at"] = snap.ExpiresAt
+	}
+	wrap(w, 200, revealed)
 }
 
 // register injects a key the bot did not mint in this process (pre-seeded /
@@ -398,16 +431,19 @@ func seedLlmgateKey(t *testing.T, st *store.Store, fl *fakeLlmgate, des string, 
 // ---- mint ---------------------------------------------------------------------
 
 // TestApikeyLlmgateMintPayloadAndRow is the cutover's headline pin: a bedrock
-// sale mints DIRECTLY on llmgate — create carries the deterministic name and
-// credit_limit with NO expires_at on the wire (omitted = never expires, the
-// only safe default for a sold key), the stored row is backend=llmgate with
-// the DECIMAL llmgate id, the delivery message carries BOTH base URLs and the
+// sale mints DIRECTLY on llmgate — create carries the deterministic name,
+// credit_limit and the 30-DAY expires_at (business rule 2026-10-10: sold
+// keys live 30 days; the field must be PRESENT on the wire, an RFC3339
+// instant ≈ now+30d, since the never-expire omission is no longer the
+// mint shape), the stored row is backend=llmgate with the DECIMAL
+// llmgate id, the delivery message carries {apibase} + {pubbase} and the
 // cleartext key, and the POOL fake receives NOTHING (no provision, no
 // anything) for the sale.
 func TestApikeyLlmgateMintPayloadAndRow(t *testing.T) {
 	ctx := context.Background()
 	b, f, st, fk, fl, _ := newAPIKeyBot(t)
 	const chat, des = 100, "1a2b00001a2b00001a2b00001a2b0000"
+	minted := time.Now()
 	o := seedOrder(t, st, des, chat, apikeyProduct, 500, 500000, "paid")
 
 	if !b.deliverApikey(ctx, o, des) {
@@ -420,8 +456,19 @@ func TestApikeyLlmgateMintPayloadAndRow(t *testing.T) {
 	if p["credit_limit"] != float64(500) {
 		t.Errorf("credit_limit = %v, want 500", p["credit_limit"])
 	}
-	if _, present := p["expires_at"]; present {
-		t.Error("create MUST NOT send expires_at — an omitted field means never-expire; a zero value would mean expired-at-epoch")
+	raw, ok := p["expires_at"].(string)
+	if !ok || raw == "" {
+		t.Fatalf("create expires_at = %v, want the 30-day RFC3339 validity (business rule 2026-10-10)", p["expires_at"])
+	}
+	exp, perr := time.Parse(time.RFC3339, raw)
+	if perr != nil {
+		t.Fatalf("create expires_at %q is not RFC3339: %v", raw, perr)
+	}
+	// ≈ mint-time + 30 days (llmgate.DefaultValidity — a flat window, not a
+	// calendar month). Tolerance of 1h absorbs clock jitter; anything
+	// wildly off is a wrong rule.
+	if d := exp.Sub(minted.Add(llmgate.DefaultValidity)); d < -time.Hour || d > time.Hour {
+		t.Errorf("create expires_at = %v, want ≈ %v (minted+30 days)", exp, minted.Add(llmgate.DefaultValidity))
 	}
 	if p["is_active"] != true {
 		t.Errorf("is_active = %v, want true (a key minted disabled cannot serve its buyer)", p["is_active"])
@@ -445,8 +492,10 @@ func TestApikeyLlmgateMintPayloadAndRow(t *testing.T) {
 	if row.APIKey != created.Key {
 		t.Fatalf("stored key = %q, want the created cleartext %q", row.APIKey, created.Key)
 	}
-	// The delivered message shows the llmgate wording: BOTH base URLs and the
-	// key in a tap-to-copy code block.
+	// The delivered message shows the llmgate wording: the {apibase}
+	// completions URL, the {pubbase} web-pages links, the 30-day validity
+	// note, and the key in a tap-to-copy code block — and NO legacy endpoint
+	// line (removed with the 2026-10-10 rules).
 	msg := lastSendMsgTo(f, chat)
 	if msg == nil {
 		t.Fatal("no delivery message")
@@ -454,8 +503,14 @@ func TestApikeyLlmgateMintPayloadAndRow(t *testing.T) {
 	if !strings.Contains(msg.Text, "https://api.example.test") {
 		t.Errorf("delivery missing the llmgate {apibase} URL: %q", msg.Text)
 	}
-	if !strings.Contains(msg.Text, fk.srv.URL) {
-		t.Errorf("delivery missing the legacy {base} URL: %q", msg.Text)
+	if !strings.Contains(msg.Text, "https://shop.example.test") {
+		t.Errorf("delivery missing the shop's {pubbase} URL: %q", msg.Text)
+	}
+	if strings.Contains(msg.Text, fk.srv.URL) {
+		t.Errorf("delivery must NOT carry the pool/legacy URL anymore: %q", msg.Text)
+	}
+	if !strings.Contains(msg.Text, "valid for 30 days") {
+		t.Errorf("delivery missing the 30-day validity note: %q", msg.Text)
 	}
 	if !strings.Contains(msg.Text, "<code>"+row.APIKey+"</code>") {
 		t.Errorf("delivery missing the cleartext key in a code block: %q", msg.Text)
@@ -569,24 +624,29 @@ func TestApikeyBedrockGateOnLlmgate(t *testing.T) {
 
 // TestApikeyLlmgateRechargeRMW pins the read-modify-write: limit 10 + a
 // 50-credit top-up writes the ABSOLUTE new limit 60, the update body carries
-// the CURRENT name (omitting it would CLEAR it server-side — verified) and
-// is_active true, the receipt quotes 60−used rounded, the row's stored credits
-// are bumped and the applied stamp is set.
+// the CURRENT name (omitting it would CLEAR it server-side — verified),
+// is_active true, and the RENEWAL expires_at ≈ now+30 days (business rule
+// 2026-10-10: recharging an ACTIVE key extends its validity), the receipt
+// quotes 60−used rounded, the row's stored credits are bumped and the
+// applied stamp is set.
 func TestApikeyLlmgateRechargeRMW(t *testing.T) {
 	ctx := context.Background()
 	b, f, st, _, fl, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "2a2b00002a2b00002a2b00002a2b0000"
 	const rcDes = "2c2d00002c2d00002c2d00002c2d0000"
-	// Live key: limit 10, 2.4 used (fractional — the receipt must round).
+	// Live key: limit 10, 2.4 used (fractional — the receipt must round), and
+	// a live (future) expiry like every key minted under the 30-day rule.
 	seedLlmgateKey(t, st, fl, keyDes, chat, 77, "sk-llmgate-"+strings.Repeat("7", 48), "bedrock", 10, 10, 2.4)
 	fl.mu.Lock()
 	fl.keys[77].Name = "tg-100-order-" + keyDes
+	fl.keys[77].ExpiresAt = time.Now().Add(10 * 24 * time.Hour).Format(time.RFC3339)
 	fl.mu.Unlock()
 	if _, err := st.AddAPIKeyRecharge(rcDes, keyDes, chat, 50); err != nil {
 		t.Fatal(err)
 	}
 	o := seedOrder(t, st, rcDes, chat, apikeyRechargeProduct, 50, 500000, "paid")
+	charged := time.Now()
 
 	if !b.deliverApikeyRecharge(ctx, o, rcDes) {
 		t.Fatal("llmgate recharge must succeed")
@@ -603,6 +663,28 @@ func TestApikeyLlmgateRechargeRMW(t *testing.T) {
 	}
 	if u["credit_limit"] != float64(60) {
 		t.Errorf("credit_limit = %v, want 60 (10 + 50, ABSOLUTE write)", u["credit_limit"])
+	}
+	// RENEWAL: the update carries expires_at ≈ now+30 days — the recharge
+	// EXTENDS the key's validity (the old 10-days-left expiry is replaced,
+	// not kept). Tolerance 1h for clock jitter; update-side omission is
+	// unverified, so the field must ALWAYS be explicit here.
+	raw, ok := u["expires_at"].(string)
+	if !ok || raw == "" {
+		t.Fatalf("update expires_at = %v, want the explicit renewal (never omitted on this path)", u["expires_at"])
+	}
+	renew, rerr := time.Parse(time.RFC3339, raw)
+	if rerr != nil {
+		t.Fatalf("update expires_at %q is not RFC3339: %v", raw, rerr)
+	}
+	if d := renew.Sub(charged.Add(llmgate.DefaultValidity)); d < -time.Hour || d > time.Hour {
+		t.Errorf("update expires_at = %v, want ≈ %v (recharge renews by another 30 days)", renew, charged.Add(llmgate.DefaultValidity))
+	}
+	// The fake's stored record moved too (the renewal actually landed).
+	fl.mu.Lock()
+	stored := fl.keys[77].ExpiresAt
+	fl.mu.Unlock()
+	if stored != raw {
+		t.Errorf("fake's stored expiry = %q, want the renewal %q applied", stored, raw)
 	}
 	// Receipt: 60 − 2.4 = 57.6 -> rounds to 58 (never floors to 57). The
 	// buyer's receipt is followed by the owner sale alert, so read the last
@@ -856,16 +938,140 @@ func TestApikeyLlmgateMyKeysAndReveal(t *testing.T) {
 		t.Error("a live llmgate key must get a reveal button")
 	}
 
-	// Reveal: the DeliveredLlmgate wording — BOTH base URLs — never the
-	// pool-only single-URL template.
+	// Reveal: the DeliveredLlmgate wording — {apibase} + the {pubbase} links
+	// and the 30-day validity note — never the pool-only single-URL template.
 	f.Sends = nil
 	b.Process(ctx, callbackUpdate(chat, "apikeyrev:"+limDes))
 	reveal := lastSendMsgTo(f, chat)
 	if reveal == nil {
 		t.Fatal("no reveal message")
 	}
-	if !strings.Contains(reveal.Text, "https://api.example.test") || !strings.Contains(reveal.Text, "legacy — also works") {
-		t.Errorf("reveal must use the llmgate two-URL template, got %q", reveal.Text)
+	if !strings.Contains(reveal.Text, "https://api.example.test") ||
+		!strings.Contains(reveal.Text, "https://shop.example.test") {
+		t.Errorf("reveal must use the llmgate template with both hosts, got %q", reveal.Text)
+	}
+	if strings.Contains(reveal.Text, "Base URL (recommended)") {
+		t.Errorf("reveal still shows the removed legacy-endpoint block: %q", reveal.Text)
+	}
+}
+
+// TestApikeyLlmgateMyKeysExpiredLabel: an llmgate key past its expires_at
+// renders the "expired" status label in My-Keys (pool rows can never produce
+// the verdict — pool keys never expire), so the customer sees WHY the key is
+// dead and what to do about it (buy a new one, not recharge).
+func TestApikeyLlmgateMyKeysExpiredLabel(t *testing.T) {
+	ctx := context.Background()
+	b, f, st, _, fl, _ := newAPIKeyBot(t)
+	const chat = 100
+	const deadDes = "3f4100003f4100003f4100003f410000"
+	seedLlmgateKey(t, st, fl, deadDes, chat, 888, "sk-llmgate-"+strings.Repeat("a", 48), "bedrock", 1000, 1000, 250)
+	fl.mu.Lock()
+	fl.keys[888].ExpiresAt = time.Now().Add(-24 * time.Hour).Format(time.RFC3339)
+	fl.mu.Unlock()
+
+	b.showMyAPIKeys(ctx, chat, i18n.EN)
+	msg := lastMsg(t, f)
+	if !strings.Contains(msg.Text, "📅 expired") {
+		t.Errorf("an expired llmgate key must render the expired label, got %q", msg.Text)
+	}
+	// The expired verdict outranks the credit arithmetic: 750 credits were
+	// still left, but the calendar killed the key.
+	if !strings.Contains(msg.Text, "750 left") {
+		t.Errorf("the remaining-credits line must still show the honest 750, got %q", msg.Text)
+	}
+}
+
+// TestApikeyLlmgateRechargeExpiredRefusedAndRefunded: business rule
+// 2026-10-10 rule 3, both layers — the ORDER-time gate refuses an expired
+// key ("expired", the RCExpired notice), and the DELIVERY-time pre-check
+// (for an order that slipped through while the key was still alive)
+// auto-refunds WITHOUT any update call reaching llmgate: the renewal write
+// is reserved for ACTIVE keys, never a resurrection.
+func TestApikeyLlmgateRechargeExpiredRefusedAndRefunded(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, fl, _ := newAPIKeyBot(t)
+	const chat = 100
+	const keyDes = "41430000414300004143000041430000"
+	seedLlmgateKey(t, st, fl, keyDes, chat, 999, "sk-llmgate-"+strings.Repeat("b", 48), "bedrock", 1000, 1000, 100)
+	fl.mu.Lock()
+	fl.keys[999].ExpiresAt = time.Now().Add(-1 * time.Hour).Format(time.RFC3339)
+	fl.mu.Unlock()
+
+	// ORDER-TIME: the gate refuses with "expired" (before the unlimited
+	// check, after disabled — an expired unlimited key would be refused
+	// here identically).
+	if g := b.apikeyRCGate(ctx, chat, keyDes); g.Err != "expired" {
+		t.Fatalf("gate = %+v, want Err expired", g)
+	}
+
+	// DELIVERY-TIME: a paid recharge order on the now-expired key must be
+	// refunded, with NO update call (no renewal of a dead key).
+	const rcDes = "43450000434500004345000043450000"
+	if _, err := st.AddAPIKeyRecharge(rcDes, keyDes, chat, 500); err != nil {
+		t.Fatal(err)
+	}
+	o := seedOrder(t, st, rcDes, chat, apikeyRechargeProduct, 500, 500000, "paid")
+
+	if b.deliverApikeyRecharge(ctx, o, rcDes) {
+		t.Fatal("must not recharge an expired key")
+	}
+	fl.mu.Lock()
+	nUpd := len(fl.Updates)
+	fl.mu.Unlock()
+	if nUpd != 0 {
+		t.Errorf("update called %d times, want 0 (never renew an expired key)", nUpd)
+	}
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 500000 {
+		t.Errorf("balance = %d, want the full 500000 back", bal)
+	}
+	if got, _ := st.GetOrder(rcDes); got.Status != "refunded" {
+		t.Errorf("order = %q, want refunded", got.Status)
+	}
+	rec, _ := st.APIKeyRechargeForOrder(rcDes)
+	if rec.AppliedTS != nil {
+		t.Error("applied_ts must stay NULL for a refused top-up")
+	}
+}
+
+// TestApikeyLlmgateRechargeDisabledAtLockRefusedAndRefunded pins the
+// in-lock DISABLED re-check: the pre-check passed while the key was alive,
+// but the fresh read inside the lock sees the admin's disable — the update's
+// is_active:true pin must never resurrect that key, so the order refunds
+// with zero update calls.
+func TestApikeyLlmgateRechargeDisabledAtLockRefusedAndRefunded(t *testing.T) {
+	ctx := context.Background()
+	b, _, st, _, fl, _ := newAPIKeyBot(t)
+	const chat = 100
+	const keyDes = "41460000414600004146000041460000"
+	seedLlmgateKey(t, st, fl, keyDes, chat, 777, "sk-llmgate-"+strings.Repeat("d", 48), "bedrock", 1000, 1000, 50)
+
+	const rcDes = "43460000434600004346000043460000"
+	if _, err := st.AddAPIKeyRecharge(rcDes, keyDes, chat, 500); err != nil {
+		t.Fatal(err)
+	}
+	o := seedOrder(t, st, rcDes, chat, apikeyRechargeProduct, 500, 500000, "paid")
+
+	// Disable AFTER order creation but BEFORE delivery — the pre-check at
+	// delivery time uses the same stats read in this test harness, so flip it
+	// here and let both the pre-check and the in-lock read see the disable.
+	fl.mu.Lock()
+	fl.keys[777].Alive = false
+	fl.mu.Unlock()
+
+	if b.deliverApikeyRecharge(ctx, o, rcDes) {
+		t.Fatal("must not recharge a disabled key")
+	}
+	fl.mu.Lock()
+	nUpd := len(fl.Updates)
+	fl.mu.Unlock()
+	if nUpd != 0 {
+		t.Errorf("update called %d times, want 0 (never re-enable a disabled key)", nUpd)
+	}
+	if bal, _ := st.GetBalance(fmtInt(chat)); bal != 500000 {
+		t.Errorf("balance = %d, want the full 500000 back", bal)
+	}
+	if got, _ := st.GetOrder(rcDes); got.Status != "refunded" {
+		t.Errorf("order = %q, want refunded", got.Status)
 	}
 }
 

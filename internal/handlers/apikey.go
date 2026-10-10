@@ -278,9 +278,10 @@ func (b *Bot) apikeyProductName(saleClass string) string {
 //
 // Backend first: a BackendLlmgate row gets DeliveredLlmgate whatever its sale
 // class — llmgate keys are minted bedrock-only, and their message carries the
-// TWO base URLs ({apibase} + the shop's {base}) the pool templates don't.
-// Anything not recognised by class (bedrock, or the legacy "" of pre-split
-// rows) keeps the bedrock template, matching apikeyKeyClass's own collapse.
+// TWO hosts the pool templates don't ({apibase}, the completions base, and
+// {pubbase}, the shop's web pages). Anything not recognised by class
+// (bedrock, or the legacy "" of pre-split rows) keeps the bedrock template,
+// matching apikeyKeyClass's own collapse.
 func apikeyDeliveredTemplate(c *i18n.APIKeyCatalog, keyClass, backend string) i18n.Str {
 	if backend == store.BackendLlmgate {
 		return c.DeliveredLlmgate
@@ -307,6 +308,24 @@ func (b *Bot) llmgateAPIBaseDisp() string {
 	u := llmgate.DefaultBaseURL
 	if b.cfg != nil {
 		u = b.cfg.LlmgateAPIBase()
+	}
+	return html.EscapeString(strings.TrimRight(u, "/"))
+}
+
+// llmgatePublicURLDisp is the {pubbase} substitution for the llmgate
+// delivery / reveal template: the base of the SHOP'S WEB PAGES (dashboard,
+// /docs, /models — served by shop-web), NOT the completions endpoint
+// ({apibase} above) and not the control plane. Needs its own knob because
+// on the dev rig the web pages live on a different host than the API
+// (config.LlmgatePublicURL chains llmgate_public_url → LLMGATE_PUBLIC_URL
+// → the pool's public-web host → the API base). Right-trimmed of '/' and
+// HTML-escaped for the same parse_mode=HTML reason as llmgateAPIBaseDisp;
+// a nil cfg (unit tests) falls back to llmgate.DefaultBaseURL so the
+// template still renders a sane URL instead of a bare "{pubbase}" token.
+func (b *Bot) llmgatePublicURLDisp() string {
+	u := llmgate.DefaultBaseURL
+	if b.cfg != nil {
+		u = b.cfg.LlmgatePublicURL()
 	}
 	return html.EscapeString(strings.TrimRight(u, "/"))
 }
@@ -871,15 +890,30 @@ const statsTimeout = 6 * time.Second
 
 // keyLiveStats — the backend-agnostic live view of one sold key: both pool
 // (kirogo /admin/stats) and llmgate (KeyStats with the customer's own key)
-// collapse into this. status: "active"|"exhausted"|"disabled"; unlimited:
-// credit side is unlimited (render ∞, refuse recharges); remaining may be
-// negative (overspend) — do not clamp; used mirrors the backend's meter.
+// collapse into this. status: "active"|"exhausted"|"expired"|"disabled";
+// unlimited: credit side is unlimited (render ∞, refuse recharges);
+// remaining may be negative (overspend) — do not clamp; used mirrors the
+// backend's meter.
+//
+// Expiry (ExpiresAt/HasExpiry/Expired) is LLMGATE-ONLY (business rule
+// 2026-10-10): pool keys never expire, so the pool mapping leaves the zero
+// values and no pool code path may ever set them. Expired mirrors the
+// "expired" Status verdict but is checked independently where the verdict's
+// precedence would blur it (e.g. the RC gate refuses disabled FIRST, then
+// expired, mirroring KeyUsage.Status's own order).
 type keyLiveStats struct {
 	Status    string
 	Remaining float64
 	Used      float64
 	Unlimited bool
 	SaleClass string // pool rows only (legacy '' display fallback); "" for llmgate
+
+	// ExpiresAt is the parsed llmgate expires_at; zero with HasExpiry=false
+	// when the key has none (never expires) or it is unreadable. Expired is
+	// the one-bit verdict: HasExpiry && ExpiresAt before now.
+	ExpiresAt time.Time
+	HasExpiry bool
+	Expired   bool
 }
 
 // apikeyLiveStats returns the live per-key stats for a minted key on WHATEVER
@@ -918,11 +952,18 @@ func (b *Bot) apikeyLiveStats(ctx context.Context, row *store.APIKey) *keyLiveSt
 			return nil
 		}
 		remaining, limited := u.Remaining()
+		expires, hasExpiry := u.Info.Expiry()
 		return &keyLiveStats{
 			Status:    u.Status(),
 			Remaining: remaining,
 			Used:      u.Used(),
 			Unlimited: !limited,
+			// Expiry off the raw wire string; Expired is re-derived here (not
+			// read off Status, whose precedence hides it under "disabled") so
+			// the RC gate can order its refusals itself.
+			ExpiresAt: expires,
+			HasExpiry: hasExpiry,
+			Expired:   hasExpiry && expires.Before(time.Now()),
 			// SaleClass stays "": llmgate keys carry no server-side sale class,
 			// and every llmgate row was minted bedrock anyway (the only class
 			// the cutover moved).
@@ -1036,6 +1077,10 @@ type rcGate struct {
 	//   "disabled"  key manually disabled — a recharge would RE-ENABLE it
 	//               server-side, so it is refused ("exhausted" keys pass:
 	//               re-enabling those is the whole point),
+	//   "expired"   llmgate key past its expires_at (business rule 2026-10-10:
+	//               a recharge RENEWS an active key's validity but can never
+	//               RESURRECT a dead one — buy a new key instead). Pool rows
+	//               never expire and can never produce this verdict.
 	//   "unlimited" creditsRemaining == -1 (Kiro-Go 400s credit top-ups on
 	//               unlimited keys),
 	//   "full"      headroom below the minimum order size.
@@ -1066,6 +1111,16 @@ func (b *Bot) apikeyRCGate(ctx context.Context, chatID int64, targetDes string) 
 	// Status() derives it from IsActive + remaining the same way).
 	if st.Status == "disabled" {
 		return rcGate{Row: row, Err: "disabled"}
+	}
+	// EXPIRED keys cannot be recharged (business rule 2026-10-10, rule 3):
+	// the renewal write below is reserved for ACTIVE keys — renewing one
+	// already past its expires_at would sell the customer 30 more days on a
+	// key llmgate has already killed. Checked BEFORE unlimited: an expired
+	// UNLIMITED key is still just expired (the calendar killed it, not the
+	// meter). Pool rows never set Expired, so this is llmgate-only by
+	// construction.
+	if st.Expired {
+		return rcGate{Row: row, Err: "expired"}
 	}
 	if st.Unlimited {
 		// Pool: creditsRemaining -1. llmgate: credit_limit 0. Both backends
@@ -1108,6 +1163,11 @@ func (b *Bot) rcGateMessage(g rcGate, lang i18n.Lang, cls string) string {
 		// (a manual disable would be re-enabled by a recharge; an unlimited key
 		// is rejected by Kiro-Go with a 400) — one customer-facing message.
 		return c.RCDisabled.T(lang)
+	case "expired":
+		// Business rule 2026-10-10, rule 3: an expired key is dead, and a
+		// recharge RENEWS but never resurrects — the wording must send the
+		// customer at a NEW key, not at support or a retry.
+		return c.RCExpired.T(lang)
 	case "full":
 		// Round, don't truncate: g.Remaining is fed straight from
 		// keyLiveStats.Remaining, which is fractional on live keys of BOTH

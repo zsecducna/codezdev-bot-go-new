@@ -376,3 +376,37 @@ func (c *Config) LlmgateAPIBase() string {
 	}
 	return c.EnvOr("LLMGATE_API_BASE", "https://api.codezdev-shop.uk")
 }
+
+// LlmgatePublicURL returns the base of the SHOP'S WEB PAGES linked from the
+// llmgate delivery/reveal message ({pubbase}: the dashboard, /docs and
+// /models routes served by shop-web) — a THIRD distinct host role: neither
+// the control plane the bot logs into (LlmgateBaseURL) nor the completions
+// endpoint buyers paste into their tooling (LlmgateAPIBase). It needs its
+// own knob because on the dev rig the web pages live on a different host
+// than the API, so falling back to either API base would link customers
+// at pages that do not exist there.
+//
+// Precedence: settings.json "llmgate_public_url" → .env/ambient
+// LLMGATE_PUBLIC_URL → the pool's public-web chain (KIRO_GO_PUBLIC_URL,
+// else the Kiro-Go admin base — exactly what handlers' kiroGoPublicURL
+// resolves to, because the shop's web has historically been served from
+// the same public host as the pool) → LlmgateAPIBase's value as the last
+// resort so the links always render SOMETHING sane. Trailing '/' trimmed
+// so template concatenation ("{pubbase}/docs") can never double-slash.
+func (c *Config) LlmgatePublicURL() string {
+	if u := strings.TrimSpace(stringValue(c.Settings(), "llmgate_public_url")); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	if u := strings.TrimSpace(c.Env("LLMGATE_PUBLIC_URL")); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	// The pool's public-web host: KIRO_GO_PUBLIC_URL, falling back to the
+	// Kiro-Go base (handlers.kiroGoPublicURL's exact chain).
+	if u := strings.TrimSpace(c.Env("KIRO_GO_PUBLIC_URL")); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	if u := strings.TrimSpace(c.KiroGoBaseURL()); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	return strings.TrimRight(c.LlmgateAPIBase(), "/")
+}

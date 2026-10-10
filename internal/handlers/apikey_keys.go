@@ -344,20 +344,22 @@ func (b *Bot) cbApikeyRev(cc *cbCtx) {
 	}
 	// SKU-correct wording/units: a kiro/fixed key re-reveals with its own
 	// delivery message, everything else (bedrock + legacy '') the bedrock one;
-	// an llmgate-backend row gets the two-URL llmgate wording whatever its
-	// class. Shared with the first delivery via apikeyDeliveredTemplate so the
+	// an llmgate-backend row gets the llmgate wording whatever its class.
+	// Shared with the first delivery via apikeyDeliveredTemplate so the
 	// two renders of one key can never disagree.
 	keyCls := apikeyKeyClass(row)
 	tmpl := apikeyDeliveredTemplate(c, keyCls, row.Backend)
 	// "name" (admin-renameable display name) must be passed here too, not only
 	// on the first delivery: this re-send uses the SAME template, so omitting
 	// it would leak a literal "{name}" into the customer's message. HTML-escaped
-	// because this goes out with parse_mode=HTML. "apibase" fills only the
-	// llmgate template (a silent no-op elsewhere, same as {opus} on prompts).
+	// because this goes out with parse_mode=HTML. "apibase"/"pubbase" fill only
+	// the llmgate template (silent no-ops elsewhere, same as {opus} on prompts);
+	// {pubbase} is the shop's web-pages host the guidance links point at.
 	b.sendHTML(cc.Ctx, cc.ChatID, i18n.F(tmpl.T(lang),
 		"name", html.EscapeString(b.apikeyProductName(keyCls)),
 		"credits", itoa64(roundCredits(row.Credits)),
 		"key", html.EscapeString(row.APIKey),
 		"base", html.EscapeString(b.kiroGoPublicURL()),
-		"apibase", b.llmgateAPIBaseDisp()))
+		"apibase", b.llmgateAPIBaseDisp(),
+		"pubbase", b.llmgatePublicURLDisp()))
 }

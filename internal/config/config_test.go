@@ -570,6 +570,58 @@ func TestLlmgateDefaults(t *testing.T) {
 	if got := c.LlmgatePassword(); got != "" {
 		t.Errorf("LlmgatePassword() = %q, want empty when unset", got)
 	}
+	// Nothing configured at all: the public-web chain bottoms out at the
+	// API base's compiled default so the delivery links always render.
+	if got := c.LlmgatePublicURL(); got != "https://api.codezdev-shop.uk" {
+		t.Errorf("LlmgatePublicURL() = %q, want the API-base default %q", got, "https://api.codezdev-shop.uk")
+	}
+}
+
+// TestLlmgatePublicURLPrecedence pins the {pubbase} chain: settings.json
+// wins over LLMGATE_PUBLIC_URL, which wins over the pool's public-web host
+// (KIRO_GO_PUBLIC_URL → the Kiro-Go base), which wins over the llmgate API
+// base. The web-pages host is a THIRD knob distinct from both API hosts
+// (on the dev rig shop-web lives on its own host), so every layer must be
+// reachable and trailing slashes trimmed.
+func TestLlmgatePublicURLPrecedence(t *testing.T) {
+	base := func(env, settings string) string {
+		dir := t.TempDir()
+		if env != "" {
+			writeFile(t, filepath.Join(dir, ".env"), env)
+		}
+		if settings != "" {
+			writeFile(t, filepath.Join(dir, "settings.json"), settings)
+		}
+		return mustLoad(t, dir).LlmgatePublicURL()
+	}
+
+	// settings.json llmgate_public_url beats every env knob.
+	if got := base(
+		"LLMGATE_PUBLIC_URL=https://pub.env\nKIRO_GO_PUBLIC_URL=https://pool.env\n",
+		`{"llmgate_public_url": "https://pub.set/"}`,
+	); got != "https://pub.set" {
+		t.Errorf("settings win: LlmgatePublicURL() = %q, want %q (slash trimmed)", got, "https://pub.set")
+	}
+	// LLMGATE_PUBLIC_URL beats the pool chain.
+	if got := base(
+		"LLMGATE_PUBLIC_URL=https://pub.env\nKIRO_GO_PUBLIC_URL=https://pool.env\n",
+		`{"llmgate_base_url": "https://ctl.set"}`,
+	); got != "https://pub.env" {
+		t.Errorf("env pub wins: LlmgatePublicURL() = %q, want %q", got, "https://pub.env")
+	}
+	// KIRO_GO_PUBLIC_URL is the first fallback (the shop's web has
+	// historically been served from the pool's public host).
+	if got := base("KIRO_GO_PUBLIC_URL=https://pool.env\n", ""); got != "https://pool.env" {
+		t.Errorf("pool public wins: LlmgatePublicURL() = %q, want %q", got, "https://pool.env")
+	}
+	// Then the Kiro-Go ADMIN base (kiroGoPublicURL's own fallback)...
+	if got := base("", `{"kiro_go_base_url": "https://kiro.admin/"}`); got != "https://kiro.admin" {
+		t.Errorf("kiro base wins: LlmgatePublicURL() = %q, want %q", got, "https://kiro.admin")
+	}
+	// ...and only then the llmgate API base (settings or compiled default).
+	if got := base("", `{"llmgate_api_base": "https://api.set"}`); got != "https://api.set" {
+		t.Errorf("api base fallback: LlmgatePublicURL() = %q, want %q", got, "https://api.set")
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -406,13 +406,15 @@ func apikeySettings(fk *fakeKiro, fl *fakeLlmgate) map[string]any {
 		"kiro_go_account_id":      "acct-1",
 		"apikey_usdt_per_100":     4.0,
 		"apikey_max_per_customer": 0,
-		// llmgate triple — the llmgate cutover's bedrock gate. The api base is
-		// a DISTINCT stable host so tests can tell {apibase} and {base} apart
-		// in the delivered message.
-		"llmgate_base_url": fl.srv.URL,
-		"llmgate_username": "shop",
-		"llmgate_password": "llm-secret",
-		"llmgate_api_base": "https://api.example.test",
+		// llmgate triple — the llmgate cutover's bedrock gate. The api base
+		// and the public-web host are DISTINCT stable hosts so tests can tell
+		// {apibase}, {pubbase} and the pool's {base} apart in the delivered
+		// message.
+		"llmgate_base_url":   fl.srv.URL,
+		"llmgate_username":   "shop",
+		"llmgate_password":   "llm-secret",
+		"llmgate_api_base":   "https://api.example.test",
+		"llmgate_public_url": "https://shop.example.test",
 	}
 }
 

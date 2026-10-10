@@ -35,18 +35,25 @@
 //     bodies, tokens, or key values: only path, status code and attempt
 //     number reach the logger. Server-supplied text that must become error
 //     text is passed through redactSecrets first (invariant 7).
-//  3. CreateKey's wire body structurally OMITS expires_at (no field exists
-//     to marshal): the verified behavior of this API is that omitting
-//     expires_at yields a key that NEVER expires — the only safe default
-//     for a sold key. Sending a zero/empty expires_at instead would mean
-//     "expired at epoch", a silently dead key.
+//  3. Expiry is CALLER-controlled on the wire. A ZERO time structurally
+//     OMITS expires_at from the create/update body (omitempty over an
+//     empty string), and the verified behavior of this API is that an
+//     omitted expires_at on CREATE yields a key that NEVER expires.
+//     Sending a zero/empty expires_at VALUE instead would mean "expired
+//     at epoch", a silently dead key — which is why the omission is
+//     structural, never a marshaled zero. The bot's mint path passes
+//     now+DefaultValidity (business rule 2026-10-10: sold keys live 30
+//     days; recharging an ACTIVE key RENEWS that window). The stats
+//     endpoint reports expires_at ONLY when the key has one (verified).
 //  4. UpdateKey is ABSOLUTE, not additive: credit_limit is SET to the
 //     request value, and OMITTING name CLEARS the stored name (verified) —
 //     so UpdateKey always sends the current name and never lets a caller
-//     accidentally blank it. The update response's created_at is zeroed
-//     garbage ("0001-01-01T00:00:00Z", verified) and its api_key comes
-//     back absent (only api_key_length): Key decodes both fine and callers
-//     must not trust those fields off an update.
+//     accidentally blank it. expires_at is settable on update (verified);
+//     its omission semantics there are UNVERIFIED, so the recharge path
+//     always sends a concrete renewal time. The update response's
+//     created_at is zeroed garbage ("0001-01-01T00:00:00Z", verified) and
+//     its api_key comes back absent (only api_key_length): Key decodes
+//     both fine and callers must not trust those fields off an update.
 //  5. Usage numbers from /stats LAG reality by ~30-60 seconds (the server
 //     aggregates asynchronously). A "just topped up" key can still report
 //     exhausted for a minute; handlers must not treat a fresh stats read as
@@ -88,6 +95,16 @@ import (
 // injects it itself (Configured stays a pure reflection of what was pinned,
 // so a missing override is visible instead of silently papered over).
 const DefaultBaseURL = "https://api.codezdev-shop.uk"
+
+// DefaultValidity is how long a freshly minted key lives: 30 DAYS exactly
+// (business rule 2026-10-10, revised same day: 30 days, NOT a calendar
+// month — AddDate(0,1,0) would hand buyers 28-to-31-day "months" and drift
+// by up to a day either way). ONE constant because three call sites must
+// agree on it: the mint path (fresh keys), the recharge renewal (topping up
+// an ACTIVE key extends its window) and cmd/migrate-llmgate (migrated keys
+// adopt the same validity). It lives HERE, at the llmgate wire boundary
+// every caller computes it against.
+const DefaultValidity = 30 * 24 * time.Hour
 
 // Config is the llmgate connection configuration the bot pins from env
 // (internal/config owns loading; this package only consumes). All three

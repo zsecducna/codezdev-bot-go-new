@@ -189,3 +189,42 @@ func TestApplySupportHandle(t *testing.T) {
 		t.Errorf("restore failed: Support.EN = %q", got)
 	}
 }
+
+// TestAPIKeyExpiryCatalogEntries pins the 2026-10-10 expiry-rule strings in
+// EVERY language: RCExpired must tell the customer an expired key cannot be
+// recharged (and to buy a new one), Status must render the "expired"
+// verdict, and DeliveredLlmgate must carry EXACTLY the {name} {credits}
+// {key} {apibase} {pubbase} placeholders — {base} is gone from that
+// template (the legacy-endpoint line was removed), and a language missing a
+// placeholder would leak a raw "{token}" into a customer message.
+func TestAPIKeyExpiryCatalogEntries(t *testing.T) {
+	c := C().APIKey
+	for _, lang := range []Lang{EN, VI, ZH} {
+		rc := c.RCExpired.T(lang)
+		if rc == "" || !strings.Contains(strings.ToLower(rc), "expired") && !strings.Contains(rc, "hết hạn") && !strings.Contains(rc, "过期") {
+			t.Errorf("RCExpired[%v] = %q, must say the key expired", lang, rc)
+		}
+		if s, ok := c.Status["expired"]; !ok || s.T(lang) == "" {
+			t.Errorf("Status[\"expired\"][%v] missing/empty — My-Keys would render a bare status word", lang)
+		}
+		// tokens() keeps duplicates ({pubbase} appears 3x: dashboard, docs,
+		// models) — compare the DEDUPED set so the assertion is about which
+		// placeholders exist, not how often each is used.
+		got := tokens(c.DeliveredLlmgate.T(lang))
+		seen := map[string]bool{}
+		var uniq []string
+		for _, tok := range got {
+			if !seen[tok] {
+				seen[tok] = true
+				uniq = append(uniq, tok)
+			}
+		}
+		want := []string{"{apibase}", "{credits}", "{key}", "{name}", "{pubbase}"}
+		if !reflect.DeepEqual(uniq, want) {
+			t.Errorf("DeliveredLlmgate[%v] placeholders = %v, want exactly %v (no {base} — legacy line removed)", lang, uniq, want)
+		}
+		if strings.Contains(c.DeliveredLlmgate.T(lang), "{base}") {
+			t.Errorf("DeliveredLlmgate[%v] still carries {base} — the legacy-endpoint line must be gone", lang)
+		}
+	}
+}

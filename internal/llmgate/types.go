@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 // Key is one llmgate api-key record. It decodes every key-shaped payload in
@@ -17,6 +18,11 @@ import (
 //   - CreditLimit is 0 = UNLIMITED (1 credit = $1 of usage). Modeled as
 //     float64, never int: limits and the costs metered against them are
 //     fractional dollars in live responses (see UsageStats).
+//   - ExpiresAt is the RAW ISO-8601 string off the wire (kept unparsed on
+//     the struct so encoding round-trips are lossless); ABSENT means the
+//     key never expires — the stats endpoint (verified live) includes
+//     "expires_at" ONLY when the key has one. Parse it through Expiry(),
+//     never time.Parse at the call site.
 //   - list reports created_at per key, but update responses zero it
 //     ("0001-01-01T00:00:00Z" — invariant 4); this struct therefore has NO
 //     created_at field at all, so no caller can branch on a field this
@@ -27,6 +33,32 @@ type Key struct {
 	Name        string  `json:"name"`
 	IsActive    bool    `json:"is_active"`
 	CreditLimit float64 `json:"credit_limit"`
+	// ExpiresAt is the raw expires_at string; omitempty mirrors the wire
+	// (absent = never expires) so a Key re-marshals to the same shape.
+	ExpiresAt string `json:"expires_at,omitempty"`
+}
+
+// Expiry parses Key.ExpiresAt into a time.Time. The bool is false when the
+// key HAS NO expiry (field absent — never expires) or the value is unparsable
+// garbage: both mean "this client cannot prove the key is expired", and every
+// caller treats expiry as OPT-IN (an unparsable timestamp must never
+// render a live sold key dead — the same fail-shape invariant 3 gives the
+// create side).
+//
+// One layout suffices despite the server's two observed spellings: Go's
+// time.Parse with time.RFC3339 accepts fractional seconds in the INPUT even
+// though the layout does not mention them (documented time.Parse behavior),
+// so "2026-10-11T01:35:00.000Z" and "2026-10-11T01:35:00Z" both parse, as do
+// non-UTC offsets (+07:00, observed on login's expire_at).
+func (k *Key) Expiry() (time.Time, bool) {
+	if k.ExpiresAt == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, k.ExpiresAt)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // UsageStats is the metered-spend half of GET /api/v1/apikey/stats. Costs
@@ -91,6 +123,11 @@ func (u *KeyUsage) Remaining() (float64, bool) {
 //	"disabled"  Info.IsActive == false — the switch is off, spend state is
 //	            irrelevant (checked FIRST: a disabled+exhausted key is
 //	            disabled, not exhausted — the operator action differs).
+//	"expired"   an Expiry is set and lies in the past — the key is dead by
+//	            calendar, not by spend (business rule 2026-10-10: minted keys
+//	            live 30 days; recharges RENEW, expired keys cannot be
+//	            recharged). outranks "exhausted" and unlimited-ness: an
+//	            expired UNLIMITED key is still just expired.
 //	"exhausted" limited AND remaining <= 0 — cut off now, or overspent.
 //	"active"    everything else, including UNLIMITED keys (a credit-limit-0
 //	            key can never be exhausted by definition, so it stays
@@ -102,6 +139,9 @@ func (u *KeyUsage) Remaining() (float64, bool) {
 func (u *KeyUsage) Status() string {
 	if !u.Info.IsActive {
 		return "disabled"
+	}
+	if exp, has := u.Info.Expiry(); has && exp.Before(time.Now()) {
+		return "expired"
 	}
 	if remaining, limited := u.Remaining(); limited && remaining <= 0 {
 		return "exhausted"
@@ -118,12 +158,17 @@ func (u *KeyUsage) Status() string {
 // (ErrCreditLimitNegative) so a typo costs a local error instead of a
 // server 400 and a dead round trip.
 //
-// WIRE SHAPE (invariant 3): the payload struct deliberately has NO
-// expires_at field — encoding/json can only marshal fields that exist, so
-// the omission is structural, not an empty-value accident. The verified
-// behavior of this API is that an omitted expires_at yields a key that
-// NEVER expires, the only safe default for a sold key (a zero time there
-// would mean "expired at the epoch": a silently dead key). is_active is
+// WIRE SHAPE (invariant 3): expires encodes the key's expiry. A ZERO time
+// omits the field from the JSON entirely (omitempty on an empty string —
+// the same structural-omission trick as the no-accountId payload), and the
+// verified behavior of this API is that an omitted expires_at yields a key
+// that NEVER expires. A NON-zero time is sent as RFC3339 (millis optional
+// server-side; this client sends the plain spelling). The bot's mint path
+// always passes time.Now().Add(DefaultValidity) — every sold key lives
+// 30 DAYS (business rule 2026-10-10) — while the zero time remains
+// the caller's explicit "never expires" escape hatch (a zero time in the
+// JSON body itself would mean "expired at the epoch": a silently dead
+// key, which is exactly why omission is structural). is_active is
 // hardcoded true — a key minted disabled cannot serve its buyer, and no
 // caller of this client has a reason to mint one off.
 //
@@ -142,7 +187,7 @@ func (u *KeyUsage) Status() string {
 // reconciliation (mintLlmgateKey): on an IsAmbiguous error it lists the
 // account's keys, finds this order's deterministic name, and reveals THAT
 // key — recovering a committed mint without ever minting twice.
-func (c *Client) CreateKey(ctx context.Context, name string, creditLimit float64) (*Key, error) {
+func (c *Client) CreateKey(ctx context.Context, name string, creditLimit float64, expires time.Time) (*Key, error) {
 	if creditLimit < 0 {
 		return nil, ErrCreditLimitNegative
 	}
@@ -150,7 +195,13 @@ func (c *Client) CreateKey(ctx context.Context, name string, creditLimit float64
 		Name        string  `json:"name"`
 		IsActive    bool    `json:"is_active"`
 		CreditLimit float64 `json:"credit_limit"`
+		// ExpiresAt is "" for a zero `expires` → the field is OMITTED from
+		// the body (never-expire); otherwise the RFC3339 spelling above.
+		ExpiresAt string `json:"expires_at,omitempty"`
 	}{Name: name, IsActive: true, CreditLimit: creditLimit}
+	if !expires.IsZero() {
+		payload.ExpiresAt = expires.Format(time.RFC3339)
+	}
 
 	var key Key
 	if err := c.userSendOnce(ctx, http.MethodPost, "/api/v1/apikey/create", payload, &key); err != nil {
@@ -161,10 +212,10 @@ func (c *Client) CreateKey(ctx context.Context, name string, creditLimit float64
 
 // ── POST /api/v1/apikey/update ─────────────────────────────────────────────
 
-// UpdateKey mutates an existing key (user realm): name, is_active and
-// credit_limit in one absolute write (invariant 4).
+// UpdateKey mutates an existing key (user realm): name, is_active,
+// credit_limit and expires_at in one absolute write (invariant 4).
 //
-// WIRE SHAPE (invariant 4, both verified live):
+// WIRE SHAPE (invariant 4, verified live):
 //   - name is ALWAYS sent. Omitting it on this endpoint CLEARS the stored
 //     name — so this client cannot express "leave the name alone"; callers
 //     must pass the current name (the handlers own it). name == "" is
@@ -172,11 +223,19 @@ func (c *Client) CreateKey(ctx context.Context, name string, creditLimit float64
 //     asked for it, never an accident of a sparse struct.
 //   - credit_limit is SET to the given value, NOT added to the old one: a
 //     top-up call re-reads current usage and sends the new absolute cap.
+//   - expires_at IS settable on update (verified live), encoded exactly
+//     like CreateKey's: a zero time OMITS the field. The omission
+//     semantics of THIS endpoint are UNVERIFIED (does an absent
+//     expires_at clear the stored expiry, or leave it alone?); every
+//     caller in this repo passes a CONCRETE time — the recharge path
+//     renews to now+DefaultValidity (business rule 2026-10-10) — so a
+//     zero time here is always the caller's deliberate choice, never a
+//     default.
 //
 // The returned Key carries the post-update record with APIKey EMPTY (the
 // server returns api_key_length only) and no trustworthy created_at (the
 // field decodes as zeroed garbage — invariant 4); branch on neither.
-func (c *Client) UpdateKey(ctx context.Context, id int64, name string, isActive bool, creditLimit float64) (*Key, error) {
+func (c *Client) UpdateKey(ctx context.Context, id int64, name string, isActive bool, creditLimit float64, expires time.Time) (*Key, error) {
 	if id <= 0 {
 		return nil, ErrIDRequired
 	}
@@ -188,7 +247,13 @@ func (c *Client) UpdateKey(ctx context.Context, id int64, name string, isActive 
 		Name        string  `json:"name"`
 		IsActive    bool    `json:"is_active"`
 		CreditLimit float64 `json:"credit_limit"`
+		// ExpiresAt is "" for a zero `expires` → OMITTED (see the doc above:
+		// unverified server-side, so callers must mean it).
+		ExpiresAt string `json:"expires_at,omitempty"`
 	}{ID: id, Name: name, IsActive: isActive, CreditLimit: creditLimit}
+	if !expires.IsZero() {
+		payload.ExpiresAt = expires.Format(time.RFC3339)
+	}
 
 	var key Key
 	if err := c.userSend(ctx, http.MethodPost, "/api/v1/apikey/update", payload, &key); err != nil {

@@ -137,10 +137,12 @@ type fakeGate struct {
 
 	logins  int
 	creates int
-	// lastCreateName/lastCreateLimit capture what CreateKey actually sent —
-	// how the tests pin the name convention and the credit figure.
-	lastCreateName  string
-	lastCreateLimit float64
+	// lastCreateName/lastCreateLimit/lastCreateExpires capture what CreateKey
+	// actually sent — how the tests pin the name convention, the credit
+	// figure, and the 30-day expiry every migrated key adopts.
+	lastCreateName    string
+	lastCreateLimit   float64
+	lastCreateExpires string
 
 	nextID int64
 	// keysByValue: created keys, keyed by cleartext value (what KeyStats
@@ -195,18 +197,20 @@ func (f *fakeGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Name        string  `json:"name"`
 			IsActive    bool    `json:"is_active"`
 			CreditLimit float64 `json:"credit_limit"`
+			ExpiresAt   string  `json:"expires_at"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad body", http.StatusBadRequest)
 			return
 		}
 		f.creates++
-		f.lastCreateName, f.lastCreateLimit = body.Name, body.CreditLimit
+		f.lastCreateName, f.lastCreateLimit, f.lastCreateExpires = body.Name, body.CreditLimit, body.ExpiresAt
 		id := f.nextID
 		f.nextID++
 		key := llmgate.Key{
 			ID: id, APIKey: fakeLlmgateKey(id), Name: body.Name,
 			IsActive: body.IsActive, CreditLimit: body.CreditLimit,
+			ExpiresAt: body.ExpiresAt,
 		}
 		f.keysByValue[key.APIKey] = key
 		writeJSON(w, http.StatusOK, llmgateWrap(200, "success", fakeGateKeyWire(key)))
@@ -257,11 +261,17 @@ func jsonNumber(id int64) string {
 }
 
 // fakeGateKeyWire is the Key wire shape (snake_case per llmgate.Key tags).
+// expires_at rides only when the key has one — the verified wire fact that
+// absent means never-expire.
 func fakeGateKeyWire(k llmgate.Key) map[string]any {
-	return map[string]any{
+	out := map[string]any{
 		"id": k.ID, "api_key": k.APIKey, "name": k.Name,
 		"is_active": k.IsActive, "credit_limit": k.CreditLimit,
 	}
+	if k.ExpiresAt != "" {
+		out["expires_at"] = k.ExpiresAt
+	}
+	return out
 }
 
 // statsData builds the KeyStats data payload in the exact llmgate.KeyUsage
@@ -480,6 +490,38 @@ func TestApplyMigratesRowHappyPath(t *testing.T) {
 	}
 	if out := e.out.String(); strings.Contains(out, "ordkiro") || strings.Contains(out, "ordref") {
 		t.Errorf("excluded rows appear in the plan transcript:\n%s", out)
+	}
+}
+
+// TestApplyMints30DayExpiry: every migrated key is minted with the SAME
+// 30-day validity as a fresh sale (user rule 2026-10-10) — migrated owners
+// recharge-to-renew exactly like everyone else, instead of holding a
+// privileged never-expiring class. Pinned on the exact create body: an
+// RFC3339 expires_at ≈ now+30 days (llmgate.DefaultValidity).
+func TestApplyMints30DayExpiry(t *testing.T) {
+	e := newEnv(t)
+	applyStart := time.Now()
+	e.seedRow(t, "ordexp", 111, "pool-uuid-exp", "sk-pool-exp", 100, "", 42)
+
+	counts, err := e.run(t, true)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if counts.Migrated != 1 {
+		t.Fatalf("migrated = %d, want 1 (tally: %+v)", counts.Migrated, counts)
+	}
+	e.gate.mu.Lock()
+	raw := e.gate.lastCreateExpires
+	e.gate.mu.Unlock()
+	if raw == "" {
+		t.Fatal("create body omitted expires_at — migrated keys must adopt the 30-day validity, not the legacy never-expire shape")
+	}
+	exp, perr := time.Parse(time.RFC3339, raw)
+	if perr != nil {
+		t.Fatalf("create expires_at %q is not RFC3339: %v", raw, perr)
+	}
+	if d := exp.Sub(applyStart.Add(llmgate.DefaultValidity)); d < -time.Hour || d > time.Hour {
+		t.Errorf("create expires_at = %v, want ≈ %v (apply-time + 30 days)", exp, applyStart.Add(llmgate.DefaultValidity))
 	}
 }
 

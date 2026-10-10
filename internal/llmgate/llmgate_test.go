@@ -267,11 +267,12 @@ func TestUserSend_401TwiceErrAuthFailed(t *testing.T) {
 
 // ── POST /api/v1/apikey/create (invariant 3) ─────────────────────────────────
 
-// TestCreateKey_WireBodyNoExpiry — the create payload must STRUCTURALLY
-// omit expires_at (no key at all in the JSON), because an omitted field
-// means "never expires" while a zero-valued one would mean "already
-// expired". name/is_active/credit_limit must all be present.
-func TestCreateKey_WireBodyNoExpiry(t *testing.T) {
+// TestCreateKey_WireBodyNoExpiryOnZeroTime — a ZERO expires must omit
+// expires_at from the create payload (no key at all in the JSON), because
+// an omitted field means "never expires" while a marshaled zero value
+// would mean "already expired". name/is_active/credit_limit must all be
+// present.
+func TestCreateKey_WireBodyNoExpiryOnZeroTime(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/user/login", func(w http.ResponseWriter, r *http.Request) {
 		writeData(w, http.StatusOK, loginData("jwt-1", 24*time.Hour))
@@ -285,7 +286,7 @@ func TestCreateKey_WireBodyNoExpiry(t *testing.T) {
 			t.Fatalf("decode create body: %v", err)
 		}
 		if _, exists := body["expires_at"]; exists {
-			t.Errorf("expires_at present in create body %v — must be structurally omitted (never expires)", body)
+			t.Errorf("expires_at present in create body %v — a zero time must omit it (never expires)", body)
 		}
 		if body["name"] != "order-9" {
 			t.Errorf("name = %v, want order-9", body["name"])
@@ -305,12 +306,57 @@ func TestCreateKey_WireBodyNoExpiry(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(srv)
-	key, err := c.CreateKey(context.Background(), "order-9", 5)
+	key, err := c.CreateKey(context.Background(), "order-9", 5, time.Time{})
 	if err != nil {
 		t.Fatalf("CreateKey: %v", err)
 	}
 	if key.ID != 1883 || key.APIKey == "" || key.Name != "order-9" || !key.IsActive || key.CreditLimit != 5 {
 		t.Errorf("decoded key = %+v, want the minted values incl. cleartext APIKey", key)
+	}
+}
+
+// TestCreateKey_WireBodySendsExpiry — a NON-zero expires must reach the
+// wire as an RFC3339 string that parses back to the exact instant sent:
+// the mint path's 30-day validity (business rule 2026-10-10) is only as
+// real as the timestamp llmgate actually receives.
+func TestCreateKey_WireBodySendsExpiry(t *testing.T) {
+	want := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/user/login", func(w http.ResponseWriter, r *http.Request) {
+		writeData(w, http.StatusOK, loginData("jwt-1", 24*time.Hour))
+	})
+	mux.HandleFunc("/api/v1/apikey/create", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode create body: %v", err)
+		}
+		raw, ok := body["expires_at"].(string)
+		if !ok || raw == "" {
+			t.Fatalf("expires_at = %v, want the RFC3339 string %q", body["expires_at"], want.Format(time.RFC3339))
+		}
+		got, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			t.Fatalf("expires_at %q is not RFC3339: %v", raw, err)
+		}
+		if !got.Equal(want) {
+			t.Errorf("expires_at = %v, want %v", got, want)
+		}
+		writeData(w, http.StatusOK, map[string]any{
+			"id": 1884, "api_key": "sk-llmgate-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			"name": "order-10", "is_active": true, "credit_limit": 5,
+			"expires_at": want.Format(time.RFC3339),
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	key, err := c.CreateKey(context.Background(), "order-10", 5, want)
+	if err != nil {
+		t.Fatalf("CreateKey: %v", err)
+	}
+	if exp, ok := key.Expiry(); !ok || !exp.Equal(want) {
+		t.Errorf("decoded Expiry = (%v,%v), want (%v,true) — create echoes the expiry back", exp, ok, want)
 	}
 }
 
@@ -331,13 +377,13 @@ func TestCreateKey_Guards(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(srv)
-	if _, err := c.CreateKey(context.Background(), "x", -0.5); !errors.Is(err, ErrCreditLimitNegative) {
+	if _, err := c.CreateKey(context.Background(), "x", -0.5, time.Time{}); !errors.Is(err, ErrCreditLimitNegative) {
 		t.Errorf("negative limit error = %v, want ErrCreditLimitNegative", err)
 	}
 	if called {
 		t.Error("negative limit still reached the server")
 	}
-	if _, err := c.CreateKey(context.Background(), "x", 0); err != nil {
+	if _, err := c.CreateKey(context.Background(), "x", 0, time.Now().Add(DefaultValidity)); err != nil {
 		t.Errorf("unlimited (0) limit rejected: %v", err)
 	}
 	if !called {
@@ -348,11 +394,14 @@ func TestCreateKey_Guards(t *testing.T) {
 // ── POST /api/v1/apikey/update (invariant 4) ─────────────────────────────────
 
 // TestUpdateKey_WireBody — update always carries id AND name (omitting
-// name CLEARS it server-side, a verified footgun), plus is_active and the
-// absolute credit_limit. The response has no api_key value (only a
-// length) and a zeroed created_at; Key must decode that without error and
-// leave APIKey empty.
+// name CLEARS it server-side, a verified footgun), plus is_active, the
+// absolute credit_limit, and the explicit expires_at the recharge path
+// sends as its renewal (business rule 2026-10-10: a top-up of an ACTIVE
+// key extends validity by another 30 days). The response has no api_key value
+// (only a length) and a zeroed created_at; Key must decode that without
+// error and leave APIKey empty.
 func TestUpdateKey_WireBody(t *testing.T) {
+	renew := time.Date(2026, 12, 25, 9, 30, 0, 0, time.UTC)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/user/login", func(w http.ResponseWriter, r *http.Request) {
 		writeData(w, http.StatusOK, loginData("jwt-1", 24*time.Hour))
@@ -374,6 +423,17 @@ func TestUpdateKey_WireBody(t *testing.T) {
 		if body["credit_limit"] != float64(12) {
 			t.Errorf("credit_limit = %v, want 12 (absolute, not additive)", body["credit_limit"])
 		}
+		raw, ok := body["expires_at"].(string)
+		if !ok || raw == "" {
+			t.Fatalf("expires_at = %v, want the renewal RFC3339 string", body["expires_at"])
+		}
+		got, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			t.Fatalf("expires_at %q is not RFC3339: %v", raw, err)
+		}
+		if !got.Equal(renew) {
+			t.Errorf("expires_at = %v, want the renewal %v", got, renew)
+		}
 		// The verified update response: api_key_length instead of api_key,
 		// and a zeroed created_at that must not be trusted.
 		writeData(w, http.StatusOK, map[string]any{
@@ -385,7 +445,7 @@ func TestUpdateKey_WireBody(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(srv)
-	key, err := c.UpdateKey(context.Background(), 1882, "current-name", true, 12)
+	key, err := c.UpdateKey(context.Background(), 1882, "current-name", true, 12, renew)
 	if err != nil {
 		t.Fatalf("UpdateKey: %v", err)
 	}
@@ -409,11 +469,11 @@ func TestUpdateKey_Guards(t *testing.T) {
 
 	c := newTestClient(srv)
 	for _, id := range []int64{0, -7} {
-		if _, err := c.UpdateKey(context.Background(), id, "n", true, 1); !errors.Is(err, ErrIDRequired) {
+		if _, err := c.UpdateKey(context.Background(), id, "n", true, 1, time.Time{}); !errors.Is(err, ErrIDRequired) {
 			t.Errorf("id %d: error = %v, want ErrIDRequired", id, err)
 		}
 	}
-	if _, err := c.UpdateKey(context.Background(), 5, "n", true, -1); !errors.Is(err, ErrCreditLimitNegative) {
+	if _, err := c.UpdateKey(context.Background(), 5, "n", true, -1, time.Time{}); !errors.Is(err, ErrCreditLimitNegative) {
 		t.Errorf("negative limit: error = %v, want ErrCreditLimitNegative", err)
 	}
 	if called {
@@ -693,12 +753,50 @@ func TestKeyStats_EmptyCustomerKey(t *testing.T) {
 
 // ── KeyUsage semantics (invariant 5 helpers) ─────────────────────────────────
 
+// TestKeyExpiry_ParseMatrix — Expiry's contract: absent expires_at (never
+// expires) and unparsable garbage both return false (expiry is opt-in, a
+// bad timestamp must never kill a live sold key), while plain RFC3339,
+// RFC3339 with fractional millis, and non-UTC offsets all parse (Go's
+// RFC3339 layout accepts fractional seconds in the input natively).
+func TestKeyExpiry_ParseMatrix(t *testing.T) {
+	want := time.Date(2026, 11, 10, 1, 35, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		raw    string
+		want   time.Time
+		wantOK bool
+	}{
+		{name: "absent means never expires", raw: "", wantOK: false},
+		{name: "plain RFC3339", raw: "2026-11-10T01:35:00Z", want: want, wantOK: true},
+		{name: "RFC3339 with millis", raw: "2026-11-10T01:35:00.000Z", want: want, wantOK: true},
+		{name: "non-UTC offset", raw: "2026-11-10T08:35:00+07:00", want: want, wantOK: true},
+		{name: "garbage", raw: "not-a-time", wantOK: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			k := &Key{ExpiresAt: tc.raw}
+			got, ok := k.Expiry()
+			if ok != tc.wantOK {
+				t.Errorf("Expiry() ok = %v, want %v", ok, tc.wantOK)
+			}
+			if tc.wantOK && !got.Equal(tc.want) {
+				t.Errorf("Expiry() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestKeyUsage_StatusMatrix — the handlers' verdict table: disabled wins
-// over everything; exhausted means limited AND remaining <= 0 (including
-// overspent negatives); unlimited keys stay active with (0, false).
+// over everything; expired (a set expiry in the past) outranks both
+// exhaustion and unlimited-ness — an expired UNLIMITED key is still just
+// expired, because the calendar killed it, not the meter; exhausted means
+// limited AND remaining <= 0 (including overspent negatives); unlimited
+// keys stay active with (0, false); a FUTURE expiry changes nothing yet.
 func TestKeyUsage_StatusMatrix(t *testing.T) {
-	usage := func(active bool, limit float64, costs ...float64) *KeyUsage {
-		u := &KeyUsage{Info: Key{IsActive: active, CreditLimit: limit}}
+	past := time.Now().Add(-24 * time.Hour).Format(time.RFC3339)
+	future := time.Now().Add(24 * time.Hour).Format(time.RFC3339)
+	usage := func(active bool, limit float64, expires string, costs ...float64) *KeyUsage {
+		u := &KeyUsage{Info: Key{IsActive: active, CreditLimit: limit, ExpiresAt: expires}}
 		u.Stats.InputCost, u.Stats.OutputCost, u.Stats.CacheCost, u.Stats.CacheWriteCost = costs[0], costs[1], costs[2], costs[3]
 		return u
 	}
@@ -709,11 +807,16 @@ func TestKeyUsage_StatusMatrix(t *testing.T) {
 		wantRemaining float64
 		wantLimited   bool
 	}{
-		{"disabled wins over exhausted", usage(false, 10, 11, 0, 0, 0), "disabled", -1, true},
-		{"exhausted at the line", usage(true, 10, 10, 0, 0, 0), "exhausted", 0, true},
-		{"exhausted overspent keeps negative", usage(true, 10, 6, 5, 0, 0), "exhausted", -1, true},
-		{"active with headroom", usage(true, 10, 9, 0, 0.5, 0), "active", 0.5, true},
-		{"unlimited is never exhausted", usage(true, 0, 999, 999, 999, 999), "active", 0, false},
+		{"disabled wins over exhausted", usage(false, 10, "", 11, 0, 0, 0), "disabled", -1, true},
+		{"disabled wins over expired", usage(false, 10, past, 0, 0, 0, 0), "disabled", 10, true},
+		{"expired with credits left", usage(true, 10, past, 0, 0, 0, 0), "expired", 10, true},
+		{"expired outranks exhausted", usage(true, 10, past, 10, 0, 0, 0), "expired", 0, true},
+		{"expired unlimited is still expired", usage(true, 0, past, 999, 999, 999, 999), "expired", 0, false},
+		{"future expiry keeps active", usage(true, 10, future, 9, 0, 0.5, 0), "active", 0.5, true},
+		{"no expiry exhausted at the line", usage(true, 10, "", 10, 0, 0, 0), "exhausted", 0, true},
+		{"exhausted overspent keeps negative", usage(true, 10, "", 6, 5, 0, 0), "exhausted", -1, true},
+		{"active with headroom", usage(true, 10, "", 9, 0, 0.5, 0), "active", 0.5, true},
+		{"unlimited is never exhausted", usage(true, 0, "", 999, 999, 999, 999), "active", 0, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -899,7 +1002,7 @@ func TestCreateKey_SingleAttemptOn500(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(srv)
-	_, err := c.CreateKey(context.Background(), "order-x", 5)
+	_, err := c.CreateKey(context.Background(), "order-x", 5, time.Now().Add(DefaultValidity))
 	if err == nil {
 		t.Fatal("expected the 500 to surface as an error")
 	}
