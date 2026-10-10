@@ -179,6 +179,11 @@ type APIKeyCatalog struct {
 	RCPayPrompt Str
 	// RCDone — APIKEY_RC_DONE (telegram_bot.py:4166); {credits} {masked} {remaining}.
 	RCDone Str
+	// RCDoneLlmgate — the llmgate recharge receipt; adds {expires} (the NEW
+	// 30-day validity date+time the top-up just set — operator 2026-10-10).
+	// Separate from RCDone because pool keys never expire and their "key is
+	// unchanged" wording must stay.
+	RCDoneLlmgate Str
 	// RCFail — APIKEY_RC_FAIL (telegram_bot.py:4179); {amount} {balance}.
 	RCFail Str
 	// RCHistLabel — APIKEY_RC_HIST_LABEL (telegram_bot.py:4190); {credits}.
@@ -374,7 +379,7 @@ func buildAPIKeyCatalog() APIKeyCatalog {
 			// "🔷 Bedrock" → "🔷 API" (operator 2026-10-10): no customer-facing
 			// screen may print "Bedrock" anymore. The map KEY stays the internal
 			// sale-class wire value.
-			"bedrock": {EN: "🔷 API", VI: "🔷 API", ZH: "🔷 API"},
+			"bedrock": {EN: "🔷 AI Credits", VI: "🔷 AI Credits", ZH: "🔷 AI Credits"},
 			"kiro":    {EN: "🟣 Kiro", VI: "🟣 Kiro", ZH: "🟣 Kiro"},
 			// Go-only, keyed by kirogo.SaleClassFixed's wire value.
 			"fixed": {EN: "⚡ Fixed", VI: "⚡ Fixed", ZH: "⚡ Fixed"},
@@ -448,6 +453,11 @@ func buildAPIKeyCatalog() APIKeyCatalog {
 			ZH: "🧾 🔁 为 API key {masked} 充值 {credits} credits\n价格：{rate} / 100 credits\n总计：{total}\n\n您的余额：{balance}\n请选择支付方式：",
 		},
 		// APIKEY_RC_DONE (telegram_bot.py:4166).
+		RCDoneLlmgate: Str{
+			EN: "✅ Recharged {credits} credits into API key {masked}.\nCredits remaining now: {remaining}.\n⏳ New expiry: {expires}\nRecharge again anytime — credits add up and validity extends by another 30 days.",
+			VI: "✅ Đã nạp {credits} credits vào API key {masked}.\nHạn mức còn lại hiện tại: {remaining}.\n⏳ Hạn mới: {expires}\nNạp thêm bất cứ lúc nào — credits cộng dồn và hạn mức kéo dài thêm 30 ngày.",
+			ZH: "✅ 已为 API key {masked} 充值 {credits} credits。\n当前剩余:{remaining}。\n⏳ 新有效期:{expires}\n随时再充值 — credits 累加,有效期再延长 30 天。",
+		},
 		RCDone: Str{
 			EN: "✅ Recharged {credits} credits into API key {masked}.\nCredits remaining now: {remaining}.\nYour key is unchanged — keep using it as before.",
 			VI: "✅ Đã nạp {credits} credits vào API key {masked}.\nHạn mức còn lại hiện tại: {remaining} credits.\nKey của bạn không đổi — tiếp tục dùng như cũ.",

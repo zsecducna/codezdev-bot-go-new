@@ -34,6 +34,7 @@ import (
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/llmgate"
 	"codezdev-bot/internal/store"
+	"codezdev-bot/internal/tg"
 )
 
 // fakeLlmgateKey is one llmgate key as the fake server sees it. Used is the
@@ -931,7 +932,7 @@ func TestApikeyLlmgateMyKeysAndReveal(t *testing.T) {
 	if !strings.Contains(msg.Text, "∞ left") {
 		t.Errorf("an unlimited llmgate key must render ∞, got %q", msg.Text)
 	}
-	if !strings.Contains(msg.Text, "🔷 API") {
+	if !strings.Contains(msg.Text, "🔷 AI Credits") {
 		t.Errorf("llmgate rows carry the bedrock SKU tag, got %q", msg.Text)
 	}
 	if _, ok := findCB(inlineRows(msg), "apikeyrev:"+limDes); !ok {
@@ -955,29 +956,40 @@ func TestApikeyLlmgateMyKeysAndReveal(t *testing.T) {
 	}
 }
 
-// TestApikeyLlmgateMyKeysExpiredLabel: an llmgate key past its expires_at
-// renders the "expired" status label in My-Keys (pool rows can never produce
-// the verdict — pool keys never expire), so the customer sees WHY the key is
-// dead and what to do about it (buy a new one, not recharge).
+// TestApikeyLlmgateMyKeysExpiredLabel: DEAD keys (EXPIRED past the 30-day
+// window, and EXHAUSTED balance-spent) are OMITTED from My-Keys entirely
+// (operator 2026-10-10: dead keys on this screen are noise). Seeded expired +
+// exhausted + LIVE rows in one page: only the live one renders, with exactly
+// its one reveal button.
 func TestApikeyLlmgateMyKeysExpiredLabel(t *testing.T) {
 	ctx := context.Background()
 	b, f, st, _, fl, _ := newAPIKeyBot(t)
 	const chat = 100
 	const deadDes = "3f4100003f4100003f4100003f410000"
+	const liveDes = "3f4200003f4200003f4200003f420000"
 	seedLlmgateKey(t, st, fl, deadDes, chat, 888, "sk-llmgate-"+strings.Repeat("a", 48), "bedrock", 1000, 1000, 250)
+	seedLlmgateKey(t, st, fl, liveDes, chat, 889, "sk-llmgate-"+strings.Repeat("c", 48), "bedrock", 1000, 1000, 100)
 	fl.mu.Lock()
 	fl.keys[888].ExpiresAt = time.Now().Add(-24 * time.Hour).Format(time.RFC3339)
 	fl.mu.Unlock()
 
+	// …and an EXHAUSTED third key hides too (operator: dead is dead).
+	seedLlmgateKey(t, st, fl, "3f4300003f4300003f4300003f430000", chat, 890,
+		"sk-llmgate-"+strings.Repeat("e", 48), "bedrock", 10, 10, 10)
+
 	b.showMyAPIKeys(ctx, chat, i18n.EN)
 	msg := lastMsg(t, f)
-	if !strings.Contains(msg.Text, "📅 expired") {
-		t.Errorf("an expired llmgate key must render the expired label, got %q", msg.Text)
+	if strings.Contains(msg.Text, maskAPIKey("sk-llmgate-"+strings.Repeat("a", 48))) {
+		t.Errorf("expired key must be hidden, got %q", msg.Text)
 	}
-	// The expired verdict outranks the credit arithmetic: 750 credits were
-	// still left, but the calendar killed the key.
-	if !strings.Contains(msg.Text, "750 left") {
-		t.Errorf("the remaining-credits line must still show the honest 750, got %q", msg.Text)
+	if strings.Contains(msg.Text, maskAPIKey("sk-llmgate-"+strings.Repeat("e", 48))) {
+		t.Errorf("exhausted key must be hidden, got %q", msg.Text)
+	}
+	if !strings.Contains(msg.Text, maskAPIKey("sk-llmgate-"+strings.Repeat("c", 48))) {
+		t.Errorf("live key must still render, got %q", msg.Text)
+	}
+	if mk, ok := msg.ReplyMarkup.(*tg.InlineKeyboardMarkup); !ok || len(mk.InlineKeyboard) != 1 {
+		t.Errorf("reveal buttons: want exactly the live key's one row")
 	}
 }
 

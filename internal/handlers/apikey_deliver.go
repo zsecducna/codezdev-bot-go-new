@@ -561,7 +561,8 @@ func (b *Bot) deliverApikeyRecharge(ctx context.Context, order *store.Order, des
 			errors.New("target key was refunded before fulfillment"))
 	}
 
-	remaining := "—" // fresh creditsRemaining for the receipt ("—" when unknown)
+	remaining := "—"            // fresh creditsRemaining for the receipt ("—" when unknown)
+	renewedUntil := time.Time{} // llmgate recharge: the NEW expiry the receipt shows
 	if rec.AppliedTS == nil {
 		// Delivery-time refusal re-checks, all on ONE stats read (fail OPEN on
 		// an unreadable read — payment is secured and blocking good orders on a
@@ -598,7 +599,8 @@ func (b *Bot) deliverApikeyRecharge(ctx context.Context, order *store.Order, des
 			// llmgateRCKeyLock). Receipt remaining = newLimit − used, "—" when
 			// negative (overspend — do not clamp, but the receipt line only
 			// carries a usable balance).
-			rem, rerr := b.applyLlmgateRecharge(ctx, krow, rec.TargetOrderID, credits)
+			rem, newExpiry, rerr := b.applyLlmgateRecharge(ctx, krow, rec.TargetOrderID, credits)
+			renewedUntil = newExpiry
 			if rerr != nil {
 				// Never log the key; rerr carries only the client's redacted
 				// error text.
@@ -698,9 +700,22 @@ func (b *Bot) deliverApikeyRecharge(ctx context.Context, order *store.Order, des
 	// Referral payout: credit the referrer REFERRAL_PCT% of the delivered total
 	// (_pay_referrer telegram_bot.py:7794). Redemption row stays (lifetime record).
 	b.payReferrer(ctx, order)
-	b.send(ctx, chatID, i18n.F(c.RCDone.T(lang),
-		"credits", itoa64(credits), "masked", maskAPIKey(krow.APIKey),
-		"remaining", remaining), nil)
+	// Receipt wording splits by backend: llmgate recharges RENEWED the key's
+	// 30-day window, so the message names the NEW expiry (date+time) — the
+	// shared RCDone's "your key is unchanged" would be a lie post-renewal.
+	if krow.Backend == store.BackendLlmgate {
+		expiresDisp := "—"
+		if !renewedUntil.IsZero() {
+			expiresDisp = fmtWhen(float64(renewedUntil.Unix()), lang)
+		}
+		b.send(ctx, chatID, i18n.F(c.RCDoneLlmgate.T(lang),
+			"credits", itoa64(credits), "masked", maskAPIKey(krow.APIKey),
+			"remaining", remaining, "expires", expiresDisp), nil)
+	} else {
+		b.send(ctx, chatID, i18n.F(c.RCDone.T(lang),
+			"credits", itoa64(credits), "masked", maskAPIKey(krow.APIKey),
+			"remaining", remaining), nil)
+	}
 	// Owner sale alert — notify_admin_sale (telegram_bot.py:7897-7902), the
 	// recharge twin of deliverApikey's sale alert above. Built from the
 	// admin-renameable SKU name + the " Recharge" suffix so a rename shows up
@@ -729,17 +744,17 @@ func (b *Bot) deliverApikeyRecharge(ctx context.Context, order *store.Order, des
 // but the arithmetic MUST have a real limit or the write would set a garbage
 // cap — so an unreadable stats read HERE fails closed into the refund path
 // (as does an expiry the open pre-check could not see).
-func (b *Bot) applyLlmgateRecharge(ctx context.Context, krow *store.APIKey, targetOrderID string, credits int64) (float64, error) {
+func (b *Bot) applyLlmgateRecharge(ctx context.Context, krow *store.APIKey, targetOrderID string, credits int64) (float64, time.Time, error) {
 	client := b.llmgateClient()
 	if client == nil {
-		return 0, errLlmgateUnconfigured
+		return 0, time.Time{}, errLlmgateUnconfigured
 	}
 	mu := b.llmgateRCKeyLock(targetOrderID)
 	mu.Lock()
 	defer mu.Unlock()
 	st := b.llmgateKeyUsage(ctx, krow)
 	if st == nil {
-		return 0, errors.New("llmgate key stats unreadable (cannot compute the new credit limit)")
+		return 0, time.Time{}, errors.New("llmgate key stats unreadable (cannot compute the new credit limit)")
 	}
 	// 0 = UNLIMITED on llmgate: an unlimited key cannot take a credit top-up
 	// (there is nothing to add to), and a newLimit of 0+credits would silently
@@ -747,7 +762,7 @@ func (b *Bot) applyLlmgateRecharge(ctx context.Context, krow *store.APIKey, targ
 	// feature. Refund instead. (The RC gate screens this earlier; this is the
 	// delivery-time re-check, same layering as the pool path's guards.)
 	if st.Info.CreditLimit <= 0 {
-		return 0, errors.New("unlimited llmgate key cannot take a credit top-up")
+		return 0, time.Time{}, errors.New("unlimited llmgate key cannot take a credit top-up")
 	}
 	// DISABLED re-check on the same FRESH in-lock read: the update below pins
 	// is_active:true, so a key the admin disabled between the pre-check and
@@ -755,7 +770,7 @@ func (b *Bot) applyLlmgateRecharge(ctx context.Context, krow *store.APIKey, targ
 	// by this very write — the exact outcome the gate refuses. Mirrors the
 	// unlimited/expired guards' fail-CLOSED layering.
 	if !st.Info.IsActive {
-		return 0, errors.New("llmgate key is disabled (recharge would re-enable it)")
+		return 0, time.Time{}, errors.New("llmgate key is disabled (recharge would re-enable it)")
 	}
 	// EXPIRED re-check on the FRESH in-lock read (business rule 2026-10-10,
 	// rule 3): the pre-check above fails OPEN on unreadable stats, so the key
@@ -764,14 +779,14 @@ func (b *Bot) applyLlmgateRecharge(ctx context.Context, krow *store.APIKey, targ
 	// as the unlimited guard: this read is the one the arithmetic AND the
 	// renewal write are computed from.
 	if exp, has := st.Info.Expiry(); has && exp.Before(time.Now()) {
-		return 0, errors.New("llmgate key is expired (recharge cannot renew an expired key)")
+		return 0, time.Time{}, errors.New("llmgate key is expired (recharge cannot renew an expired key)")
 	}
 	// The stored key id is llmgate's NUMERIC id as a decimal string (minted by
 	// mintLlmgateKey); anything else is a corrupt row for an operator, never a
 	// condition to guess a top-up around.
 	id, perr := strconv.ParseInt(krow.KeyID, 10, 64)
 	if perr != nil {
-		return 0, fmt.Errorf("llmgate key id %q is not a decimal id: %w", krow.KeyID, perr)
+		return 0, time.Time{}, fmt.Errorf("llmgate key id %q is not a decimal id: %w", krow.KeyID, perr)
 	}
 	newLimit := st.Info.CreditLimit + float64(credits)
 	// RECHARGE RENEWS VALIDITY (business rule 2026-10-10, rule 2): the top-up
@@ -789,9 +804,11 @@ func (b *Bot) applyLlmgateRecharge(ctx context.Context, krow *store.APIKey, targ
 	// disabled key, and re-asserting it is the verified normal state for a
 	// live key.
 	if _, uerr := client.UpdateKey(ctx, id, st.Info.Name, true, newLimit, expires); uerr != nil {
-		return 0, uerr
+		return 0, time.Time{}, uerr
 	}
-	return newLimit - st.Used(), nil
+	// The renewal expiry rides back to the receipt so the customer sees the
+	// NEW date+time their key is valid until (operator 2026-10-10).
+	return newLimit - st.Used(), expires, nil
 }
 
 // apikeyRCFailRefund is the recharge-failure chokepoint

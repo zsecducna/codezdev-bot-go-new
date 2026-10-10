@@ -161,6 +161,17 @@ func (b *Bot) showMyAPIKeys(ctx context.Context, chatID int64, lang i18n.Lang) {
 		tag := c.SkuTag[rowCls].T(lang)
 		// A REFUNDED key is never re-served: show it struck from the list (no
 		// live stats, no reveal button) so the buyer sees why it disappeared.
+		// DEAD keys are OMITTED entirely (operator 2026-10-10): EXPIRED
+		// (past the 30-day window, unrechargeable) and EXHAUSTED (balance
+		// spent) alike — a dead key on this screen is noise and only invites
+		// "why is this here" questions. Only a POSITIVE live verdict hides
+		// the row; unreadable stats keep it visible (fail-open display, same
+		// reasoning as the statsFailed note). An exhausted key stays
+		// rechargeable through the BUY menu's Recharge flow regardless —
+		// this is display-only. Refunded-and-dead hides too.
+		if stat != nil && (stat.Expired || stat.Status == "exhausted") {
+			continue
+		}
 		if k.RefundedTS != nil {
 			lines = append(lines, "\n🔑 "+masked+" · "+tag+" — ↩️ refunded\n   "+
 				i18n.F(c.MyKeysLineLocal.T(lang), "bought", itoa64(bought), "when", when))

@@ -1484,6 +1484,27 @@ func (b *Bot) cbApikeyRCStart(cc *cbCtx) {
 		b.send(cc.Ctx, cc.ChatID, c.RCNone.T(lang), nil)
 		return
 	}
+	// EXPIRED keys are hidden from the picker (operator 2026-10-10): they
+	// cannot be recharged, so offering them only bounces at the gate. One
+	// bounded parallel stats pass buys the verdict for every llmgate row —
+	// the same shape My-Keys uses. Unreadable stats keep the row (fail-open:
+	// the pick-time gate still refuses a dead key cleanly). EXHAUSTED keys
+	// STAY: recharging one is the whole point of the flow.
+	lgStats := b.llmgateKeyStatsParallel(cc.Ctx, live)
+	var rechargeable []*store.APIKey
+	for _, k := range live {
+		if k.Backend == store.BackendLlmgate {
+			if st := lgStats[k.OrderID]; st != nil && st.Expired {
+				continue
+			}
+		}
+		rechargeable = append(rechargeable, k)
+	}
+	live = rechargeable
+	if len(live) == 0 {
+		b.send(cc.Ctx, cc.ChatID, c.RCNone.T(lang), nil)
+		return
+	}
 	// One button per key: SKU tag + masked value + originally bought credits, so
 	// a two-SKU customer picks the right kind (the units are ~5.7x apart — a
 	// mispick would read as wild over/under-pricing). The per-key LIVE stats
