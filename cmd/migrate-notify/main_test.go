@@ -221,9 +221,9 @@ func TestDryRunPrintsRecipientsAndSendsNothing(t *testing.T) {
 	}
 	out := e.out.String()
 	for _, want := range []string{
-		"would-notify chat=11 lang=en credits=100.00 order=ord-en",
-		"would-notify chat=22 lang=vi credits=200.50 order=ord-vi",
-		"DRY RUN — nothing was sent; 2 recipient(s) would be DM'd their new key",
+		"would-notify chat=11 lang=en keys=1 orders=[ord-en]",
+		"would-notify chat=22 lang=vi keys=1 orders=[ord-vi]",
+		"DRY RUN — nothing was sent; 2 customer(s) would each get ONE DM listing their new key(s)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("dry-run transcript missing %q:\n%s", want, out)
@@ -311,21 +311,60 @@ func TestApplySendsHTMLWithKeyAndStampsRows(t *testing.T) {
 // belt-and-suspenders the bot's sendHTML paths apply, so a future key or URL
 // alphabet containing &<> can never inject markup into a parse_mode=HTML DM.
 func TestMessageForLanguagesAndEscaping(t *testing.T) {
+	mk := func(key string, credits float64) store.MigratedKey {
+		return store.MigratedKey{OrderID: "o", ChatID: 1, APIKey: key, Credits: credits, Lang: "en"}
+	}
 	// vi template identifiable, en fallback for junk langs.
-	if m := messageFor("vi", "k", "https://a", "https://p"); !strings.Contains(m, "API key của bạn") {
+	if m := messageFor("vi", []store.MigratedKey{mk("k", 1)}, "https://a", "https://p"); !strings.Contains(m, "API key của bạn") {
 		t.Errorf("vi message did not use the vi template:\n%s", m)
 	}
-	if m := messageFor("fr", "k", "https://a", "https://p"); !strings.Contains(m, "Your API key was upgraded") {
+	if m := messageFor("fr", []store.MigratedKey{mk("k", 1)}, "https://a", "https://p"); !strings.Contains(m, "Your API key was upgraded") {
 		t.Errorf("unknown lang must fall back to English:\n%s", m)
 	}
 	// Escaping: a hostile key value must arrive entity-encoded, and both
 	// URL placeholders must survive verbatim.
-	m := messageFor("en", `sk-x"<a>&'`, "https://a&b", "https://p")
+	m := messageFor("en", []store.MigratedKey{mk(`sk-x"<a>&'`, 0)}, "https://a&b", "https://p")
 	if strings.Contains(m, `sk-x"<a>`) {
 		t.Errorf("key value not HTML-escaped:\n%s", m)
 	}
 	if !strings.Contains(m, "https://a&amp;b") {
 		t.Errorf("apibase not HTML-escaped:\n%s", m)
+	}
+	// Multi-key: ONE message lists every key with its credits, and the
+	// header pluralizes.
+	m = messageFor("en", []store.MigratedKey{mk("sk-one", 100), mk("sk-two", 5.5)}, "https://a", "https://p")
+	if !strings.Contains(m, "Your new API keys (tap to copy):") {
+		t.Errorf("multi-key header missing:\n%s", m)
+	}
+	for _, want := range []string{"<code>sk-one</code> (100.00 cr)", "<code>sk-two</code> (5.50 cr)"} {
+		if !strings.Contains(m, want) {
+			t.Errorf("key line %q missing:\n%s", want, m)
+		}
+	}
+}
+
+// TestGroupByChatOneDMPerCustomer pins the anti-spam contract: several
+// migrated keys in one chat collapse into ONE group (one DM), and separate
+// chats stay separate.
+func TestGroupByChatOneDMPerCustomer(t *testing.T) {
+	keys := []store.MigratedKey{
+		{OrderID: "a", ChatID: 7, Lang: "en", APIKey: "k1"},
+		{OrderID: "b", ChatID: 7, Lang: "en", APIKey: "k2"},
+		{OrderID: "c", ChatID: 9, Lang: "vi", APIKey: "k3"},
+		{OrderID: "d", ChatID: 7, Lang: "en", APIKey: "k4"},
+	}
+	g := groupByChat(keys)
+	if len(g) != 2 {
+		t.Fatalf("groups = %d, want 2", len(g))
+	}
+	if g[0].ChatID != 7 || len(g[0].Keys) != 3 || g[0].Lang != "en" {
+		t.Errorf("group 7 = %+v", g[0])
+	}
+	if g[1].ChatID != 9 || len(g[1].Keys) != 1 || g[1].Lang != "vi" {
+		t.Errorf("group 9 = %+v", g[1])
+	}
+	if got := g[0].orderList(); got != "a,b,d" {
+		t.Errorf("orderList = %q", got)
 	}
 }
 
@@ -352,7 +391,7 @@ func TestFailingChatSkippedOthersStillSent(t *testing.T) {
 		t.Errorf("counts: %+v, want recipients/sent/failed = 2/1/1", counts)
 	}
 	out := e.out.String()
-	if !strings.Contains(out, "failed chat=11 order=ord-bad") || !strings.Contains(out, "sent chat=22 lang=en order=ord-good") {
+	if !strings.Contains(out, "failed chat=11 keys=1") || !strings.Contains(out, "sent chat=22 lang=en keys=1") {
 		t.Errorf("transcript missing per-recipient verdicts:\n%s", out)
 	}
 	if !strings.Contains(out, "summary: recipients=2 sent=1 failed=1") {

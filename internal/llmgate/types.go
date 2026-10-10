@@ -198,7 +198,12 @@ func (c *Client) CreateKey(ctx context.Context, name string, creditLimit float64
 		// ExpiresAt is "" for a zero `expires` → the field is OMITTED from
 		// the body (never-expire); otherwise the RFC3339 spelling above.
 		ExpiresAt string `json:"expires_at,omitempty"`
-	}{Name: name, IsActive: true, CreditLimit: creditLimit}
+		// Prefix is FIXED at "sk-" by operator instruction (2026-10-10):
+		// newly minted keys read sk-<body>, not sk-llmgate-<body>. It is a
+		// structural literal — there is no caller-settable knob to get
+		// wrong, same treatment as tokenLimit in the old pool client.
+		Prefix string `json:"prefix"`
+	}{Name: name, IsActive: true, CreditLimit: creditLimit, Prefix: "sk-"}
 	if !expires.IsZero() {
 		payload.ExpiresAt = expires.Format(time.RFC3339)
 	}

@@ -115,57 +115,67 @@ func (n *Notifier) Run(ctx context.Context, apply bool, limit int) (NotifyCounts
 	if err != nil {
 		return c, fmt.Errorf("list unnotified migrated keys: %w", err)
 	}
-	c.Recipients = len(keys)
+	// ONE DM PER CUSTOMER, not per key: a customer holding several migrated
+	// keys gets a single message listing all of them — five separate DMs to
+	// the same chat for five keys is spam, and this tool's whole contract is
+	// "migrated API-key buyers only, one message each" (operator 2026-10-10).
+	groups := groupByChat(keys)
+	c.Recipients = len(groups)
 
 	// DRY RUN: the recipient audit only — chat/lang/credits/order. The key
 	// is deliberately absent: a piped dry-run transcript is exactly the kind
 	// of artifact that ends up in a ticket, and it must carry no secrets.
 	if !apply {
-		for _, k := range keys {
-			fmt.Fprintf(n.Out, "would-notify chat=%d lang=%s credits=%.2f order=%s\n",
-				k.ChatID, k.Lang, k.Credits, k.OrderID)
+		for _, g := range groups {
+			orders := make([]string, len(g.Keys))
+			for i, k := range g.Keys {
+				orders[i] = k.OrderID
+			}
+			fmt.Fprintf(n.Out, "would-notify chat=%d lang=%s keys=%d orders=%v\n",
+				g.ChatID, g.Lang, len(g.Keys), orders)
 		}
-		fmt.Fprintf(n.Out, "DRY RUN — nothing was sent; %d recipient(s) would be DM'd their new key\n",
+		fmt.Fprintf(n.Out, "DRY RUN — nothing was sent; %d customer(s) would each get ONE DM listing their new key(s)\n",
 			c.Recipients)
 		return c, nil
 	}
 
-	for i, k := range keys {
+	for i, g := range groups {
 		// The DM body, keyed off the ORDER's language (vi/zh, en default —
 		// the store's COALESCE already applied the default; the switch here
-		// only picks the template).
-		text := messageFor(k.Lang, k.APIKey, n.APIBase, n.PubBase)
+		// only picks the template). One message lists every key.
+		text := messageFor(g.Lang, g.Keys, n.APIBase, n.PubBase)
 
-		switch sendErr := n.send(ctx, k.ChatID, text); {
+		switch sendErr := n.send(ctx, g.ChatID, text); {
 		case sendErr != nil:
-			// Per-recipient failure: count, log (chat + order + reason —
-			// never key/token), CONTINUE. The row keeps its NULL stamp, so
-			// the next run picks this customer up again by itself.
+			// Per-CUSTOMER failure: count, log (chat + orders + reason —
+			// never key/token), CONTINUE. The rows keep their NULL stamps,
+			// so the next run picks this customer up again by itself.
 			c.Failed++
-			n.Log.Error("migrate-notify: DM failed — row stays unnotified for the next run",
-				"chat", k.ChatID, "order", k.OrderID, "error", sendErr.Error())
-			fmt.Fprintf(n.Out, "failed chat=%d order=%s\n", k.ChatID, k.OrderID)
+			n.Log.Error("migrate-notify: DM failed — rows stay unnotified for the next run",
+				"chat", g.ChatID, "orders", g.orderList(), "error", sendErr.Error())
+			fmt.Fprintf(n.Out, "failed chat=%d keys=%d\n", g.ChatID, len(g.Keys))
 		default:
-			// Sent. Stamp the row BEFORE counting success: an unstamped
-			// sent-DM is the one state worse than a clean failure (the
-			// customer has the key, the database will re-DM them), so a
-			// stamp error is loud and reads as a failed recipient the
-			// operator must reconcile by hand.
-			if err := n.Store.MarkMigratedNotified(k.OrderID); err != nil {
-				c.Failed++
-				n.Log.Error("migrate-notify: DM sent but stamp FAILED — customer was served, row will re-DM on next run; stamp by hand",
-					"chat", k.ChatID, "order", k.OrderID, "error", err.Error())
-				fmt.Fprintf(n.Out, "stamp-failed chat=%d order=%s\n", k.ChatID, k.OrderID)
-				continue
+			// Sent. Stamp EVERY row of the group BEFORE counting success:
+			// an unstamped sent-DM is the one state worse than a clean
+			// failure (the customer has the keys, the database will re-DM
+			// them), so a stamp error is loud and reads as a failed
+			// recipient the operator must reconcile by hand.
+			for _, k := range g.Keys {
+				if err := n.Store.MarkMigratedNotified(k.OrderID); err != nil {
+					c.Failed++
+					n.Log.Error("migrate-notify: DM sent but stamp FAILED — customer was served, row will re-DM on next run; stamp by hand",
+						"chat", g.ChatID, "order", k.OrderID, "error", err.Error())
+					fmt.Fprintf(n.Out, "stamp-failed chat=%d order=%s\n", g.ChatID, k.OrderID)
+				}
 			}
 			c.Sent++
-			fmt.Fprintf(n.Out, "sent chat=%d lang=%s order=%s\n", k.ChatID, k.Lang, k.OrderID)
+			fmt.Fprintf(n.Out, "sent chat=%d lang=%s keys=%d\n", g.ChatID, g.Lang, len(g.Keys))
 		}
 
 		// Pace BETWEEN sends (not after the last): 1s idle keeps the whole
 		// fan-out under Telegram's per-bot flood limits, and skipping the
 		// trailing sleep keeps a one-recipient run instant.
-		if i < len(keys)-1 {
+		if i < len(groups)-1 {
 			if err := sleepCtx(ctx, n.SendPause); err != nil {
 				return c, fmt.Errorf("aborted between sends: %w", err)
 			}
@@ -350,8 +360,7 @@ var messageTemplates = map[string]string{
 
 The shop now serves API traffic through a faster gateway. Your remaining credits were carried over to this NEW key:
 
-🔑 Your new API key (tap to copy):
-<code>{key}</code>
+{keys}
 
 📍 Base URL:
 <code>{apibase}</code>
@@ -366,8 +375,7 @@ Your OLD key still works for now — switch when convenient. View the new key an
 
 Shop hiện phục vụ lưu lượng API qua một cổng nhanh hơn. Số tín dụng còn lại của bạn đã được chuyển sang key MỚI này:
 
-🔑 API key mới của bạn (chạm để sao chép):
-<code>{key}</code>
+{keys}
 
 📍 Base URL:
 <code>{apibase}</code>
@@ -382,8 +390,7 @@ Key CŨ của bạn vẫn còn dùng được tạm thời — hãy chuyển khi
 
 本店现在通过更快的网关提供 API 服务。您剩余的额度已转入这把新 key：
 
-🔑 您的新 API key（点击复制）：
-<code>{key}</code>
+{keys}
 
 📍 Base URL：
 <code>{apibase}</code>
@@ -396,18 +403,82 @@ Key CŨ của bạn vẫn còn dùng được tạm thời — hãy chuyển khi
 您的旧 key 目前仍可使用 — 方便时再切换即可。随时可在 自助服务 → 🔑 My API Keys 查看新 key。`,
 }
 
-// messageFor renders one recipient's DM: pick the template by order lang
+// messageFor renders one CUSTOMER's DM: pick the template by order lang
 // (anything but vi/zh is English — the store already COALESCE'd NULL/missing
 // langs to 'en', this switch only guards unknown values), then substitute
-// the three placeholders with their HTML-escaped values.
-func messageFor(lang, key, apiBase, pubBase string) string {
+// the placeholders with their HTML-escaped values. {keys} is the pre-rendered
+// block: a header line ("Your new API key" / "…keys") plus one <code> line
+// per migrated key with its credits — one DM lists them ALL.
+func messageFor(lang string, keys []store.MigratedKey, apiBase, pubBase string) string {
 	tmpl, ok := messageTemplates[lang]
 	if !ok {
 		tmpl = messageTemplates["en"]
 	}
+	var kb strings.Builder
+	switch lang {
+	case "vi":
+		if len(keys) == 1 {
+			kb.WriteString("🔑 API key mới của bạn (chạm để sao chép):\n")
+		} else {
+			kb.WriteString("🔑 Các API key mới của bạn (chạm để sao chép):\n")
+		}
+	case "zh":
+		if len(keys) == 1 {
+			kb.WriteString("🔑 您的新 API key（点击复制）：\n")
+		} else {
+			kb.WriteString("🔑 您的新 API key（多个，点击复制）：\n")
+		}
+	default:
+		if len(keys) == 1 {
+			kb.WriteString("🔑 Your new API key (tap to copy):\n")
+		} else {
+			kb.WriteString("🔑 Your new API keys (tap to copy):\n")
+		}
+	}
+	for _, k := range keys {
+		kb.WriteString("<code>" + html.EscapeString(k.APIKey) + "</code>")
+		if k.Credits > 0 {
+			kb.WriteString(fmt.Sprintf(" (%.2f cr)", k.Credits))
+		}
+		kb.WriteString("\n")
+	}
 	return strings.NewReplacer(
-		"{key}", html.EscapeString(key),
+		"{keys}", kb.String(),
 		"{apibase}", html.EscapeString(apiBase),
 		"{pubbase}", html.EscapeString(pubBase),
 	).Replace(tmpl)
+}
+
+// chatGroup is one customer's slice of migrated keys, in listing order.
+type chatGroup struct {
+	ChatID int64
+	Lang   string
+	Keys   []store.MigratedKey
+}
+
+// orderList renders the group's order ids for LOG lines only (no secrets).
+func (g *chatGroup) orderList() string {
+	ids := make([]string, len(g.Keys))
+	for i, k := range g.Keys {
+		ids[i] = k.OrderID
+	}
+	return strings.Join(ids, ",")
+}
+
+// groupByChat folds the flat key listing into per-customer groups. Lang
+// comes from the group's first row — a customer's orders share a lang in
+// practice, and a mixed history still renders a sensible default.
+func groupByChat(keys []store.MigratedKey) []chatGroup {
+	var groups []chatGroup
+	byChat := map[int64]int{}
+	for _, k := range keys {
+		idx, ok := byChat[k.ChatID]
+		if !ok {
+			groups = append(groups, chatGroup{ChatID: k.ChatID, Lang: k.Lang})
+			idx = len(groups) - 1
+			byChat[k.ChatID] = idx
+		}
+		groups[idx].Keys = append(groups[idx].Keys, k)
+	}
+	return groups
 }

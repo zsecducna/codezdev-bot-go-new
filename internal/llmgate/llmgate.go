@@ -322,7 +322,11 @@ type storedToken struct {
 // (unlike a password) contains no spaces — the class boundary IS the secret
 // boundary and the surrounding message stays readable.
 var (
+	// Keys minted since 2026-10-10 carry the plain "sk-" prefix (the create
+	// body pins prefix:"sk-"); older ones read sk-llmgate-. Both shapes are
+	// secrets and both must redact from any server-echoed text.
 	llmgateKeyShapeRe = regexp.MustCompile(`(sk-llmgate-)[A-Za-z0-9_-]{8,}`)
+	plainKeyShapeRe   = regexp.MustCompile(`(sk-)[A-Za-z0-9_-]{24,}`)
 	jwtShapeRe        = regexp.MustCompile(`(eyJ)[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+`)
 )
 
@@ -333,6 +337,7 @@ var (
 // repeated passes are stable.
 func redactSecrets(s string) string {
 	s = llmgateKeyShapeRe.ReplaceAllString(s, "${1}<redacted>")
+	s = plainKeyShapeRe.ReplaceAllString(s, "${1}<redacted>")
 	return jwtShapeRe.ReplaceAllString(s, "${1}<redacted>")
 }
 

@@ -267,6 +267,34 @@ func TestUserSend_401TwiceErrAuthFailed(t *testing.T) {
 
 // ── POST /api/v1/apikey/create (invariant 3) ─────────────────────────────────
 
+// TestCreateKey_WireBodyPinsPlainPrefix pins the operator-fixed mint body:
+// prefix is ALWAYS "sk-" (new keys read sk-<body>, not sk-llmgate-<body>) —
+// a structural literal, not a caller knob.
+func TestCreateKey_WireBodyPinsPlainPrefix(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/user/login", func(w http.ResponseWriter, r *http.Request) {
+		writeData(w, http.StatusOK, loginData("jwt-1", 24*time.Hour))
+	})
+	mux.HandleFunc("/api/v1/apikey/create", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode create body: %v", err)
+		}
+		if got, _ := body["prefix"].(string); got != "sk-" {
+			t.Errorf("prefix = %q, want the fixed \"sk-\"", got)
+		}
+		writeData(w, http.StatusOK, map[string]any{
+			"id": 1890, "api_key": "sk-abc123def456abc123def456abc123def4", "name": "n", "is_active": true, "credit_limit": 1,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := New(Config{BaseURL: srv.URL, Username: "u", Password: "p"}, nil)
+	if _, err := c.CreateKey(context.Background(), "n", 1, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestCreateKey_WireBodyNoExpiryOnZeroTime — a ZERO expires must omit
 // expires_at from the create payload (no key at all in the JSON), because
 // an omitted field means "never expires" while a marshaled zero value
