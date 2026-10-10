@@ -70,12 +70,15 @@ func (b *Bot) canDeleteAccounts(chatID int64) bool {
 func (b *Bot) showSelfService(ctx context.Context, chatID int64, lang i18n.Lang) {
 	c := &i18n.C().Customer
 
-	// Fixed rows shown to every customer (@4264-4267).
+	// Fixed rows shown to every customer (@4264-4267). Login Code and
+	// Password Reset are DELIBERATELY ABSENT (operator decision 2026-10-10):
+	// both served the retired Kiro/Entra account products, and showing them
+	// post-cutover only invited support questions about dead flows. The
+	// ss:getcode / ss:reset callbacks themselves stay registered — a stale
+	// button in an old chat still answers instead of dead-ending.
 	rows := [][]tg.InlineKeyboardButton{
 		{{Text: c.SSHistoryBtn.T(lang), CallbackData: "ss:history"}},
 		{{Text: c.SSInfoBtn.T(lang), CallbackData: "ss:info"}},
-		{{Text: c.SSCodeBtn.T(lang), CallbackData: "ss:getcode"}},
-		{{Text: c.SSResetBtn.T(lang), CallbackData: "ss:reset"}},
 	}
 
 	// Delete Accounts is destructive: shown only when DELACCT_ENABLED (settings

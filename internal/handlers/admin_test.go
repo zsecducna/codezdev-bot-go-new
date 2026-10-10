@@ -189,7 +189,7 @@ func TestFilterAdminRowsParity(t *testing.T) {
 			}
 		}
 		for _, deny := range []string{
-			"admcat:orders", "admcat:customers", "admcat:pricing", "admcat:entra",
+			"admcat:orders", "admcat:customers", "admcat:pricing",
 			"adm:pool", "adm:revenue", "admcat:roles",
 		} {
 			if containsStr(data, deny) {

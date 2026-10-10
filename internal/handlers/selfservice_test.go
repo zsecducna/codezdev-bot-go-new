@@ -625,7 +625,7 @@ func TestShowSelfServiceAlwaysOffersCoreRows(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"ss:history", "ss:info", "ss:getcode", "ss:reset",
+		"ss:history", "ss:info",
 		"ss:mykeys", "ss:refund", "ss:support",
 	} {
 		if !got[want] {

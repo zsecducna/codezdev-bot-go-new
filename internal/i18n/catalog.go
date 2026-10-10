@@ -132,7 +132,7 @@ func buildCatalog() Catalog {
 		},
 		// KB_REFRESH_NOTE (telegram_bot.py:6935-6939).
 		KBRefreshNote: Str{
-			EN: "🔄 Keyboard updated: self-service actions (history, info, login code, support, password reset) now live under the 🛠️ Self-Service button.",
+			EN: "🔄 Keyboard updated: self-service actions (history, info, support) now live under the 🛠️ Self-Service button.",
 			VI: "🔄 Bàn phím đã được cập nhật: các chức năng tự phục vụ (lịch sử, thông tin, mã đăng nhập, hỗ trợ, đặt lại mật khẩu) nay nằm trong nút 🛠️ Self-Service.",
 			ZH: "🔄 键盘已更新：自助功能（历史、信息、登录码、客服、密码重置）现已移至 🛠️ Self-Service 按钮中。",
 		},

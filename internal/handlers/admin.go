@@ -240,7 +240,9 @@ func (b *Bot) showAdminPanel(ctx context.Context, chatID int64) {
 		btnRow("👥 Customers", "admcat:customers"),
 		btnRow("🏷️ Pricing & discounts", "admcat:pricing"),
 		btnRow("⚙️ Settings", "admcat:settings"),
-		btnRow("☁️ Entra / Kiro SSO", "admcat:entra"),
+		// ☁️ Entra / Kiro SSO hidden (operator 2026-10-10): the category
+		// served the retired Entra/Kiro account provisioning. The admcat:entra
+		// callback stays registered for stale buttons.
 		btnRow("🏊 Pool health", "adm:pool"),
 		btnRow("📜 Audit log", "adm:audit"),
 	}
