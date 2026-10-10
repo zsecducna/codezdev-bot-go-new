@@ -141,7 +141,7 @@ func TestApikeyProductNameFallbacks(t *testing.T) {
 		t.Errorf("nil-config fixed name = %q, want %q", got, apikeyDefaultNameFixed)
 	}
 
-	b, _, _, _, dir := newAPIKeyBot(t)
+	b, _, _, _, _, dir := newAPIKeyBot(t)
 	fkSettings := func(names any) {
 		s := map[string]any{"apikey_usdt_per_100": 4.0}
 		if names != nil {
@@ -197,8 +197,8 @@ func TestApikeyProductNameFallbacks(t *testing.T) {
 // failure mode of a call site that forgot to pass the argument.
 func TestApikeyRenameReachesCustomerScreens(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, dir := newAPIKeyBot(t)
-	s := apikeySettings(fk)
+	b, f, st, fk, fl, dir := newAPIKeyBot(t)
+	s := apikeySettings(fk, fl)
 	s["kiro_apikey_enabled"] = true
 	s["kiro_apikey_usdt_per_100"] = 1.0
 	s["apikey_names"] = map[string]any{"bedrock": "Nebula Credits"}
@@ -270,8 +270,8 @@ func TestApikeyRenameReachesCustomerScreens(t *testing.T) {
 // never receives the key they just paid for.
 func TestApikeyDeliveredEscapesHostileName(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, dir := newAPIKeyBot(t)
-	s := apikeySettings(fk)
+	b, f, st, fk, fl, dir := newAPIKeyBot(t)
+	s := apikeySettings(fk, fl)
 	s["apikey_names"] = map[string]any{"bedrock": "A & B <x>"}
 	writeSettings(t, dir, s)
 
@@ -299,8 +299,8 @@ func TestApikeyDeliveredEscapesHostileName(t *testing.T) {
 // delivery path's HTML-escaping helper on these plain screens would show the
 // customer a garbled "A &amp; B" instead of the name they were actually sold.
 func TestApikeyRenameNoDoubleEscapeOnPlainScreens(t *testing.T) {
-	b, _, st, fk, dir := newAPIKeyBot(t)
-	s := apikeySettings(fk)
+	b, _, st, fk, fl, dir := newAPIKeyBot(t)
+	s := apikeySettings(fk, fl)
 	s["apikey_names"] = map[string]any{"bedrock": "A & B"}
 	writeSettings(t, dir, s)
 	const chat = 100
@@ -328,8 +328,8 @@ func TestApikeyRenameNoDoubleEscapeOnPlainScreens(t *testing.T) {
 // that test while silently never showing a kiro rename to a real buyer.
 func TestApikeyRenameReachesKiroCustomerScreens(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, dir := newAPIKeyBot(t)
-	s := apikeySettings(fk)
+	b, f, st, fk, fl, dir := newAPIKeyBot(t)
+	s := apikeySettings(fk, fl)
 	s["kiro_apikey_enabled"] = true
 	s["kiro_apikey_usdt_per_100"] = 1.0
 	s["apikey_names"] = map[string]any{"kiro": "Aurora Kiro Credits"}
@@ -378,13 +378,13 @@ func TestApikeyRenameReachesKiroCustomerScreens(t *testing.T) {
 // which is the only path that reads the stored row instead of the order.
 func TestApikeyOwnerAlertUsesStoredRowClassNotOrderClass(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, _, _ := newAPIKeyBot(t)
+	b, f, st, _, _, _ := newAPIKeyBot(t)
 	const chat, des = 100, "0b0b0000b0b00000b0b00000b0b00000"
 
 	// Order is kiro-family (order-derived saleClass == "kiro")...
 	o := seedOrder(t, st, des, chat, kiroApikeyProduct, 500, 500000, "paid")
 	// ...but the stored row is unclassed — the legacy/pre-split state.
-	if _, err := st.AddAPIKey(des, chat, "keyid-1", "sk-legacy-key", 500, ""); err != nil {
+	if _, err := st.AddAPIKey(des, chat, "keyid-1", "sk-legacy-key", 500, "", ""); err != nil {
 		t.Fatalf("seed api_keys row: %v", err)
 	}
 

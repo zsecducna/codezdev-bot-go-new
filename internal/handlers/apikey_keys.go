@@ -16,9 +16,11 @@ import (
 	"html"
 	"log"
 	"strings"
+	"sync"
 
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/kirogo"
+	"codezdev-bot/internal/store"
 	"codezdev-bot/internal/tg"
 )
 
@@ -73,13 +75,16 @@ func (b *Bot) sendHTMLKB(ctx context.Context, chatID int64, text string, markup 
 // showMyAPIKeys renders Self-Service → My API Keys: this buyer's minted keys,
 // newest first — _show_my_api_keys (telegram_bot.py:4293-4369).
 //
-// Per key: masked key, SKU tag, live status + used/remaining from Kiro-Go
-// /admin/stats, purchase date — degrading to the locally stored info with a
-// "stats unavailable" note when the stats call fails. ONE batched stats call
-// for ALL keys (empty filter = every key), matched locally by key id / mint
-// name — never one HTTP round-trip per key: this is a customer-facing handler
-// on the shared worker pool, so it makes a single bounded attempt and degrades
-// rather than pinning a worker.
+// Per key: masked key, SKU tag, live status + used/remaining, purchase date —
+// degrading to the locally stored info with a "stats unavailable" note when
+// the stats fetch fails. TWO fetch shapes since the llmgate cutover, split by
+// row backend: POOL rows keep the ONE batched /admin/stats call for ALL their
+// keys (empty filter = every key, matched locally by key id / mint name —
+// never one HTTP round-trip per key); LLMGATE rows have no batch endpoint, so
+// each is a per-key KeyStats read, run in parallel but bounded (see
+// llmgateKeyStatsParallel). Either way this is a customer-facing handler on
+// the shared worker pool, so it makes bounded attempts and degrades rather
+// than pinning a worker.
 func (b *Bot) showMyAPIKeys(ctx context.Context, chatID int64, lang i18n.Lang) {
 	c := &i18n.C().APIKey
 	keys, err := b.store.APIKeysForChat(chatID, 10, false)
@@ -91,7 +96,23 @@ func (b *Bot) showMyAPIKeys(ctx context.Context, chatID int64, lang i18n.Lang) {
 		b.send(ctx, chatID, c.MyKeysEmpty.T(lang), nil)
 		return
 	}
-	statsByID, statsByName, statsFailed := b.batchedKeyStats(ctx)
+	// The batched pool call runs only when the page actually holds a pool row:
+	// with llmgate-only inventory and no pool configured it would return
+	// failed=true unconditionally (kirogoClient == nil) and pin a bogus
+	// "stats unavailable" note under keys whose stats are about to load fine.
+	anyPool := false
+	for _, k := range keys {
+		if k.Backend != store.BackendLlmgate {
+			anyPool = true
+			break
+		}
+	}
+	var statsByID, statsByName map[string]*kirogo.KeyStat
+	statsFailed := false
+	if anyPool {
+		statsByID, statsByName, statsFailed = b.batchedKeyStats(ctx)
+	}
+	lgStats := b.llmgateKeyStatsParallel(ctx, keys)
 
 	lines := []string{c.MyKeysHeader.T(lang)}
 	var rows [][]tg.InlineKeyboardButton
@@ -102,19 +123,33 @@ func (b *Bot) showMyAPIKeys(ctx context.Context, chatID int64, lang i18n.Lang) {
 		if k.CreatedAt != 0 {
 			when = fmtWhen(float64(k.CreatedAt), lang)
 		}
-		// Match this row's live stats by Kiro-Go key id, falling back to the
-		// deterministic mint name for legacy rows stored without an id.
-		stat := statsByID[k.KeyID]
-		if stat == nil {
-			stat = statsByName["tg-"+fmtInt(k.ChatID)+"-order-"+k.OrderID]
+		// This row's live stats, by backend: llmgate rows read their per-key
+		// parallel fetch; pool rows match the batched call by Kiro-Go key id,
+		// falling back to the deterministic mint name for legacy rows stored
+		// without an id.
+		var stat *keyLiveStats
+		if k.Backend == store.BackendLlmgate {
+			stat = lgStats[k.OrderID]
+		} else {
+			ps := statsByID[k.KeyID]
+			if ps == nil {
+				ps = statsByName["tg-"+fmtInt(k.ChatID)+"-order-"+k.OrderID]
+			}
+			if ps != nil {
+				stat = poolStatToLive(ps)
+			}
 		}
-		// SKU tag: the STORED class wins; a legacy '' row falls back to the LIVE
-		// stats row's class, and only then to the bedrock default — so an
-		// operator who classed a legacy key kiro/fixed server-side still sees it
-		// labelled (and unit-labelled) correctly here (telegram_bot.py:4340-4342).
-		// DISPLAY ONLY: the recharge guard must keep reading the raw stored value.
+		// SKU tag: llmgate rows are always bedrock (the only class the cutover
+		// moved). For pool rows the STORED class wins; a legacy '' row falls
+		// back to the LIVE stats row's class, and only then to the bedrock
+		// default — so an operator who classed a legacy key kiro/fixed
+		// server-side still sees it labelled (and unit-labelled) correctly here
+		// (telegram_bot.py:4340-4342). DISPLAY ONLY: the recharge guard must
+		// keep reading the raw stored value.
 		rowCls := k.SaleClass
-		if rowCls == "" && stat != nil {
+		if k.Backend == store.BackendLlmgate {
+			rowCls = saleClassBedrock
+		} else if rowCls == "" && stat != nil {
 			rowCls = stat.SaleClass
 		}
 		// Collapse anything unrecognised onto bedrock, exactly as
@@ -140,19 +175,21 @@ func (b *Bot) showMyAPIKeys(ctx context.Context, chatID int64, lang i18n.Lang) {
 			if s, ok := c.Status[status]; ok {
 				label = s.T(lang)
 			}
-			// -1 = unlimited (defensive; sold keys always carry a quota).
-			// CreditsRemaining/CreditsUsed are fractional now (kirogo.Remaining
-			// and KeyStat.CreditsUsed are float64-backed — live keys accrue
-			// sub-1-credit usage), so round to the nearest whole credit for
-			// display via roundCredits rather than truncating with int64(...)
-			// (would show 1999 instead of 2000 for a 1999.95 balance) or
-			// printing the float directly (would show "1999.950000").
+			// Unlimited renders ∞ (llmgate credit_limit 0, pool -1 — the same
+			// keyLiveStats.Unlimited flag either way). Remaining/Used are
+			// fractional live numbers on BOTH backends, so round to the nearest
+			// whole credit for display via roundCredits rather than truncating
+			// with int64(...) (would show 1999 instead of 2000 for a 1999.95
+			// balance) or printing the float directly (would show
+			// "1999.950000"). A negative remaining on a LIMITED key keeps the
+			// pre-cutover pool rendering (∞) — the status line already says
+			// exhausted, and this branch is defensive for sold keys.
 			left := "∞"
-			if !stat.CreditsRemaining.IsUnlimited() && stat.CreditsRemaining >= 0 {
-				left = itoa64(roundCredits(float64(stat.CreditsRemaining)))
+			if !stat.Unlimited && stat.Remaining >= 0 {
+				left = itoa64(roundCredits(stat.Remaining))
 			}
 			detail := i18n.F(c.MyKeysLineStats.T(lang),
-				"used", itoa64(roundCredits(stat.CreditsUsed)), "bought", itoa64(bought),
+				"used", itoa64(roundCredits(stat.Used)), "bought", itoa64(bought),
 				"left", left, "when", when)
 			lines = append(lines, "\n🔑 "+masked+" · "+tag+" — "+label+"\n   "+detail)
 		} else {
@@ -169,6 +206,89 @@ func (b *Bot) showMyAPIKeys(ctx context.Context, chatID int64, lang i18n.Lang) {
 		lines = append(lines, "\n"+c.MyKeysStatsNA.T(lang))
 	}
 	b.sendMenu(ctx, chatID, strings.Join(lines, "\n"), rows)
+}
+
+// poolStatToLive maps one pool /admin/stats row into the backend-agnostic
+// keyLiveStats shape — the My-Keys view's half of the union apikeyLiveStats
+// performs for single-key reads, kept as its own mapper because this call
+// site starts from an ALREADY-FETCHED batched row and must not pay another
+// round trip per key.
+func poolStatToLive(st *kirogo.KeyStat) *keyLiveStats {
+	if st == nil {
+		return nil
+	}
+	return &keyLiveStats{
+		Status:    st.Status,
+		Remaining: float64(st.CreditsRemaining),
+		Used:      st.CreditsUsed,
+		Unlimited: st.CreditsRemaining.IsUnlimited() || st.CreditsRemaining < 0,
+		SaleClass: st.SaleClass,
+	}
+}
+
+// llmgateKeyStatsMaxConcurrent bounds the parallel per-key llmgate stats fetch
+// on the My-Keys view. llmgate has no batch endpoint, so a 10-key page is 10
+// KeyStats reads; 4 at a time keeps the view's latency near 3 sequential
+// round trips instead of 10, without opening 10 simultaneous connections to
+// the API on every Self-Service tap.
+const llmgateKeyStatsMaxConcurrent = 4
+
+// llmgateKeyStatsParallel fetches live stats for every LLMGATE-backend row of
+// the My-Keys page, in parallel (bounded by llmgateKeyStatsMaxConcurrent)
+// under ONE overall statsTimeout budget, keyed by order id. Refunded rows are
+// skipped (they render from local state) and every failure is silent — the
+// caller degrades that key to its local row plus the statsFailed note, the
+// same contract a failed batched pool call has. Returns an empty map (never
+// nil) when there is nothing to fetch or llmgate is unconfigured, so callers
+// can index it unconditionally.
+func (b *Bot) llmgateKeyStatsParallel(ctx context.Context, keys []*store.APIKey) map[string]*keyLiveStats {
+	out := map[string]*keyLiveStats{}
+	if b.llmgateClient() == nil {
+		return out
+	}
+	var lg []*store.APIKey
+	for _, k := range keys {
+		if k.Backend == store.BackendLlmgate && k.RefundedTS == nil {
+			lg = append(lg, k)
+		}
+	}
+	if len(lg) == 0 {
+		return out
+	}
+	// ONE parent deadline for the whole page: each per-key read applies its own
+	// statsTimeout too, but as a CHILD of this context the effective deadline
+	// is the tighter of the two, so a slow tail key can never stretch the view
+	// past the budget a single-key read would have had.
+	pctx, cancel := context.WithTimeout(ctx, statsTimeout)
+	defer cancel()
+	sem := make(chan struct{}, llmgateKeyStatsMaxConcurrent)
+	var (
+		wg sync.WaitGroup
+		mu sync.Mutex
+	)
+	for _, k := range lg {
+		wg.Add(1)
+		go func(row *store.APIKey) {
+			defer wg.Done()
+			// Acquire a slot or die with the page budget — a queued 5th key
+			// must not hold the worker past the deadline waiting for its turn.
+			select {
+			case sem <- struct{}{}:
+			case <-pctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			st := b.apikeyLiveStats(pctx, row)
+			if st == nil {
+				return // silent: caller marks this key statsFailed
+			}
+			mu.Lock()
+			out[row.OrderID] = st
+			mu.Unlock()
+		}(k)
+	}
+	wg.Wait()
+	return out
 }
 
 // batchedKeyStats fetches EVERY key's live stats in one /admin/stats call and
@@ -223,18 +343,21 @@ func (b *Bot) cbApikeyRev(cc *cbCtx) {
 		return
 	}
 	// SKU-correct wording/units: a kiro/fixed key re-reveals with its own
-	// delivery message, everything else (bedrock + legacy '') the bedrock one.
-	// Shared with the first delivery via apikeyDeliveredTemplate so the two
-	// renders of one key can never disagree.
+	// delivery message, everything else (bedrock + legacy '') the bedrock one;
+	// an llmgate-backend row gets the two-URL llmgate wording whatever its
+	// class. Shared with the first delivery via apikeyDeliveredTemplate so the
+	// two renders of one key can never disagree.
 	keyCls := apikeyKeyClass(row)
-	tmpl := apikeyDeliveredTemplate(c, keyCls)
+	tmpl := apikeyDeliveredTemplate(c, keyCls, row.Backend)
 	// "name" (admin-renameable display name) must be passed here too, not only
 	// on the first delivery: this re-send uses the SAME template, so omitting
 	// it would leak a literal "{name}" into the customer's message. HTML-escaped
-	// because this goes out with parse_mode=HTML.
+	// because this goes out with parse_mode=HTML. "apibase" fills only the
+	// llmgate template (a silent no-op elsewhere, same as {opus} on prompts).
 	b.sendHTML(cc.Ctx, cc.ChatID, i18n.F(tmpl.T(lang),
 		"name", html.EscapeString(b.apikeyProductName(keyCls)),
 		"credits", itoa64(roundCredits(row.Credits)),
 		"key", html.EscapeString(row.APIKey),
-		"base", html.EscapeString(b.kiroGoPublicURL())))
+		"base", html.EscapeString(b.kiroGoPublicURL()),
+		"apibase", b.llmgateAPIBaseDisp()))
 }

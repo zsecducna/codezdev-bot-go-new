@@ -20,6 +20,7 @@ package handlers
 
 import (
 	"context"
+	"html"
 	"log"
 	"math"
 	"strconv"
@@ -28,6 +29,7 @@ import (
 
 	"codezdev-bot/internal/i18n"
 	"codezdev-bot/internal/kirogo"
+	"codezdev-bot/internal/llmgate"
 	"codezdev-bot/internal/store"
 	"codezdev-bot/internal/tg"
 )
@@ -269,13 +271,20 @@ func (b *Bot) apikeyProductName(saleClass string) string {
 	return def
 }
 
-// apikeyDeliveredTemplate picks the SKU-correct delivery/reveal template for a
-// key's effective class. Shared by the first delivery (deliverApikey) and the
-// 👁 re-reveal (cbApikeyRev) so the two can never show a buyer one SKU's
-// wording on delivery and another's on a re-read of the same key. Anything not
-// recognised (bedrock, or the legacy "" of pre-split rows) keeps the bedrock
-// template, matching apikeyKeyClass's own collapse.
-func apikeyDeliveredTemplate(c *i18n.APIKeyCatalog, keyClass string) i18n.Str {
+// apikeyDeliveredTemplate picks the delivery/reveal template for a key's
+// effective class AND backend. Shared by the first delivery (deliverApikey)
+// and the 👁 re-reveal (cbApikeyRev) so the two can never show a buyer one
+// SKU's wording on delivery and another's on a re-read of the same key.
+//
+// Backend first: a BackendLlmgate row gets DeliveredLlmgate whatever its sale
+// class — llmgate keys are minted bedrock-only, and their message carries the
+// TWO base URLs ({apibase} + the shop's {base}) the pool templates don't.
+// Anything not recognised by class (bedrock, or the legacy "" of pre-split
+// rows) keeps the bedrock template, matching apikeyKeyClass's own collapse.
+func apikeyDeliveredTemplate(c *i18n.APIKeyCatalog, keyClass, backend string) i18n.Str {
+	if backend == store.BackendLlmgate {
+		return c.DeliveredLlmgate
+	}
 	switch keyClass {
 	case saleClassKiro:
 		return c.KiroDelivered
@@ -283,6 +292,23 @@ func apikeyDeliveredTemplate(c *i18n.APIKeyCatalog, keyClass string) i18n.Str {
 		return c.FixedDelivered
 	}
 	return c.Delivered
+}
+
+// llmgateAPIBaseDisp is the {apibase} substitution for the llmgate delivery /
+// reveal template: the PUBLIC completions base buyers paste into their
+// tooling, right-trimmed of '/' and HTML-escaped — it lands inside a
+// parse_mode=HTML message, and a configured URL with a stray "&" must not
+// make Telegram reject the one message the buyer must receive. Distinct from
+// LlmgateBaseURL (the control plane the bot logs into) on purpose; see
+// config.LlmgateAPIBase. A nil cfg (unit tests with no config wired) falls
+// back to llmgate.DefaultBaseURL so the template still renders a sane URL
+// instead of a bare "{apibase}" token.
+func (b *Bot) llmgateAPIBaseDisp() string {
+	u := llmgate.DefaultBaseURL
+	if b.cfg != nil {
+		u = b.cfg.LlmgateAPIBase()
+	}
+	return html.EscapeString(strings.TrimRight(u, "/"))
 }
 
 // apikeyNameOK is the shared shape check for a SKU display name — non-empty,
@@ -569,7 +595,7 @@ func (b *Bot) fixedApikeyEnabled() bool {
 
 // apikeyForSale reports whether a SKU is actually sellable — apikey_for_sale
 // (telegram_bot.py:6207-6215): a positive admin rate AND a reachable-in-
-// principle Kiro-Go config. The product HIDES rather than selling and
+// principle backend config. The product HIDES rather than selling and
 // auto-refunding (repo CLAUDE.md domain invariant).
 func (b *Bot) apikeyForSale(saleClass string) bool {
 	switch saleClass {
@@ -582,7 +608,15 @@ func (b *Bot) apikeyForSale(saleClass string) bool {
 		// account id here would hide a perfectly sellable product.
 		return b.fixedApikeyEnabled() && b.apikeyRateUSDT(saleClassFixed) > 0 && b.kiroGoConfiguredBase()
 	}
-	return b.apikeyRateUSDT(saleClassBedrock) > 0 && b.kiroGoConfigured()
+	// BEDROCK mints DIRECTLY on llmgate since the cutover (deliverApikey's
+	// mintLlmgateKey path), so its gate is the llmgate client being configured
+	// — NOT kiroGoConfigured(). The pool's account id is irrelevant to a mint
+	// that never touches the pool: gating on it would hide a sellable product
+	// behind a setting its mints never read (the same reasoning that keeps the
+	// kiro/fixed arms on ConfiguredBase). The pool gate stays in place for the
+	// kiro/fixed arms above and for OLD pool keys' recharge/stats/revoke paths,
+	// which route per-row on api_keys.backend, not on the SKU.
+	return b.apikeyRateUSDT(saleClassBedrock) > 0 && b.llmgateClient() != nil
 }
 
 // apikeyPriceMicro is the micro-USDT total for `credits` at the SKU's admin
@@ -835,9 +869,30 @@ func (b *Bot) orderSaleClass(o *store.Order) string {
 // one of these two rather than adding a third number.
 const statsTimeout = 6 * time.Second
 
-// apikeyLiveStats returns the live per-key stats for a minted key, or nil when
-// the call fails / the key can't be found — _apikey_live_stats
-// (telegram_bot.py:4498-4516). Callers MUST degrade gracefully.
+// keyLiveStats — the backend-agnostic live view of one sold key: both pool
+// (kirogo /admin/stats) and llmgate (KeyStats with the customer's own key)
+// collapse into this. status: "active"|"exhausted"|"disabled"; unlimited:
+// credit side is unlimited (render ∞, refuse recharges); remaining may be
+// negative (overspend) — do not clamp; used mirrors the backend's meter.
+type keyLiveStats struct {
+	Status    string
+	Remaining float64
+	Used      float64
+	Unlimited bool
+	SaleClass string // pool rows only (legacy '' display fallback); "" for llmgate
+}
+
+// apikeyLiveStats returns the live per-key stats for a minted key on WHATEVER
+// backend its row names (api_keys.backend), or nil when the call fails / the
+// key can't be found — _apikey_live_stats (telegram_bot.py:4498-4516), made
+// backend-routing by the llmgate cutover. Callers MUST degrade gracefully.
+//
+// Backend split: a BackendLlmgate row reads GET /api/v1/apikey/stats
+// authenticated AS the customer's own sk-llmgate-… key (the KEY realm — a 401
+// means the key itself is bad, so internal/llmgate never re-login-retries it);
+// every other row is a pool key read through the batched /admin/stats shape as
+// before. Both map into keyLiveStats so no caller needs to know which gateway
+// answered.
 //
 // This used to carry a note claiming the opposite of the truth: that the
 // deployed server sends the documented "keys" field, so dropping Python's
@@ -853,10 +908,59 @@ const statsTimeout = 6 * time.Second
 // the decoder recognises therefore leaves no trace at all, and the customer
 // simply sees "couldn't check this key's credits". Do not read an empty log
 // as evidence the call was never made.
-func (b *Bot) apikeyLiveStats(ctx context.Context, row *store.APIKey) *kirogo.KeyStat {
+func (b *Bot) apikeyLiveStats(ctx context.Context, row *store.APIKey) *keyLiveStats {
 	if row == nil {
 		return nil
 	}
+	if row.Backend == store.BackendLlmgate {
+		u := b.llmgateKeyUsage(ctx, row)
+		if u == nil {
+			return nil
+		}
+		remaining, limited := u.Remaining()
+		return &keyLiveStats{
+			Status:    u.Status(),
+			Remaining: remaining,
+			Used:      u.Used(),
+			Unlimited: !limited,
+			// SaleClass stays "": llmgate keys carry no server-side sale class,
+			// and every llmgate row was minted bedrock anyway (the only class
+			// the cutover moved).
+		}
+	}
+	// Pool arm: the same row→union mapping the My-Keys batch path uses
+	// (poolStatToLive, apikey_keys.go), so a single mapping defines what a
+	// pool KeyStat means in the backend-agnostic shape.
+	return poolStatToLive(b.poolKeyLiveStats(ctx, row))
+}
+
+// llmgateKeyUsage reads one llmgate key's record + usage through the KEY realm
+// (customer's own key as Bearer), bounded by statsTimeout like every other
+// display-path stats call. nil on ANY failure, logging the ORDER id only —
+// never the key (invariant 2; the llmgate client itself never logs the token
+// either). Split out of apikeyLiveStats because the recharge path needs the
+// RAW KeyUsage (Info.Name / Info.CreditLimit) for its read-modify-write, not
+// the collapsed display shape.
+func (b *Bot) llmgateKeyUsage(ctx context.Context, row *store.APIKey) *llmgate.KeyUsage {
+	client := b.llmgateClient()
+	if client == nil || row == nil {
+		return nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, statsTimeout)
+	defer cancel()
+	u, err := client.KeyStats(cctx, row.APIKey)
+	if err != nil {
+		log.Println("llmgate stats failed for order", row.OrderID, ":", err)
+		return nil
+	}
+	return u
+}
+
+// poolKeyLiveStats is the pre-cutover body of apikeyLiveStats: one pool key's
+// live row off kirogo /admin/stats, matched by key id with a fallback to the
+// deterministic mint name for legacy rows stored without an id. nil when the
+// pool is unconfigured, the call fails, or the key isn't in the answer.
+func (b *Bot) poolKeyLiveStats(ctx context.Context, row *store.APIKey) *kirogo.KeyStat {
 	client := b.kirogoClient()
 	if client == nil {
 		return nil
@@ -885,12 +989,34 @@ func (b *Bot) apikeyLiveStats(ctx context.Context, row *store.APIKey) *kirogo.Ke
 // (0, false) when unreadable — _apikey_remaining_credits
 // (telegram_bot.py:4519-4528). Refund maths falls back to the deliberate
 // force-full prompt on false; never guess a payout from stale data.
+//
+// UNLIMITED keys report the pool-shaped -1 sentinel: the refund maths reading
+// this (< 0 = unlimited = treat as fully-unused, store.py semantics) predates
+// the cutover and is shared by both backends, so an llmgate unlimited key
+// (whose Remaining() is (0,false) — zero reads as "nothing left" to that
+// maths) must be translated here or a full refund would silently pro-rate to
+// nothing.
 func (b *Bot) apikeyRemainingCredits(ctx context.Context, row *store.APIKey) (float64, bool) {
 	st := b.apikeyLiveStats(ctx, row)
 	if st == nil {
 		return 0, false
 	}
-	return float64(st.CreditsRemaining), true
+	// Unlimited reports the pool-shaped -1 sentinel so the shared refund maths
+	// (< 0 = unlimited = fully-unused) keeps meaning what it always meant.
+	if st.Unlimited {
+		return -1, true
+	}
+	// A LIMITED key's negative remaining is OVERSPEND, not the -1 sentinel —
+	// llmgate returns CreditLimit − Used unclamped, so a burnt-past-the-limit
+	// key reads e.g. -2.5. Passed through raw it would fall into the refund
+	// maths' unlimited branch and pay a FULL refund for a fully-used key
+	// (money out for credits already spent). Clamp to 0: an overspent key has
+	// nothing left to return. keyLiveStats.Remaining itself stays unclamped —
+	// the RC gate's headroom arithmetic needs the true figure.
+	if st.Remaining < 0 {
+		return 0, true
+	}
+	return st.Remaining, true
 }
 
 // ---- recharge eligibility gate ---------------------------------------------
@@ -935,14 +1061,18 @@ func (b *Bot) apikeyRCGate(ctx context.Context, chatID int64, targetDes string) 
 	// ONLY the tri-state "status" distinguishes a MANUAL disable from plain
 	// exhaustion — an exhausted key also has enabled=false server-side, and
 	// exhausted keys MUST stay rechargeable, so never gate on the bare
-	// `enabled` flag here.
+	// `enabled` flag here. Backend-agnostic since the cutover: keyLiveStats
+	// carries the same tri-state for pool and llmgate rows alike (llmgate's
+	// Status() derives it from IsActive + remaining the same way).
 	if st.Status == "disabled" {
 		return rcGate{Row: row, Err: "disabled"}
 	}
-	if st.CreditsRemaining.IsUnlimited() || st.CreditsRemaining < 0 {
+	if st.Unlimited {
+		// Pool: creditsRemaining -1. llmgate: credit_limit 0. Both backends
+		// reject a credit top-up on an unlimited key, so refuse identically.
 		return rcGate{Row: row, Err: "unlimited"}
 	}
-	remaining := float64(st.CreditsRemaining)
+	remaining := st.Remaining
 	// Per-key cap: total UNUSED credits after the top-up must stay within the
 	// per-order/per-key ceiling, so the sellable headroom is
 	// cap − remaining − any IN-FLIGHT (reserved/paid, not yet applied) recharge
@@ -980,8 +1110,11 @@ func (b *Bot) rcGateMessage(g rcGate, lang i18n.Lang, cls string) string {
 		return c.RCDisabled.T(lang)
 	case "full":
 		// Round, don't truncate: g.Remaining is fed straight from
-		// kirogo.KeyStat.CreditsRemaining, which is fractional on live keys —
-		// int64(...) would floor 1999.95 down to 1999 in this notice.
+		// keyLiveStats.Remaining, which is fractional on live keys of BOTH
+		// backends — int64(...) would floor 1999.95 down to 1999 in this
+		// notice. It is deliberately NOT clamped at 0 first: an overspent
+		// llmgate key reports a NEGATIVE remaining, and headroom computed off
+		// it is still the honest cap − remaining arithmetic.
 		return i18n.F(c.RCFull.T(lang), "remaining", itoa64(roundCredits(g.Remaining)),
 			"cap", itoa64(b.apikeyMaxCredits(cls)))
 	}

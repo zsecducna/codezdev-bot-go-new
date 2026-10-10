@@ -105,6 +105,23 @@ type APIKeyCatalog struct {
 	// FixedHistLabel — history row; {credits}.
 	FixedHistLabel Str
 
+	// ---- llmgate-backend delivery (llmgate cutover) --------------------------
+	//
+	// GO-ONLY: no Python constant to cite (same precedent as the fixed block
+	// above). Used for BOTH the first delivery and the 👁 re-reveal of any
+	// backend==llmgate key row, via apikeyDeliveredTemplate — the one place
+	// that picks templates keeps the two renders of the same key identical.
+
+	// DeliveredLlmgate — delivery/reveal message (HTML) for a key minted
+	// DIRECTLY on llmgate.app; {name} {credits} {key} {apibase} {base}.
+	// {apibase} is the llmgate completions base buyers point their clients at
+	// (config LlmgateAPIBase); {base} stays the shop's public web
+	// (kiroGoPublicURL) because THAT is what serves /customer /docs /models.
+	// Both URLs are offered — recommended + legacy — so customers wired to the
+	// old endpoint keep working through the cutover. {name}/{key}/{apibase}/
+	// {base} are HTML-escaped by the sender, same as Delivered above.
+	DeliveredLlmgate Str
+
 	// ---- shared gates / errors ----
 
 	// BadAmount — APIKEY_BAD_AMOUNT (telegram_bot.py:3899); {min} {max}.
@@ -301,6 +318,16 @@ func buildAPIKeyCatalog() APIKeyCatalog {
 			EN: "⚡ Fixed Pricing API key — {credits} credits",
 			VI: "⚡ Fixed Pricing API key — {credits} credits",
 			ZH: "⚡ Fixed Pricing API key — {credits} credits",
+		},
+		// llmgate-backend delivery/reveal (Go-only, llmgate cutover). Structure
+		// mirrors Delivered above but carries BOTH base URLs: {apibase} (the
+		// llmgate completions endpoint, recommended) and {base} (the shop's
+		// public web, legacy — also works, and still the host of /customer
+		// /docs /models). {credits} counts the key's credits (1 credit = $1).
+		DeliveredLlmgate: Str{
+			EN: "✅ Your {name} are ready — {credits} credits\n\n🔑 Your API key (tap to copy):\n<code>{key}</code>\n\n📍 Base URL (recommended):\n<code>{apibase}</code>\n📍 Base URL (legacy — also works):\n<code>{base}</code>\n🔐 Send it as header: <code>Authorization: Bearer &lt;your key&gt;</code>\n\n👉 <b>How to use it</b>\n📊 Dashboard — check quota &amp; usage:\n{base}/customer\n📖 API docs + client setup (Claude Code, Codex, curl):\n{base}/docs\n🧠 Models &amp; pricing:\n{base}/models\n\n⚠️ Keep this key secret — anyone holding it can spend your credits. You can view it again anytime: Self-Service → 🔑 My API Keys.",
+			VI: "✅ {name} của bạn đã sẵn sàng — {credits} credits\n\n🔑 API key của bạn (chạm để sao chép):\n<code>{key}</code>\n\n📍 Base URL (khuyến nghị):\n<code>{apibase}</code>\n📍 Base URL (cũ — vẫn dùng được):\n<code>{base}</code>\n🔐 Gửi kèm header: <code>Authorization: Bearer &lt;key của bạn&gt;</code>\n\n👉 <b>Hướng dẫn sử dụng</b>\n📊 Bảng điều khiển — kiểm tra hạn mức &amp; mức dùng:\n{base}/customer\n📖 Tài liệu API + cách cài đặt (Claude Code, Codex, curl):\n{base}/docs\n🧠 Danh sách model &amp; bảng giá:\n{base}/models\n\n⚠️ Giữ kín key này — ai có nó là dùng được credits của bạn. Xem lại bất cứ lúc nào: Tự phục vụ → 🔑 API key của tôi.",
+			ZH: "✅ 您的 {name} 已就绪 — {credits} credits\n\n🔑 您的 API key（点击复制）：\n<code>{key}</code>\n\n📍 Base URL（推荐）：\n<code>{apibase}</code>\n📍 Base URL（旧版 — 同样可用）：\n<code>{base}</code>\n🔐 请求头：<code>Authorization: Bearer &lt;您的 key&gt;</code>\n\n👉 <b>使用指南</b>\n📊 控制台 — 查询额度与用量：\n{base}/customer\n📖 API 文档 + 客户端配置（Claude Code、Codex、curl）：\n{base}/docs\n🧠 模型与价格：\n{base}/models\n\n⚠️ 请妥善保管此 key — 任何持有者都能消耗您的 credits。随时可再次查看：自助服务 → 🔑 我的 API Key。",
 		},
 		// APIKEY_BAD_AMOUNT (telegram_bot.py:3899).
 		BadAmount: Str{

@@ -20,7 +20,7 @@ import (
 // notifyOwners call in doRefundApikeyGroup must turn this test red.
 func TestDoRefundApikeyGroupCreditFailedNotifiesOwner(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "1111aaaa1111aaaa1111aaaa1111aaaa"
 	seedKey(t, st, fk, keyDes, chat, "poolkey-credfail", "sk-test-credfail-0123456789a", "bedrock", 1000, 1000, 200)
@@ -59,7 +59,7 @@ func TestDoRefundApikeyGroupCreditFailedNotifiesOwner(t *testing.T) {
 // guard in cbApikeyRefOK turns this test red.
 func TestCbApikeyRefOKSkipsAdminRefundedNoticeOnCreditFailed(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "ffff6666ffff6666ffff6666ffff6666"
 	seedKey(t, st, fk, keyDes, chat, "poolkey-cbcredfail", "sk-test-cbcredfail-0123456789", "bedrock", 1000, 1000, 200)
@@ -131,7 +131,7 @@ func TestSplitRefundedAmountExactSum(t *testing.T) {
 // turns this test red.
 func TestDoRefundApikeyGroupRecordsRefundedAmountAcceptance(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, _ := newAPIKeyBot(t)
+	b, _, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "aaaa1111aaaa1111aaaa1111aaaa1111"
 	const rcDes = "bbbb2222bbbb2222bbbb2222bbbb2222"
@@ -186,7 +186,7 @@ func TestDoRefundApikeyGroupRecordsRefundedAmountAcceptance(t *testing.T) {
 // split and not NULL.
 func TestDoRefundApikeyGroupCreditFailedRecordsZero(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, _ := newAPIKeyBot(t)
+	b, _, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "cccc3333cccc3333cccc3333cccc3333"
 	seedKey(t, st, fk, keyDes, chat, "poolkey-zero", "sk-test-zero-0123456789abcdef", "bedrock", 1000, 1000, 200)
@@ -211,7 +211,7 @@ func TestDoRefundApikeyGroupCreditFailedRecordsZero(t *testing.T) {
 // group refund, same as the single-order path.
 func TestDoRefundApikeyGroupManualRecordsRefundedAmount(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, _ := newAPIKeyBot(t)
+	b, _, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "dddd4444dddd4444dddd4444dddd4444"
 	seedKey(t, st, fk, keyDes, chat, "poolkey-manual", "sk-test-manual-0123456789abcd", "bedrock", 1000, 1000, 200)
@@ -244,7 +244,7 @@ func TestDoRefundApikeyGroupManualRecordsRefundedAmount(t *testing.T) {
 // stuck order itself — apikeyRefundGroup resolves back to the same root).
 func TestDoRefundApikeyGroupUnknownMethodAlertsOwner(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "eeee5555eeee5555eeee5555eeee5555"
 	const rcDes = "eeee5555eeee5555eeee5555eeee5551"

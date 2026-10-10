@@ -21,7 +21,7 @@ import (
 // Deleting the notifyOwners call in deliverApikey must turn this test red.
 func TestApikeyRowPersistFailedNotifiesOwner(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, _, _ := newAPIKeyBot(t)
+	b, f, st, _, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const des = "aaaa1111aaaa1111aaaa1111aaaa1111"
 	o := seedOrder(t, st, des, chat, apikeyProduct, 500, 500000, "paid")
@@ -52,11 +52,11 @@ func TestApikeyRowPersistFailedNotifiesOwner(t *testing.T) {
 // apikeyMintFailRefund must turn this test red.
 func TestApikeyMintFailRefundRevertFailedNotifiesOwner(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, _, fl, _ := newAPIKeyBot(t)
 	const chat = 100
 	const des = "bbbb2222bbbb2222bbbb2222bbbb2222"
 	o := seedOrder(t, st, des, chat, apikeyProduct, 500, 500000, "paid")
-	fk.ProvisionStatus = 400 // mint rejected
+	fl.CreateStatus = 400 // llmgate create rejected (bedrock mints there now)
 
 	if _, err := st.DB().Exec("DROP TABLE balances"); err != nil {
 		t.Fatal(err)
@@ -85,7 +85,7 @@ func TestApikeyMintFailRefundRevertFailedNotifiesOwner(t *testing.T) {
 // errors, AND the revert to 'paid' ALSO errors.
 func TestApikeyRechargeFailRefundRevertFailedNotifiesOwner(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "cccc3333cccc3333cccc3333cccc3333"
 	const rcDes = "dddd4444dddd4444dddd4444dddd4444"
@@ -132,7 +132,7 @@ func TestApikeyRechargeFailRefundRevertFailedNotifiesOwner(t *testing.T) {
 // unnoticed precisely because nothing asserted the status.
 func TestApikeyRechargeAppliedStampFailedNotifiesOwner(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "eeee5555eeee5555eeee5555eeee5555"
 	const rcDes = "ffff6666ffff6666ffff6666ffff6666"

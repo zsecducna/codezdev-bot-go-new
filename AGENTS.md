@@ -72,8 +72,14 @@ thread pool, entry point `telegram_bot.py` ~1 MB) with these subsystems:
   no tx-hash paste required. SePay, PayPal, and Binance Pay were explicitly
   cut from scope (2026-08-13, user decision) and are fully removed from the
   Go tree — don't port them without a fresh explicit ask.
-- **API-key product (`__apikey__`)**: bot mints metered customer keys via the
-  Kiro-Go admin API (`POST /admin/provision_customer`). See invariants below.
+- **API-key product (`__apikey__`)**: the BEDROCK sale class mints keys
+  DIRECTLY on llmgate.app via internal/llmgate (`POST /api/v1/apikey/create`,
+  no expires_at = never expires; recharge is an absolute UpdateKey
+  read-modify-write serialized per key). The Kiro-Go/Pool gateway
+  (`POST /admin/provision_customer`) remains for the kiro/fixed SKUs and for
+  LEGACY keys already sold on it — recharge/revoke/stats route per-row on
+  `api_keys.backend` (`""` = pool, `"llmgate"` = direct). See invariants below
+  and docs/llmgate-cutover.md for the runbook.
 - **Account provisioning**: `kiro_provision.py`, `entra_*.py`. The Python
   browser-login scripts (`kiro-*-login.py`) run as subprocesses under a
   separate Python venv with the browser stack (`KIRO_LOGIN_PYTHON`,

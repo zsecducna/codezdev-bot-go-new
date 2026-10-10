@@ -476,7 +476,8 @@ func (s *Store) initSchema() error {
 		"CREATE TABLE IF NOT EXISTS api_keys (" +
 			"order_id TEXT PRIMARY KEY, chat_id INTEGER, key_id TEXT, " +
 			"api_key TEXT, credits REAL, created_at INTEGER, refunded_ts REAL, " +
-			"sale_class TEXT NOT NULL DEFAULT '')",
+			"sale_class TEXT NOT NULL DEFAULT '', " +
+			"backend TEXT NOT NULL DEFAULT '', pool_key_id TEXT, pool_api_key TEXT)",
 		"CREATE INDEX IF NOT EXISTS idx_api_keys_chat ON api_keys(chat_id)", // store.py:163
 	}
 	for _, q := range creates2 {
@@ -501,6 +502,39 @@ func (s *Store) initSchema() error {
 	if !haveAK["sale_class"] {
 		if _, err := tx.Exec("ALTER TABLE api_keys ADD COLUMN sale_class TEXT NOT NULL DEFAULT ''"); err != nil {
 			return fmt.Errorf("migrate api_keys.sale_class: %w", err)
+		}
+	}
+	// Migration: the llmgate-cutover columns. Key minting is moving off the
+	// Kiro-Go/Pool gateway onto direct llmgate.app keys (existing pool keys
+	// stay valid), so every row must record WHICH backend its key lives on:
+	//
+	//   - backend: '' = legacy Pool-Go key (store.BackendPool), 'llmgate' =
+	//     llmgate.app key (store.BackendLlmgate). NOT NULL DEFAULT '' because
+	//     the zero value IS pool BY DESIGN — every pre-cutover row is a pool
+	//     key, so '' classifies the whole existing table correctly with no
+	//     backfill (the same trick sale_class uses directly above, and unlike
+	//     refund_kind above, the stamped constant is TRUE of history here).
+	//   - pool_key_id / pool_api_key: the ORIGINAL pool key uuid + cleartext
+	//     customer key, copied aside when MigrateAPIKeyToLlmgate repoints a
+	//     row at its llmgate replacement. NULLABLE because NULL means "no pool
+	//     key was displaced": a fresh llmgate mint never had a pool
+	//     predecessor, and an un-migrated pool row still holds its originals
+	//     in key_id/api_key.
+	//
+	// ALTER order (backend first, then the pool pair) matches the CREATE
+	// TABLE column order above, so a migrated old DB and a fresh one end up
+	// byte-identical in shape — the explicit apiKeyCols SELECT order in
+	// apikeys.go depends on that stability.
+	if !haveAK["backend"] {
+		if _, err := tx.Exec("ALTER TABLE api_keys ADD COLUMN backend TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("migrate api_keys.backend: %w", err)
+		}
+	}
+	for _, col := range []string{"pool_key_id", "pool_api_key"} {
+		if !haveAK[col] {
+			if _, err := tx.Exec("ALTER TABLE api_keys ADD COLUMN " + col + " TEXT"); err != nil {
+				return fmt.Errorf("migrate api_keys.%s: %w", col, err)
+			}
 		}
 	}
 

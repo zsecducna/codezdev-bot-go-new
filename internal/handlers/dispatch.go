@@ -11,6 +11,7 @@ import (
 
 	"codezdev-bot/internal/config"
 	"codezdev-bot/internal/i18n"
+	"codezdev-bot/internal/llmgate"
 	"codezdev-bot/internal/pay/bands"
 	"codezdev-bot/internal/pay/bep20"
 	"codezdev-bot/internal/pay/tron"
@@ -282,6 +283,91 @@ type Bot struct {
 	// Bot field (not a bare const) so tests can shrink it, the same pattern
 	// as every other timing knob on this struct (otpCooldown, expirySweepInterval, …).
 	upstockRenderThrottle time.Duration
+
+	// ---- llmgate.app direct key minting (llmgate cutover) --------------------
+	//
+	// llmgateMu guards the llmgate client cache triple below AND the lazy
+	// per-key recharge lock map (llmgateRCLocks). A leaf mutex: held only for
+	// pointer swaps and map reads, never across an HTTP call or a DB query.
+	llmgateMu sync.Mutex
+	// llmgate is the cached LONG-LIVED llmgate client, or nil while
+	// unconfigured. Long-lived on purpose: it owns the ~30-day login-token
+	// cache, and internal/llmgate handles the 401 re-login itself, so a fresh
+	// client per call would throw that cache away on every tap and multiply
+	// logins sixteen-fold under the worker pool (the exact load shape
+	// llmgate.Client's tokenMu exists to prevent — see its package doc).
+	llmgate *llmgate.Client
+	// llmgateKey is the config triple the cached client was built from
+	// ("base|user|pass"). A settings.json edit that changes any of the three
+	// swaps the client on the next call; an identical triple reuses the cached
+	// one, preserving its token cache across unrelated settings writes.
+	llmgateKey string
+	// llmgateRCLocks serializes llmgate RECHARGES per target key. See
+	// llmgateRCKeyLock for the race it exists to close.
+	llmgateRCLocks map[string]*sync.Mutex
+}
+
+// llmgateClient — returns the cached long-lived llmgate client or nil when
+// unconfigured. Long-lived on purpose: it owns the login-token cache. Rebuilt
+// only when the effective config triple changes (kirogo builds per-call
+// because it is stateless).
+//
+// The cache key is "base|user|pass" of the LIVE config snapshot (settings.json
+// overriding .env, per config.Llmgate*): a triple that changed rebuilds the
+// client on the very next gate check, exactly like kiroGoConfig's per-call
+// snapshot, while an unchanged triple keeps the old client — and therefore its
+// cached ~30-day login token. Rebuilding per call would log in on every
+// customer tap; NEVER do that (internal/llmgate tokens live ~30 days and the
+// 401 re-login is handled inside the client).
+func (b *Bot) llmgateClient() *llmgate.Client {
+	if b.cfg == nil {
+		return nil
+	}
+	cfg := llmgate.Config{
+		BaseURL:  strings.TrimSpace(b.cfg.LlmgateBaseURL()),
+		Username: strings.TrimSpace(b.cfg.LlmgateUsername()),
+		Password: b.cfg.LlmgatePassword(),
+	}
+	if !cfg.Configured() {
+		// Half-configured = unconfigured: without all three no USER-realm call
+		// (login/create/update/delete) can even be attempted, and the callers
+		// gate "sell vs hide" on this nil — the same fail-closed shape as
+		// kirogoClient's ConfiguredBase check.
+		return nil
+	}
+	key := cfg.BaseURL + "|" + cfg.Username + "|" + cfg.Password
+	b.llmgateMu.Lock()
+	defer b.llmgateMu.Unlock()
+	if b.llmgate == nil || b.llmgateKey != key {
+		b.llmgate = llmgate.New(cfg, nil)
+		b.llmgateKey = key
+	}
+	return b.llmgate
+}
+
+// llmgateRCKeyLock returns the per-KEY mutex serializing llmgate recharges of
+// one target order's key, creating it lazily. THE RACE IT CLOSES: an llmgate
+// top-up is a read-modify-write (KeyStats → newLimit = CreditLimit + credits →
+// UpdateKey SETS the limit ABSOLUTELY), so two concurrent recharges of the
+// same key that both read CreditLimit=10 and each write 10+their own credits
+// silently DROP one customer's paid credits — money vanishes into a lost write.
+// Keyed by the TARGET order id (the api_keys row's des), not the recharge
+// order's: the shared resource is the key, and row.KeyID already holds the
+// llmgate id string, but the des is what every caller here already carries and
+// is unique per key row. Pool recharges need no such lock: the pool's
+// recharge_api_key is additive server-side, so concurrent top-ups commute.
+func (b *Bot) llmgateRCKeyLock(targetOrderID string) *sync.Mutex {
+	b.llmgateMu.Lock()
+	defer b.llmgateMu.Unlock()
+	if b.llmgateRCLocks == nil {
+		b.llmgateRCLocks = map[string]*sync.Mutex{}
+	}
+	mu := b.llmgateRCLocks[targetOrderID]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		b.llmgateRCLocks[targetOrderID] = mu
+	}
+	return mu
 }
 
 // Ctx is the per-update working context threaded through the dispatch stages,
@@ -330,6 +416,7 @@ func New(d Deps) *Bot {
 		chatNames:       map[int64]string{},
 		chatLang:        map[int64]i18n.Lang{},
 		refundAsOfByDes: map[string]float64{},
+		llmgateRCLocks:  map[string]*sync.Mutex{},
 	}
 	// Product-click limits + order timers — env-tunable (telegram_bot.py:12183-12185,
 	// 10542-10550), defaults applied when unset or no config is wired (unit tests).

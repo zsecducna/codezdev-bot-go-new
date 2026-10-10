@@ -399,6 +399,13 @@ func TestMigrationOldSchema(t *testing.T) {
 			t.Errorf("api_keys missing migrated column %q", c)
 		}
 	}
+	// The llmgate-cutover columns (backend + pool preservation pair) must be
+	// ALTERed on by the same boot, with no data touched.
+	for _, c := range []string{"backend", "pool_key_id", "pool_api_key"} {
+		if !akCols[c] {
+			t.Errorf("api_keys missing cutover column %q", c)
+		}
+	}
 	// Legacy rows survive and scan through the new column set.
 	o, err := s.GetOrder("old1")
 	if err != nil || o == nil {
@@ -414,6 +421,17 @@ func TestMigrationOldSchema(t *testing.T) {
 	// Migrated sale_class default is '' (legacy class, store.py:170-177).
 	if k.SaleClass != "" || k.RefundedTS != nil {
 		t.Fatalf("legacy api_key mangled: %+v", k)
+	}
+	// Same for the cutover columns: a pre-cutover row must read as POOL with
+	// no displaced pool originals — that DEFAULT '' classification is the
+	// whole reason the backend marker's zero value is pool.
+	if k.Backend != BackendPool || k.PoolKeyID != "" || k.PoolAPIKey != "" {
+		t.Fatalf("legacy api_key cutover columns = %q/%q/%q, want pool/\"\"/\"\"",
+			k.Backend, k.PoolKeyID, k.PoolAPIKey)
+	}
+	// And a legacy row is exactly what the migration tool must pick up.
+	if n, err := s.CountAPIKeysToMigrate(); err != nil || n != 1 {
+		t.Fatalf("CountAPIKeysToMigrate on legacy DB = %d err=%v, want 1 (the legacy row is pool+bedrock-class)", n, err)
 	}
 }
 
@@ -472,13 +490,13 @@ func TestPromoReserveBounds(t *testing.T) {
 // the STORED key instead of minting a second one.
 func TestAPIKeyDoubleInsert(t *testing.T) {
 	s := newTestStore(t)
-	ins, err := s.AddAPIKey("ord1", 99, "kid-1", "sk-first", 500, "bedrock")
+	ins, err := s.AddAPIKey("ord1", 99, "kid-1", "sk-first", 500, "bedrock", BackendPool)
 	if err != nil || !ins {
 		t.Fatalf("first mint: ins=%v err=%v", ins, err)
 	}
 	// Replayed settle tries to mint a different key for the same order —
 	// must be IGNOREd, first key stays.
-	ins, err = s.AddAPIKey("ord1", 99, "kid-2", "sk-second", 500, "bedrock")
+	ins, err = s.AddAPIKey("ord1", 99, "kid-2", "sk-second", 500, "bedrock", BackendPool)
 	if err != nil {
 		t.Fatalf("replay err: %v", err)
 	}
@@ -501,6 +519,175 @@ func TestAPIKeyDoubleInsert(t *testing.T) {
 	}
 	if n, _ := s.CountAPIKeysForChat(99); n != 0 {
 		t.Fatalf("live count after refund=%d", n)
+	}
+}
+
+// TestAPIKeyBackendColumnsRoundTrip pins the llmgate-cutover columns through
+// the AddAPIKey → APIKeyForOrder round trip: the backend stamped at mint
+// reads back verbatim (both markers), and the pool_* preservation columns
+// start EMPTY (SQL NULL → "") — they are written only by
+// MigrateAPIKeyToLlmgate. This is also the cheapest guard that apiKeyCols and
+// scanAPIKey still agree: the SELECT lists columns explicitly and the scan
+// reads them positionally, so a column added to one but not the other would
+// silently shift every later field — this test would catch the backend value
+// landing in the wrong slot.
+func TestAPIKeyBackendColumnsRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	if ins, err := s.AddAPIKey("ord-pool", 1, "kid-pool", "sk-pool", 100, "bedrock", BackendPool); err != nil || !ins {
+		t.Fatalf("pool mint: ins=%v err=%v", ins, err)
+	}
+	k, err := s.APIKeyForOrder("ord-pool")
+	if err != nil || k == nil {
+		t.Fatalf("APIKeyForOrder(ord-pool): %v %v", k, err)
+	}
+	if k.Backend != BackendPool || k.PoolKeyID != "" || k.PoolAPIKey != "" {
+		t.Fatalf("pool row cutover columns = backend:%q poolKeyID:%q poolAPIKey:%q, want %q/\"\"/\"\"",
+			k.Backend, k.PoolKeyID, k.PoolAPIKey, BackendPool)
+	}
+	if ins, err := s.AddAPIKey("ord-lg", 2, "kid-lg", "sk-lg", 200, "bedrock", BackendLlmgate); err != nil || !ins {
+		t.Fatalf("llmgate mint: ins=%v err=%v", ins, err)
+	}
+	k, err = s.APIKeyForOrder("ord-lg")
+	if err != nil || k == nil {
+		t.Fatalf("APIKeyForOrder(ord-lg): %v %v", k, err)
+	}
+	if k.Backend != BackendLlmgate {
+		t.Fatalf("llmgate row backend = %q, want %q", k.Backend, BackendLlmgate)
+	}
+	// Sanity on the marker values themselves: '' is pool BY DESIGN (it is
+	// the column DEFAULT, classifying every pre-cutover row correctly with
+	// no backfill), 'llmgate' is the only other backend today.
+	if BackendPool != "" || BackendLlmgate != "llmgate" {
+		t.Fatalf("backend consts drifted: pool=%q llmgate=%q", BackendPool, BackendLlmgate)
+	}
+}
+
+// TestMigrateAPIKeyToLlmgate proves the per-key commit point: one UPDATE
+// repoints the row at the llmgate key while PRESERVING the pool originals in
+// pool_key_id/pool_api_key (what makes a later pool-side revoke possible),
+// and the backend=” WHERE guard makes a replayed call a no-op (false, values
+// untouched) instead of a double-apply.
+func TestMigrateAPIKeyToLlmgate(t *testing.T) {
+	s := newTestStore(t)
+	// Seed a row exactly as the pre-cutover world wrote it: pool key, pool
+	// backend, originals in key_id/api_key.
+	if ins, err := s.AddAPIKey("ord-m", 7, "pool-kid-1", "sk-pool-1", 500, "bedrock", BackendPool); err != nil || !ins {
+		t.Fatalf("seed pool row: ins=%v err=%v", ins, err)
+	}
+	moved, err := s.MigrateAPIKeyToLlmgate("ord-m", "pool-kid-1", "sk-pool-1", "lg-kid-9", "sk-lg-9", 650)
+	if err != nil || !moved {
+		t.Fatalf("first migrate: moved=%v err=%v", moved, err)
+	}
+	k, err := s.APIKeyForOrder("ord-m")
+	if err != nil || k == nil {
+		t.Fatalf("APIKeyForOrder after migrate: %v %v", k, err)
+	}
+	if k.Backend != BackendLlmgate || k.KeyID != "lg-kid-9" || k.APIKey != "sk-lg-9" || k.Credits != 650 {
+		t.Fatalf("row not repointed at llmgate key: %+v", k)
+	}
+	if k.PoolKeyID != "pool-kid-1" || k.PoolAPIKey != "sk-pool-1" {
+		t.Fatalf("pool originals not preserved: poolKeyID:%q poolAPIKey:%q", k.PoolKeyID, k.PoolAPIKey)
+	}
+	// Replay (tool re-run / concurrent worker): must report false AND leave
+	// every stored value exactly as the first call left it — the losing
+	// caller's llmgate key is orphaned server-side, never double-applied.
+	moved, err = s.MigrateAPIKeyToLlmgate("ord-m", "pool-kid-1", "sk-pool-1", "lg-kid-OTHER", "sk-lg-OTHER", 1)
+	if err != nil {
+		t.Fatalf("replayed migrate err: %v", err)
+	}
+	if moved {
+		t.Fatal("replayed migrate moved a row — backend='' guard is broken, second llmgate key applied over the first")
+	}
+	k, err = s.APIKeyForOrder("ord-m")
+	if err != nil || k == nil {
+		t.Fatalf("APIKeyForOrder after replay: %v %v", k, err)
+	}
+	if k.KeyID != "lg-kid-9" || k.APIKey != "sk-lg-9" || k.Credits != 650 ||
+		k.Backend != BackendLlmgate || k.PoolKeyID != "pool-kid-1" || k.PoolAPIKey != "sk-pool-1" {
+		t.Fatalf("replay mutated stored values: %+v", k)
+	}
+	// Unknown order: idempotent false, not an error (the tool may race a
+	// hand-deleted row).
+	if moved, err = s.MigrateAPIKeyToLlmgate("ord-nope", "a", "b", "c", "d", 1); err != nil || moved {
+		t.Fatalf("migrate unknown order: moved=%v err=%v, want false/nil", moved, err)
+	}
+	// A REFUNDED row must NEVER be repointed (the refunded_ts IS NULL guard
+	// in the WHERE): its revoke already killed — or tried to kill — the key
+	// the row points at, and swapping the corpse for a fresh live llmgate
+	// key would arm a SECOND spendable key under a row whose money was
+	// already paid back. Same idempotent-false contract as a replay.
+	if ins, err := s.AddAPIKey("ord-ref", 8, "pool-kid-r", "sk-pool-r", 90, "bedrock", BackendPool); err != nil || !ins {
+		t.Fatalf("seed refunded-row fixture: ins=%v err=%v", ins, err)
+	}
+	if err := s.MarkAPIKeyRefunded("ord-ref"); err != nil {
+		t.Fatalf("mark ord-ref refunded: %v", err)
+	}
+	if moved, err = s.MigrateAPIKeyToLlmgate("ord-ref", "pool-kid-r", "sk-pool-r", "lg-kid-r", "sk-lg-r", 90); err != nil || moved {
+		t.Fatalf("migrate refunded row: moved=%v err=%v, want false/nil (never repoint a refunded row)", moved, err)
+	}
+	if k, err = s.APIKeyForOrder("ord-ref"); err != nil || k == nil {
+		t.Fatalf("APIKeyForOrder(ord-ref): %v %v", k, err)
+	}
+	if k.Backend != BackendPool || k.KeyID != "pool-kid-r" || k.APIKey != "sk-pool-r" || k.PoolKeyID != "" || k.PoolAPIKey != "" {
+		t.Fatalf("refunded row mutated by refused migrate: %+v", k)
+	}
+}
+
+// TestListAndCountAPIKeysToMigrate pins the eligibility WHERE shared by
+// ListAPIKeysToMigrate and CountAPIKeysToMigrate: live + backend=” +
+// sale_class IN (”,'bedrock'). Refunded, kiro, fixed and already-migrated
+// rows must all be excluded, oldest-first order must hold, LIMIT must page,
+// and the COUNT(*) twin must agree with the full list.
+func TestListAndCountAPIKeysToMigrate(t *testing.T) {
+	s := newTestStore(t)
+	seed := func(ins bool, err error) {
+		t.Helper()
+		if err != nil || !ins {
+			t.Fatalf("seed: ins=%v err=%v", ins, err)
+		}
+	}
+	seed(s.AddAPIKey("ord-kiro", 1, "kid-k", "sk-k", 100, "kiro", BackendPool))       // stays pool by decision
+	seed(s.AddAPIKey("ord-bedrock", 1, "kid-b", "sk-b", 100, "bedrock", BackendPool)) // eligible
+	seed(s.AddAPIKey("ord-legacy", 1, "kid-l", "sk-l", 100, "", BackendPool))         // eligible (legacy '')
+	seed(s.AddAPIKey("ord-fixed", 1, "kid-f", "sk-f", 100, "fixed", BackendPool))     // stays pool by decision
+	seed(s.AddAPIKey("ord-refunded", 1, "kid-r", "sk-r", 100, "bedrock", BackendPool))
+	// Refund mark comes after the seed helper (it returns only error).
+	if err := s.MarkAPIKeyRefunded("ord-refunded"); err != nil { // refunded -> excluded
+		t.Fatalf("seed refund mark: %v", err)
+	}
+	// Already migrated -> excluded by backend='llmgate'.
+	seed(s.AddAPIKey("ord-migrated", 1, "kid-m", "sk-m", 100, "bedrock", BackendPool))
+	if moved, err := s.MigrateAPIKeyToLlmgate("ord-migrated", "kid-m", "sk-m", "lg-1", "sk-lg-1", 100); err != nil || !moved {
+		t.Fatalf("pre-migrate fixture: moved=%v err=%v", moved, err)
+	}
+	// AddAPIKey stamps whole-second created_at values, so same-instant seeds
+	// would tie and ORDER BY created_at ASC would be non-deterministic;
+	// stamp explicit distinct values instead.
+	for i, id := range []string{"ord-kiro", "ord-bedrock", "ord-legacy", "ord-fixed", "ord-refunded", "ord-migrated"} {
+		if _, err := s.db.Exec("UPDATE api_keys SET created_at=? WHERE order_id=?", int64(1000+i), id); err != nil {
+			t.Fatalf("stamp created_at %s: %v", id, err)
+		}
+	}
+
+	got, err := s.ListAPIKeysToMigrate(100)
+	if err != nil {
+		t.Fatalf("ListAPIKeysToMigrate: %v", err)
+	}
+	var ids []string
+	for _, k := range got {
+		ids = append(ids, k.OrderID)
+	}
+	if len(ids) != 2 || ids[0] != "ord-bedrock" || ids[1] != "ord-legacy" {
+		t.Fatalf("eligible set = %v, want [ord-bedrock ord-legacy] (refunded/kiro/fixed/migrated excluded, oldest first)", ids)
+	}
+	// LIMIT pages the tool through batches.
+	got, err = s.ListAPIKeysToMigrate(1)
+	if err != nil || len(got) != 1 || got[0].OrderID != "ord-bedrock" {
+		t.Fatalf("ListAPIKeysToMigrate(1) = %d rows err=%v, want exactly [ord-bedrock]", len(got), err)
+	}
+	// COUNT(*) twin agrees with the unlimited list.
+	if n, err := s.CountAPIKeysToMigrate(); err != nil || n != 2 {
+		t.Fatalf("CountAPIKeysToMigrate = %d err=%v, want 2", n, err)
 	}
 }
 

@@ -349,13 +349,23 @@ func (b *Bot) doRefundApikeyGroup(ctx context.Context, o *store.Order, method st
 		}
 		ok, detail := b.revokeAPIKey(ctx, krow)
 		if !ok {
-			// _notify_owners — telegram_bot.py:4888-4902.
-			log.Printf("OWNER ALERT: REFUNDED API-KEY ORDER %s — REVOKE FAILED (%s) 🔑 %s · id %s · name tg-%d-order-%s — DELETE this key on Kiro-Go now; its remaining credits stay usable until you do",
-				rootDes, detail, maskAPIKey(krow.APIKey), orDash(krow.KeyID), krow.ChatID, rootDes)
+			// _notify_owners — telegram_bot.py:4888-4902. The manual-cleanup
+			// instruction must name the console the key ACTUALLY lives on:
+			// since the llmgate cutover a refunded row's key is on llmgate
+			// (backend "llmgate") or still on Kiro-Go (pool rows) — telling
+			// the operator to hunt an llmgate key "on Kiro-Go" would send the
+			// cleanup to the wrong portal while the credits stay spendable.
+			// The masked key / id below are already non-cleartext.
+			where := "Kiro-Go"
+			if krow.Backend == store.BackendLlmgate {
+				where = "llmgate"
+			}
+			log.Printf("OWNER ALERT: REFUNDED API-KEY ORDER %s — REVOKE FAILED (%s) 🔑 %s · id %s · name tg-%d-order-%s — DELETE this key on %s now; its remaining credits stay usable until you do",
+				rootDes, detail, maskAPIKey(krow.APIKey), orDash(krow.KeyID), krow.ChatID, rootDes, where)
 			b.notifyOwners(ctx, fmt.Sprintf(
 				"⚠️ REFUNDED API-KEY ORDER %s — REVOKE FAILED (%s)\n🔑 %s · id %s\n🏷 name tg-%d-order-%s\n"+
-					"DELETE this key on Kiro-Go now — its remaining credits stay usable until you do.",
-				rootDes, detail, maskAPIKey(krow.APIKey), orDash(krow.KeyID), krow.ChatID, rootDes))
+					"DELETE this key on %s now — its remaining credits stay usable until you do.",
+				rootDes, detail, maskAPIKey(krow.APIKey), orDash(krow.KeyID), krow.ChatID, rootDes, where))
 		} else {
 			log.Printf("apikey group refund: revoked key for order %s (%s)", rootDes, detail)
 		}

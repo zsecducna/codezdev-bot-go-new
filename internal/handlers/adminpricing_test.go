@@ -1642,7 +1642,8 @@ func newModelPriceBot(t *testing.T) (*Bot, *fakeTG, *fakeKiro) {
 	t.Helper()
 	dir := t.TempDir()
 	fk := newFakeKiro(t)
-	writeSettings(t, dir, apikeySettings(fk))
+	fl := newFakeLlmgate(t)
+	writeSettings(t, dir, apikeySettings(fk, fl))
 	st, err := store.Open(filepath.Join(dir, "store.db"))
 	if err != nil {
 		t.Fatalf("store open: %v", err)

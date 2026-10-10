@@ -396,24 +396,35 @@ func writeSettings(t *testing.T, dir string, s map[string]any) {
 }
 
 // apikeySettings is the baseline fully-configured shop: bedrock priced at
-// 4 USDT / 100 credits against the fake Kiro-Go.
-func apikeySettings(fk *fakeKiro) map[string]any {
+// 4 USDT / 100 credits, the POOL configured for kiro/fixed mints and legacy
+// keys, and LLMGATE configured for the bedrock mints the cutover moved off
+// the pool (deliverApikey routes bedrock/” orders to fl, kiro/fixed to fk).
+func apikeySettings(fk *fakeKiro, fl *fakeLlmgate) map[string]any {
 	return map[string]any{
 		"kiro_go_base_url":        fk.srv.URL,
 		"kiro_go_admin_key":       "admin-secret",
 		"kiro_go_account_id":      "acct-1",
 		"apikey_usdt_per_100":     4.0,
 		"apikey_max_per_customer": 0,
+		// llmgate triple — the llmgate cutover's bedrock gate. The api base is
+		// a DISTINCT stable host so tests can tell {apibase} and {base} apart
+		// in the delivered message.
+		"llmgate_base_url": fl.srv.URL,
+		"llmgate_username": "shop",
+		"llmgate_password": "llm-secret",
+		"llmgate_api_base": "https://api.example.test",
 	}
 }
 
-// newAPIKeyBot wires a Bot to a temp store/stock/config plus the fake Kiro-Go,
-// with the baseline settings already written.
-func newAPIKeyBot(t *testing.T) (*Bot, *fakeTG, *store.Store, *fakeKiro, string) {
+// newAPIKeyBot wires a Bot to a temp store/stock/config plus BOTH fakes (the
+// pool double for kiro/fixed + legacy keys, the llmgate double for bedrock
+// mints), with the baseline settings already written.
+func newAPIKeyBot(t *testing.T) (*Bot, *fakeTG, *store.Store, *fakeKiro, *fakeLlmgate, string) {
 	t.Helper()
 	dir := t.TempDir()
 	fk := newFakeKiro(t)
-	writeSettings(t, dir, apikeySettings(fk))
+	fl := newFakeLlmgate(t)
+	writeSettings(t, dir, apikeySettings(fk, fl))
 	st, err := store.Open(filepath.Join(dir, "store.db"))
 	if err != nil {
 		t.Fatalf("store open: %v", err)
@@ -426,7 +437,7 @@ func newAPIKeyBot(t *testing.T) (*Bot, *fakeTG, *store.Store, *fakeKiro, string)
 	f := &fakeTG{}
 	b := New(Deps{TG: f, Store: st, Stock: stk, Config: cfg, AdminID: "999"})
 	t.Cleanup(func() { b.Shutdown(); st.Close() })
-	return b, f, st, fk, dir
+	return b, f, st, fk, fl, dir
 }
 
 // seedPaidOrder creates an order already in the given status.
@@ -461,77 +472,77 @@ func lastMsg(t *testing.T, f *fakeTG) tg.SendMessageParams {
 
 // TestApikeyMintIdempotent is THE invariant: the api_keys row is persisted
 // before the paid->delivered flip, so a replayed settle re-delivers the STORED
-// key and provision_customer is called exactly ONCE for one sale.
+// key and the mint endpoint is called exactly ONCE for one sale — on EITHER
+// backend since the llmgate cutover (bedrock -> llmgate create, kiro -> pool
+// provision_customer; fixed shares kiro's pool arm).
 func TestApikeyMintIdempotent(t *testing.T) {
-	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
-	const chat, des = 100, "aaaa0000aaaa0000aaaa0000aaaa0000"
-	o := seedOrder(t, st, des, chat, apikeyProduct, 500, 500000, "paid")
+	for _, tc := range []struct {
+		name    string
+		product string
+	}{
+		{"bedrock/llmgate", apikeyProduct},
+		{"kiro/pool", kiroApikeyProduct},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			b, f, st, fk, fl, _ := newAPIKeyBot(t)
+			fk.UpstreamStatus = "skipped" // kiro's normal terminal status
+			const chat, des = 100, "aaaa0000aaaa0000aaaa0000aaaa0000"
+			o := seedOrder(t, st, des, chat, tc.product, 500, 500000, "paid")
 
-	if !b.deliverApikey(ctx, o, des) {
-		t.Fatal("first delivery must succeed")
-	}
-	row, _ := st.APIKeyForOrder(des)
-	if row == nil || row.APIKey == "" {
-		t.Fatal("api_keys row must exist after the mint")
-	}
-	if got, _ := st.GetOrder(des); got.Status != "delivered" {
-		t.Errorf("order status = %q, want delivered", got.Status)
-	}
+			if !b.deliverApikey(ctx, o, des) {
+				t.Fatal("first delivery must succeed")
+			}
+			row, _ := st.APIKeyForOrder(des)
+			if row == nil || row.APIKey == "" {
+				t.Fatal("api_keys row must exist after the mint")
+			}
+			if got, _ := st.GetOrder(des); got.Status != "delivered" {
+				t.Errorf("order status = %q, want delivered", got.Status)
+			}
 
-	// Replay the settle (crash-between-mint-and-flip / re-driven payment).
-	o2, _ := st.GetOrder(des)
-	if !b.deliverApikey(ctx, o2, des) {
-		t.Fatal("replay must re-deliver")
-	}
-	if n := fk.provisionCount(); n != 1 {
-		t.Fatalf("provision_customer called %d times, want exactly 1 (double-mint!)", n)
-	}
-	row2, _ := st.APIKeyForOrder(des)
-	if row2.APIKey != row.APIKey {
-		t.Errorf("replay delivered a DIFFERENT key: %q vs %q", row2.APIKey, row.APIKey)
-	}
-	if n := countContains(f, row.APIKey); n != 2 {
-		t.Errorf("stored key delivered %d times, want 2 (mint + replay re-send)", n)
+			// Replay the settle (crash-between-mint-and-flip / re-driven payment).
+			o2, _ := st.GetOrder(des)
+			if !b.deliverApikey(ctx, o2, des) {
+				t.Fatal("replay must re-deliver")
+			}
+			wantMints := 1
+			if tc.product == apikeyProduct {
+				if n := fl.createCount(); n != wantMints {
+					t.Fatalf("llmgate create called %d times, want exactly 1 (double-mint!)", n)
+				}
+				if n := fk.provisionCount(); n != 0 {
+					t.Fatalf("pool provision called %d times, want 0 for a bedrock sale", n)
+				}
+			} else if n := fk.provisionCount(); n != wantMints {
+				t.Fatalf("provision_customer called %d times, want exactly 1 (double-mint!)", n)
+			}
+			row2, _ := st.APIKeyForOrder(des)
+			if row2.APIKey != row.APIKey {
+				t.Errorf("replay delivered a DIFFERENT key: %q vs %q", row2.APIKey, row.APIKey)
+			}
+			if n := countContains(f, row.APIKey); n != 2 {
+				t.Errorf("stored key delivered %d times, want 2 (mint + replay re-send)", n)
+			}
+		})
 	}
 }
 
-// TestApikeyMintBedrockPayload pins the bedrock wire payload: explicit
-// accountId, tokenLimit 0, saleClass "bedrock", skipUpstream false.
-func TestApikeyMintBedrockPayload(t *testing.T) {
-	ctx := context.Background()
-	b, _, st, fk, _ := newAPIKeyBot(t)
-	const chat, des = 100, "bbbb0000bbbb0000bbbb0000bbbb0000"
-	o := seedOrder(t, st, des, chat, apikeyProduct, 500, 500000, "paid")
-	b.deliverApikey(ctx, o, des)
-
-	p := fk.lastProvision()
-	if p["accountId"] != "acct-1" {
-		t.Errorf("accountId = %v, want acct-1 (must always be explicit)", p["accountId"])
-	}
-	if p["saleClass"] != "bedrock" {
-		t.Errorf("saleClass = %v, want bedrock", p["saleClass"])
-	}
-	if p["tokenLimit"] != float64(0) {
-		t.Errorf("tokenLimit = %v, want 0", p["tokenLimit"])
-	}
-	if p["skipUpstream"] != false {
-		t.Errorf("skipUpstream = %v, want false for bedrock", p["skipUpstream"])
-	}
-	if p["credits"] != float64(500) {
-		t.Errorf("credits = %v, want 500", p["credits"])
-	}
-	if name, _ := p["name"].(string); name != "tg-100-order-"+des {
-		t.Errorf("name = %q, want the deterministic mint name", name)
-	}
-}
+// TestApikeyMintBedrockPayload (the pool-shaped bedrock wire payload pin:
+// explicit accountId, skipUpstream false, saleClass "bedrock") is GONE with
+// the mint it pinned: bedrock no longer calls provision_customer at all. Its
+// llmgate successor — name, credit_limit, NO expires_at on the wire, row
+// backend/key_id, both-URL delivery, pool receives NOTHING — is
+// TestApikeyLlmgateMintPayloadAndRow (apikey_llmgate_test.go). The kiro and
+// fixed pool payloads stay pinned by TestApikeyMintKiroPayload and
+// TestFixedMintSendsNoAccountID below/elsewhere.
 
 // TestApikeyMintKiroPayload pins the kiro wire payload: NO accountId field at
 // all, skipUpstream true, saleClass "kiro".
 func TestApikeyMintKiroPayload(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, dir := newAPIKeyBot(t)
-	s := apikeySettings(fk)
+	b, _, st, fk, fl, dir := newAPIKeyBot(t)
+	s := apikeySettings(fk, fl)
 	s["kiro_apikey_enabled"] = true
 	s["kiro_apikey_usdt_per_100"] = 1.0
 	writeSettings(t, dir, s)
@@ -558,22 +569,23 @@ func TestApikeyMintKiroPayload(t *testing.T) {
 	}
 }
 
-// TestApikeyMintPendingIsSuccess: upstreamStatus "pending" (bedrock) and
-// "skipped" (kiro/fixed, which bind no upstream key at all) are ALL terminal
-// successes — the key is delivered, the order closes, and nothing is retried
-// or refunded.
+// TestApikeyMintPendingIsSuccess: upstreamStatus "skipped" (kiro/fixed,
+// which bind no upstream key at all) is a terminal success — the key is
+// delivered, the order closes, and nothing is retried or refunded. The
+// bedrock/"pending" row died with the pool mint itself: bedrock mints on
+// llmgate now, where a 2xx create is the whole success condition and no
+// upstream status exists (pinned by TestApikeyLlmgateMintPayloadAndRow).
 func TestApikeyMintPendingIsSuccess(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
 		name, product, upstream string
 	}{
-		{"bedrock/pending", apikeyProduct, "pending"},
 		{"kiro/skipped", kiroApikeyProduct, "skipped"},
 		{"fixed/skipped", fixedApikeyProduct, "skipped"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			b, f, st, fk, dir := newAPIKeyBot(t)
-			s := apikeySettings(fk)
+			b, f, st, fk, fl, dir := newAPIKeyBot(t)
+			s := apikeySettings(fk, fl)
 			s["kiro_apikey_enabled"] = true
 			s["kiro_apikey_usdt_per_100"] = 1.0
 			s["fixed_apikey_enabled"] = true
@@ -607,8 +619,8 @@ func TestApikeyMintPendingIsSuccess(t *testing.T) {
 // money goes back to the wallet and the order lands 'refunded'.
 func TestApikeyMintFailureRefunds(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
-	fk.ProvisionStatus = 400
+	b, f, st, fk, fl, _ := newAPIKeyBot(t)
+	fl.CreateStatus = 400 // bedrock mints on llmgate now
 	const chat, des = 100, "eeee0000eeee0000eeee0000eeee0000"
 	o := seedOrder(t, st, des, chat, apikeyProduct, 500, 500000, "paid")
 
@@ -627,28 +639,23 @@ func TestApikeyMintFailureRefunds(t *testing.T) {
 	if countContains(f, "could not be created") != 1 {
 		t.Error("the buyer must be told the mint failed and the money came back")
 	}
-	// A 4xx is a real rejection: never retried (retrying can't succeed).
-	if n := fk.provisionCount(); n != 1 {
-		t.Errorf("provision called %d times, want 1 (never retry a 4xx)", n)
+	// A 4xx is a real rejection: never retried (retrying can't succeed —
+	// and retrying a create could mint a second paid key).
+	if n := fl.createCount(); n != 1 {
+		t.Errorf("llmgate create called %d times, want 1 (never retry a 4xx)", n)
+	}
+	if n := fk.provisionCount(); n != 0 {
+		t.Errorf("pool provision called %d times, want 0 for a bedrock sale", n)
 	}
 }
 
-// TestApikeyMintLegacyEchoStoresEmptyClass: a PRE-saleClass Kiro-Go echoes no
-// class, so the bot must store "" — storing the order's "bedrock" would 409
-// the key's first-ever recharge.
-func TestApikeyMintLegacyEchoStoresEmptyClass(t *testing.T) {
-	ctx := context.Background()
-	b, _, st, fk, _ := newAPIKeyBot(t)
-	fk.EchoSaleClass = false
-	const chat, des = 100, "ffff0000ffff0000ffff0000ffff0000"
-	o := seedOrder(t, st, des, chat, apikeyProduct, 500, 500000, "paid")
-	b.deliverApikey(ctx, o, des)
-
-	row, _ := st.APIKeyForOrder(des)
-	if row == nil || row.SaleClass != "" {
-		t.Fatalf("stored sale_class = %q, want '' (the server's absent echo)", row.SaleClass)
-	}
-}
+// TestApikeyMintLegacyEchoStoresEmptyClass (a PRE-saleClass Kiro-Go echoes no
+// class, so the bot must store "") is GONE with the mint it constrained:
+// bedrock rows are minted on llmgate now, where there IS no server-side class
+// echo to store — mintLlmgateKey always stores saleClassBedrock (pinned by
+// TestApikeyLlmgateMintPayloadAndRow). The '' class survives only on OLD pool
+// rows, whose recharge OMITS saleClass — still pinned by
+// TestApikeyRechargeLegacyOmitsSaleClass below.
 
 // ---- recharge ----------------------------------------------------------------
 
@@ -658,7 +665,7 @@ func seedKey(t *testing.T, st *store.Store, fk *fakeKiro, des string, chat int64
 	keyID, key, saleClass string, bought, limit, used int64) {
 	t.Helper()
 	seedOrder(t, st, des, chat, apikeyProduct, bought, bought*1000, "delivered")
-	if _, err := st.AddAPIKey(des, chat, keyID, key, float64(bought), saleClass); err != nil {
+	if _, err := st.AddAPIKey(des, chat, keyID, key, float64(bought), saleClass, store.BackendPool); err != nil {
 		t.Fatal(err)
 	}
 	fk.register(keyID, key, limit, used)
@@ -669,7 +676,7 @@ func seedKey(t *testing.T, st *store.Store, fk *fakeKiro, des string, chat int64
 // SET the token cap to N, instantly disabling any key already past N.
 func TestApikeyRechargeNeverSendsTokens(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, _ := newAPIKeyBot(t)
+	b, _, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "11110000111100001111000011110000"
 	const rcDes = "22220000222200002222000022220000"
@@ -705,7 +712,7 @@ func TestApikeyRechargeNeverSendsTokens(t *testing.T) {
 // "" could be rejected as an unrecognized class.
 func TestApikeyRechargeLegacyOmitsSaleClass(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, _ := newAPIKeyBot(t)
+	b, _, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "33330000333300003333000033330000"
 	const rcDes = "44440000444400004444000044440000"
@@ -726,7 +733,7 @@ func TestApikeyRechargeLegacyOmitsSaleClass(t *testing.T) {
 // the key up a second time.
 func TestApikeyRechargeAppliedAfterConfirm(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "55550000555500005555000055550000"
 	const rcDes = "66660000666600006666000066660000"
@@ -788,7 +795,7 @@ func TestApikeyRechargeAppliedAfterConfirm(t *testing.T) {
 // the top-up sat unpaid can't be recharged — the money goes back instead.
 func TestApikeyRechargeRefundedTargetRefunds(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, _ := newAPIKeyBot(t)
+	b, _, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "88880000888800008888000088880000"
 	const rcDes = "99990000999900009999000099990000"
@@ -815,15 +822,19 @@ func TestApikeyRechargeRefundedTargetRefunds(t *testing.T) {
 // ---- gates -------------------------------------------------------------------
 
 // TestApikeyHiddenWhenUnconfigured: the product HIDES rather than selling and
-// auto-refunding (repo CLAUDE.md). A bedrock sale needs the account id too.
+// auto-refunding (repo CLAUDE.md). Since the llmgate cutover the bedrock gate
+// is the LLMGATE triple — an unconfigured llmgate hides bedrock even with the
+// pool fully configured (the deeper llmgate-only/pool-only matrix lives in
+// TestApikeyBedrockGateOnLlmgate; this keeps the buyer-facing shape pinned:
+// hidden row, stale tap answered with APIKEY_OFF).
 func TestApikeyHiddenWhenUnconfigured(t *testing.T) {
-	b, f, _, fk, dir := newAPIKeyBot(t)
-	s := apikeySettings(fk)
-	delete(s, "kiro_go_account_id") // bedrock gate needs URL + key + ACCOUNT ID
+	b, f, _, fk, fl, dir := newAPIKeyBot(t)
+	s := apikeySettings(fk, fl)
+	delete(s, "llmgate_username") // bedrock gate needs base URL + user + password
 	writeSettings(t, dir, s)
 
 	if b.apikeyForSale(saleClassBedrock) {
-		t.Error("bedrock must NOT be for sale without an account id")
+		t.Error("bedrock must NOT be for sale when llmgate is unconfigured")
 	}
 	rows, any := b.apikeyBuyRows(100, i18n.EN)
 	if any || len(rows) != 0 {
@@ -839,8 +850,8 @@ func TestApikeyHiddenWhenUnconfigured(t *testing.T) {
 // TestApikeyRateUnsetHidesProduct: a zero/unset rate disables the SKU even with
 // Kiro-Go fully configured.
 func TestApikeyRateUnsetHidesProduct(t *testing.T) {
-	b, _, _, fk, dir := newAPIKeyBot(t)
-	s := apikeySettings(fk)
+	b, _, _, fk, fl, dir := newAPIKeyBot(t)
+	s := apikeySettings(fk, fl)
 	delete(s, "apikey_usdt_per_100")
 	writeSettings(t, dir, s)
 	if b.apikeyForSale(saleClassBedrock) {
@@ -867,7 +878,7 @@ func TestApikeyRateUnsetHidesProduct(t *testing.T) {
 // feeds usdtStr (rate-free micro->2dp), so the estimate is deterministic from
 // the stored micro total, with no exchange rate to disagree on.
 func TestApikeyOpusTokenEstimate(t *testing.T) {
-	b, _, _, _, _ := newAPIKeyBot(t)
+	b, _, _, _, _, _ := newAPIKeyBot(t)
 
 	// 4.00 USDT / 100 credits (4,000,000 micro), 80M tokens per 100 credits ->
 	// 80M / 4 = 20.0M tokens per USDT, 4 / 80 = 0.05 USDT per 1M.
@@ -916,7 +927,7 @@ func TestApikeyOpusTokenEstimate(t *testing.T) {
 // is reseller-specific; if the two were computed from different rates the one
 // screen would contradict itself.
 func TestApikeyOpusEstimateFollowsResellerRate(t *testing.T) {
-	b, _, st, fk, dir := newAPIKeyBot(t)
+	b, _, st, fk, fl, dir := newAPIKeyBot(t)
 	t.Setenv("USD_TO_VND", "25000")
 	const chat = 200
 
@@ -928,7 +939,7 @@ func TestApikeyOpusEstimateFollowsResellerRate(t *testing.T) {
 	if err := st.SetHandle(fmtInt(chat), "@myreseller"); err != nil {
 		t.Fatal(err)
 	}
-	s := apikeySettings(fk)
+	s := apikeySettings(fk, fl)
 	s["resellers"] = []any{map[string]any{"u": "myreseller", "note": "", "disc": 50}} // 4.00 -> 2.00 USDT/100
 	writeSettings(t, dir, s)
 	discounted := b.apikeyOpusEstFor(chat, i18n.EN)
@@ -948,9 +959,9 @@ func TestApikeyOpusEstimateFollowsResellerRate(t *testing.T) {
 // credit unit, for which the same token count would be a giveaway).
 func TestApikeyPromptShowsOpusEstimate(t *testing.T) {
 	ctx := context.Background()
-	b, f, _, fk, dir := newAPIKeyBot(t)
+	b, f, _, fk, fl, dir := newAPIKeyBot(t)
 	t.Setenv("USD_TO_VND", "25000")
-	s := apikeySettings(fk)
+	s := apikeySettings(fk, fl)
 	s["kiro_apikey_enabled"] = true
 	s["kiro_apikey_usdt_per_100"] = 1.0
 	writeSettings(t, dir, s)
@@ -978,8 +989,8 @@ func TestApikeyPromptShowsOpusEstimate(t *testing.T) {
 // toggle flips, even when priced — enabling against a pre-saleClass server would
 // mint UNCLASSED keys billed at the bedrock rate (~5.7x giveaway).
 func TestApikeyKiroSKUNeedsToggle(t *testing.T) {
-	b, _, _, fk, dir := newAPIKeyBot(t)
-	s := apikeySettings(fk)
+	b, _, _, fk, fl, dir := newAPIKeyBot(t)
+	s := apikeySettings(fk, fl)
 	s["kiro_apikey_usdt_per_100"] = 1.0
 	writeSettings(t, dir, s)
 	if b.apikeyForSale(saleClassKiro) {
@@ -1002,8 +1013,8 @@ func TestApikeyKiroSKUNeedsToggle(t *testing.T) {
 // prompt, and a forged amount can't create an order either.
 func TestApikeyPerCustomerCap(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, dir := newAPIKeyBot(t)
-	s := apikeySettings(fk)
+	b, f, st, fk, fl, dir := newAPIKeyBot(t)
+	s := apikeySettings(fk, fl)
 	s["apikey_max_per_customer"] = 1
 	writeSettings(t, dir, s)
 	const chat = 100
@@ -1029,8 +1040,8 @@ func TestApikeyPerCustomerCap(t *testing.T) {
 // can't see them yet).
 func TestApikeyRCGateHeadroomSubtractsInflight(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, dir := newAPIKeyBot(t)
-	s := apikeySettings(fk)
+	b, _, st, fk, fl, dir := newAPIKeyBot(t)
+	s := apikeySettings(fk, fl)
 	s["apikey_max_credits"] = 1000
 	writeSettings(t, dir, s)
 	const chat = 100
@@ -1061,7 +1072,7 @@ func TestApikeyRCGateHeadroomSubtractsInflight(t *testing.T) {
 // TestApikeyRCGateRefusals pins the fail-closed / permanent-refusal verdicts.
 func TestApikeyRCGateRefusals(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, _ := newAPIKeyBot(t)
+	b, _, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "cc110000cc110000cc110000cc110000"
 	seedKey(t, st, fk, keyDes, chat, "poolkey-g", "sk-test-poolkey-g-0123456789ab", "bedrock", 1000, 1000, 0)
@@ -1109,7 +1120,7 @@ func TestApikeyRCGateRefusals(t *testing.T) {
 // apikeyrev: tap is a dead button.
 func TestApikeyMyKeysAndReveal(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const liveDes = "dd110000dd110000dd110000dd110000"
 	const refDes = "ee110000ee110000ee110000ee110000"
@@ -1153,7 +1164,7 @@ func TestApikeyMyKeysAndReveal(t *testing.T) {
 // "minus one left".
 func TestApikeyMyKeysUnlimitedRender(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const des = "ff110000ff110000ff110000ff110000"
 	seedKey(t, st, fk, des, chat, "poolkey-inf", "sk-test-inf-0123456789abcdef", "bedrock", 1000, 0, 0)
@@ -1171,7 +1182,7 @@ func TestApikeyMyKeysUnlimitedRender(t *testing.T) {
 // none left it says so instead of offering a revoked key.
 func TestApikeyRechargePickerSkipsRefunded(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const des = "11220000112200001122000011220000"
 	seedKey(t, st, fk, des, chat, "poolkey-p", "sk-test-poolkey-p-0123456789ab", "bedrock", 1000, 1000, 0)
@@ -1190,13 +1201,13 @@ func TestApikeyRechargePickerSkipsRefunded(t *testing.T) {
 // unit, pro-rated by credits REMAINING, and the key is revoked once.
 func TestApikeyGroupRefundProration(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "22330000223300002233000022330000"
 	const rcDes = "33440000334400003344000033440000"
 	// 1000 credits bought for 1,000,000 VND...
 	seedOrder(t, st, keyDes, chat, apikeyProduct, 1000, 1000000, "delivered")
-	if _, err := st.AddAPIKey(keyDes, chat, "poolkey-grp", "sk-test-grp-0123456789abcdef", 1000, "bedrock"); err != nil {
+	if _, err := st.AddAPIKey(keyDes, chat, "poolkey-grp", "sk-test-grp-0123456789abcdef", 1000, "bedrock", store.BackendPool); err != nil {
 		t.Fatal(err)
 	}
 	// ...plus an APPLIED 500-credit top-up for 500,000 VND.
@@ -1259,12 +1270,12 @@ func TestApikeyGroupRefundProration(t *testing.T) {
 // agrees with what actually gets paid.
 func TestDoRefundAdminForceFullApikeyGroup(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, _ := newAPIKeyBot(t)
+	b, _, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "aabb0000aabb0000aabb0000aabb0000"
 	const rcDes = "ccdd0000ccdd0000ccdd0000ccdd0000"
 	seedOrder(t, st, keyDes, chat, apikeyProduct, 1000, 1000000, "delivered")
-	if _, err := st.AddAPIKey(keyDes, chat, "poolkey-adm", "sk-test-adm-0123456789abcdef", 1000, "bedrock"); err != nil {
+	if _, err := st.AddAPIKey(keyDes, chat, "poolkey-adm", "sk-test-adm-0123456789abcdef", 1000, "bedrock", store.BackendPool); err != nil {
 		t.Fatal(err)
 	}
 	seedOrder(t, st, rcDes, chat, apikeyRechargeProduct, 500, 500000, "delivered")
@@ -1312,7 +1323,7 @@ func TestDoRefundAdminForceFullApikeyGroup(t *testing.T) {
 // money never moved.
 func TestDoRefundApikeyGroupCreditBalanceFailure(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "eeff0000eeff0000eeff0000eeff0000"
 	seedKey(t, st, fk, keyDes, chat, "poolkey-cbf", "sk-test-cbf-0123456789abcdef", "bedrock", 1000, 1000, 400)
@@ -1345,7 +1356,7 @@ func TestDoRefundApikeyGroupCreditBalanceFailure(t *testing.T) {
 // untouched, and the customer sees the retry notice.
 func TestApikeyRefundAbortsOnUnreadableStats(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "44550000445500004455000044550000"
 	seedKey(t, st, fk, keyDes, chat, "poolkey-abort", "sk-test-abort-0123456789abcd", "bedrock", 1000, 1000, 100)
@@ -1377,7 +1388,7 @@ func TestApikeyRefundAbortsOnUnreadableStats(t *testing.T) {
 // button is offered.
 func TestApikeyRefundFullyUsedKey(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "55660000556600005566000055660000"
 	seedKey(t, st, fk, keyDes, chat, "poolkey-burnt", "sk-test-burnt-0123456789abcd", "bedrock", 1000, 1000, 1000)
@@ -1404,7 +1415,7 @@ func TestApikeyRefundFullyUsedKey(t *testing.T) {
 // produced.
 func TestApikeyRefundAmount_WholeCreditPayoutUnchanged(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, _ := newAPIKeyBot(t)
+	b, _, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "77880000778800007788000077880000"
 	seedKey(t, st, fk, keyDes, chat, "poolkey-whole", "sk-test-whole-0123456789abcdef", "bedrock", 1000, 1000, 400)
@@ -1423,7 +1434,7 @@ func TestApikeyRefundAmount_WholeCreditPayoutUnchanged(t *testing.T) {
 // so a 404 delete counts as a successful revoke and never blocks a refund.
 func TestApikeyRevokeTreats404AsRevoked(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, _ := newAPIKeyBot(t)
+	b, _, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "66770000667700006677000066770000"
 	seedKey(t, st, fk, keyDes, chat, "poolkey-404", "sk-test-404-0123456789abcdef", "bedrock", 1000, 1000, 0)
@@ -1442,7 +1453,7 @@ func TestApikeyRevokeTreats404AsRevoked(t *testing.T) {
 // screen -> pay by balance -> mint -> delivery, all through Process.
 func TestApikeyPurchaseE2E(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, _, _ := newAPIKeyBot(t)
+	b, f, st, _, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	primeKB(b, chat)
 	if _, err := st.CreditBalance(fmtInt(chat), 80_000_000); err != nil { // 80 USDT, enough for the 20 USDT order
@@ -1509,7 +1520,7 @@ func TestApikeyPurchaseE2E(t *testing.T) {
 // escape semantics, thousands-separator tolerance, and the bad-amount retry.
 func TestApikeyTypedAmountCapture(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, _, _ := newAPIKeyBot(t)
+	b, f, st, _, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	primeKB(b, chat)
 
@@ -1543,7 +1554,7 @@ func TestApikeyTypedAmountCapture(t *testing.T) {
 // button at all — Python parity, so the buttons never drift older than the text.
 func TestApikeyHistoryRedlSlots(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, _, _ := newAPIKeyBot(t)
+	b, f, st, _, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	// Six delivered orders, newest last-created: the detail view offers at most
 	// HISTORY_DEFAULT_N (5) buttons.
@@ -1584,13 +1595,13 @@ func TestApikeyHistoryRedlSlots(t *testing.T) {
 // same figure the executor pays (telegram_bot.py:4791-4803 / 4607-4612).
 func TestApikeyStuckRechargeRefundsFaceValue(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, _ := newAPIKeyBot(t)
+	b, _, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "77880000778800007788000077880000"
 	const stuckDes = "88990000889900008899000088990000"
 	// 1000 credits for 1,000,000 VND, 400 already burned -> 600 remaining.
 	seedOrder(t, st, keyDes, chat, apikeyProduct, 1000, 1000000, "delivered")
-	if _, err := st.AddAPIKey(keyDes, chat, "poolkey-stuck", "sk-test-stuck-0123456789abc", 1000, "bedrock"); err != nil {
+	if _, err := st.AddAPIKey(keyDes, chat, "poolkey-stuck", "sk-test-stuck-0123456789abc", 1000, "bedrock", store.BackendPool); err != nil {
 		t.Fatal(err)
 	}
 	fk.register("poolkey-stuck", "sk-test-stuck-0123456789abc", 1000, 400)
@@ -1634,12 +1645,12 @@ func TestApikeyStuckRechargeRefundsFaceValue(t *testing.T) {
 // (telegram_bot.py:4853-4856).
 func TestApikeyStuckOnlyRefundDoesNotRevoke(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, _ := newAPIKeyBot(t)
+	b, _, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "99aa000099aa000099aa000099aa0000"
 	const stuckDes = "aabb0000aabb0000aabb0000aabb0000"
 	seedOrder(t, st, keyDes, chat, apikeyProduct, 1000, 1000000, "delivered")
-	if _, err := st.AddAPIKey(keyDes, chat, "poolkey-so", "sk-test-so-0123456789abcdef", 1000, "bedrock"); err != nil {
+	if _, err := st.AddAPIKey(keyDes, chat, "poolkey-so", "sk-test-so-0123456789abcdef", 1000, "bedrock", store.BackendPool); err != nil {
 		t.Fatal(err)
 	}
 	fk.register("poolkey-so", "sk-test-so-0123456789abcdef", 1000, 0)
@@ -1675,7 +1686,7 @@ func TestApikeyStuckOnlyRefundDoesNotRevoke(t *testing.T) {
 // (telegram_bot.py:7758-7772).
 func TestApikeyRechargeTOCTOURefundsInstead(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, _ := newAPIKeyBot(t)
+	b, _, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "bbcc0000bbcc0000bbcc0000bbcc0000"
 	const rcDes = "ccdd0000ccdd0000ccdd0000ccdd0000"
@@ -1711,7 +1722,7 @@ func TestApikeyRechargeTOCTOURefundsInstead(t *testing.T) {
 // PEEK escape, bad-amount retry, and the atomic claim on a valid amount.
 func TestApikeyRCTypedAmountCapture(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "ddee0000ddee0000ddee0000ddee0000"
 	primeKB(b, chat)
@@ -1754,8 +1765,8 @@ func TestApikeyRCTypedAmountCapture(t *testing.T) {
 // rate — the two credit units are ~5.7x apart.
 func TestApikeyQtyCrossSKUButtonRefused(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, dir := newAPIKeyBot(t)
-	s := apikeySettings(fk)
+	b, _, st, fk, fl, dir := newAPIKeyBot(t)
+	s := apikeySettings(fk, fl)
 	s["kiro_apikey_enabled"] = true
 	s["kiro_apikey_usdt_per_100"] = 1.0
 	writeSettings(t, dir, s)
@@ -1783,7 +1794,7 @@ func TestApikeyQtyCrossSKUButtonRefused(t *testing.T) {
 // server knows classes the bot predates (telegram_bot.py:4340-4342).
 func TestApikeyMyKeysLegacyClassFallsBackToServer(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const des = "eeff0000eeff0000eeff0000eeff0000"
 	seedKey(t, st, fk, des, chat, "poolkey-leg", "sk-test-leg-0123456789abcdef", "", 1000, 1000, 0)
@@ -1801,7 +1812,7 @@ func TestApikeyMyKeysLegacyClassFallsBackToServer(t *testing.T) {
 // M2.6 owns).
 func TestApikeySelfServiceEntryPoints(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "0a0a00000a0a00000a0a00000a0a0000"
 	seedKey(t, st, fk, keyDes, chat, "poolkey-ss", "sk-test-ss-0123456789abcdef", "bedrock", 1000, 1000, 400)
@@ -1832,8 +1843,8 @@ func TestApikeySelfServiceEntryPoints(t *testing.T) {
 // disables the SKU (rate 0), it must NOT silently re-price the shop off the
 // write-only legacy key.
 func TestApikeyRateInvalidPer100DisablesSKU(t *testing.T) {
-	b, _, _, fk, dir := newAPIKeyBot(t)
-	s := apikeySettings(fk)
+	b, _, _, fk, fl, dir := newAPIKeyBot(t)
+	s := apikeySettings(fk, fl)
 	s["apikey_usdt_per_100"] = "garbage"
 	s["apikey_usdt_per_1k"] = 40.0 // legacy key present and valid
 	writeSettings(t, dir, s)
@@ -1859,7 +1870,7 @@ func TestApikeyRateInvalidPer100DisablesSKU(t *testing.T) {
 // reach Kiro-Go.
 func TestApikeyRechargeDisabledAtDeliveryRefunds(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "d15ab1edd15ab1edd15ab1edd15ab1ed"
 	const rcDes = "d15ab1e2d15ab1e2d15ab1e2d15ab1e2"
@@ -1910,24 +1921,14 @@ func TestApikeyRechargeDisabledAtDeliveryRefunds(t *testing.T) {
 // is set (so "no sends recorded" would be true whether or not the attempt
 // happened, and proves nothing about the flow).
 
-// TestApikeySoldWithoutUpstreamBindingNotifiesOwner: a BEDROCK mint that
-// completes with an anomalous (non-bound, non-pending) upstream status must
-// alert the owner — apikey_deliver.go:138, _notify_owners
-// (telegram_bot.py:7701-7711).
-func TestApikeySoldWithoutUpstreamBindingNotifiesOwner(t *testing.T) {
-	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
-	fk.UpstreamStatus = "skipped" // anomalous for bedrock (bound/pending are the only non-alert states)
-	const chat, des = 100, "0001aaaa0001aaaa0001aaaa0001aaaa"
-	o := seedOrder(t, st, des, chat, apikeyProduct, 500, 500000, "paid")
-
-	if !b.deliverApikey(ctx, o, des) {
-		t.Fatal("an anomalous (non-error) upstream status must still deliver the key")
-	}
-	if n := countContains(f, "SOLD WITHOUT UPSTREAM BINDING"); n != 1 {
-		t.Errorf("owner alert count = %d, want 1", n)
-	}
-}
+// TestApikeySoldWithoutUpstreamBindingNotifiesOwner (a BEDROCK mint with an
+// anomalous upstream status alerts the owner) is GONE with the mint it
+// watched: bedrock mints on llmgate now and the llmgate branch has no
+// upstream-binding concept to alert on — the llmgate key IS the upstream.
+// The no-alert direction for every SKU is pinned by
+// TestFixedMintDoesNotAlertOwners; the pool alert code itself stays for the
+// kiro/fixed SKUs' pool path and remains reachable only if a binding class is
+// ever minted through the pool again.
 
 // TestApikeyMintFailRefundNotifiesOwnerAndSurvivesSendFailure covers
 // apikey_deliver.go:258 (apikeyMintFailRefund) both directions: the owner is
@@ -1936,8 +1937,8 @@ func TestApikeySoldWithoutUpstreamBindingNotifiesOwner(t *testing.T) {
 // must not roll back because Telegram was unreachable").
 func TestApikeyMintFailRefundNotifiesOwnerAndSurvivesSendFailure(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
-	fk.ProvisionStatus = 400
+	b, f, st, _, fl, _ := newAPIKeyBot(t)
+	fl.CreateStatus = 400 // bedrock mints on llmgate now
 	const chat, des = 100, "0002aaaa0002aaaa0002aaaa0002aaaa"
 	o := seedOrder(t, st, des, chat, apikeyProduct, 500, 500000, "paid")
 
@@ -1950,8 +1951,8 @@ func TestApikeyMintFailRefundNotifiesOwnerAndSurvivesSendFailure(t *testing.T) {
 
 	// Same scenario again, but Telegram is down for every send (including the
 	// buyer's own refund notice) — the refund itself must still land.
-	b2, f2, st2, fk2, _ := newAPIKeyBot(t)
-	fk2.ProvisionStatus = 400
+	b2, f2, st2, _, fl2, _ := newAPIKeyBot(t)
+	fl2.CreateStatus = 400
 	f2.sendErr = context.DeadlineExceeded
 	const des2 = "0003aaaa0003aaaa0003aaaa0003aaaa"
 	o2 := seedOrder(t, st2, des2, chat, apikeyProduct, 500, 500000, "paid")
@@ -1970,7 +1971,7 @@ func TestApikeyMintFailRefundNotifiesOwnerAndSurvivesSendFailure(t *testing.T) {
 // (apikeyRCFailRefund), the recharge twin of the mint-fail alert above.
 func TestApikeyRCFailRefundNotifiesOwner(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "0004aaaa0004aaaa0004aaaa0004aaaa"
 	const rcDes = "0005aaaa0005aaaa0005aaaa0005aaaa"
@@ -2000,7 +2001,7 @@ func TestApikeyRCFailRefundNotifiesOwner(t *testing.T) {
 // _notify_owners (telegram_bot.py:6130-6144).
 func TestApikeyRevokeUpstreamNotRevokedNotifiesOwner(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "0006aaaa0006aaaa0006aaaa0006aaaa"
 	seedKey(t, st, fk, keyDes, chat, "poolkey-live", "sk-test-live-0123456789abcdef", "bedrock", 1000, 1000, 0)
@@ -2022,7 +2023,7 @@ func TestApikeyRevokeUpstreamNotRevokedNotifiesOwner(t *testing.T) {
 // completing (the money has already moved by the time the alert fires).
 func TestApikeyGroupRefundRevokeFailedNotifiesOwner(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "0007aaaa0007aaaa0007aaaa0007aaaa"
 	seedKey(t, st, fk, keyDes, chat, "poolkey-revfail", "sk-test-revfail-0123456789ab", "bedrock", 1000, 1000, 200)
@@ -2041,7 +2042,7 @@ func TestApikeyGroupRefundRevokeFailedNotifiesOwner(t *testing.T) {
 	}
 
 	// Same scenario, Telegram down for every send: the refund must still land.
-	b2, f2, st2, fk2, _ := newAPIKeyBot(t)
+	b2, f2, st2, fk2, _, _ := newAPIKeyBot(t)
 	const keyDes2 = "0008aaaa0008aaaa0008aaaa0008aaaa"
 	seedKey(t, st2, fk2, keyDes2, chat, "poolkey-revfail2", "sk-test-revfail2-0123456789", "bedrock", 1000, 1000, 200)
 	fk2.DeleteStatus = 500
@@ -2065,7 +2066,7 @@ func TestApikeyGroupRefundRevokeFailedNotifiesOwner(t *testing.T) {
 // alerts the owner with the SKU-correct label.
 func TestApikeySaleNotifiesOwnersOnDeliveryAndRecharge(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const mintDes = "0009aaaa0009aaaa0009aaaa0009aaaa"
 	o := seedOrder(t, st, mintDes, chat, apikeyProduct, 500, 500000, "paid")
@@ -2120,7 +2121,7 @@ func TestApikeySaleNotifiesOwnersOnDeliveryAndRecharge(t *testing.T) {
 // revenue event.
 func TestApikeySelfServiceRefundNotifiesAdmins(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, fk, _ := newAPIKeyBot(t)
+	b, f, st, fk, _, _ := newAPIKeyBot(t)
 	const chat = 100
 	const keyDes = "0011aaaa0011aaaa0011aaaa0011aaaa"
 	seedKey(t, st, fk, keyDes, chat, "poolkey-ssref", "sk-test-ssref-0123456789abcd", "bedrock", 1000, 1000, 200)

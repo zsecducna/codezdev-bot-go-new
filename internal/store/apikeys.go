@@ -9,38 +9,61 @@ package store
 
 import "database/sql"
 
+// Backend markers for api_keys.backend — WHICH gateway a row's key lives on.
+// The llmgate cutover moved minting from the Kiro-Go/Pool gateway to direct
+// llmgate.app keys, but every pool key already sold stays valid on its own
+// gateway, so the row has to say which one it is. The zero value IS
+// BackendPool BY DESIGN (and is the column's SQL-side DEFAULT ”): every row
+// minted before the cutover is a pool key, so ” classifies the entire
+// pre-existing table correctly with no backfill — the same trick SaleClass's
+// ” legacy value plays.
+const (
+	// BackendPool marks a key minted on the Kiro-Go/Pool gateway — the only
+	// backend that existed before the cutover, and still the backend for the
+	// kiro/fixed SKUs, which are NOT migrating.
+	BackendPool = ""
+	// BackendLlmgate marks a key the bot minted directly on llmgate.app.
+	BackendLlmgate = "llmgate"
+)
+
 // APIKey mirrors one `api_keys` row (store.py:159-162): one row per delivered
 // "__apikey__" order; order_id PK is the settle-idempotency anchor.
 type APIKey struct {
 	OrderID    string
 	ChatID     int64
-	KeyID      string   // Kiro-Go's uuid for the key (used to query /admin/stats)
+	KeyID      string   // gateway's uuid for the key (used to query /admin/stats)
 	APIKey     string   // cleartext key — the buyer's own secret, resent via "reveal"
 	Credits    float64  // total credits ever bought (mint + confirmed recharges)
 	CreatedAt  int64    // epoch seconds (INTEGER column)
 	RefundedTS *float64 // non-NULL once refunded (store.py:164-169)
 	SaleClass  string   // "bedrock" | "kiro" | "" legacy (store.py:170-177)
+	Backend    string   // BackendPool ("") | BackendLlmgate — which gateway holds this key
+	PoolKeyID  string   // ORIGINAL pool uuid, preserved by MigrateAPIKeyToLlmgate ("" = none displaced)
+	PoolAPIKey string   // ORIGINAL pool cleartext key, preserved for a later pool-side revoke
 }
 
-// scanAPIKey scans one api_keys row (explicit column order below).
-const apiKeyCols = "order_id, chat_id, key_id, api_key, credits, created_at, refunded_ts, sale_class"
+// scanAPIKey scans one api_keys row (explicit column order below). The three
+// llmgate-cutover columns are APPENDED AT THE END — every earlier column's
+// position is load-bearing (scan order must match apiKeyCols verbatim), so a
+// new column may only ever be added at the tail of both.
+const apiKeyCols = "order_id, chat_id, key_id, api_key, credits, created_at, refunded_ts, sale_class, backend, pool_key_id, pool_api_key"
 
 func scanAPIKey(r rowScanner) (*APIKey, error) {
 	var (
-		k             APIKey
-		keyID, apiKey sql.NullString
-		credits       sql.NullFloat64
-		createdAt     sql.NullInt64
-		refunded      sql.NullFloat64
-		saleClass     sql.NullString
+		k                                                        APIKey
+		keyID, apiKey, saleClass, backend, poolKeyID, poolAPIKey sql.NullString
+		credits                                                  sql.NullFloat64
+		createdAt                                                sql.NullInt64
+		refunded                                                 sql.NullFloat64
 	)
 	if err := r.Scan(&k.OrderID, &k.ChatID, &keyID, &apiKey, &credits,
-		&createdAt, &refunded, &saleClass); err != nil {
+		&createdAt, &refunded, &saleClass, &backend, &poolKeyID, &poolAPIKey); err != nil {
 		return nil, err
 	}
 	k.KeyID, k.APIKey = keyID.String, apiKey.String
 	k.Credits, k.CreatedAt = credits.Float64, createdAt.Int64
-	k.SaleClass = saleClass.String
+	k.SaleClass, k.Backend = saleClass.String, backend.String
+	k.PoolKeyID, k.PoolAPIKey = poolKeyID.String, poolAPIKey.String
 	if refunded.Valid {
 		v := refunded.Float64
 		k.RefundedTS = &v
@@ -48,7 +71,7 @@ func scanAPIKey(r rowScanner) (*APIKey, error) {
 	return &k, nil
 }
 
-// AddAPIKey persists a freshly minted Kiro-Go key for an order
+// AddAPIKey persists a freshly minted key for an order
 // (store.py:314-332). Returns true if the row was inserted, false if one
 // already existed for this order (PRIMARY KEY conflict) — the caller treats
 // false as "already minted, deliver the STORED key" so a settle replay can
@@ -58,12 +81,18 @@ func scanAPIKey(r rowScanner) (*APIKey, error) {
 //
 // saleClass is the key's SKU ("bedrock" | "kiro"), fixed forever at mint; ""
 // only exists for legacy callers/rows.
-func (s *Store) AddAPIKey(orderID string, chatID int64, keyID, apiKey string, credits float64, saleClass string) (bool, error) {
+//
+// backend records WHICH gateway minted the key — BackendPool ("") for the
+// Kiro-Go/Pool gateway, BackendLlmgate for a direct llmgate.app mint. Like
+// saleClass it is stamped once at insert and must match where the key REALLY
+// lives (only MigrateAPIKeyToLlmgate ever changes it), or the recharge/stats
+// paths will later talk to the wrong gateway for this key.
+func (s *Store) AddAPIKey(orderID string, chatID int64, keyID, apiKey string, credits float64, saleClass, backend string) (bool, error) {
 	res, err := s.db.Exec(
 		"INSERT OR IGNORE INTO api_keys "+
-			"(order_id, chat_id, key_id, api_key, credits, created_at, sale_class) "+
-			"VALUES (?,?,?,?,?,?,?)",
-		orderID, chatID, keyID, apiKey, credits, nowUnix(), saleClass)
+			"(order_id, chat_id, key_id, api_key, credits, created_at, sale_class, backend) "+
+			"VALUES (?,?,?,?,?,?,?,?)",
+		orderID, chatID, keyID, apiKey, credits, nowUnix(), saleClass, backend)
 	if err != nil {
 		return false, err
 	}
@@ -140,6 +169,92 @@ func (s *Store) APIKeysForChat(chatID int64, limit int, liveOnly bool) ([]*APIKe
 		out = append(out, k)
 	}
 	return out, rows.Err()
+}
+
+// ---- llmgate migration (Kiro-Go/Pool → llmgate.app cutover) -----------------
+
+// ListAPIKeysToMigrate returns the pool-backend keys still eligible for the
+// one-shot migration to llmgate.app keys, oldest first (a deterministic
+// replay order, so a re-run after a partial pass resumes where it stopped).
+// Eligible = live (refunded_ts IS NULL), backend=” (pool — this is what
+// excludes already-migrated rows and makes re-running the tool safe), and
+// sale_class IN (”,'bedrock') — the metered pool classes. kiro/fixed rows
+// stay pool-backed BY DECISION: those SKUs are not moving in this cutover,
+// so handing them to the migrator would repoint keys whose gateway must not
+// change. Refunded rows are excluded because there is nothing to hand the
+// customer and no live quota to carry over.
+func (s *Store) ListAPIKeysToMigrate(limit int) ([]*APIKey, error) {
+	rows, err := s.db.Query(
+		"SELECT "+apiKeyCols+" FROM api_keys "+
+			"WHERE refunded_ts IS NULL AND backend='' "+
+			"AND sale_class IN ('','bedrock') "+
+			"ORDER BY created_at ASC LIMIT ?", limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*APIKey
+	for rows.Next() {
+		k, err := scanAPIKey(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// MigrateAPIKeyToLlmgate repoints one api_keys row from its pool key to a
+// freshly minted llmgate.app key — the COMMIT POINT of the per-key migration.
+// The caller must have ALREADY created the llmgate key (and topped it up to
+// lgCredits) before calling: this single UPDATE only swaps the row's
+// key_id/api_key/credits to the llmgate values and stamps backend='llmgate'.
+//
+// poolKeyID/poolAPIKey must be the row's ORIGINAL pool uuid + cleartext
+// customer key (i.e. what key_id/api_key held BEFORE this call): they are
+// preserved into pool_key_id/pool_api_key because revoking the pool key
+// later NEEDS both — the pool admin API addresses keys by uuid, and an
+// operator revoking by hand needs the cleartext to identify the row in the
+// pool's own console. That preservation is what makes the migration
+// reversible by hand; do not "clean up" the columns.
+//
+// The WHERE backend=” AND refunded_ts IS NULL guard makes the move
+// IDEMPOTENT and race-safe in exactly the spirit of AddAPIKey's INSERT OR
+// IGNORE: a replayed or concurrent call matches zero rows, returns
+// (false, nil), and leaves the stored values untouched (the losing caller's
+// llmgate key is orphaned, never double-applied). refunded_ts IS NULL is
+// load-bearing alongside it: NEVER repoint an already-refunded row — its
+// revoke already killed (or tried to kill) the key the row pointed at, and
+// swapping the corpse for a fresh llmgate key would arm a SECOND live key
+// under a row whose money was already paid back. false therefore means
+// "already migrated, refunded, or no such row", which callers must treat as
+// success, not failure.
+func (s *Store) MigrateAPIKeyToLlmgate(orderID, poolKeyID, poolAPIKey, lgKeyID, lgAPIKey string, lgCredits float64) (bool, error) {
+	res, err := s.db.Exec(
+		"UPDATE api_keys SET pool_key_id=?, pool_api_key=?, key_id=?, "+
+			"api_key=?, credits=?, backend='llmgate' "+
+			"WHERE order_id=? AND backend='' AND refunded_ts IS NULL",
+		poolKeyID, poolAPIKey, lgKeyID, lgAPIKey, lgCredits, orderID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// CountAPIKeysToMigrate is the COUNT(*) twin of ListAPIKeysToMigrate over the
+// exact same WHERE — the migration tool's progress meter (done vs remaining).
+// Kept as a separate method (not len(ListAPIKeysToMigrate(huge))) so the
+// count never depends on paging through every row, and so the two queries
+// drift only if someone edits one WHERE and not the other — which the store
+// tests pin.
+func (s *Store) CountAPIKeysToMigrate() (int64, error) {
+	var n int64
+	err := s.db.QueryRow(
+		"SELECT COUNT(*) FROM api_keys " +
+			"WHERE refunded_ts IS NULL AND backend='' " +
+			"AND sale_class IN ('','bedrock')").Scan(&n)
+	return n, err
 }
 
 // ---- apikey recharges (credit top-ups for already-sold keys) --------------

@@ -29,8 +29,8 @@ import (
 
 // fixedSettings is apikeySettings plus a live, enabled Fixed SKU priced at
 // 1.5 USDT / 100 credits.
-func fixedSettings(fk *fakeKiro) map[string]any {
-	s := apikeySettings(fk)
+func fixedSettings(fk *fakeKiro, fl *fakeLlmgate) map[string]any {
+	s := apikeySettings(fk, fl)
 	s["fixed_apikey_enabled"] = true
 	s["fixed_apikey_usdt_per_100"] = 1.5
 	return s
@@ -39,13 +39,13 @@ func fixedSettings(fk *fakeKiro) map[string]any {
 // newFixedBot is newAPIKeyBot with the Fixed SKU turned on and the server
 // echoing the sale class back, the way the real Kiro-Go does (the echoed class
 // is what gets persisted on the api_keys row).
-func newFixedBot(t *testing.T) (*Bot, *fakeTG, *store.Store, *fakeKiro, string) {
+func newFixedBot(t *testing.T) (*Bot, *fakeTG, *store.Store, *fakeKiro, *fakeLlmgate, string) {
 	t.Helper()
-	b, f, st, fk, dir := newAPIKeyBot(t)
+	b, f, st, fk, fl, dir := newAPIKeyBot(t)
 	fk.EchoSaleClass = true
 	fk.UpstreamStatus = "skipped" // the NORMAL terminal status for a fixed mint
-	writeSettings(t, dir, fixedSettings(fk))
-	return b, f, st, fk, dir
+	writeSettings(t, dir, fixedSettings(fk, fl))
+	return b, f, st, fk, fl, dir
 }
 
 // ---- BUG 1: the mint payload ------------------------------------------------
@@ -60,7 +60,7 @@ func newFixedBot(t *testing.T) (*Bot, *fakeTG, *store.Store, *fakeKiro, string) 
 // payload one.
 func TestFixedMintSendsNoAccountID(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, _ := newFixedBot(t)
+	b, _, st, fk, _, _ := newFixedBot(t)
 	const chat = 100
 	const des = "f1f10000f1f10000f1f10000f1f10000"
 	o := seedOrder(t, st, des, chat, fixedApikeyProduct, 1000, 1500000, "paid")
@@ -99,7 +99,7 @@ func TestFixedMintSendsNoAccountID(t *testing.T) {
 // kiro one, and must leak no unsubstituted placeholder.
 func TestFixedMintDeliversFixedTemplate(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, _, _ := newFixedBot(t)
+	b, f, st, _, _, _ := newFixedBot(t)
 	const chat = 100
 	const des = "f2f20000f2f20000f2f20000f2f20000"
 	o := seedOrder(t, st, des, chat, fixedApikeyProduct, 1000, 1500000, "paid")
@@ -136,13 +136,15 @@ func TestFixedMintDoesNotAlertOwners(t *testing.T) {
 	}{
 		{"fixed/skipped", fixedApikeyProduct, 0},
 		{"kiro/skipped", kiroApikeyProduct, 0},
-		// A BEDROCK mint that skips binding really IS anomalous: it should
-		// bind or defer-bind, so the owners are told.
-		{"bedrock/skipped", apikeyProduct, 1},
+		// BEDROCK no longer mints through the pool at all (llmgate cutover),
+		// so the upstream-binding alert is structurally unreachable for it:
+		// the llmgate key IS the upstream. Kept as a case to pin that no
+		// pool-shaped alert leaks onto the llmgate mint path.
+		{"bedrock/skipped", apikeyProduct, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			b, f, st, fk, dir := newFixedBot(t)
-			s := fixedSettings(fk)
+			b, f, st, fk, fl, dir := newFixedBot(t)
+			s := fixedSettings(fk, fl)
 			s["kiro_apikey_enabled"] = true
 			s["kiro_apikey_usdt_per_100"] = 1.0
 			writeSettings(t, dir, s)
@@ -167,8 +169,11 @@ func TestFixedMintDoesNotAlertOwners(t *testing.T) {
 //
 // The "no account id" row is the load-bearing one: a fixed mint sends no
 // accountId at all, so gating on kiroGoConfigured() (which requires one) would
-// hide a perfectly sellable product. Bedrock is asserted hidden in that same
-// row to prove the two gates really are different checks.
+// hide a perfectly sellable product. Bedrock is asserted STILL SELLABLE in
+// every pool-degraded row to prove the two gates really are different checks:
+// since the llmgate cutover bedrock mints on llmgate, so NO pool setting (nor
+// the whole pool) can hide it — only the llmgate triple can
+// (TestApikeyBedrockGateOnLlmgate pins that side).
 func TestFixedForSaleGate(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -181,14 +186,15 @@ func TestFixedForSaleGate(t *testing.T) {
 		{"toggle absent", func(s map[string]any) { delete(s, "fixed_apikey_enabled") }, false, true},
 		{"rate 0", func(s map[string]any) { s["fixed_apikey_usdt_per_100"] = 0.0 }, false, true},
 		{"rate absent", func(s map[string]any) { delete(s, "fixed_apikey_usdt_per_100") }, false, true},
-		{"no base url", func(s map[string]any) { delete(s, "kiro_go_base_url") }, false, false},
-		{"no admin key", func(s map[string]any) { delete(s, "kiro_go_admin_key") }, false, false},
-		// Fixed needs NO account id; bedrock does.
-		{"no account id", func(s map[string]any) { delete(s, "kiro_go_account_id") }, true, false},
+		{"no base url", func(s map[string]any) { delete(s, "kiro_go_base_url") }, false, true},
+		{"no admin key", func(s map[string]any) { delete(s, "kiro_go_admin_key") }, false, true},
+		// Fixed needs NO account id — and neither does bedrock any more: its
+		// llmgate mint never reads a pool account.
+		{"no account id", func(s map[string]any) { delete(s, "kiro_go_account_id") }, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			b, _, _, fk, dir := newAPIKeyBot(t)
-			s := fixedSettings(fk)
+			b, _, _, fk, fl, dir := newAPIKeyBot(t)
+			s := fixedSettings(fk, fl)
 			tc.mutate(s)
 			writeSettings(t, dir, s)
 
@@ -220,7 +226,7 @@ func TestFixedForSaleGate(t *testing.T) {
 // resulting order — which must carry the FIXED sentinel, not the bedrock one.
 func TestFixedBuyFlowEndToEnd(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, _, _ := newFixedBot(t)
+	b, f, st, _, _, _ := newFixedBot(t)
 	const chat = 100
 
 	b.Process(ctx, callbackUpdate(chat, "fixedapi:start"))
@@ -318,7 +324,7 @@ func TestApikeyBindsUpstream(t *testing.T) {
 // must carry the RAW stored class so the server's own class guard can fire.
 func TestFixedKeyRecharge(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, fk, _ := newFixedBot(t)
+	b, _, st, fk, _, _ := newFixedBot(t)
 	const chat = 100
 	const des = "f4f40000f4f40000f4f40000f4f40000"
 	o := seedOrder(t, st, des, chat, fixedApikeyProduct, 1000, 1500000, "paid")
@@ -349,8 +355,8 @@ func TestFixedKeyRecharge(t *testing.T) {
 // its defaults hold with nothing configured — a shared read would let a bedrock
 // change move the fixed SKU's floor or ceiling.
 func TestFixedBoundsAreItsOwn(t *testing.T) {
-	b, _, _, fk, dir := newAPIKeyBot(t)
-	s := fixedSettings(fk)
+	b, _, _, fk, fl, dir := newAPIKeyBot(t)
+	s := fixedSettings(fk, fl)
 	s["apikey_min_credits"] = 250
 	s["apikey_max_credits"] = 900
 	s["kiro_apikey_min_credits"] = 700
@@ -396,8 +402,8 @@ func TestFixedBoundsAreItsOwn(t *testing.T) {
 // TestFixedRateIsItsOwnSetting: the fixed rate reads fixed_apikey_usdt_per_100
 // and has NO legacy per-1k fallback (the SKU postdates that migration).
 func TestFixedRateIsItsOwnSetting(t *testing.T) {
-	b, _, _, fk, dir := newAPIKeyBot(t)
-	s := apikeySettings(fk)
+	b, _, _, fk, fl, dir := newAPIKeyBot(t)
+	s := apikeySettings(fk, fl)
 	s["apikey_usdt_per_1k"] = 40.0
 	writeSettings(t, dir, s)
 	if got := b.apikeyRateUSDT(saleClassFixed); got != 0 {
@@ -434,7 +440,7 @@ func TestFixedRateIsItsOwnSetting(t *testing.T) {
 // to be a different number, so the two can never be satisfied at once.
 func TestRemoveCodeRepricesRechargeAtTargetKeyClass(t *testing.T) {
 	ctx := context.Background()
-	b, _, st, _, _ := newFixedBot(t)
+	b, _, st, _, _, _ := newFixedBot(t)
 	const (
 		chat      = int64(100)
 		targetDes = "aaaa1111aaaa1111aaaa1111aaaa1111"
@@ -450,7 +456,7 @@ func TestRemoveCodeRepricesRechargeAtTargetKeyClass(t *testing.T) {
 	// A delivered FIXED key, and a reserved recharge order pointing at it. The
 	// recharge order's own product carries no class; only this binding does.
 	seedOrder(t, st, targetDes, chat, fixedApikeyProduct, credits, fixedBaseline, "delivered")
-	if _, err := st.AddAPIKey(targetDes, chat, "kid-fixed", "sk-fixed-abc", float64(credits), saleClassFixed); err != nil {
+	if _, err := st.AddAPIKey(targetDes, chat, "kid-fixed", "sk-fixed-abc", float64(credits), saleClassFixed, store.BackendPool); err != nil {
 		t.Fatalf("AddAPIKey: %v", err)
 	}
 	o := seedOrder(t, st, rcDes, chat, apikeyRechargeProduct, credits, fixedBaseline, "reserved")
@@ -504,7 +510,7 @@ func TestRemoveCodeRepricesRechargeAtTargetKeyClass(t *testing.T) {
 // either way.
 func TestMyKeysRendersFixedTag(t *testing.T) {
 	ctx := context.Background()
-	b, f, st, _, _ := newFixedBot(t)
+	b, f, st, _, _, _ := newFixedBot(t)
 	const (
 		chat     = int64(100)
 		fixedDes = "cccc3333cccc3333cccc3333cccc3333"
@@ -513,10 +519,10 @@ func TestMyKeysRendersFixedTag(t *testing.T) {
 	// A fixed key and a kiro one side by side: the kiro row proves the tag
 	// column is really per-row, so a change that hardcoded one tag for
 	// everything would not slip through.
-	if _, err := st.AddAPIKey(fixedDes, chat, "kid-fixed", "sk-fixed-abc", 1000, saleClassFixed); err != nil {
+	if _, err := st.AddAPIKey(fixedDes, chat, "kid-fixed", "sk-fixed-abc", 1000, saleClassFixed, store.BackendPool); err != nil {
 		t.Fatalf("AddAPIKey fixed: %v", err)
 	}
-	if _, err := st.AddAPIKey(kiroDes, chat, "kid-kiro", "sk-kiro-xyz", 1000, saleClassKiro); err != nil {
+	if _, err := st.AddAPIKey(kiroDes, chat, "kid-kiro", "sk-kiro-xyz", 1000, saleClassKiro, store.BackendPool); err != nil {
 		t.Fatalf("AddAPIKey kiro: %v", err)
 	}
 
@@ -548,7 +554,7 @@ func TestMyKeysRendersFixedTag(t *testing.T) {
 // fixedPriceCardBot is newFixedBot with a stocked flat-price card.
 func fixedPriceCardBot(t *testing.T) (*Bot, *fakeTG, *fakeKiro) {
 	t.Helper()
-	b, f, _, fk, _ := newFixedBot(t)
+	b, f, _, fk, _, _ := newFixedBot(t)
 	fk.ModelPriceList = []map[string]any{
 		{"model": "claude-opus-5", "perRequest": 4.0},
 		{"model": "claude-haiku-4", "perRequest": 0.25},
@@ -698,9 +704,9 @@ func TestFixedPromptSurvivesPriceCardFailure(t *testing.T) {
 // and they must not pay an admin-API round trip for it either.
 func TestBedrockAndKiroPromptsHaveNoPriceCard(t *testing.T) {
 	ctx := context.Background()
-	b, f, _, fk, dir := newFixedBot(t)
+	b, f, _, fk, fl, dir := newFixedBot(t)
 	fk.ModelPriceList = []map[string]any{{"model": "claude-opus-5", "perRequest": 4.0}}
-	s := fixedSettings(fk)
+	s := fixedSettings(fk, fl)
 	s["kiro_apikey_enabled"] = true
 	s["kiro_apikey_usdt_per_100"] = 1.0
 	writeSettings(t, dir, s)

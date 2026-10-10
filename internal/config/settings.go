@@ -316,3 +316,63 @@ func (c *Config) KiroGoAccountID() string {
 	}
 	return c.Env("KIRO_GO_ACCOUNT_ID")
 }
+
+// ---- llmgate.app (direct key minting) ---------------------------------------
+//
+// The four getters below configure the llmgate.app cutover, where the bot
+// starts minting customer keys directly on llmgate instead of via the
+// Kiro-Go/Pool gateway. They follow the exact KiroGo* precedence above:
+// settings.json value (blank/whitespace never shadows) → .env/ambient env
+// fallback. Two of the four additionally carry a compiled default.
+
+// LlmgateBaseURL returns the effective llmgate CONTROL-PLANE base URL — what
+// the BOT itself logs into (session login, key mint/revoke/recharge calls):
+// settings.json's "llmgate_base_url" overrides .env/ambient LLMGATE_BASE_URL,
+// else the compiled default. The default is the literal spelling of
+// llmgate.DefaultBaseURL ("https://api.codezdev-shop.uk") rather than a
+// reference to internal/llmgate: this package must not import the client
+// package (which may not even exist yet while these getters are being built),
+// so the value is duplicated on purpose — keep the two in sync.
+func (c *Config) LlmgateBaseURL() string {
+	if u := strings.TrimSpace(stringValue(c.Settings(), "llmgate_base_url")); u != "" {
+		return u
+	}
+	return c.EnvOr("LLMGATE_BASE_URL", "https://api.codezdev-shop.uk")
+}
+
+// LlmgateUsername returns the effective llmgate login username:
+// settings.json's "llmgate_username" overrides .env/ambient LLMGATE_USERNAME.
+// "" means unset — callers must treat an unconfigured llmgate as "don't
+// sell/hide the llmgate path", never as a half-configured login.
+func (c *Config) LlmgateUsername() string {
+	if u := strings.TrimSpace(stringValue(c.Settings(), "llmgate_username")); u != "" {
+		return u
+	}
+	return c.Env("LLMGATE_USERNAME")
+}
+
+// LlmgatePassword returns the effective llmgate login password: settings.json's
+// "llmgate_password" overrides .env/ambient LLMGATE_PASSWORD. This is a
+// SECRET — never log it (same rule as KiroGoAdminKey above; repo CLAUDE.md).
+func (c *Config) LlmgatePassword() string {
+	if p := strings.TrimSpace(stringValue(c.Settings(), "llmgate_password")); p != "" {
+		return p
+	}
+	return c.Env("LLMGATE_PASSWORD")
+}
+
+// LlmgateAPIBase returns the PUBLIC completions endpoint shown to CUSTOMERS in
+// delivery messages — the base their own clients send requests to, to spend
+// the key they bought. DISTINCT from LlmgateBaseURL even though both are
+// "https://api.codezdev-shop.uk" today: that one is the control plane the bot
+// logs into, this one is what buyers paste into their tooling, and they are
+// separate knobs so either can move independently (a customer-facing domain
+// swap must not silently repoint the bot's admin session, and vice versa).
+// settings.json's "llmgate_api_base" overrides .env/ambient LLMGATE_API_BASE,
+// else the same compiled default (same keep-in-sync caveat as LlmgateBaseURL).
+func (c *Config) LlmgateAPIBase() string {
+	if u := strings.TrimSpace(stringValue(c.Settings(), "llmgate_api_base")); u != "" {
+		return u
+	}
+	return c.EnvOr("LLMGATE_API_BASE", "https://api.codezdev-shop.uk")
+}

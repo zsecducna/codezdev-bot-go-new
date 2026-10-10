@@ -483,6 +483,95 @@ func TestKiroGoFallsBackToEnvWhenSettingsBlank(t *testing.T) {
 	}
 }
 
+// TestLlmgateSettingsOverrideEnv: the four llmgate getters follow the KiroGo*
+// precedence — a settings.json value wins over a set .env/ambient variable.
+func TestLlmgateSettingsOverrideEnv(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, ".env"), strings.Join([]string{
+		"LLMGATE_BASE_URL=https://env-control.example",
+		"LLMGATE_USERNAME=envuser",
+		"LLMGATE_PASSWORD=envpass",
+		"LLMGATE_API_BASE=https://env-api.example",
+		"",
+	}, "\n"))
+	writeFile(t, filepath.Join(dir, "settings.json"), `{
+		"llmgate_base_url": "https://set-control.example",
+		"llmgate_username": "setuser",
+		"llmgate_password": "setpass",
+		"llmgate_api_base": "https://set-api.example"
+	}`)
+	c := mustLoad(t, dir)
+
+	if got := c.LlmgateBaseURL(); got != "https://set-control.example" {
+		t.Errorf("LlmgateBaseURL() = %q, want %q", got, "https://set-control.example")
+	}
+	if got := c.LlmgateUsername(); got != "setuser" {
+		t.Errorf("LlmgateUsername() = %q, want %q", got, "setuser")
+	}
+	if got := c.LlmgatePassword(); got != "setpass" {
+		t.Errorf("LlmgatePassword() = %q, want %q", got, "setpass")
+	}
+	if got := c.LlmgateAPIBase(); got != "https://set-api.example" {
+		t.Errorf("LlmgateAPIBase() = %q, want %q", got, "https://set-api.example")
+	}
+}
+
+// TestLlmgateFallsBackToEnvWhenSettingsBlank: a blank/whitespace settings
+// value must not shadow a set env variable — the KiroGo* `.strip()`-truthiness
+// rule, applied to the credentials; and with settings entirely absent the
+// env value also beats the compiled default on the two URL getters.
+func TestLlmgateFallsBackToEnvWhenSettingsBlank(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, ".env"), strings.Join([]string{
+		"LLMGATE_BASE_URL=https://env-control.example",
+		"LLMGATE_USERNAME=envuser",
+		"LLMGATE_PASSWORD=envpass",
+		"LLMGATE_API_BASE=https://env-api.example",
+		"",
+	}, "\n"))
+	writeFile(t, filepath.Join(dir, "settings.json"), `{
+		"llmgate_base_url": "   ",
+		"llmgate_username": "  ",
+		"llmgate_password": "",
+		"llmgate_api_base": " "
+	}`)
+	c := mustLoad(t, dir)
+
+	if got := c.LlmgateBaseURL(); got != "https://env-control.example" {
+		t.Errorf("LlmgateBaseURL() = %q, want env fallback %q", got, "https://env-control.example")
+	}
+	if got := c.LlmgateUsername(); got != "envuser" {
+		t.Errorf("LlmgateUsername() = %q, want env fallback %q", got, "envuser")
+	}
+	if got := c.LlmgatePassword(); got != "envpass" {
+		t.Errorf("LlmgatePassword() = %q, want env fallback %q", got, "envpass")
+	}
+	if got := c.LlmgateAPIBase(); got != "https://env-api.example" {
+		t.Errorf("LlmgateAPIBase() = %q, want env fallback %q", got, "https://env-api.example")
+	}
+}
+
+// TestLlmgateDefaults pins the nothing-configured state: both URL getters
+// fall back to the compiled literal (the llmgate.DefaultBaseURL spelling —
+// duplicated here on purpose because config must not import
+// internal/llmgate), and the credentials read as unset ("") so callers hide
+// the llmgate path rather than half-configuring it.
+func TestLlmgateDefaults(t *testing.T) {
+	c := mustLoad(t, t.TempDir())
+	if got := c.LlmgateBaseURL(); got != "https://api.codezdev-shop.uk" {
+		t.Errorf("LlmgateBaseURL() = %q, want the compiled default %q", got, "https://api.codezdev-shop.uk")
+	}
+	if got := c.LlmgateAPIBase(); got != "https://api.codezdev-shop.uk" {
+		t.Errorf("LlmgateAPIBase() = %q, want the compiled default %q", got, "https://api.codezdev-shop.uk")
+	}
+	if got := c.LlmgateUsername(); got != "" {
+		t.Errorf("LlmgateUsername() = %q, want empty when unset", got)
+	}
+	if got := c.LlmgatePassword(); got != "" {
+		t.Errorf("LlmgatePassword() = %q, want empty when unset", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Pure settings.json getters: ReferralEnabled, PayEnabled, MaxBulk.
 // ---------------------------------------------------------------------------
