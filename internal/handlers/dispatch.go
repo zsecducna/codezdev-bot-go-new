@@ -297,10 +297,11 @@ type Bot struct {
 	// logins sixteen-fold under the worker pool (the exact load shape
 	// llmgate.Client's tokenMu exists to prevent — see its package doc).
 	llmgate *llmgate.Client
-	// llmgateKey is the config triple the cached client was built from
-	// ("base|user|pass"). A settings.json edit that changes any of the three
-	// swaps the client on the next call; an identical triple reuses the cached
-	// one, preserving its token cache across unrelated settings writes.
+	// llmgateKey is the config signature the cached client was built from
+	// ("base|user|pass|token_store"). A settings.json edit that changes any
+	// of the three, or an LLMGATE_TOKEN_STORE flip, swaps the client on the
+	// next call; an identical signature reuses the cached one, preserving
+	// its token cache across unrelated settings writes.
 	llmgateKey string
 	// llmgateRCLocks serializes llmgate RECHARGES per target key. See
 	// llmgateRCKeyLock for the race it exists to close.
@@ -313,9 +314,10 @@ type Bot struct {
 // because it is stateless).
 //
 // The cache key is "base|user|pass" of the LIVE config snapshot (settings.json
-// overriding .env, per config.Llmgate*): a triple that changed rebuilds the
-// client on the very next gate check, exactly like kiroGoConfig's per-call
-// snapshot, while an unchanged triple keeps the old client — and therefore its
+// overriding .env, per config.Llmgate*) plus the token-store path, making it
+// a quadruple: a settings.json edit that changes any of the three swaps the
+// client on the next gate check, exactly like kiroGoConfig's per-call
+// snapshot, while an unchanged key keeps the old client — and therefore its
 // cached ~30-day login token. Rebuilding per call would log in on every
 // customer tap; NEVER do that (internal/llmgate tokens live ~30 days and the
 // 401 re-login is handled inside the client).
@@ -335,11 +337,27 @@ func (b *Bot) llmgateClient() *llmgate.Client {
 		// kirogoClient's ConfiguredBase check.
 		return nil
 	}
-	key := cfg.BaseURL + "|" + cfg.Username + "|" + cfg.Password
+	// LLMGATE_TOKEN_STORE (env-only, no settings.json layer): file path for
+	// llmgate.NewWithTokenStore, read through cfg.Env for the same reason
+	// every knob here is (envInt's contract: the .env snapshot never reaches
+	// the ambient environment in production, so os.Getenv would see ""). The
+	// OPT-IN empty default is deliberate: unset, the client is plain
+	// llmgate.New and unit tests / odd deployments keep byte-identical
+	// memory-only behavior; set, the ~30d login token survives restarts so
+	// the first mint after one doesn't hinge on a fresh login (one transient
+	// 522 there was failing paid mints). The path joins the cache key above
+	// so flipping the knob rebuilds the client instead of leaving a
+	// store-less one cached.
+	tokenPath := strings.TrimSpace(b.cfg.Env("LLMGATE_TOKEN_STORE"))
+	key := cfg.BaseURL + "|" + cfg.Username + "|" + cfg.Password + "|" + tokenPath
 	b.llmgateMu.Lock()
 	defer b.llmgateMu.Unlock()
 	if b.llmgate == nil || b.llmgateKey != key {
-		b.llmgate = llmgate.New(cfg, nil)
+		if tokenPath != "" {
+			b.llmgate = llmgate.NewWithTokenStore(cfg, nil, tokenPath)
+		} else {
+			b.llmgate = llmgate.New(cfg, nil)
+		}
 		b.llmgateKey = key
 	}
 	return b.llmgate

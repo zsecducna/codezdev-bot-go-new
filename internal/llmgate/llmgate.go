@@ -85,6 +85,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"regexp"
 	"sync"
 	"time"
@@ -147,6 +148,18 @@ type Client struct {
 	tokenMu         sync.Mutex
 	userToken       string
 	userTokenExpiry time.Time
+
+	// tokenPath is the OPTIONAL on-disk persistence file for the login
+	// token (NewWithTokenStore; "" = the memory-only behavior of New).
+	// Set, it lets the ~30-day token survive a process restart: this
+	// client seeds its cache from the file at construction and rewrites
+	// it on every successful login. All access to the FILE itself happens
+	// under tokenMu too (writes come only from loginLocked, the load runs
+	// before the client is shared), so two goroutines can never interleave
+	// a half-written read with a rename. See NewWithTokenStore for the
+	// full contract; the token VALUE never appears in any log line
+	// (invariant 2).
+	tokenPath string
 }
 
 // perAttemptTimeout bounds each individual HTTP attempt, matching the 20s
@@ -197,6 +210,39 @@ func New(cfg Config, logger *slog.Logger) *Client {
 		httpClient: &http.Client{Timeout: perAttemptTimeout},
 		logger:     logger,
 	}
+}
+
+// NewWithTokenStore builds the SAME client as New plus an optional on-disk
+// login-token store at path. MOTIVATION: New caches the ~30-day login token
+// in memory only, so the FIRST mint after every bot restart must login — and
+// one transient failure on that single login (a live Cloudflare 522 was
+// observed) fails the mint and auto-refunds a paid order. A persisted token
+// removes the restart-login window entirely: the client comes up already
+// authenticated.
+//
+// Contract:
+//   - path == "" is EXACTLY New's behavior (pure memory, no file I/O) — the
+//     knob is opt-in so nothing changes for callers that don't ask for it.
+//   - On construction the file is read BEST-EFFORT: a well-formed entry whose
+//     expire_at is still more than tokenRefreshMargin (1min) away seeds the
+//     in-memory cache, skipping the first login entirely. An absent, corrupt,
+//     unparseable, or within-margin-stale file is silently ignored — the
+//     client just starts fresh and logins on first use like New would.
+//   - On every successful login the file is rewritten ({token, expire_at},
+//     JSON, mode 0600, tmp-file + rename so a reader never sees a torn
+//     write). A write FAILURE only logs a Warn: the in-memory token this
+//     process just obtained is unaffected, so a read-only disk degrades to
+//     New's memory-only behavior instead of failing the login.
+//
+// SECURITY (invariant 2 extended to disk): the file holds the raw JWT, so it
+// is written 0600 and its path is operator-provided (handlers:
+// LLMGATE_TOKEN_STORE); the token VALUE itself is never logged — error text
+// from the os package carries the PATH, not the contents.
+func NewWithTokenStore(cfg Config, logger *slog.Logger, path string) *Client {
+	c := New(cfg, logger)
+	c.tokenPath = path
+	c.loadStoredToken()
+	return c
 }
 
 // Configured reports whether this client can make USER-realm calls — thin
@@ -257,6 +303,15 @@ type wireResponse struct {
 	Code    int             `json:"code"`
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data"`
+}
+
+// storedToken is the JSON shape of the on-disk token store (NewWithTokenStore)
+// — the login response's two load-bearing fields, nothing else: the JWT
+// itself and its expiry. expire_at is RFC3339 for symmetry with the login
+// wire format (the value round-trips time.Parse(time.RFC3339) unchanged).
+type storedToken struct {
+	Token    string `json:"token"`
+	ExpireAt string `json:"expire_at"`
 }
 
 // secretShapeRe matches the two secret shapes this API traffic in: the
@@ -645,5 +700,83 @@ func (c *Client) loginLocked(ctx context.Context) (string, error) {
 	}
 
 	c.userToken, c.userTokenExpiry = data.Token, expiry
+
+	// Persist FIRST, before returning success: this is the only install
+	// point for the in-memory cache too (both authToken's lazy login and
+	// userSend's 401 re-login funnel here), so hooking the store here keeps
+	// disk and memory from ever disagreeing about which token is current.
+	// Best-effort by contract — a write failure is logged inside and never
+	// fails the login (see saveTokenLocked).
+	c.saveTokenLocked()
 	return c.userToken, nil
+}
+
+// saveTokenLocked writes the current token cache to tokenPath (tmp file +
+// rename, 0600). Caller must hold tokenMu (loginLocked is the only caller,
+// which is what serializes writers). BEST-EFFORT: any failure — unwritable
+// directory, full disk, a path that names a directory — logs ONE Warn and
+// returns; the in-memory token the caller just installed keeps working for
+// this process, so a broken store degrades to New's memory-only behavior
+// rather than breaking logins. SECURITY: the error attr is the os error,
+// which carries the PATH and errno but never the token bytes; the token
+// itself is only ever written into the 0600 file (invariant 2).
+func (c *Client) saveTokenLocked() {
+	if c.tokenPath == "" {
+		return
+	}
+	blob, err := json.Marshal(storedToken{
+		Token:    c.userToken,
+		ExpireAt: c.userTokenExpiry.UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		// Unreachable in practice (two strings marshal); kept for the same
+		// best-effort shape as the I/O failures below.
+		c.logger.Warn("llmgate: token store encode failed", "error", err.Error())
+		return
+	}
+	// tmp + rename = atomic publish. The tmp sits BESIDE the final path
+	// (same directory) so rename(2) never crosses a filesystem boundary
+	// and a concurrent reader sees either the old file or the new one,
+	// never a torn write. Mode is set on the tmp and survives the rename.
+	tmp := c.tokenPath + ".tmp"
+	if err := os.WriteFile(tmp, blob, 0o600); err != nil {
+		c.logger.Warn("llmgate: token store write failed", "error", err.Error())
+		return
+	}
+	if err := os.Rename(tmp, c.tokenPath); err != nil {
+		c.logger.Warn("llmgate: token store publish failed", "error", err.Error())
+	}
+}
+
+// loadStoredToken seeds the in-memory token cache from tokenPath. Called
+// only from NewWithTokenStore, before the client is shared with any
+// goroutine, so no lock is needed. EVERY failure mode — absent file,
+// unreadable, corrupt JSON, missing token, unparseable expiry — returns
+// silently: the client simply starts fresh and logins on first use, exactly
+// like New, so a damaged store can never wedge startup (invariant: the
+// store is an optimization, not a dependency). A structurally valid entry
+// is used ONLY when its expiry is still more than tokenRefreshMargin away —
+// the same freshness bar authToken applies to the in-memory cache — so a
+// restored token is never sent inside the final-minute window where server
+// clock skew could 401 it.
+func (c *Client) loadStoredToken() {
+	if c.tokenPath == "" {
+		return
+	}
+	blob, err := os.ReadFile(c.tokenPath)
+	if err != nil {
+		return // absent/unreadable: start fresh
+	}
+	var st storedToken
+	if json.Unmarshal(blob, &st) != nil || st.Token == "" {
+		return // corrupt or tokenless: start fresh
+	}
+	expiry, err := time.Parse(time.RFC3339, st.ExpireAt)
+	if err != nil {
+		return // unparseable expiry: start fresh
+	}
+	if !time.Now().Before(expiry.Add(-tokenRefreshMargin)) {
+		return // expired or inside the final margin: start fresh
+	}
+	c.userToken, c.userTokenExpiry = st.Token, expiry
 }

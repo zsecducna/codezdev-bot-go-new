@@ -2,9 +2,13 @@ package handlers
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -516,5 +520,99 @@ func TestNewClampsStockSweepIntervalConfiguredZero(t *testing.T) {
 	if b.stockSweepInterval != stockSweepMinInterval {
 		t.Errorf("b.stockSweepInterval = %s, want the %s floor — a configured 0 "+
 			"reached the ticker unclamped", b.stockSweepInterval, stockSweepMinInterval)
+	}
+}
+
+// TestLlmgateClientHonorsTokenStoreEnv is the LLMGATE_TOKEN_STORE wiring
+// pin, asserted BEHAVIORALLY end-to-end (fresh Bot = simulated restart)
+// because the interesting choice — NewWithTokenStore vs plain New — lives
+// inside llmgateClient and must not be exposed just for a test. Two Bots
+// over the same .env and store path must share ONE login total: the second
+// Bot's client seeds its cache from the file the first one wrote, which is
+// only possible if llmgateClient actually routed it through the store. The
+// control case pins the default: with the knob unset the restarted Bot
+// logs in again (memory-only, byte-identical pre-feature behavior).
+//
+// Falsification: making llmgateClient ignore LLMGATE_TOKEN_STORE (always
+// llmgate.New) drives the second Bot's login count to 2 and fails the
+// first assertion; wiring a raw os.Getenv instead of cfg.Env makes the
+// knob invisible to a .env-supplied value and fails the same way (the
+// task-#23 class of bug this file already pins twice for envDuration).
+func TestLlmgateClientHonorsTokenStoreEnv(t *testing.T) {
+	for _, k := range []string{"LLMGATE_BASE_URL", "LLMGATE_USERNAME", "LLMGATE_PASSWORD", "LLMGATE_TOKEN_STORE"} {
+		if _, ok := os.LookupEnv(k); ok {
+			t.Fatalf("%s is set in the ambient environment — this test needs it ABSENT so only the .env file supplies it", k)
+		}
+	}
+
+	// Minimal llmgate double: counts logins, issues a far-future token,
+	// serves an empty key list. Static JSON (no dynamic fields) keeps the
+	// handler a one-liner; the envelope is the wire shape every response
+	// from this API carries (internal/llmgate package doc).
+	var logins atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/user/login", func(w http.ResponseWriter, r *http.Request) {
+		logins.Add(1)
+		fmt.Fprint(w, `{"code":200,"message":"success","data":{"token":"jwt-wired-A","expire_at":"2099-01-01T00:00:00Z"}}`)
+	})
+	mux.HandleFunc("/api/v1/apikey/list", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"code":200,"message":"success","data":[]}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	storePath := filepath.Join(t.TempDir(), "token.json")
+	envBody := "LLMGATE_BASE_URL=" + srv.URL + "\n" +
+		"LLMGATE_USERNAME=tester\n" +
+		"LLMGATE_PASSWORD=secret-pw\n" +
+		"LLMGATE_TOKEN_STORE=" + storePath + "\n"
+
+	// First process: logs in once and writes the store file.
+	b1 := envDurationTestBot(t, envBody)
+	c1 := b1.llmgateClient()
+	if c1 == nil || !c1.Configured() {
+		t.Fatal("llmgateClient = nil/unconfigured despite the full LLMGATE_* triple in .env")
+	}
+	if _, err := c1.ListKeys(context.Background()); err != nil {
+		t.Fatalf("first Bot ListKeys: %v", err)
+	}
+	if n := logins.Load(); n != 1 {
+		t.Fatalf("logins = %d after first Bot, want 1", n)
+	}
+	if _, err := os.Stat(storePath); err != nil {
+		t.Fatalf("token store not written by the wired client: %v", err)
+	}
+
+	// The "restart": fresh Bot, same .env, same store path. The wired
+	// client must serve its first call off the stored token.
+	b2 := envDurationTestBot(t, envBody)
+	c2 := b2.llmgateClient()
+	if c2 == nil {
+		t.Fatal("restarted Bot llmgateClient = nil")
+	}
+	if _, err := c2.ListKeys(context.Background()); err != nil {
+		t.Fatalf("restarted Bot ListKeys: %v", err)
+	}
+	if n := logins.Load(); n != 1 {
+		t.Errorf("logins = %d after restarted Bot, want 1 — the client was not built "+
+			"with the token store (or read the knob outside cfg.Env)", n)
+	}
+
+	// Control: the knob UNSET must keep the pre-feature memory-only
+	// behavior — a restarted Bot logs in again, proving the default is
+	// opt-in rather than always-on.
+	envNoStore := "LLMGATE_BASE_URL=" + srv.URL + "\n" +
+		"LLMGATE_USERNAME=tester\n" +
+		"LLMGATE_PASSWORD=secret-pw\n"
+	b3 := envDurationTestBot(t, envNoStore)
+	c3 := b3.llmgateClient()
+	if c3 == nil {
+		t.Fatal("knob-unset Bot llmgateClient = nil")
+	}
+	if _, err := c3.ListKeys(context.Background()); err != nil {
+		t.Fatalf("knob-unset Bot ListKeys: %v", err)
+	}
+	if n := logins.Load(); n != 2 {
+		t.Errorf("logins = %d after knob-unset Bot, want 2 (memory-only default must login fresh)", n)
 	}
 }
