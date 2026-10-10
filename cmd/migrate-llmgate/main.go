@@ -18,6 +18,7 @@
 //
 //	migrate-llmgate -db store.db                        # dry run: reads pool stats, prints the plan, writes/mints nothing
 //	migrate-llmgate -db store.db -apply                 # the real migration, after a 3s Ctrl-C-to-abort window
+//	migrate-llmgate -db store.db -chat 12345 -apply     # REHEARSAL: same flow, scoped to ONE telegram chat only
 //
 // Both upstream credentials come from flags or their env fallbacks:
 // -pool-base/-pool-key (KIRO_GO_BASE_URL / KIRO_GO_ADMIN_KEY) address the
@@ -60,6 +61,12 @@ func main() {
 	dbPath := flag.String("db", "", "path to store.db — REQUIRED")
 	apply := flag.Bool("apply", false, "actually mint llmgate keys and migrate rows. Without this flag: dry run — reads and a plan printout only, nothing is written and no llmgate key is created")
 	limit := flag.Int("limit", 0, "migrate at most N rows this run (oldest first); 0 = all eligible rows")
+	// REHEARSAL SCOPE: -chat restricts BOTH the eligible count and the listed
+	// rows to one telegram chat_id, so the operator can run the ENTIRE
+	// mint→verify→commit flow against their own account before pointing it at
+	// every customer. 0 (unset) keeps the unscoped behavior — the flag is a
+	// pure filter on the same WHERE, never a different code path.
+	chat := flag.Int64("chat", 0, "rehearsal scope: only migrate rows belonging to this telegram chat id (0 = all eligible rows)")
 	poolBase := flag.String("pool-base", "", "Kiro-Go pool admin base URL (fallback env KIRO_GO_BASE_URL)")
 	poolKey := flag.String("pool-key", "", "Kiro-Go admin key (fallback env KIRO_GO_ADMIN_KEY)")
 	lgBase := flag.String("llmgate-base", "", "llmgate.app base URL (fallback env LLMGATE_BASE_URL, default "+defaultLlmgateBase+")")
@@ -147,7 +154,7 @@ func main() {
 		AbortDelay:    abortDelay,
 		PreCommitHook: nil, // test-only seam; production never sets it
 	}
-	counts, err := m.Run(ctx, *apply, *limit)
+	counts, err := m.Run(ctx, *apply, *limit, *chat)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "migrate-llmgate: %v\n", err)
 		os.Exit(1)

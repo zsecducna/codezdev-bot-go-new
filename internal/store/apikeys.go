@@ -46,6 +46,9 @@ type APIKey struct {
 // llmgate-cutover columns are APPENDED AT THE END — every earlier column's
 // position is load-bearing (scan order must match apiKeyCols verbatim), so a
 // new column may only ever be added at the tail of both.
+// (migrated_notified_ts exists in the TABLE at the tail but deliberately NOT
+// here: no APIKey consumer reads it, ListUnnotifiedMigratedKeys owns its own
+// query, and this explicit list — never SELECT * — is what makes that safe.)
 const apiKeyCols = "order_id, chat_id, key_id, api_key, credits, created_at, refunded_ts, sale_class, backend, pool_key_id, pool_api_key"
 
 func scanAPIKey(r rowScanner) (*APIKey, error) {
@@ -183,12 +186,28 @@ func (s *Store) APIKeysForChat(chatID int64, limit int, liveOnly bool) ([]*APIKe
 // so handing them to the migrator would repoint keys whose gateway must not
 // change. Refunded rows are excluded because there is nothing to hand the
 // customer and no live quota to carry over.
-func (s *Store) ListAPIKeysToMigrate(limit int) ([]*APIKey, error) {
-	rows, err := s.db.Query(
-		"SELECT "+apiKeyCols+" FROM api_keys "+
-			"WHERE refunded_ts IS NULL AND backend='' "+
-			"AND sale_class IN ('','bedrock') "+
-			"ORDER BY created_at ASC LIMIT ?", limit)
+//
+// chatID is the REHEARSAL SCOPE: when non-zero, only that telegram chat's
+// rows are returned (AND chat_id=?) — the operator's way of running the
+// whole mint/verify/commit flow against their own account before touching
+// every customer. 0 keeps the previous behavior: every eligible row, no
+// chat filter at all.
+func (s *Store) ListAPIKeysToMigrate(limit int, chatID int64) ([]*APIKey, error) {
+	// The chat filter is appended to the shared WHERE (never edited into it)
+	// so the unscoped query's text stays byte-identical to what it was before
+	// the flag existed — and so List and Count below keep appending the SAME
+	// clause in the SAME spot, which is what stops the two from drifting.
+	q := "SELECT " + apiKeyCols + " FROM api_keys " +
+		"WHERE refunded_ts IS NULL AND backend='' " +
+		"AND sale_class IN ('','bedrock') "
+	var args []any
+	if chatID != 0 {
+		q += "AND chat_id=? "
+		args = append(args, chatID)
+	}
+	q += "ORDER BY created_at ASC LIMIT ?"
+	args = append(args, limit)
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -243,18 +262,100 @@ func (s *Store) MigrateAPIKeyToLlmgate(orderID, poolKeyID, poolAPIKey, lgKeyID, 
 }
 
 // CountAPIKeysToMigrate is the COUNT(*) twin of ListAPIKeysToMigrate over the
-// exact same WHERE — the migration tool's progress meter (done vs remaining).
-// Kept as a separate method (not len(ListAPIKeysToMigrate(huge))) so the
-// count never depends on paging through every row, and so the two queries
-// drift only if someone edits one WHERE and not the other — which the store
-// tests pin.
-func (s *Store) CountAPIKeysToMigrate() (int64, error) {
+// exact same WHERE (same chatID rehearsal-scope semantics: 0 = all chats) —
+// the migration tool's progress meter (done vs remaining). Kept as a separate
+// method (not len(ListAPIKeysToMigrate(huge))) so the count never depends on
+// paging through every row, and so the two queries drift only if someone
+// edits one WHERE and not the other — which the store tests pin.
+func (s *Store) CountAPIKeysToMigrate(chatID int64) (int64, error) {
+	q := "SELECT COUNT(*) FROM api_keys " +
+		"WHERE refunded_ts IS NULL AND backend='' " +
+		"AND sale_class IN ('','bedrock')"
+	var args []any
+	if chatID != 0 {
+		q += " AND chat_id=?"
+		args = append(args, chatID)
+	}
 	var n int64
-	err := s.db.QueryRow(
-		"SELECT COUNT(*) FROM api_keys " +
-			"WHERE refunded_ts IS NULL AND backend='' " +
-			"AND sale_class IN ('','bedrock')").Scan(&n)
+	err := s.db.QueryRow(q, args...).Scan(&n)
 	return n, err
+}
+
+// ---- migrated-key DM notifications (cmd/migrate-notify) ---------------------
+
+// MigratedKey is one MIGRATED-but-not-yet-DM'd customer, shaped directly by
+// the ListUnnotifiedMigratedKeys join rather than reusing APIKey: the notify
+// tool needs exactly these five fields (the new key to deliver, the chat to
+// deliver it to, the credits to mention, and the order's language to say it
+// in), and a dedicated struct keeps that join's shape from growing tentacles
+// into every APIKey consumer. api_key here is the customer's own NEW llmgate
+// key — the secret this row exists to deliver, never to be logged.
+type MigratedKey struct {
+	OrderID string  // des of the original "__apikey__" order (the DM's audit anchor)
+	ChatID  int64   // INTEGER per-table quirk, same as APIKey.ChatID
+	APIKey  string  // the NEW llmgate cleartext key to send the customer
+	Credits float64 // credits carried over by the migration (the DM's figure)
+	Lang    string  // order's language ('vi'|'zh'|'en' default via COALESCE)
+}
+
+// ListUnnotifiedMigratedKeys returns the migrated llmgate keys whose owners
+// have NOT yet been DM'd their new key, oldest first — cmd/migrate-notify's
+// work queue. "Migrated" means backend='llmgate' AND pool_key_id!=”: the
+// non-empty preserved pool uuid is the fingerprint of the one-shot cutover
+// (a FRESH llmgate mint never had a pool predecessor — its pool_key_id is
+// NULL, and SQL `NULL != ”` is not true, so fresh mints are excluded by the
+// same clause with no extra term). "Not yet notified" means
+// migrated_notified_ts IS NULL — the stamp MarkMigratedNotified writes is
+// what makes re-running the tool skip everyone already served. The LEFT JOIN
+// orders picks the DM's language; a missing order row (or a NULL lang)
+// COALESCEs to 'en', the shop's default. Refunded rows are deliberately NOT
+// excluded here: the migration only ever moved LIVE rows, so a refunded-after
+// -migration row is vanishingly rare and the customer still holds the key —
+// the DM is harmless, the stamp still applies, and the operator can see the
+// row in dry-run output before applying.
+func (s *Store) ListUnnotifiedMigratedKeys(limit int) ([]MigratedKey, error) {
+	rows, err := s.db.Query(
+		"SELECT k.order_id, k.chat_id, k.api_key, k.credits, COALESCE(o.lang,'en') AS lang "+
+			"FROM api_keys k LEFT JOIN orders o ON o.des=k.order_id "+
+			"WHERE k.backend='llmgate' AND k.pool_key_id!='' "+
+			"AND k.migrated_notified_ts IS NULL "+
+			"ORDER BY k.created_at ASC LIMIT ?", limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MigratedKey
+	for rows.Next() {
+		var (
+			k            MigratedKey
+			apiKey, lang sql.NullString
+			credits      sql.NullFloat64
+		)
+		if err := rows.Scan(&k.OrderID, &k.ChatID, &apiKey, &credits, &lang); err != nil {
+			return nil, err
+		}
+		k.APIKey, k.Credits = apiKey.String, credits.Float64
+		// COALESCE already defaulted NULL lang to 'en' in SQL; a '' lang
+		// (order row present, lang never set) reads as the same default.
+		if lang.Valid && lang.String != "" {
+			k.Lang = lang.String
+		} else {
+			k.Lang = "en"
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// MarkMigratedNotified stamps one api_keys row as DM-delivered (idempotent —
+// first stamp wins, exactly like MarkAPIKeyRefunded): migrate-notify calls it
+// only AFTER the sendMessage came back ok, so the stamp IS the delivery
+// record and the WHERE ... IS NULL guard keeps a re-run from ever re-DMing a
+// customer the tool already served.
+func (s *Store) MarkMigratedNotified(orderID string) error {
+	_, err := s.db.Exec("UPDATE api_keys SET migrated_notified_ts=? "+
+		"WHERE order_id=? AND migrated_notified_ts IS NULL", now(), orderID)
+	return err
 }
 
 // ---- apikey recharges (credit top-ups for already-sold keys) --------------

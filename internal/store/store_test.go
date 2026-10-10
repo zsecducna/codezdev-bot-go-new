@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -430,8 +431,13 @@ func TestMigrationOldSchema(t *testing.T) {
 			k.Backend, k.PoolKeyID, k.PoolAPIKey)
 	}
 	// And a legacy row is exactly what the migration tool must pick up.
-	if n, err := s.CountAPIKeysToMigrate(); err != nil || n != 1 {
+	if n, err := s.CountAPIKeysToMigrate(0); err != nil || n != 1 {
 		t.Fatalf("CountAPIKeysToMigrate on legacy DB = %d err=%v, want 1 (the legacy row is pool+bedrock-class)", n, err)
+	}
+	// The notify stamp column must land on old DBs by the same boot, so a
+	// pre-notify-store db migrates in one Open (column-gated ALTER).
+	if !akCols["migrated_notified_ts"] {
+		t.Errorf("api_keys missing notify column migrated_notified_ts")
 	}
 }
 
@@ -669,7 +675,7 @@ func TestListAndCountAPIKeysToMigrate(t *testing.T) {
 		}
 	}
 
-	got, err := s.ListAPIKeysToMigrate(100)
+	got, err := s.ListAPIKeysToMigrate(100, 0)
 	if err != nil {
 		t.Fatalf("ListAPIKeysToMigrate: %v", err)
 	}
@@ -681,13 +687,164 @@ func TestListAndCountAPIKeysToMigrate(t *testing.T) {
 		t.Fatalf("eligible set = %v, want [ord-bedrock ord-legacy] (refunded/kiro/fixed/migrated excluded, oldest first)", ids)
 	}
 	// LIMIT pages the tool through batches.
-	got, err = s.ListAPIKeysToMigrate(1)
+	got, err = s.ListAPIKeysToMigrate(1, 0)
 	if err != nil || len(got) != 1 || got[0].OrderID != "ord-bedrock" {
 		t.Fatalf("ListAPIKeysToMigrate(1) = %d rows err=%v, want exactly [ord-bedrock]", len(got), err)
 	}
 	// COUNT(*) twin agrees with the unlimited list.
-	if n, err := s.CountAPIKeysToMigrate(); err != nil || n != 2 {
+	if n, err := s.CountAPIKeysToMigrate(0); err != nil || n != 2 {
 		t.Fatalf("CountAPIKeysToMigrate = %d err=%v, want 2", n, err)
+	}
+}
+
+// TestListAndCountAPIKeysToMigrateChatScope pins the -chat rehearsal filter:
+// a non-zero chatID narrows BOTH the list and the count to that chat's
+// eligible rows only, while chatID=0 keeps the unscoped behavior (proven
+// directly above). This is the store half of the operator's dress-rehearsal
+// mode in cmd/migrate-llmgate.
+func TestListAndCountAPIKeysToMigrateChatScope(t *testing.T) {
+	s := newTestStore(t)
+	seed := func(ins bool, err error) {
+		t.Helper()
+		if err != nil || !ins {
+			t.Fatalf("seed: ins=%v err=%v", ins, err)
+		}
+	}
+	// Two eligible rows in chat 7, one in chat 8, plus a chat-7 row that is
+	// NOT eligible (kiro class) — the scope must filter, never widen.
+	seed(s.AddAPIKey("ord-7a", 7, "kid-7a", "sk-7a", 100, "bedrock", BackendPool))
+	seed(s.AddAPIKey("ord-7k", 7, "kid-7k", "sk-7k", 100, "kiro", BackendPool))
+	seed(s.AddAPIKey("ord-8a", 8, "kid-8a", "sk-8a", 100, "", BackendPool))
+	for i, id := range []string{"ord-7a", "ord-7k", "ord-8a"} {
+		if _, err := s.db.Exec("UPDATE api_keys SET created_at=? WHERE order_id=?", int64(2000+i), id); err != nil {
+			t.Fatalf("stamp created_at %s: %v", id, err)
+		}
+	}
+
+	// Scoped list: only chat 7's ELIGIBLE row (the kiro row stays excluded by
+	// the sale_class term — chat scope composes with, never replaces, the
+	// eligibility WHERE).
+	got, err := s.ListAPIKeysToMigrate(100, 7)
+	if err != nil || len(got) != 1 || got[0].OrderID != "ord-7a" {
+		t.Fatalf("scoped list = %v err=%v, want exactly [ord-7a]", got, err)
+	}
+	if n, err := s.CountAPIKeysToMigrate(7); err != nil || n != 1 {
+		t.Fatalf("scoped count = %d err=%v, want 1", n, err)
+	}
+	// A chat with no rows at all: empty list, zero count — not an error.
+	if got, err = s.ListAPIKeysToMigrate(100, 999); err != nil || len(got) != 0 {
+		t.Fatalf("no-such-chat list = %v err=%v, want empty", got, err)
+	}
+	if n, err := s.CountAPIKeysToMigrate(999); err != nil || n != 0 {
+		t.Fatalf("no-such-chat count = %d err=%v, want 0", n, err)
+	}
+	// chatID=0: unscoped — both chats' eligible rows, exactly as before the
+	// flag existed.
+	if n, err := s.CountAPIKeysToMigrate(0); err != nil || n != 2 {
+		t.Fatalf("unscoped count = %d err=%v, want 2 (0 must mean no filter)", n, err)
+	}
+	if got, err = s.ListAPIKeysToMigrate(100, 0); err != nil || len(got) != 2 {
+		t.Fatalf("unscoped list = %d rows err=%v, want 2", len(got), err)
+	}
+}
+
+// TestListUnnotifiedMigratedKeysAndMarkNotified is the cmd/migrate-notify
+// store round trip: the listing admits ONLY migrated rows (backend='llmgate'
+// + non-empty pool_key_id) whose migrated_notified_ts is still NULL, joins
+// the order's lang (COALESCE'd to 'en' when the order is missing or its lang
+// is NULL/empty), pages by LIMIT oldest-first, and MarkMigratedNotified
+// stamps the row so a re-list skips it — idempotently (a replayed stamp
+// never re-opens the row).
+func TestListUnnotifiedMigratedKeysAndMarkNotified(t *testing.T) {
+	s := newTestStore(t)
+	seed := func(ins bool, err error) {
+		t.Helper()
+		if err != nil || !ins {
+			t.Fatalf("seed: ins=%v err=%v", ins, err)
+		}
+	}
+	// Three real migrated rows (AddAPIKey pool-side, then the migration
+	// commit), each with an orders row in a different lang.
+	mk := func(des, lang string, chat int64, credits float64, createdAt int64) {
+		seed(s.AddAPIKey(des, chat, "pool-"+des, "sk-pool-"+des, 1, "bedrock", BackendPool))
+		if lang != "" {
+			// A real order row carrying the lang the DM must be keyed off.
+			if err := s.CreateOrder(des, strconv.FormatInt(chat, 10), lang, "__apikey__", "", 1, 100); err != nil {
+				t.Fatalf("CreateOrder %s: %v", des, err)
+			}
+		}
+		if moved, err := s.MigrateAPIKeyToLlmgate(des, "pool-"+des, "sk-pool-"+des, "lg-"+des, "sk-lg-"+des, credits); err != nil || !moved {
+			t.Fatalf("migrate %s: moved=%v err=%v", des, moved, err)
+		}
+		if _, err := s.db.Exec("UPDATE api_keys SET created_at=? WHERE order_id=?", createdAt, des); err != nil {
+			t.Fatalf("stamp created_at %s: %v", des, err)
+		}
+	}
+	mk("ord-en", "en", 11, 100, 3000)
+	mk("ord-vi", "vi", 22, 200.5, 3001)
+	mk("ord-zh", "zh", 33, 300, 3002)
+	// The shapes that must be EXCLUDED:
+	seed(s.AddAPIKey("ord-fresh-lg", 44, "lg-fresh", "sk-lg-fresh", 50, "bedrock", BackendLlmgate)) // fresh llmgate mint: pool_key_id NULL
+	seed(s.AddAPIKey("ord-pool", 55, "kid-p", "sk-p", 100, "bedrock", BackendPool))                 // not migrated at all
+	// Already notified: a migrated row with the stamp set.
+	mk("ord-done", "", 66, 400, 2999)
+	if err := s.MarkMigratedNotified("ord-done"); err != nil {
+		t.Fatalf("mark notified: %v", err)
+	}
+
+	got, err := s.ListUnnotifiedMigratedKeys(100)
+	if err != nil {
+		t.Fatalf("ListUnnotifiedMigratedKeys: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("unnotified set = %d rows, want 3 (fresh lg / pool / notified excluded): %+v", len(got), got)
+	}
+	// Oldest first, with the migrated key values, carried credits, and the
+	// joined langs (ord-done at 2999 is older but already stamped — excluded).
+	want := []MigratedKey{
+		{OrderID: "ord-en", ChatID: 11, APIKey: "sk-lg-ord-en", Credits: 100, Lang: "en"},
+		{OrderID: "ord-vi", ChatID: 22, APIKey: "sk-lg-ord-vi", Credits: 200.5, Lang: "vi"},
+		{OrderID: "ord-zh", ChatID: 33, APIKey: "sk-lg-ord-zh", Credits: 300, Lang: "zh"},
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("row %d = %+v, want %+v", i, got[i], w)
+		}
+	}
+	// LIMIT pages the tool through batches.
+	if got, err = s.ListUnnotifiedMigratedKeys(1); err != nil || len(got) != 1 || got[0].OrderID != "ord-en" {
+		t.Fatalf("LIMIT 1 = %v err=%v, want exactly [ord-en]", got, err)
+	}
+
+	// Stamp one row: it leaves the queue immediately, others stay.
+	if err := s.MarkMigratedNotified("ord-vi"); err != nil {
+		t.Fatalf("mark ord-vi: %v", err)
+	}
+	got, err = s.ListUnnotifiedMigratedKeys(100)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("after stamp = %d rows err=%v, want 2 (ord-en, ord-zh)", len(got), err)
+	}
+	// Replaying the stamp is a no-op (first stamp wins — the DM must never
+	// be re-sendable by a re-run), and stamping an unknown order is silent.
+	if err := s.MarkMigratedNotified("ord-vi"); err != nil {
+		t.Fatalf("replayed mark: %v", err)
+	}
+	if err := s.MarkMigratedNotified("ord-nope"); err != nil {
+		t.Fatalf("unknown-order mark: %v", err)
+	}
+	if got, err = s.ListUnnotifiedMigratedKeys(100); err != nil || len(got) != 2 {
+		t.Fatalf("after replayed stamps = %d rows err=%v, want still 2", len(got), err)
+	}
+
+	// Lang defaulting: a migrated row with NO order row at all must COALESCE
+	// to 'en' — the LEFT JOIN half of the contract.
+	mk("ord-noorder", "", 77, 10, 3003)
+	if got, err = s.ListUnnotifiedMigratedKeys(100); err != nil || len(got) != 3 {
+		t.Fatalf("after no-order row = %d rows err=%v, want 3", len(got), err)
+	}
+	last := got[len(got)-1]
+	if last.OrderID != "ord-noorder" || last.Lang != "en" {
+		t.Errorf("orderless row = %+v, want lang 'en' via COALESCE", last)
 	}
 }
 

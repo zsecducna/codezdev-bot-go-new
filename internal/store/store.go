@@ -472,12 +472,14 @@ func (s *Store) initSchema() error {
 		// Kiro-Go API keys minted for delivered "__apikey__" orders. order_id
 		// PK = the settle-idempotency anchor. ⚠ chat_id is INTEGER here,
 		// TEXT everywhere else — preserve per-table types
-		// (store.py:151-162, architecture-go.md §4.1).
+		// (store.py:151-162, architecture-go.md §4.1). migrated_notified_ts is
+		// the cmd/migrate-notify delivery stamp (see its ALTER below).
 		"CREATE TABLE IF NOT EXISTS api_keys (" +
 			"order_id TEXT PRIMARY KEY, chat_id INTEGER, key_id TEXT, " +
 			"api_key TEXT, credits REAL, created_at INTEGER, refunded_ts REAL, " +
 			"sale_class TEXT NOT NULL DEFAULT '', " +
-			"backend TEXT NOT NULL DEFAULT '', pool_key_id TEXT, pool_api_key TEXT)",
+			"backend TEXT NOT NULL DEFAULT '', pool_key_id TEXT, pool_api_key TEXT, " +
+			"migrated_notified_ts REAL)",
 		"CREATE INDEX IF NOT EXISTS idx_api_keys_chat ON api_keys(chat_id)", // store.py:163
 	}
 	for _, q := range creates2 {
@@ -535,6 +537,21 @@ func (s *Store) initSchema() error {
 			if _, err := tx.Exec("ALTER TABLE api_keys ADD COLUMN " + col + " TEXT"); err != nil {
 				return fmt.Errorf("migrate api_keys.%s: %w", col, err)
 			}
+		}
+	}
+	// Migration: migrated_notified_ts — stamped by cmd/migrate-notify once the
+	// customer has been DM'd their new llmgate key (MarkMigratedNotified).
+	// NULLABLE because NULL means "not yet notified": every migrated row
+	// starts un-notified, and the IS NULL filter in ListUnnotifiedMigratedKeys
+	// is the tool's entire re-run-safety mechanism. Appended AFTER the pool
+	// pair so a migrated old DB and a fresh CREATE land in the same column
+	// order (same rule the backend/pool ALTERs above follow); deliberately
+	// NOT added to apiKeyCols — no APIKey consumer reads it, it has its own
+	// dedicated query, and keeping it out of the shared SELECT avoids
+	// touching every scanAPIKey call site for a column only one tool wants.
+	if !haveAK["migrated_notified_ts"] {
+		if _, err := tx.Exec("ALTER TABLE api_keys ADD COLUMN migrated_notified_ts REAL"); err != nil {
+			return fmt.Errorf("migrate api_keys.migrated_notified_ts: %w", err)
 		}
 	}
 

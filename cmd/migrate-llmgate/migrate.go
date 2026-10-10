@@ -138,13 +138,20 @@ type planRow struct {
 // listing, or a commit error) and main must exit non-zero regardless of the
 // counts. Per-row upstream failures NEVER abort the run; they only bump
 // their bucket — one bad row must not strand the other hundreds.
-func (m *Migrator) Run(ctx context.Context, apply bool, limit int) (Counts, error) {
+//
+// chatID is the -chat rehearsal scope: 0 migrates every eligible row (the
+// only behavior that existed before the flag), non-zero restricts BOTH the
+// headline count and the row list to that one telegram chat — the operator's
+// end-to-end dress rehearsal against their own account.
+func (m *Migrator) Run(ctx context.Context, apply bool, limit int, chatID int64) (Counts, error) {
 	var c Counts
 
 	// The plan headline: the store's own count of eligible rows (independent
 	// of any -limit paging), so the operator sees the true backlog even when
-	// slicing the run with -limit.
-	eligible, err := m.Store.CountAPIKeysToMigrate()
+	// slicing the run with -limit. Under a -chat rehearsal the count is the
+	// chat's own backlog — the number the operator is about to act on, not
+	// the whole table's.
+	eligible, err := m.Store.CountAPIKeysToMigrate(chatID)
 	if err != nil {
 		return c, fmt.Errorf("count eligible rows: %w", err)
 	}
@@ -157,13 +164,19 @@ func (m *Migrator) Run(ctx context.Context, apply bool, limit int) (Counts, erro
 	if sqlLimit <= 0 {
 		sqlLimit = -1
 	}
-	rows, err := m.Store.ListAPIKeysToMigrate(sqlLimit)
+	rows, err := m.Store.ListAPIKeysToMigrate(sqlLimit, chatID)
 	if err != nil {
 		return c, fmt.Errorf("list rows to migrate: %w", err)
 	}
 
 	// ---- PLAN PHASE (reads only; identical for dry run and apply) --------
 	fmt.Fprintf(m.Out, "plan: %d eligible key(s) to migrate", eligible)
+	if chatID != 0 {
+		// Name the rehearsal scope in the plan headline: a scoped run must be
+		// unmistakable in the transcript, because it is the one mode an
+		// operator runs against their own live account.
+		fmt.Fprintf(m.Out, " (rehearsal chat=%d)", chatID)
+	}
 	if limit > 0 {
 		fmt.Fprintf(m.Out, " (limit=%d applies)", limit)
 	}

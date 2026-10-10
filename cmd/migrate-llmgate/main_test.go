@@ -381,10 +381,10 @@ func (e *testEnv) row(t *testing.T, des string) *store.APIKey {
 	return k
 }
 
-// run is Run with the boilerplate (background ctx) folded in.
+// run is Run with the boilerplate (background ctx, no chat scope) folded in.
 func (e *testEnv) run(t *testing.T, apply bool) (Counts, error) {
 	t.Helper()
-	return e.m.Run(context.Background(), apply, 0)
+	return e.m.Run(context.Background(), apply, 0, 0)
 }
 
 // ---- the eight required cases ------------------------------------------------
@@ -636,6 +636,53 @@ func TestVerifyMismatchCountedFailedVerifyRowNotMigrated(t *testing.T) {
 	}
 	if counts.FailureCount() != 1 {
 		t.Errorf("failure count = %d, want 1 (non-zero exit contract)", counts.FailureCount())
+	}
+}
+
+// TestChatRehearsalScopeFiltersRowsAndCount: -chat is the operator's dress
+// rehearsal — with chat=222 set, ONLY that chat's rows are counted, listed,
+// and migrated (rows of other chats and even other eligible chats stay
+// pool-backed, untouched); the plan headline names the scope. chat=0 keeps
+// the unscoped behavior (both chats migrate), which the other tests already
+// pin — this test contrasts the two directly.
+func TestChatRehearsalScopeFiltersRowsAndCount(t *testing.T) {
+	e := newEnv(t)
+	e.seedRow(t, "ord1", 111, "pool-uuid-1", "sk-pool-1", 100, "", 42)
+	e.seedRow(t, "ord2", 222, "pool-uuid-2", "sk-pool-2", 100, "bedrock", 43)
+
+	// Scoped apply: only chat 222's row is in play.
+	counts, err := e.m.Run(context.Background(), true, 0, 222)
+	if err != nil {
+		t.Fatalf("scoped apply: %v", err)
+	}
+	if counts.Eligible != 1 || counts.Planned != 1 || counts.Migrated != 1 {
+		t.Errorf("scoped counts: %+v, want eligible/planned/migrated = 1/1/1", counts)
+	}
+	if k := e.row(t, "ord1"); k.Backend != store.BackendPool || k.KeyID != "pool-uuid-1" {
+		t.Errorf("out-of-scope row migrated by -chat run: %+v", k)
+	}
+	if k := e.row(t, "ord2"); k.Backend != store.BackendLlmgate || k.KeyID != "1" {
+		t.Errorf("in-scope row not migrated: %+v", k)
+	}
+	if out := e.out.String(); !strings.Contains(out, "plan: 1 eligible key(s) to migrate (rehearsal chat=222)") {
+		t.Errorf("plan headline must name the rehearsal scope:\n%s", out)
+	}
+	if out := e.out.String(); strings.Contains(out, "des=ord1") {
+		t.Errorf("out-of-scope row leaked into the scoped transcript:\n%s", out)
+	}
+
+	// Unscoped follow-up: chat 0 behaves as before — the remaining row is
+	// eligible and migrates normally.
+	e.out.Reset()
+	counts, err = e.m.Run(context.Background(), true, 0, 0)
+	if err != nil {
+		t.Fatalf("unscoped apply: %v", err)
+	}
+	if counts.Eligible != 1 || counts.Migrated != 1 {
+		t.Errorf("unscoped counts: %+v, want eligible/migrated = 1/1 (chat=0 must keep the old behavior)", counts)
+	}
+	if k := e.row(t, "ord1"); k.Backend != store.BackendLlmgate {
+		t.Errorf("chat=0 run left the row unmigrated: %+v", k)
 	}
 }
 
